@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flovopy"
+version = "0.1.0"
+description = "Seismology and volcano observatory tools including Seisan parsing"
+authors = [
+  { name = "Your Name", email = "you@example.com" }
+]
+requires-python = ">=3.8"
+dependencies = [
+  "obspy",
+  "pandas",
+  "numpy"
+]
+
+[project.scripts]
+run-iceweb = "flovopy.wrappers.run_iceweb:main"
