@@ -204,3 +204,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+"""
+run-asl   --start 2001-01-01T00:00:00   --end 2001-01-01T03:00:00   --db MVOE_    --outdir output/asl   --Q 23   --peakf 8.0   --metric rms   --speed 1.5   --interactive --verbose
+"""
