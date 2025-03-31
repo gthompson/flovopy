@@ -56,3 +56,23 @@ def FDSN_to_SDS_daily_wrapper(startt, endt, SDS_TOP, centerlat=None, centerlon=N
     
 
         startt+=secsPerDay # add 1 day 
+        
+def main():
+    import argparse
+    from obspy import UTCDateTime
+
+    parser = argparse.ArgumentParser(description="Download FDSN data into SDS structure.")
+    parser.add_argument("--network", required=True)
+    parser.add_argument("--station", required=True)
+    parser.add_argument("--start", required=True)
+    parser.add_argument("--end", required=True)
+    parser.add_argument("--outdir", default="SDS")
+    args = parser.parse_args()
+
+    FDSN_to_SDS_daily_wrapper(
+        startt=UTCDateTime(args.start),
+        endt=UTCDateTime(args.end),
+        outdir=args.outdir,
+        network=args.network,
+        station=args.station
+    )

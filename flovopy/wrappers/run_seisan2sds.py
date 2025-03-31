@@ -55,7 +55,54 @@ def seisan_to_sds(seisandbdir, sdsdir, startt0, endt0, net, dbout=None, round_sa
 
         dayt += SECONDS_PER_DAY
 
+def main():
+    import argparse
 
+    parser = argparse.ArgumentParser(description="Convert Seisan waveform files to SDS archive format")
+
+    parser.add_argument("--start", type=str, required=True,
+                        help="Start date in UTC (e.g., 2001-01-01T00:00:00)")
+    parser.add_argument("--end", type=str, required=True,
+                        help="End date in UTC (e.g., 2001-01-02T00:00:00)")
+    parser.add_argument("--seisan", type=str, required=True,
+                        help="Path to Seisan database root directory (e.g., /data/SEISAN_DB)")
+    parser.add_argument("--sds", type=str, required=True,
+                        help="Path to output SDS archive directory")
+    parser.add_argument("--net", type=str, required=True,
+                        help="Network code (e.g., MV)")
+    parser.add_argument("--dbout", type=str,
+                        help="Optional Datascope database name prefix (e.g., SDS2DB/MVOE_)")
+    parser.add_argument("--round_sampling_rate", action="store_true",
+                        help="Round sampling rate to nearest integer Hz")
+    parser.add_argument("--MBWHZ_only", action="store_true",
+                        help="Only include MBWH station Z component")
+
+    args = parser.parse_args()
+
+    seisan_to_sds(
+        seisandbdir=args.seisan,
+        sdsdir=args.sds,
+        startt0=UTCDateTime(args.start),
+        endt0=UTCDateTime(args.end),
+        net=args.net,
+        dbout=args.dbout,
+        round_sampling_rate=args.round_sampling_rate,
+        MBWHZ_only=args.MBWHZ_only
+    )
+
+if __name__ == "__main__":
+    main()
+"""
+run-seisan2sds \
+  --start 2001-01-01T00:00:00 \
+  --end 2001-01-02T00:00:00 \
+  --seisan /data/SEISAN_DB \
+  --sds SDS_ARCHIVE \
+  --net MV \
+  --dbout SDS2DB/MVOE_ \
+  --MBWHZ_only
+
+"""
 
 
 

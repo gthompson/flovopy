@@ -14,7 +14,6 @@ from flovopy.core.inventory import attach_station_coordinates_from_inventory, at
 
 logger = logging.getLogger(__name__)
 
-
 class IceWebDatabase:
     def __init__(self, dbpath: str):
         self.dbpath = dbpath
@@ -432,6 +431,34 @@ def main():
 
     job.run(startt, endt, inv, trace_ids)
 
+
+def main():
+    parser = argparse.ArgumentParser(description="Run IceWeb processing pipeline")
+    parser.add_argument("--config", type=str, required=True, help="Path to config directory")
+    parser.add_argument("--subnet", type=str, required=True, help="Subnet label")
+    parser.add_argument("--start", type=str, required=True, help="Start time in UTC (e.g., 2023-01-01T00:00:00)")
+    parser.add_argument("--end", type=str, required=True, help="End time in UTC (e.g., 2023-01-02T00:00:00)")
+    parser.add_argument("--trace_ids", type=str, nargs='+', help="List of trace IDs (e.g., XX.STA..BHZ)")
+    parser.add_argument("--inventory", type=str, help="Path to StationXML inventory file")
+    args = parser.parse_args()
+
+    from flovopy.wrappers.run_iceweb import read_config, IceWebJob
+
+    config = read_config(configdir=args.config)
+
+    job = IceWebJob(subnet=args.subnet, config=config)
+
+    startt = UTCDateTime(args.start)
+    endt = UTCDateTime(args.end)
+
+    inv = None
+    if args.inventory:
+        inv = obspy.read_inventory(args.inventory)
+
+    trace_ids = args.trace_ids if args.trace_ids else None
+
+    job.run(startt, endt, inv, trace_ids)
+
 if __name__ == "__main__":
     main()
 """
@@ -445,3 +472,4 @@ python -m flovopy.wrappers.run_iceweb \
   --trace_ids XX.STA..BHZ XX.STB..BHZ \
   --inventory my_station_metadata.xml
 """
+   

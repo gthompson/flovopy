@@ -1,4 +1,3 @@
-from pathlib import Path
 import os
 
 def remove_ds_store_files_and_empty_dirs(sds_directory):
@@ -47,12 +46,13 @@ def yes_or_no(question, default_answer='y', auto=False):
         return False
     
 
- def yn_choice(message, default='y'):
+def yn_choice(message, default='y'):
     choices = 'Y/n' if default.lower() in ('y', 'yes') else 'y/N'
     choice = input("%s (%s) " % (message, choices))
     values = ('y', 'yes', '') if default == 'y' else ('y', 'yes')
     return True if choice.strip().lower() in values else False   
 
+'''
 def tree(dir_path: Path, prefix: str=''):
     """A recursive generator, given a directory Path object
     will yield a visual tree structure line by line
@@ -75,3 +75,50 @@ def tree(dir_path: Path, prefix: str=''):
             extension = branch if pointer == tee else space 
             # i.e. space because last, └── , above so no more |
             yield from tree(path, prefix=prefix+extension)
+'''
+
+import ast
+from pathlib import Path
+
+def extract_definitions(path: Path):
+    """Return a string listing the class and function names in the file."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            node = ast.parse(f.read(), filename=str(path))
+        classes = [n.name for n in node.body if isinstance(n, ast.ClassDef)]
+        funcs = [n.name for n in node.body if isinstance(n, ast.FunctionDef)]
+        parts = []
+        if classes:
+            parts.append("classes: " + ", ".join(classes))
+        if funcs:
+            parts.append("functions: " + ", ".join(funcs))
+        return "  # " + "; ".join(parts) if parts else ""
+    except Exception as e:
+        return "  # [error parsing]"
+
+def tree(dir_path: Path, prefix: str=''):
+    """Recursively print a visual tree of a directory with function/class info for .py files."""
+    space =  '    '
+    branch = '│   '
+    tee =    '├── '
+    last =   '└── '
+    
+    contents = sorted(list(dir_path.iterdir()), key=lambda p: (not p.is_dir(), p.name.lower()))
+    pointers = [tee] * (len(contents) - 1) + [last]
+    for pointer, path in zip(pointers, contents):
+        line = prefix + pointer + path.name
+        if path.is_file() and path.suffix == '.py':
+            line += extract_definitions(path)
+        yield line
+        if path.is_dir():
+            extension = branch if pointer == tee else space
+            yield from tree(path, prefix=prefix + extension)
+
+if __name__ == "__main__":
+    homedir = Path.home()
+    flovodir = homedir / 'Developer' / 'flovopy' / 'flovopy'
+    if not flovodir.exists():
+        print(f"ERROR: {flovodir} does not exist")
+    else:
+        for line in tree(flovodir):
+            print(line)

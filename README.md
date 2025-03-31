@@ -1,10 +1,10 @@
 # FLOVOpy: Florida Virtual Volcano Observatory Tools
 
-FLOVOpy is a Python package providing advanced tools for volcano observatories and seismology research. It includes waveform processing utilities, RSAM/DRS computation, spectrogram generation, and enhanced support for legacy datasets such as Seisan files.
+FLOVOpy is a Python package providing advanced tools for volcano observatories and seismology research. It includes waveform processing utilities, RSAM/DRS computation, spectrogram generation, amplitude source location (ASL), and enhanced support for legacy datasets such as Seisan files.
 
 ---
 
-## Installation (via Conda)
+## 📦 Installation (via Conda)
 
 To install FLOVOpy in **editable mode** using a Conda environment:
 
@@ -17,17 +17,32 @@ cd flovopy
 conda create -n flovopy-env python=3.10
 conda activate flovopy-env
 
-# Install dependencies
+# Install dependencies and the package in editable mode
 pip install -e .
 ```
 
-This registers FLOVOpy for local development and enables the `run-iceweb` command-line interface.
+---
+
+## 🚀 Available CLI Tools
+
+The following command-line tools are installed with the package:
+
+| Command            | Description                                                                 |
+|--------------------|-----------------------------------------------------------------------------|
+| `run-iceweb`       | Generate RSAM, DRS, and spectrograms from SDS or FDSN waveform sources      |
+| `run-asl`          | Amplitude-based source location (ASL) processing of Seisan database events |
+| `run-seisan2sds`   | Convert Seisan waveform files to SDS archive format                         |
+| `run-fdsn2sds`     | Download FDSN waveform data into SDS archive format                         |
+| `run-sds2rsam`     | Compute RSAM from SDS archive                                                |
+| `run-sds2disp`     | Compute displacement streams from SDS archive                               |
+
+Run any tool with `--help` for full usage.
 
 ---
 
-## Running the IceWeb Pipeline
+## 🧰 Example Usage
 
-The `run-iceweb` command processes RSAM, DRS, and spectrogram products from waveform archives.
+### `run-iceweb`
 
 ```bash
 run-iceweb \
@@ -39,56 +54,72 @@ run-iceweb \
   --trace_ids XX.STA..BHZ XX.STA..HHZ
 ```
 
-### Arguments
-- `--config`: Path to the configuration directory with `.config.csv` files
-- `--start`, `--end`: UTC time range in ISO format
-- `--subnet`: Label for the virtual network/subnet
-- `--trace_ids`: List of N.S.L.C. trace IDs (optional)
-- `--inventory`: StationXML file for instrument response correction (optional)
+### `run-asl`
 
-Output products (RSAM, DRS, spectrogram PNGs) are stored under paths defined in the general config file.
-
----
-
-## Project Structure
-
-```text
-flovopy/
-├── core/               # Core utilities (inventory, plotting, time, simulation)
-├── processing/         # Metrics, spectrograms, RSAM/DRS (SAM)
-├── analysis/           # Amplitude-based source location (ASL)
-├── seisanio/           # Seisan file support
-├── sds/                # SDS archive reader
-├── wrappers/           # CLI entry points and scripts
-└── obsolete/           # Legacy code modules
+```bash
+run-asl \
+  --start 2001-01-01T00:00:00 \
+  --end 2001-01-02T00:00:00 \
+  --subnet SHV \
+  --db MVOE_ \
+  --seisan /data/SEISAN_DB \
+  --inventory metadata/station.xml \
+  --outdir ASL_DB \
+  --Q 23 \
+  --peakf 8.0 \
+  --metric rms \
+  --surfaceWaveSpeed_kms 1.5 \
+  --interactive False
 ```
 
 ---
 
-## Upcoming CLI Tools
+## 📂 Project Structure
 
-Additional scripts will be made available via CLI:
-- `run-seisan2sds`: Convert Seisan waveform files to SDS format
-- `run-fdsn2sds`: Download FDSN waveforms into an SDS archive
-- `run-compute-sam`: Compute statistical/amplitude metrics (SAM)
+```text
+flovopy/
+├── analysis/             # Amplitude-based source location (ASL)
+├── core/                 # Core utilities: inventory, plotting, simulation
+├── processing/           # RSAM/DRS and signal metrics (SAM)
+├── seisanio/             # Seisan format support and waveform parsing
+├── sds/                  # SDS archive handling
+├── wrappers/             # CLI entry points and batch wrappers
+├── obsolete/             # Deprecated modules
+├── utils.py              # Shared utility functions
+└── tests/                # Unit tests
+```
 
 ---
 
-## Requirements
-- Python 3.8 or later
+## 📋 Requirements
+
+- Python 3.8 or newer
 - Conda environment (recommended)
 - Dependencies:
   - `obspy`
   - `numpy`
   - `pandas`
+  - (plus others depending on specific modules)
 
 ---
 
-## License
+## 📖 Documentation
+
+Full documentation (under construction) is being developed using Sphinx and will include:
+- API reference
+- Tutorials for real-time observatory pipelines
+- Guides for legacy Seisan data conversion
+- Tools for ASL modeling and seismic/infrasound visualization
+
+---
+
+## 📜 License
+
 FLOVOpy is released under the MIT License.
 
 ---
 
-## Acknowledgments
-FLOVOpy is developed at the University of South Florida as part of the Florida Virtual Volcano Observatory (FLO-VO) initiative, with contributions from volcano seismologists, geophysicists, and observatory partners.
+## 🤝 Acknowledgments
+
+FLOVOpy is developed at the University of South Florida as part of the Florida Virtual Volcano Observatory (FLO-VO) initiative, with contributions from volcano seismologists, geophysicists, and observatory partners across the Caribbean and the Americas.
 

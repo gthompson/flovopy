@@ -18,3 +18,8 @@ dependencies = [
 
 [project.scripts]
 run-iceweb = "flovopy.wrappers.run_iceweb:main"
+run-asl = "flovopy.wrappers.run_asl:main"
+run-sds2rsam = "flovopy.wrappers.run_sds2rsam:main"
+run-sds2disp = "flovopy.wrappers.run_sds2disp:main"
+run-fdsn2sds = "flovopy.wrappers.run_fdsn2sds:main"
+run-seisan2sds = "flovopy.wrappers.run_seisan2sds:main"
