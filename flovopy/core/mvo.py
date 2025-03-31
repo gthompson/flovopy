@@ -15,8 +15,12 @@ dome_location = {'lat':16.71111, 'lon':-62.17722}
 def fix_trace_mvo(trace, legacy=False, netcode='MV'):
     fix_y2k_times_mvo(trace)
     fix_sample_rate(trace)
+    original_id = trace.id
     trace.id = correct_nslc_mvo(trace.id, trace.stats.sampling_rate)
+    mvo_id = trace.id
     fix_trace_id(trace, legacy=legacy, netcode=netcode)
+    fixed_id = trace.id
+    print(f'{original_id} -> {mvo_id} -> {fixed_id}')
 
 def load_mvo_master_inventory(XMLDIR):
     master_station_xml = os.path.join(XMLDIR, 'MontserratDigitalSeismicNetwork.xml')
@@ -96,15 +100,19 @@ def correct_nslc_mvo(traceID, Fs, shortperiod=None):
 
     if not shortperiod:
         if 'SB' in chan or chan[0] in 'BH':
-            shortperiod=False
+            shortperiod = False
+            chan = 'BH' + chan[2:]
         else:
             shortperiod = True
+    #print(f'shortperiod: {shortperiod}')
 
     # Determine the correct band code
     expected_band_code = _get_band_code(Fs) # this assumes broadband sensor
+    #print(f'band_code 1: {expected_band_code}')
 
     # adjust if short-period sensor
     expected_band_code = _adjust_band_code_for_sensor_type(chan[0], expected_band_code, short_period=shortperiod)
+    #print(f'band_code 2: {expected_band_code}')
     chan = expected_band_code + chan[1:]    
 
     instrumentcode = 'H'
@@ -143,7 +151,7 @@ def correct_nslc_mvo(traceID, Fs, shortperiod=None):
     # location code was usually 'J' for seismic, 'E' for pressure
     # channel was 'PRS' for pressure
     # there were also 'A N' channels co-located with single-component Integra LA100s, so perhaps those were some other
-    # type of seismometer, oriented North?
+    # type of seismometer, oriented Northt?
     # let's handle these directly here
     if len(chan)==2:
 

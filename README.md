@@ -10,7 +10,7 @@ To install FLOVOpy in **editable mode** using a Conda environment:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/flovopy.git
+git clone https://github.com/gthompson/flovopy.git
 cd flovopy
 
 # Create and activate a Conda environment

@@ -1,5 +1,5 @@
 import os
-from .helpers import correct_nslc
+from flovopy.seisanio.utils.helpers import correct_nslc
 
 
 class AEFfile:

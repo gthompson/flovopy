@@ -82,21 +82,24 @@ def apply_custom_function_to_each_event(
     if vertical_only or outputType:
         seismic_only = True
 
-    sfiles = get_sfile_list(SEISAN_DATA, DB, startdate, enddate, verbose=verbose)
-
+    sfiles = get_sfile_list(SEISAN_DATA, DB, startdate, enddate)#, verbose=verbose)
+    
     for sfile_path in sfiles:
+        print(sfile_path)
         try:
             s = Sfile(sfile_path, fast_mode=True)
             d = s.to_dict()
-
+            print(d)
             if valid_subclasses and not (
                 d['mainclass'] == 'LV' and d['subclass'] in valid_subclasses
             ):
+                print('Failed test')
                 continue
         except Exception as e:
             print(f"[WARN] Failed to parse Sfile {sfile_path}: {e}")
             continue
 
+        
         for item in ['wavfile1', 'wavfile2']:
             wavfile = d.get(item)
             wavfound = False
@@ -138,7 +141,7 @@ def apply_custom_function_to_each_event(
                 taperFraction=0.05,
                 filterType="bandpass",
                 freq=freq,
-                corners=2,
+                corners=6,
                 zerophase=False,
                 outputType=outputType,
                 miniseed_qc=True,
@@ -152,7 +155,7 @@ def apply_custom_function_to_each_event(
 
             if post_process_function:
                 print(f"[INFO] Calling {post_process_function.__name__} with kwargs: {kwargs}")
-                post_process_function(st, raw_st, **kwargs)
+                post_process_function(st, raw_st, inv=inv, **kwargs)
             elif plot:
                 print("[INFO] Final stream preview:")
                 raw_st.plot(equal_scale=False, title="Raw Data")

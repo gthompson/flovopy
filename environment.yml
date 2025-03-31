@@ -1,0 +1,14 @@
+name: flovopy-env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - jupyterlab
+  - obspy
+  - pandas
+  - pip
+  - pygmt
+  - pytest
+  - sphinx
+  - sqlite
+

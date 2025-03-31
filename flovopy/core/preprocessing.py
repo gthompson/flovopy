@@ -2,6 +2,7 @@ import numpy as np
 import os
 from obspy import read, read_inventory, Stream, Trace, UTCDateTime
 from scipy.signal import welch
+from obspy.signal.quality_control import MSEEDMetadata 
 
 #######################################################################
 ##                Trace  tools                                       ##
@@ -139,9 +140,11 @@ def preprocess_trace(tr, bool_despike=True, bool_clean=True, inv=None, quality_t
 
     # Step 4: Detect and Handle Dropouts
     tr.stats['gap_report'] = []
-    #if not _detect_and_handle_dropouts(tr, max_dropout, verbose=verbose):
-    if not _detect_and_handle_gaps(tr, max_dropout=max_dropout, verbose=verbose):
-        return False  # Trace has excessive dropouts, discard
+    if not _detect_and_handle_dropouts(tr, max_dropout=max_dropout, verbose=verbose):
+        return False
+    if not _detect_and_handle_gaps(tr, gap_threshold=int(max_dropout * tr.stats.sampling_rate), verbose=verbose):
+        return False
+
 
     # Step 5: Detect and Correct Clipping, Spikes, and Step Functions
     if verbose:
@@ -158,8 +161,7 @@ def preprocess_trace(tr, bool_despike=True, bool_clean=True, inv=None, quality_t
     if artifacts.get("spike_count", 0) == 0:
         tr.stats.quality_factor += 1.0
     else:
-        add_to_trace_history(tr, f'{artifacts["spike_count"]} outliers found')
-    else:
+        #add_to_trace_history(tr, f'{artifacts["spike_count"]} outliers found')
         add_to_trace_history(tr, f'{spike_count} outliers (spikes) found')
         tr.stats['outlier_indices'] = artifacts.get("spike_indices", [])
 
@@ -1586,7 +1588,7 @@ def _detect_and_handle_dropouts(tr, max_dropout, verbose=False):
     except:
         return False  # If error occurs, discard trace
 
-def detect_and_handle_gaps(tr, gap_threshold=10, null_values=[0, np.nan], verbose=False):
+def _detect_and_handle_gaps(tr, gap_threshold=10, null_values=[0, np.nan], verbose=False):
     """
     Detects and processes gaps in a seismic trace.
 

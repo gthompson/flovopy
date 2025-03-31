@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from obspy import read, Stream, Trace, UTCDateTime
 from obspy.core.event import Event, Origin, Magnitude, Comment, ResourceIdentifier
 from obspy.core.event.magnitude import StationMagnitude, StationMagnitudeContribution
-from obspy.core.event.source import WaveformStreamID
+from obspy.core.event.base import WaveformStreamID
 
 from collections import defaultdict
 from math import pi
@@ -18,7 +18,7 @@ Functions for computing data quality metrics and statistical metrics (such as am
 on Stream/Trace objects.
 """
 def estimate_snr(trace_or_stream, method='std', window_length=1.0, split_time=None,
-                 verbose=False, spectral_kwargs=None, freq_band=None):
+                 verbose=True, spectral_kwargs=None, freq_band=None):
     """
     Estimate the signal-to-noise ratio (SNR) from a Trace or Stream.
 
@@ -45,87 +45,80 @@ def estimate_snr(trace_or_stream, method='std', window_length=1.0, split_time=No
         SNR and underlying values.
     """
     if isinstance(trace_or_stream, Stream):
-        return zip(*[
-            estimate_snr(tr, method, window_length, split_time, verbose, spectral_kwargs, freq_band)
-            for tr in trace_or_stream
-        ])
+        results = [estimate_snr(tr, method, window_length, split_time, verbose, spectral_kwargs, freq_band)
+                for tr in trace_or_stream]
+        snrs, signals, noises = zip(*results)
+        return list(snrs), list(signals), list(noises)
+
 
     trace = trace_or_stream
     fs = trace.stats.sampling_rate
+    snr = signal_val = noise_val = np.nan
 
-    if split_time:
-        try:
+    try:
+        # ---- Get signal and noise data ----
+        if split_time:
             if isinstance(split_time, (list, tuple)) and len(split_time) == 2:
-                signal_trace = trace.copy().trim(starttime=split_time[0], endtime=split_time[1], pad=True, fill_value=0)
-                noise_trace = trace.copy().trim(endtime=split_time[0], pad=True, fill_value=0)
+                signal_data = trace.copy().trim(starttime=split_time[0], endtime=split_time[1],
+                                                pad=True, fill_value=0).data
+                noise_data = trace.copy().trim(endtime=split_time[0],
+                                               pad=True, fill_value=0).data
             else:
-                noise_trace = trace.copy().trim(endtime=split_time, pad=True, fill_value=0)
-                signal_trace = trace.copy().trim(starttime=split_time, pad=True, fill_value=0)
+                signal_data = trace.copy().trim(starttime=split_time,
+                                                pad=True, fill_value=0).data
+                noise_data = trace.copy().trim(endtime=split_time,
+                                               pad=True, fill_value=0).data
+        else:
+            data = trace.data
+            npts = trace.stats.npts
+            samples_per_window = int(fs * window_length)
+            num_windows = int(npts // samples_per_window)
 
-            signal_data = signal_trace.data
-            noise_data = noise_trace.data
+            if num_windows < 2:
+                if verbose:
+                    print("Trace too short for SNR estimation.")
+                return np.nan, np.nan, np.nan
 
-            if method == 'max':
-                signal_val = np.nanmax(np.abs(signal_data))
-                noise_val = np.nanmax(np.abs(noise_data))
+            reshaped = data[:samples_per_window * num_windows].reshape((num_windows, samples_per_window))
+            signal_data = reshaped[np.argmax(np.nanstd(reshaped, axis=1))]  # Most energetic window
+            noise_data = reshaped[np.argmin(np.nanstd(reshaped, axis=1))]  # Quietest window
 
-            elif method in ('std', 'rms'):
-                signal_val = np.nanstd(signal_data)
-                noise_val = np.nanstd(noise_data)
-
-            elif method == 'spectral':
-                spectral_kwargs = spectral_kwargs or {}
-                freqs, avg_ratio, *_ = compute_amplitude_ratios(
-                    signal_trace, noise_trace, **spectral_kwargs, verbose=verbose
-                )
-                if avg_ratio is None:
-                    snr = signal_val = noise_val = np.nan
-                else:
-                    if freq_band:
-                        fmin, fmax = freq_band
-                        band_mask = (freqs >= fmin) & (freqs <= fmax)
-                        band_vals = avg_ratio[band_mask]
-                        signal_val = np.nanmax(band_vals)
-                        noise_val = np.nanmin(band_vals)
-                        snr = np.nanmean(band_vals)
-                    else:
-                        signal_val = np.nanmax(avg_ratio)
-                        noise_val = np.nanmin(avg_ratio)
-                        snr = np.nanmean(avg_ratio)
-            else:
-                raise ValueError(f"Unknown SNR method: {method}")
-
-            snr = snr if noise_val != 0 else np.inf
-
-        except Exception as e:
-            if verbose:
-                print(f"Error during split-time SNR estimation: {e}")
-            return np.nan, np.nan, np.nan
-
-    else:
-        data = trace.data
-        npts = trace.stats.npts
-        samples_per_window = int(fs * window_length)
-        num_windows = int(npts // samples_per_window)
-
-        if num_windows < 2:
-            if verbose:
-                print("Trace too short for SNR estimation.")
-            return np.nan, np.nan, np.nan
-
-        reshaped = data[:samples_per_window * num_windows].reshape((num_windows, samples_per_window))
-
+        # ---- Compute SNR based on method ----
         if method == 'max':
-            values = np.nanmax(np.abs(reshaped), axis=1)
+            signal_val = np.nanmax(np.abs(signal_data))
+            noise_val = np.nanmax(np.abs(noise_data))
         elif method in ('std', 'rms'):
-            values = np.nanstd(reshaped, axis=1)
+            signal_val = np.nanstd(signal_data)
+            noise_val = np.nanstd(noise_data)
+        elif method == 'spectral':
+            spectral_kwargs = spectral_kwargs or {}
+            freqs, avg_ratio, *_ = compute_amplitude_ratios(
+                signal_data, noise_data, **spectral_kwargs, verbose=verbose
+            )
+            if avg_ratio is not None:
+                if freq_band:
+                    fmin, fmax = freq_band
+                    band_mask = (freqs >= fmin) & (freqs <= fmax)
+                    band_vals = avg_ratio[band_mask]
+                else:
+                    band_vals = avg_ratio
+                signal_val = np.nanmax(band_vals)
+                noise_val = np.nanmin(band_vals)
+                snr = np.nanmean(band_vals)
+            else:
+                signal_val = noise_val = snr = np.nan
         else:
             raise ValueError(f"Unknown SNR method: {method}")
 
-        signal_val = np.max(values)
-        noise_val = np.min(values)
-        snr = signal_val / noise_val if noise_val != 0 else np.inf
+        if method != 'spectral':
+            snr = signal_val / noise_val if noise_val != 0 else np.inf
 
+    except Exception as e:
+        if verbose:
+            print(f"[ERROR] SNR estimation failed: {e}")
+        return np.nan, np.nan, np.nan
+
+    # ---- Store metrics ----
     if 'metrics' not in trace.stats:
         trace.stats.metrics = {}
     trace.stats.metrics[f'snr_{method}'] = snr
@@ -136,6 +129,7 @@ def estimate_snr(trace_or_stream, method='std', window_length=1.0, split_time=No
         print(f"[{method}] SNR = {snr:.2f} (signal={signal_val:.2f}, noise={noise_val:.2f})")
 
     return snr, signal_val, noise_val
+
 
 
 def _check_spectral_qc(freqs, ratios, threshold=2.0, min_fraction_pass=0.5):
@@ -337,6 +331,7 @@ def plot_amplitude_ratios(avg_freqs, avg_spectral_ratio,
     plt.legend()
 
     if outfile:
+        print(f'Saving amplitude_ratio plot to {outfile} from {os.getcwd()}')
         plt.savefig(outfile, bbox_inches='tight')
     else:
         plt.show()

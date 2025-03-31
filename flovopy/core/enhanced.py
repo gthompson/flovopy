@@ -20,8 +20,8 @@ from obspy.core.event import (
 from obspy.core.util.attribdict import AttribDict
 from obspy.geodetics.base import gps2dist_azimuth
 
-from flovopy.helpers add_to_trace_history
-from flovopy.metrics import compute_amplitude_spectra #, compute_stationEnergy
+from flovopy.core.preprocessing import add_to_trace_history
+from flovopy.processing.metrics import compute_amplitude_spectra #, compute_stationEnergy
 
 class EnhancedStream(Stream):
 

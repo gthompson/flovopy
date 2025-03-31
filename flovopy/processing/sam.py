@@ -211,6 +211,7 @@ class SAM:
     def get_distance_km(self, inventory, source):
         distance_km = {}
         coordinates = {}
+        print(f'SCAFFOLD: {inventory}')
         for seed_id in self.dataframes:
             coordinates[seed_id] = inventory.get_coordinates(seed_id)
             if seed_id[0:2]=='MV':
@@ -716,6 +717,7 @@ class RSAM(SAM):
                 if u == 'COUNTS':
                     good_st.append(tr)
             else: # for RSAM, ok if no units
+                tr.stats.units = 'Counts'
                 good_st.append(tr)
         return good_st
         
@@ -828,6 +830,7 @@ class VSAM(SAM):
                 wavespeed_kms=3 # km/s
         
         # Need to pass a source too, which should be a dict with name, lat, lon, elev.
+        print(f'SCAFFOLD: {inventory}')
         distance_km, coordinates = self.get_distance_km(inventory, source)
 
         corrected_dataframes = {}
@@ -879,11 +882,17 @@ class DSAM(VSAM):
                 u = tr.stats['units'].upper()
                 if u == 'M' or u == 'PA':
                     good_st.append(tr)
+                else:
+                    print(f'DSAM: skipping {tr}: units are wrong {tr.stats.units}')
+
+            elif tr.stats.channel[1]=='H':
+                tr.stats['units'] = 'm'
+                good_st.append(tr)
+            elif tr.stats.channel[1]=='D':
+                tr.stats['units'] = 'Pa'
+                good_st.append(tr)                
             else:
-                if tr.stats.channel[1]=='H':
-                    tr.stats['units'] = 'm'
-                    good_st.append(tr)
-                
+                print(f'DSAM: skipping {tr}: malformed channel code, not seismometer or pressure sensor')
         return good_st
 
     @staticmethod
@@ -891,6 +900,7 @@ class DSAM(VSAM):
         return SAM.get_filename(SAM_DIR, id, year, sampling_interval, ext, name=name)
 
     def compute_reduced_displacement(self, inventory, source, surfaceWaves=False, Q=None, wavespeed_kms=2.0, peakf=None):
+        print(f'SCAFFOLD: {inventory}')
         corrected_dataframes = self.reduce(inventory, source, surfaceWaves=surfaceWaves, Q=Q, wavespeed_kms=wavespeed_kms, fixpeakf=peakf)
         if surfaceWaves:
             return DRS(dataframes=corrected_dataframes)

@@ -1,12 +1,13 @@
 import os
 import numpy as np
-from obspy import Stream
-from flovopy.processing.sam import DSAM, DRS
+import pandas as pd
+from obspy import Stream, Inventory
+from flovopy.processing.sam import DSAM, DRS, RSAM
 from flovopy.analysis.asl import ASL, initial_source, make_grid, dome_location
 from flovopy.processing.detection import run_event_detection, detection_snr, plot_detected_stream, run_monte_carlo, detect_network_event
-from flovopy.processing.metrics import signal2noise
+#from flovopy.processing.metrics import signal2noise
 
-def asl_event(st: Stream, raw_st: Stream, **kwargs):
+def asl_event(st: Stream, raw_st: Stream, inv: Inventory, **kwargs):
     """
     Runs amplitude-based source location (ASL) processing on a preprocessed Stream object.
 
@@ -16,6 +17,8 @@ def asl_event(st: Stream, raw_st: Stream, **kwargs):
         Preprocessed stream.
     raw_st : obspy.Stream
         Raw stream for comparison/archival.
+    inv: obspy.Inventory
+        Inventory object with station metadata.
     kwargs : dict
         Options controlling ASL processing (Q, peakf, metric, surfaceWaveSpeed_kms, etc.).
     """
@@ -35,7 +38,15 @@ def asl_event(st: Stream, raw_st: Stream, **kwargs):
     freq = [1.0, 15.0]
     compute_DRS_at_fixed_source = kwargs.get("compute_DRS_at_fixed_source", True)
     numtrials = kwargs.get("numtrials", 500)
-    inv = kwargs.get("inv", None)
+
+    if not isinstance(Q, list):
+        Q = [Q]
+    if not isinstance(peakf, list):        
+        peakf = [peakf]
+    if not isinstance(surfaceWaveSpeed_kms, list):
+        surfaceWaveSpeed_kms = [surfaceWaveSpeed_kms]
+    if not isinstance(metric, list):
+        metric = [metric]
 
     os.makedirs(outdir, exist_ok=True)
 
@@ -45,18 +56,18 @@ def asl_event(st: Stream, raw_st: Stream, **kwargs):
     st.plot(equal_scale=False, outfile=os.path.join(outdir, "stream.png"))
     st.write(os.path.join(outdir, "stream.mseed"), format="MSEED")
 
-    if interactive:
-        st, best_params, all_params_df = run_event_detection(st, n_trials=numtrials)
+    trialscsv = os.path.join(outdir, 'detection_trials.csv')
+    if os.path.isfile(trialscsv):
+        all_params_df = pd.read_csv(trialscsv)
+        best_params = all_params_df.loc[0].to_dict()
     else:
-        all_params_df, best_params = run_monte_carlo(st, st[0].stats.starttime + 5.0,
+        if interactive:
+            st, best_params, all_params_df = run_event_detection(st, n_trials=numtrials)
+        else:
+            all_params_df, best_params = run_monte_carlo(st, st[0].stats.starttime + 5.0,
                                                      st[0].stats.endtime - 5.0, numtrials)
 
-    all_params_df.sort_values(by="misfit").head(20).to_csv(os.path.join(outdir, "detection_trials.csv"))
-
-    snr, fmetrics = detection_snr(st, best_params)
-    if fmetrics:
-        freq = [fmetrics['f_low'], fmetrics['f_high']]
-        peakf = [fmetrics['f_peak']]
+        all_params_df.sort_values(by="misfit").head(20).to_csv(trialscsv)
 
     best_trig = detect_network_event(
         st, minchans=None, threshon=best_params['thr_on'], threshoff=best_params['thr_off'],
@@ -71,10 +82,26 @@ def asl_event(st: Stream, raw_st: Stream, **kwargs):
     detected_st = Stream(tr for tr in st if tr.id in best_trig['trace_ids'])
     plot_detected_stream(detected_st, best_trig, outfile=os.path.join(outdir, "detected_stream.png"))
 
-    snr, fmetrics_dict = signal2noise(detected_st, best_trig, outfile=os.path.join(outdir, "signal2noise.png"))
+    snr, fmetrics_dict = detection_snr(detected_st, best_trig, outfile=os.path.join(outdir, "signal2noise.png"))
+    print(f'[INFO] Signal-to-noise ratio: {snr}')
+    print([tr.stats.metrics.snr_std for tr in detected_st])
 
+    if fmetrics_dict:
+        freq = [fmetrics_dict['f_low'], fmetrics_dict['f_high']]
+        peakf = [fmetrics_dict['f_peak']]
+        print(f'[INFO] Frequency metrics from SNR: {fmetrics_dict}')
+    else:
+        print('[INFO] No frequency metrics returned from SNR analysis')
+
+    print('before trimming')
+    print(detected_st)
     detected_st.trim(best_trig['time'] - 1, best_trig['time'] + best_trig['duration'] + 1)
-    dsamObj = DSAM(detected_st, sampling_interval=1.0)
+    print('after trimming')
+    print(detected_st)
+    for tr in detected_st:
+        tr.stats['units'] = 'm'
+    dsamObj = DSAM(stream=detected_st, sampling_interval=1.0)
+    print(len(dsamObj.dataframes))
     dsamObj.plot(metrics=metric, equal_scale=True, outfile=os.path.join(outdir, "DSAM.png"))
     dsamObj.write(outdir, ext="csv")
 
@@ -112,9 +139,9 @@ def asl_event(st: Stream, raw_st: Stream, **kwargs):
 import os
 import sys
 import argparse
-from obspy import UTCDateTime
+from obspy import UTCDateTime, read_inventory
 from flovopy.wrappers.seisandb_event_wrappers import apply_custom_function_to_each_event
-from flovopy.core.mvo import load_mvo_master_inventory
+#from flovopy.core.mvo import load_mvo_master_inventory
 #from flovopy.analysis.asl import asl_event
 
 def find_seisan_data_dir():
@@ -139,12 +166,14 @@ def main():
     parser.add_argument("--metric", type=str, default="rms", help="Metric to use (e.g. rms, peak)")
     parser.add_argument("--interactive", action="store_true", help="Use interactive detection tuner")
     parser.add_argument("--min_stations", type=int, default=5, help="Minimum required stations")
+    parser.add_argument("--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
     startdate = UTCDateTime(args.start)
     enddate = UTCDateTime(args.end)
     seisan_dir = find_seisan_data_dir()
-    inv = load_mvo_master_inventory()
+    xmlfile = os.path.join(seisan_dir, 'CAL', 'MV.xml')
+    inv = read_inventory(xmlfile)
     outdir = os.path.join(os.path.dirname(seisan_dir), args.outdir)
 
     apply_custom_function_to_each_event(
@@ -162,6 +191,7 @@ def main():
         freq=[0.5, 30.0],
         vertical_only=True,
         max_dropout=4.0,
+        # arguments for asl_event follow
         outdir=outdir,
         Q=args.Q,
         surfaceWaveSpeed_kms=args.speed,

@@ -1,7 +1,7 @@
 import os
 import datetime as dt
 from obspy import read
-from utils.helpers import filetime2spath, correct_nslc
+from flovopy.seisanio.utils.helpers import filetime2spath, correct_nslc
 
 
 class Wavfile:
@@ -21,7 +21,7 @@ class Wavfile:
                 yyyy = '19' + yy if yy.startswith('9') else '20' + yy
                 mm = parts[0][2:4]
 
-            dd, HHMI, SS = parts[-3], parts[-2], parts[-1]
+            dd, HHMI, SS = parts[-3], parts[-2], parts[-1][0:2]
             HH, MI = HHMI[0:2], HHMI[2:4]
 
             self.filetime = dt.datetime(

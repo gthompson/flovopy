@@ -23,13 +23,15 @@ from obspy.signal.trigger import (
 )
 
 # Custom or local functions assumed from other modules
-from flovopy.core.metrics import (
+from flovopy.processing.metrics import (
     estimate_snr,
     compute_amplitude_ratios,
     plot_amplitude_ratios,
-    get_bandwidth,
-    pad_trace
 )
+
+from flovopy.core.preprocessing import _pad_trace
+
+from flovopy.core.enhanced import get_bandwidth
 
 class SeismicGUI:
     def __init__(self, master, stream):
@@ -247,7 +249,7 @@ def plot_detected_stream(detected_st, best_trig, outfile=None):
     # plot detected stream
     trig_time = best_trig['time'].matplotlib_date
     trig_end = (best_trig['time'] + best_trig['duration']).matplotlib_date
-    fig = detected_st.plot(show=False)  # show=False prevents it from auto-displaying
+    fig = detected_st.plot(show=False, equal_scale=False)  # show=False prevents it from auto-displaying
     for ax in fig.axes:  # Stream.plot() returns multiple axes (one per trace)
         ax.axvline(trig_time, color='r', linestyle='--', label="Trigger Start")
         ax.axvline(trig_end, color='b', linestyle='--', label="Trigger End")
@@ -475,7 +477,7 @@ def detect_network_event(st_in, minchans=None, threshon=3.5, threshoff=1.0,
     st = st_in.copy()
     if pad>0.0:
         for tr in st:
-            pad_trace(tr, pad)
+            _pad_trace(tr, pad)
 
     if freq:
         if verbose:

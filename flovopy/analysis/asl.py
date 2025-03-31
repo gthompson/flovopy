@@ -20,8 +20,8 @@ from obspy.geodetics import locations2degrees, degrees2kilometers
 
 # Your internal or local modules (assumed to exist)
 # For example:
-from flovopy.core.inventory import inventory2traceid, inventory2seedids
-from flovopy.core.sam import DSAM  # DSAM class for corrections and simulation
+from flovopy.core.inventory import inventory2traceid
+from flovopy.processing.sam import DSAM  # DSAM class for corrections and simulation
 from flovopy.core.mvo import dome_location
 
 
