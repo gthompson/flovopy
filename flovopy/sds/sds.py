@@ -393,7 +393,7 @@ class SDSFileManager:
             with open(logfile, "a") as f:
                 f.write(f'{src} to {dst} CRASHED\n')
 
-    def fix_sds_ids(self, write=False, networks=None, log_file):
+    def fix_sds_ids(self, write=False, networks=None, log_file='sdsfilemanager.log'):
         """
         Scan the SDS archive, correct band codes, and rename files if necessary.
         Walks the directory tree in alphanumeric order, resuming from log if interrupted.

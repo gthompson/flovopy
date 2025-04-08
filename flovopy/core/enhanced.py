@@ -1022,6 +1022,18 @@ class EventContainer:
         self.classification = classification
         self.miniseedfile = miniseedfile
 
+    def to_enhancedevent(self):
+        return EnhancedEvent(
+            event=self.event,
+            stream=self.stream,
+            sfile_path=None,  # Optional
+            wav_paths=[self.miniseedfile] if self.miniseedfile else [],
+            trigger_window=self.trigger['trigger_window'] if self.trigger else None,
+            average_window=self.trigger['average_window'] if self.trigger else None,
+            metrics={}  # or extract from stream.stats.metrics
+        )
+
+
 class EnhancedCatalog(Catalog):
     """
     Extended ObsPy Catalog class for volcano-seismic workflows.
@@ -1094,7 +1106,24 @@ class EnhancedCatalog(Catalog):
             event.creation_info = CreationInfo(
                 author=author, agency_id=agency_id, creation_time=UTCDateTime()
             )
-        self.records.append(EventContainer(event, stream, trigger, classification))
+        #self.records.append(EventContainer(event, stream, trigger, classification))
+        self.records.append(EnhancedEvent(
+            obspy_event=event,
+            stream=stream,
+            sfile_path=None,  # or pass it if available
+            wav_paths=[s.path for s in stream] if stream else [],
+            aef_path=None,
+            trigger_window=trigger.get('duration') if trigger else None,
+            average_window=trigger.get('average_window') if trigger else None,
+            metrics={
+                "classification": classification,
+                "event_type": event.event_type,
+                "mainclass": mainclass,
+                "subclass": subclass,
+            }
+        ))
+
+
 
     def get_times(self):
         """Return a list of origin times for events that have origins."""
@@ -1135,30 +1164,6 @@ class EnhancedCatalog(Catalog):
         print("\nSubclass Summary:")
         print(df['subclass'].value_counts(dropna=False))
 
-    def export_csv(self, filepath):
-        """
-        Export catalog metadata and classification fields to a CSV file.
-
-        Parameters
-        ----------
-        filepath : str
-            Path to save the CSV file.
-        """
-        df = self.to_dataframe()
-        df.to_csv(filepath, index=False)
-
-    def write_events(self, outdir, net='MV', xmlfile=None):
-        """Write event metadata and associated streams to disk."""
-        if xmlfile:
-            self.write(os.path.join(outdir, xmlfile), format="QUAKEML")
-        for i, rec in enumerate(self.records):
-            if not rec.stream or not rec.event.origins:
-                continue
-            t = rec.event.origins[0].time
-            mseedfile = os.path.join(outdir, 'WAV', net, t.strftime('%Y'), t.strftime('%m'), t.strftime('%Y%m%dT%H%M%S.mseed'))
-            os.makedirs(os.path.dirname(mseedfile), exist_ok=True)
-            rec.miniseedfile = mseedfile
-            rec.stream.write(mseedfile, format='MSEED')
 
     def to_dataframe(self):
         """
@@ -1191,6 +1196,7 @@ class EnhancedCatalog(Catalog):
             rows.append(row)
         return pd.DataFrame(rows)
 
+    '''
     def save(self, outdir, outfile, net='MV'):
         """Write QuakeML and associated stream metadata to disk."""
         self.write_events(outdir, net=net, xmlfile=outfile + '.xml')
@@ -1208,6 +1214,52 @@ class EnhancedCatalog(Catalog):
                 pickle.dump(picklevars, fileptr, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception as ex:
             print("Error during pickling object (Possibly unsupported):", ex)
+    '''
+
+    def save(self, outdir, outfile, net='MV'):
+        """Write catalog-wide QuakeML + JSON for each event and save summary metadata."""
+        self._write_events(outdir, net=net, xmlfile=outfile + '.xml')
+
+        summary_json = os.path.join(outdir, outfile + '_meta.json')
+        summary_vars = {
+            'triggerParams': self.triggerParams,
+            'comments': self.comments,
+            'description': self.description,
+            'starttime': self.starttime.strftime('%Y/%m/%d %H:%M:%S') if self.starttime else None,
+            'endtime': self.endtime.strftime('%Y/%m/%d %H:%M:%S') if self.endtime else None
+        }
+        try:
+            with open(summary_json, "w") as f:
+                json.dump(summary_vars, f, indent=2, default=str)
+        except Exception as ex:
+            print("Error saving catalog summary JSON:", ex)
+
+    def export_csv(self, filepath):
+        """
+        Export catalog metadata and classification fields to a CSV file.
+
+        Parameters
+        ----------
+        filepath : str
+            Path to save the CSV file.
+        """
+        df = self.to_dataframe()
+        df.to_csv(filepath, index=False)
+
+    def _write_events(self, outdir, net='MV', xmlfile=None):
+        """Write event metadata and associated streams to disk."""
+        if xmlfile:
+            self.write(os.path.join(outdir, xmlfile), format="QUAKEML")
+        for rec in self.records:
+            if not hasattr(rec, "to_enhancedevent"):
+                continue
+            enh = rec.to_enhancedevent()
+            t = enh.event.origins[0].time if enh.event.origins else None
+            if not t:
+                continue
+            base_path = os.path.join(outdir, 'WAV', net, t.strftime('%Y'), t.strftime('%m'), t.strftime('%Y%m%dT%H%M%S'))
+            os.makedirs(os.path.dirname(base_path), exist_ok=True)
+            enh.save(os.path.dirname(base_path), os.path.basename(base_path))
 
     def filter_by_event_type(self, event_type):
         """Return new catalog filtered by QuakeML event_type."""
@@ -1434,83 +1486,54 @@ class EnhancedCatalog(Catalog):
 
 
 
-def load_catalog(catdir, catfile, net='MV', load_waveforms=False):
+def load_catalog(catdir, load_waveforms=False):
     """
-    Load a EnhancedCatalog from QuakeML and pickled metadata.
+    Load an EnhancedCatalog from per-event QuakeML + JSON files.
 
     Parameters
     ----------
     catdir : str
-        Path to directory containing catalog files.
-    catfile : str
-        Base filename (no extension).
-    net : str
-        Network code for waveform paths (default: 'MV').
+        Path to directory containing .qml + .json pairs.
     load_waveforms : bool
-        If True, attempt to load waveform files from disk.
+        Whether to read waveforms from disk.
 
     Returns
     -------
     EnhancedCatalog
-        Catalog object with metadata and records loaded.
     """
-    from obspy import read
+    import glob
+    from flovopy.enhanced import EnhancedEvent, EnhancedCatalog, EventContainer
 
-    qmlfile = os.path.join(catdir, f"{catfile}.xml")
-    pklfile = os.path.join(catdir, f"{catfile}_vars.pkl")
-
-    if not os.path.exists(qmlfile):
-        print(f"{qmlfile} not found.")
-        return None
-
-    catObj = read_events(qmlfile)
-    events = catObj.events.copy()
     records = []
+    qml_files = sorted(glob.glob(os.path.join(catdir, "**", "*.qml"), recursive=True))
 
-    # Try to load metadata
-    if os.path.exists(pklfile):
+    for qml_file in tqdm(qml_files, desc="Loading events"):
+        base_path = os.path.splitext(qml_file)[0]
         try:
-            with open(pklfile, 'rb') as fileptr:
-                picklevars = pickle.load(fileptr)
-        except Exception as ex:
-            print(f"Error reading {pklfile}:", ex)
-            picklevars = {}
-    else:
-        picklevars = {}
+            enh = EnhancedEvent.load(base_path)
+        except Exception as e:
+            print(f"[WARN] Skipping {base_path}: {e}")
+            continue
 
-    miniseedfiles = picklevars.get('miniseedfiles', [])
-    triggers = picklevars.get('triggers', [])
-    classifications = picklevars.get('classifications', [])
-
-    for i, event in enumerate(events):
         stream = None
-        mseedfile = miniseedfiles[i] if i < len(miniseedfiles) else None
+        mseedfile = enh.wav_paths[0] if enh.wav_paths else None
         if load_waveforms and mseedfile and os.path.exists(mseedfile):
             try:
                 stream = read(mseedfile)
             except Exception as e:
-                print(f"Could not read {mseedfile}: {e}")
-        record = EventContainer(
-            event=event,
+                print(f"[WARN] Could not load waveform {mseedfile}: {e}")
+
+        rec = EventContainer(
+            event=enh.event,
             stream=stream,
-            trigger=triggers[i] if i < len(triggers) else None,
-            classification=classifications[i] if i < len(classifications) else None,
+            trigger=enh.trigger_window,
+            classification=enh.metrics.get("class_label"),
             miniseedfile=mseedfile
         )
-        records.append(record)
+        records.append(rec)
 
-    starttime = UTCDateTime.strptime(picklevars['starttime'], '%Y/%m/%d %H:%M:%S') if 'starttime' in picklevars else None
-    endtime = UTCDateTime.strptime(picklevars['endtime'], '%Y/%m/%d %H:%M:%S') if 'endtime' in picklevars else None
+    return EnhancedCatalog(events=[r.event for r in records], records=records)
 
-    return EnhancedCatalog(
-        events=events,
-        records=records,
-        triggerParams=picklevars.get('triggerParams', {}),
-        comments=picklevars.get('comments', []),
-        description=picklevars.get('description', ""),
-        starttime=starttime,
-        endtime=endtime
-    )
 
 
 def triggers2catalog(trig_list, threshON, threshOFF, sta_secs, lta_secs, max_secs,
@@ -1805,8 +1828,114 @@ def classify_and_add_event(stream, catalog, trigger=None, save_stream=False, cla
     return ev, subclass, features
 
 
+class EnhancedEvent:
+    def __init__(self, obspy_event, metrics=None, sfile_path=None, wav_paths=None,
+                 aef_path=None, trigger_window=None, average_window=None, stream=None):
+        """
+        Enhanced representation of a seismic event.
+
+        Parameters
+        ----------
+        obspy_event : obspy.core.event.Event
+            Core ObsPy Event object.
+        metrics : dict, optional
+            Additional metrics or classifications (e.g., peakf, energy, subclass).
+        sfile_path : str, optional
+            Path to original SEISAN S-file.
+        wav_paths : list of str, optional
+            Paths to one or two associated waveform files.
+        aef_path : str, optional
+            Path to AEF file (if external).
+        trigger_window : float, optional
+            Trigger window duration in seconds.
+        average_window : float, optional
+            Averaging window duration in seconds.
+        stream : obspy.Stream or EnhancedStream, optional
+            Associated waveform stream.
+        """
+        self.event = obspy_event
+        self.metrics = metrics or {}
+        self.sfile_path = sfile_path
+        self.wav_paths = wav_paths or []
+        self.aef_path = aef_path
+        self.trigger_window = trigger_window
+        self.average_window = average_window
+        self.stream = stream
+
+    '''
+    def to_quakeml(self):
+        return self.event'
+    '''
+
+    def to_json(self):
+        return {
+            "event_id": str(self.event.resource_id),
+            "sfile_path": self.sfile_path,
+            "wav_paths": self.wav_paths,
+            "aef_path": self.aef_path,
+            "trigger_window": self.trigger_window,
+            "average_window": self.average_window,
+            "metrics": self.metrics,
+        }
+
+    def save(self, outdir, base_name):
+        """
+        Save to QuakeML and JSON.
+
+        Parameters
+        ----------
+        outdir : str
+            Base directory to save outputs.
+        base_name : str
+            Base filename (no extension).
+        """
+
+        qml_path = os.path.join(outdir, base_name + ".qml")
+        json_path = os.path.join(outdir, base_name + ".json")
+
+        Catalog(events=[self.event]).write(qml_path, format="QUAKEML")
+
+        with open(json_path, "w") as f:
+            json.dump(self.to_json(), f, indent=2, default=str)
 
 
+    @classmethod
+    def load(cls, base_path):
+        """
+        Load an EnhancedEvent from a base path (no extension).
+
+        Parameters
+        ----------
+        base_path : str
+            Full path to the event file *without* extension.
+            Assumes `{base_path}.qml` and `{base_path}.json` exist.
+
+        Returns
+        -------
+        EnhancedEvent
+        """
+        qml_file = base_path + ".qml"
+        json_file = base_path + ".json"
+
+        if not os.path.exists(qml_file):
+            raise FileNotFoundError(f"Missing QuakeML file: {qml_file}")
+        if not os.path.exists(json_file):
+            raise FileNotFoundError(f"Missing JSON metadata file: {json_file}")
+
+        event = read_events(qml_file)[0]
+
+        with open(json_file, "r") as f:
+            metadata = json.load(f)
+
+        return cls(
+            event=event,
+            sfile_path=metadata.get("sfile_path"),
+            wav_paths=metadata.get("wav_paths", []),
+            aef_path=metadata.get("aef_path"),
+            trigger_window=metadata.get("trigger_window"),
+            average_window=metadata.get("average_window"),
+            metrics=metadata.get("metrics", {})
+        )
 
 
 if  __name__ == '__main__':

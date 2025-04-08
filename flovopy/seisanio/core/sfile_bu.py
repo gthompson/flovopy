@@ -1,15 +1,14 @@
 import os
 from glob import glob
 import datetime as dt
+from obspy.core.event import Pick, QuantityError
 from obspy.io.nordic.core import readheader, readwavename, _is_sfile
 from obspy import read
-from obspy.core.event import Event, Origin, Magnitude, Catalog, Pick, QuantityError
+
 from flovopy.seisanio.core.wavfile import Wavfile
 from flovopy.seisanio.core.aeffile import AEFfile
 from flovopy.seisanio.utils.helpers import spath2datetime
 from flovopy.core.mvo import correct_nslc_mvo
-from flovopy.core.enhanced_catalog import EnhancedEvent
-import json
 
 class Sfile:
     def __init__(self, path, use_mvo_parser=False, fast_mode=False):
@@ -35,12 +34,11 @@ class Sfile:
         self.url = None
         self.gap = None
         self.maximum_intensity = None
-        self.picks = []
+        self.arrivals = []
         self.wavfiles = []
         self.aeffiles = []
         self.aefrows = []
-        self.event = None
-        self.parsed_event = None
+        self.events = None
 
         self.error = {
             'origintime': None,
@@ -65,19 +63,16 @@ class Sfile:
             return
 
         if _is_sfile(self.path):
-            self.event = readheader(self.path)
-            wavnames = readwavename(self.path)
-            wavpath = os.path.dirname(self.path).replace("REA", "WAV")
-            for wavfile in wavnames:
-                self.wavfiles.append(Wavfile(os.path.join(wavpath, wavfile)))   
-
-            # pick up extra information        
             if fast_mode:
                 self._parse_sfile_fast()
-                self.to_obspyevent()
             elif use_mvo_parser:
                 self.parse_sfile()
-                self.to_obspyevent()
+            else:
+                self.events = readheader(self.path)
+                wavnames = readwavename(self.path)
+                wavpath = os.path.dirname(self.path).replace("REA", "WAV")
+                for wavfile in wavnames:
+                    self.wavfiles.append(Wavfile(os.path.join(wavpath, wavfile)))
 
     def _parse_sfile_fast(self):
         with open(self.path, 'r') as f:
@@ -243,17 +238,17 @@ class Sfile:
                     if verbose:
                         print('Failed 18-29:\n01233456789' * 8 + f"\n{line}")
 
-                thispick = {
+                thisarrival = {
                     'sta': asta,
                     'chan': achan,
                     'phase': aphase,
                     'time': atime
                 }
                 if line[64:79].strip():
-                    thispick['time_residual'] = parse_string(line, 64, 68, 'float')
-                    thispick['weight'] = parse_string(line, 68, 70, 'int')
-                    thispick['distance_km'] = parse_string(line, 72, 75, 'float')
-                    thispick['azimuth'] = parse_string(line, 77, 79, 'int')
+                    thisarrival['time_residual'] = parse_string(line, 64, 68, 'float')
+                    thisarrival['weight'] = parse_string(line, 68, 70, 'int')
+                    thisarrival['distance_km'] = parse_string(line, 72, 75, 'float')
+                    thisarrival['azimuth'] = parse_string(line, 77, 79, 'int')
 
                 onset = 'questionable'
                 if aphase.startswith('I'):
@@ -267,13 +262,13 @@ class Sfile:
                     traceID = f".{asta}..{achan}"
                     Fs = 75 if asta[:2] == 'MB' and self.filetime.year < 2005 else 100
                     fixedID = correct_nslc_mvo(traceID, Fs, shortperiod=False)
-                    if 'time_residual' in thispick:
-                        tres = QuantityError(uncertainty=thispick['time_residual'])
+                    if 'time_residual' in thisarrival:
+                        tres = QuantityError(uncertainty=thisarrival['time_residual'])
                         p = Pick(time=atime, waveform_id=fixedID, onset=onset, phase_hint=aphase,
-                                time_errors=tres, backazimuth=(180 + thispick['azimuth']) % 360)
+                                time_errors=tres, backazimuth=(180 + thisarrival['azimuth']) % 360)
                     else:
                         p = Pick(time=atime, waveform_id=fixedID, onset=onset, phase_hint=aphase)
-                    self.picks.append(p)
+                    self.arrivals.append(p)
 
         for _aeffile in _aeffiles:
             self.aeffiles.append(AEFfile(_aeffile))
@@ -302,7 +297,7 @@ class Sfile:
             'num_wavfiles': len(self.wavfiles),
             'num_aeffiles': len(self.aeffiles),
             'located': self.longitude is not None,
-            'num_picks': len(self.picks),
+            'num_arrivals': len(self.arrivals),
             'error_exists': self.error['latitude'] is not None,
             'focmec_exists': self.focmec['strike'] is not None
         }
@@ -348,10 +343,10 @@ class Sfile:
             str += "\n\tError: " + pprint.pformat(self.error)
         if self.focmec:
             str += "\n\tFocmec: " + pprint.pformat(self.focmec)
-        str += "\n\tNumber of picks: %d" % len(self.picks)
-        if len(self.picks)>0:
+        str += "\n\tNumber of arrivals: %d" % len(self.arrivals)
+        if len(self.arrivals)>0:
             str += "\n\tArrivals:" 
-            for pick in self.picks:
+            for pick in self.arrivals:
                 str += pick.__str__()
         if len(self.wavfiles)>0:
             str += "\n\tWAV files:" 
@@ -361,9 +356,9 @@ class Sfile:
             str += "\n\tAEF files:" 
             for aeffile in self.aeffiles:
                 str += "\n\t\t" + aeffile.__str__()
-        if self.event:
+        if self.events:
             str += "\n\tEvents:"
-            for event in self.event:
+            for event in self.events:
                 str += "\n\t\t" + event.__str__()
 
         return str
@@ -378,21 +373,8 @@ class Sfile:
         sdict.to_csv(csvfile)
     
     def to_obspyevent(self):
-        if self.otime and self.latitude and self.longitude and self.depth is not None:
-            origin = Origin(time=self.otime, latitude=self.latitude, longitude=self.longitude, depth=self.depth)
-        else:
-            origin = Origin(time=self.otime)
-
-        if self.magnitude:
-            magnitude = Magnitude(mag=self.magnitude[0], magnitude_type=self.magnitude_type[0] if self.magnitude_type else None)
-        else:
-            magnitude = None
-
-        self.parsed_event = Event(origins=[origin])
-        if magnitude:
-            self.parsed_event.magnitudes.append(magnitude)
-        if self.picks:
-            self.parsed_event.picks = self.picks
+        thisevent = self.events
+        return thisevent
     
     def to_pickle(self):
         import pickle
@@ -409,60 +391,11 @@ class Sfile:
         print(contents)
                  
     def printEvents(self):
-        evobj = self.event
+        evobj = sfileobj.events
         print(evobj)
         print(evobj.event_descriptions)
         for i, originobj in enumerate(evobj.origins):
             print(i, originobj)
-
-    def to_enhancedevent(self, stream=None):
-        """
-        Convert Sfile to an EnhancedEvent object.
-
-        Parameters
-        ----------
-        stream : obspy.Stream or EnhancedStream, optional
-            Associated waveform data.
-
-        Returns
-        -------
-        EnhancedEvent
-        """
-        if self.parsed_event:
-            event = self.parsed_event
-        elif isinstance(self.event, list) and len(self.event) > 0:
-            event = self.event[0]
-        else:
-            raise ValueError("No ObsPy Event object found in Sfile.")
-
-        wav_paths = [w.path for w in self.wavfiles if hasattr(w, "path")]
-        aef_path = self.aeffiles[0].path if self.aeffiles else None
-        trigger_window = getattr(self.aeffiles[0], "trigger_window", None) if self.aeffiles else None
-        average_window = getattr(self.aeffiles[0], "average_window", None) if self.aeffiles else None
-
-        # Basic feature/metric dictionary from known Sfile fields
-        metrics = {
-            "mainclass": self.mainclass,
-            "subclass": self.subclass,
-            "magnitude": self.maximum_magnitude()[0],
-            "magnitude_type": self.maximum_magnitude()[1],
-            "agency": self.agency,
-            "rms": self.rms,
-            "gap": self.gap,
-            "error": self.error,
-            "focmec": self.focmec
-        }
-
-        return EnhancedEvent(
-            obspy_event=event,
-            metrics=metrics,
-            sfile_path=self.path,
-            wav_paths=wav_paths,
-            aef_path=aef_path,
-            trigger_window=trigger_window,
-            average_window=average_window,
-            stream=stream
-        )
 
 
 def get_sfile_list(SEISAN_DATA, DB, startdate, enddate): 

@@ -40,7 +40,7 @@ def asl_event(st: Stream, raw_st: Stream, inv: Inventory, **kwargs):
     numtrials = kwargs.get("numtrials", 500)
 
     if not isinstance(Q, list):
-        Q = [Q]
+        Q = [Q, 1000]
     if not isinstance(peakf, list):        
         peakf = [peakf]
     if not isinstance(surfaceWaveSpeed_kms, list):

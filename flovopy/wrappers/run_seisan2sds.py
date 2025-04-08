@@ -13,6 +13,8 @@ def seisan_to_sds(seisandbdir, sdsdir, startt0, endt0, net, dbout=None, round_sa
     mseeddir = 'seisan2mseed'
     os.makedirs(mseeddir, exist_ok=True)
     os.makedirs(sdsdir, exist_ok=True)
+    print(startt, endt)
+    seisandbdir = os.path.join(seisandbdir, 'WAV', 'DSNC_')
 
     dayt = startt
     while dayt <= endt:
@@ -20,7 +22,7 @@ def seisan_to_sds(seisandbdir, sdsdir, startt0, endt0, net, dbout=None, round_sa
         yyyy, mm, dd = dayt.strftime("%Y %m %d").split()
         currentdb = f"{seisandbdir}/{yyyy}/{mm}"
         prevdb = f"{seisandbdir}/{UTCDateTime(dayt - SECONDS_PER_DAY).strftime('%Y/%m')}"
-
+        print(ymd, prevdb, currentdb)
         allfiles = sorted(set(
             glob.glob(f"{prevdb}/{yyyy}-{mm}-{dd}-23[45]*S.MVO___*") +
             glob.glob(f"{currentdb}/{yyyy}-{mm}-{dd}*S.MVO___*")

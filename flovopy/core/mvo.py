@@ -95,39 +95,25 @@ def correct_nslc_mvo(traceID, Fs, shortperiod=None):
     loc = oldloc.strip()
     chan = oldcha.strip()
 
-    if loc == '--' or loc == 'J' or loc=='I':
-        loc = ''    
-
-    if not shortperiod:
-        if 'SB' in chan or chan[0] in 'BH':
-            shortperiod = False
-            chan = 'BH' + chan[2:]
-        else:
-            shortperiod = True
-    #print(f'shortperiod: {shortperiod}')
-
-    # Determine the correct band code
-    expected_band_code = _get_band_code(Fs) # this assumes broadband sensor
-    #print(f'band_code 1: {expected_band_code}')
-
-    # adjust if short-period sensor
-    expected_band_code = _adjust_band_code_for_sensor_type(chan[0], expected_band_code, short_period=shortperiod)
-    #print(f'band_code 2: {expected_band_code}')
-    chan = expected_band_code + chan[1:]    
-
-    instrumentcode = 'H'
-    orientationcode = 'x'
-    if 'Z' in loc or 'Z' in chan:
-        orientationcode = 'Z'
-    elif 'N' in loc or 'N' in chan:
-        orientationcode = 'N'
-    elif 'E' in loc or 'E' in chan:
-        orientationcode = 'E'    
-
-
-    if (sta=='MBLY' and chan[0]=='P') or 'AP' in chan or 'PR' in chan or 'PH' in chan or chan=='S A':
+    # Deal with the weird microbarometer ids
+    # from the old DSN
+    if chan == 'A N' and loc == 'J':
+        chan = 'SDO' # barometer, or maybe acoustic pressure sensor, at 75 Hz
+        loc = ""
+    elif chan == 'PRS': 
+        chan ='SD' + loc[0]
+        loc = loc[1:]
+    # from the new DSN
+    elif loc == 'S' and chan == 'AP': 
+        chan = 'EDO'
+        loc = ""
+    elif loc in '0123456789' and chan == 'PR':
+        chan = 'EDO'
+        loc = loc.zfill(2)
+    # final catch
+    elif 'AP' in chan or 'PR' in chan or 'PH' in chan or chan=='S A':
         instrumentcode = 'D'
-        orientationcode = 'F'
+        orientationcode = 'O'
         if chan[-1].isnumeric():
             loc = chan[-1].zfill(2)
         elif loc.isnumeric():
@@ -135,52 +121,82 @@ def correct_nslc_mvo(traceID, Fs, shortperiod=None):
         else:
             loc = ''
 
+    else: # Now deal with seismic channels
+        if loc == '--' or loc == 'J' or loc=='I':
+            loc = ''    
 
-    elif len(chan)>1:
-        if chan[1].strip():
-            instrumentcode = chan[1] 
-        if len(chan)>2:
-            orientationcode = chan[2]
-            if orientationcode=='H':
-                orientationcode='x'
+        if not shortperiod:
+            if 'SB' in chan or chan[0] in 'BH':
+                shortperiod = False
+                chan = 'BH' + chan[2:]
+            else:
+                shortperiod = True
+        #print(f'shortperiod: {shortperiod}')
 
-    
-    # Montserrat BB network 1996-2004 had weirdness like
-    # BB stations having channels 'SB[Z,N,E]' and
-    # SP stations having channels 'S [Z,N,E]'
-    # location code was usually 'J' for seismic, 'E' for pressure
-    # channel was 'PRS' for pressure
-    # there were also 'A N' channels co-located with single-component Integra LA100s, so perhaps those were some other
-    # type of seismometer, oriented Northt?
-    # let's handle these directly here
-    if len(chan)==2:
+        # Determine the correct band code
+        expected_band_code = _get_band_code(Fs) # this assumes broadband sensor
+        #print(f'band_code 1: {expected_band_code}')
 
-        # could be a 2006 era waveform trace ID where given as .STAT.[ZNE].[BS]H
-        if len(loc)==1:
-            #chan=chan+loc # now length 3
-            if loc in 'ZNE':
-                orientationcode = loc
-                loc = ''
-            #if not loc.isnumeric():
-            #    loc='' 
-        elif len(loc)==0:
-            # could be arrival row from an Sfile, where the "H" is omitted
-            # or an AEF line where trace dead and orientation missing
-            #instrumentcode = 'H'
-            if chan[1] in 'ZNE':
-                orientationcode = chan[1]
-            #else:
-            #    orientationcode = '' # sometimes get two-character chans from AEF lines which omit component when trace is dead, e.g. 01-0954-24L.S200601, 
+        # adjust band_code if short-period sensor
+        expected_band_code = _adjust_band_code_for_sensor_type(chan[0], expected_band_code, short_period=shortperiod)
+        #print(f'band_code 2: {expected_band_code}')
+        chan = expected_band_code + chan[1:]    
 
+        instrumentcode = 'H' 
+        if shortperiod and 'L' in chan or sta[-1]=='L': # trying to account for a low gain sensor, but this should be dealt with by processing legacy IDs
+            print(f'Warning: {traceID} might be a legacy ID for a low gain sensor from an old analog network')
+        orientationcode = 'x'
+        if 'Z' in loc or 'Z' in chan:
+            orientationcode = 'Z'
+        elif 'N' in loc or 'N' in chan:
+            orientationcode = 'N'
+        elif 'E' in loc or 'E' in chan:
+            orientationcode = 'E'    
+        elif len(chan)>1:
+            if chan[1].strip():
+                instrumentcode = chan[1] 
+            if len(chan)>2:
+                orientationcode = chan[2]
+                if orientationcode=='H':
+                    orientationcode='x'
 
-    
-    elif len(chan)==3:
         
-        if chan[0:2]=='SB':
-             # just because we know it is BB sensor
-            instrumentcode = 'H'
+        # Montserrat BB network 1996-2004 had weirdness like
+        # BB stations having channels 'SB[Z,N,E]' and
+        # SP stations having channels 'S [Z,N,E]'
+        # location code was usually 'J' for seismic, 'E' for pressure
+        # channel was 'PRS' for pressure
+        # there were also 'A N' channels co-located with single-component Integra LA100s, so perhaps those were some other
+        # type of seismometer, oriented Northt?
+        # let's handle these directly here
+        if len(chan)==2:
 
-    chan = expected_band_code + instrumentcode + orientationcode
+            # could be a 2006 era waveform trace ID where given as .STAT.[ZNE].[BS]H
+            if len(loc)==1:
+                #chan=chan+loc # now length 3
+                if loc in 'ZNE':
+                    orientationcode = loc
+                    loc = ''
+                #if not loc.isnumeric():
+                #    loc='' 
+            elif len(loc)==0:
+                # could be arrival row from an Sfile, where the "H" is omitted
+                # or an AEF line where trace dead and orientation missing
+                #instrumentcode = 'H'
+                if chan[1] in 'ZNE':
+                    orientationcode = chan[1]
+                #else:
+                #    orientationcode = '' # sometimes get two-character chans from AEF lines which omit component when trace is dead, e.g. 01-0954-24L.S200601, 
+
+
+        
+        elif len(chan)==3:
+            
+            if chan[0:2]=='SB':
+                # just because we know it is BB sensor
+                instrumentcode = 'H' # alternative is L, which only applies for low-gain short-period station
+
+        chan = expected_band_code + instrumentcode + orientationcode
 
     newID = net + "." + sta + "." + loc + "." + chan
     #print(traceID,'->',newID)
