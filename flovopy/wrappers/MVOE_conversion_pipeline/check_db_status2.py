@@ -5,9 +5,15 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.express as px
 import plotly.io as pio
-#pio.kaleido.scope.mathjax = None  # Avoid MathJax warnings
-#engine = 'kaleido'
-engine = 'orca'
+import plotly.graph_objects as go
+import subprocess
+
+# Optional: Disable MathJax to suppress warnings
+try:
+    if pio.kaleido.scope:
+        pio.kaleido.scope.mathjax = None
+except Exception:
+    pass
 
 TABLES = [
     "wav_files", "aef_files", "aef_metrics",
@@ -18,6 +24,34 @@ TABLES = [
 START_DATE = pd.Timestamp("1996-10-01", tz='UTC')
 END_DATE = pd.Timestamp("2008-09-01", tz='UTC')
 
+def run_shell_count(cmd):
+    try:
+        result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+        return int(result.stdout.strip())
+    except Exception as e:
+        print(f"[ERROR] Could not run command: {cmd}\n{e}")
+        return -1
+
+def add_filesystem_summary():
+    print("\n=== Filesystem Summary ===")
+
+    dsn_wav_count = run_shell_count("find /data/SEISAN_DB/WAV/MVOE_/[12]* -type f -iname '*MVO*' ! -iname '*.png' ! -iname '*.jpg' | wc -l")
+    dsn_aef_count = run_shell_count("find /data/SEISAN_DB/AEF/MVOE_/[12]* -type f -iname '*MVO*.aef' ! -iname '*.png' ! -iname '*.jpg' | wc -l")
+    dsn_local_count = run_shell_count("find /data/SEISAN_DB/REA/MVOE_/[12]* -type f -iname '*L.S*' ! -iname '*.png' ! -iname '*.jpg' | wc -l")
+    dsn_regional_count = run_shell_count("find /data/SEISAN_DB/REA/MVOE_/[12]* -type f -iname '*R.S*' ! -iname '*.png' ! -iname '*.jpg' | wc -l")
+    dsn_teleseismic_count = run_shell_count("find /data/SEISAN_DB/REA/MVOE_/[12]* -type f -iname '*D.S*' ! -iname '*.png' ! -iname '*.jpg' | wc -l")
+    spn_merged_count = run_shell_count("find /data/SEISAN_DB/WAV/MVOE_/[12]* -type f -iname '*SPN*' ! -iname '*.png' ! -iname '*.jpg' | wc -l")
+    asn_wav_count = run_shell_count("find /data/SEISAN_DB/WAV/ASNE_/[12]* -type f -iname '*ASN*' ! -iname '*.png' ! -iname '*.jpg' | wc -l")
+    asn_rea_count = run_shell_count("find /data/SEISAN_DB/REA/ASNE_/[12]* -type f -iname '*L.S*' ! -iname '*.png' ! -iname '*.jpg' | wc -l")
+    print("\n--- DSN (MVOE_) ---")
+    print(f"Number of MVO (DSN) event WAV files: {dsn_wav_count}")
+    print(f"Number of MVO (DSN) event AEF files: {dsn_aef_count}")
+    print(f"Number of REA files by type:\n- Local: {dsn_local_count}\n- Regional: {dsn_regional_count}\n- Teleseismic: {dsn_teleseismic_count}\n- TOTAL {dsn_local_count + dsn_regional_count + dsn_teleseismic_count}")
+
+    print("\n--- ASN ---")
+    print(f"Number of SPN (ASN) event WAV files in merged MVOE_ db: {spn_merged_count}")
+    print(f"Number of ASN event WAV files: {asn_wav_count}")
+    print(f"Number of ASN REA files: {asn_rea_count}")
 
 def save_plotly_timeseries(df, x_col, y_col, title, out_prefix, freq, is_mean=False):
     df = df.copy()
@@ -38,15 +72,32 @@ def save_plotly_timeseries(df, x_col, y_col, title, out_prefix, freq, is_mean=Fa
     fig = px.line(df_resampled, x=x_col, y=y_col, title=f"{title} ({freq})")
     fig.write_html(html_path)
     try:
-        fig.write_image(png_path, engine=engine)
+        fig.write_image(png_path, engine="kaleido")
     except Exception as e:
         print(f"[ERROR] Failed to write image for {title} ({freq}): {e}")
 
+def generate_error_summary(df_errors, outdir):
+    if 'error_message' in df_errors.columns:
+        counts = df_errors['error_message'].value_counts()
+        print("\n--- WAV PROCESSING ERRORS SUMMARY ---")
+        print(counts)
+        counts.to_csv(os.path.join(outdir, "wav_processing_errors_summary.csv"))
+        fig = px.bar(counts.reset_index(), x='index', y='error_message',
+                     title="Top WAV Processing Errors",
+                     labels={'index': 'Error Message', 'error_message': 'Count'})
+        fig.update_layout(xaxis_tickangle=-45)
+        fig.write_html(os.path.join(outdir, "wav_processing_errors_summary.html"))
+        try:
+            fig.write_image(os.path.join(outdir, "wav_processing_errors_summary.png"), engine="kaleido")
+        except Exception as e:
+            print(f"[ERROR] Could not save error plot: {e}")
 
 def show_status_summary(db_path):
     if not os.path.exists(db_path):
         print(f"[ERROR] Database not found: {db_path}")
         return
+
+    add_filesystem_summary()
 
     conn = sqlite3.connect(db_path)
     outdir = os.path.dirname(db_path)
@@ -54,10 +105,7 @@ def show_status_summary(db_path):
     # (1) WAV processing errors summary
     try:
         df_errors = pd.read_sql_query("SELECT error_message FROM wav_processing_errors", conn)
-        error_counts = df_errors['error_message'].value_counts()
-        print("\n--- WAV PROCESSING ERRORS SUMMARY ---")
-        print(error_counts)
-        error_counts.to_csv(os.path.join(outdir, "wav_processing_errors_summary.csv"))
+        generate_error_summary(df_errors, outdir)
     except Exception as e:
         print(f"[ERROR] Could not summarize wav_processing_errors: {e}")
 
@@ -120,14 +168,13 @@ def show_status_summary(db_path):
             fig = px.line(summary, x='datetime', y=['wav_files', 'aef_files', 'sfiles'], title=f"Files Summary ({freq})")
             fig.write_html(os.path.join(outdir, f"files_summary_{freq}.html"))
             try:
-                fig.write_image(os.path.join(outdir, f"files_summary_{freq}.png"), engine=engine)
+                fig.write_image(os.path.join(outdir, f"files_summary_{freq}.png"), engine="kaleido")
             except Exception as e:
                 print(f"[ERROR] Could not save plot files_summary_{freq}.png: {e}")
     except Exception as e:
         print(f"[ERROR] Could not create files summary plots: {e}")
 
     conn.close()
-
 
 if __name__ == "__main__":
     import argparse
