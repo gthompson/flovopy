@@ -21,16 +21,16 @@ def run_pipeline(args):
     """
 
     print("Running Step 00: Create MVOE index database...")
-    main00(args)
+    #main00(args)
     
     print("Running Step 01: Index WAV files...")
-    main01(args)
+    #main01(args)
 
     print("Running Step 02: Index AEF files...")
     main02(args)
 
     print("Running Step 03: Index S-files...")
-    main03(args)
+    #main03(args)
 
     print("All steps completed successfully.")   
 

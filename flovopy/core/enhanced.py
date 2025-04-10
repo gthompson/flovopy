@@ -22,13 +22,20 @@ from obspy.geodetics.base import gps2dist_azimuth
 
 from flovopy.core.preprocessing import add_to_trace_history
 from flovopy.processing.metrics import compute_amplitude_spectra #, compute_stationEnergy
-
+from flovopy.seisanio.core.ampengfft import compute_ampengfft_stream, write_aef_file
 class EnhancedStream(Stream):
 
     def __init__(self, stream=None):
         if stream is None:
             stream = Stream()
         super().__init__(traces=stream.traces)
+
+
+
+    def legacy_ampengfft(self, filepath, freq_bins=None, amp_avg_window=2.0,
+                                trigger_window=None, average_window=None):
+        compute_ampengfft_stream(self, freq_bins=freq_bins, amp_avg_window=amp_avg_window)
+        write_aef_file(self, filepath, trigger_window=trigger_window, average_window=average_window)
 
 
     def ampengfft(self, threshold=0.707, window_length=9, polyorder=2, differentiate=True):

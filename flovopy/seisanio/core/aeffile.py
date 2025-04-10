@@ -1,9 +1,42 @@
+"""
+AEFfile: Parser for SEISAN amplitude-energy-frequency (AEF) files.
+
+AEF files contain summary metrics computed by the legacy `ampengfft` C program, which was
+part of the standard analyst workflow at the Montserrat Volcano Observatory (MVO). Each 
+AEF file corresponds to a SEISAN-format event waveform file and includes processed results
+such as:
+
+- Maximum average amplitude (in m/s)
+- Total signal energy (in J/kg)
+- Dominant frequency (in Hz)
+- Percentage energy in predefined spectral bands ("SSAM")
+
+The ampengfft tool computed these metrics using a preconfigured FFT and energy slicing algorithm.
+Results were either:
+
+1. Embedded directly in the corresponding event `.S` file (as lines starting with `VOLC`)
+2. Or saved to a separate `.AEF` file with a filename derived from the event.
+
+This parser reads both standalone AEF files and embedded `VOLC` lines from `.S` files,
+returning a structured list of dictionaries, one per station-channel. Each entry includes:
+
+- `station`, `channel`: Network/station/channel info
+- `amplitude`: Maximum average amplitude (float)
+- `energy`: Total energy (float)
+- `maxf`: Frequency of peak spectral amplitude (Hz)
+- `ssam`: Dictionary with:
+    - `bands`: List of N+1 frequency edges (Hz)
+    - `fractions`: List of N values, each representing the fraction of total energy in that band
+    - `energies`: Optional per-band energy values, if present
+"""
+
+
 import os
 import re
 from flovopy.core.mvo import correct_nslc_mvo
 
 class AEFfile:
-    def __init__(self, path=None, filetime=None):
+    def __init__(self, path=None, filetime=None, verbose=False):
         self.aefrows = []  # List of trace-level rows (dicts)
         self.trigger_window = None
         self.average_window = None
@@ -17,29 +50,48 @@ class AEFfile:
         try:
             with open(self.path, 'r') as f:
                 lines = f.readlines()
+             
         except IOError as e:
             print(f"[ERROR] Could not read {self.path}: {e}")
             return
 
         for line in lines:
+            if verbose:
+                print(line)
             if len(line) < 60:
+                if verbose:
+                    print('line length too short')
                 continue
 
             if 'trigger window' in line.lower():
+                if verbose:
+                    print('trigger window found')
                 self.trigger_window = self._extract_window(line, 'trigger window')
 
             if 'average window' in line.lower():
+                if verbose:
+                    print('average window found')
                 self.average_window = self._extract_window(line, 'average window')
 
             # Skip header lines
-            if line[1:10] == "VOLC MAIN":
+            line = line.lstrip()
+            if "VOLC MAIN" in line:
+                if verbose:
+                    print('header line found')
                 continue
             if not line.startswith("VOLC"):
+                if verbose:
+                    print('other line found')
                 continue
 
             # Parse actual AEF data line
+            if verbose:
+                print('Trying to parse AEF line')
+
             aefrow = self.parse_aefline(line)
             if aefrow:
+                if verbose:
+                    print(aefrow)
                 self.aefrows.append(aefrow)
 
     def _extract_window(self, line, keyword):
@@ -67,9 +119,11 @@ class AEFfile:
         return info
 
     def parse_aefline(self, line):
+        line = line.split('VOLC ')[-1]
         try:
-            station = line[6:10].strip()
-            channel = line[11:14].strip()
+            station = line[0:4].strip()
+            channel = line[5:9].strip()
+            line = line[9:] # just in case A, E, or F are in the Station or Channel name
 
             a_idx = line.find("A")
             e_idx = line.find("E")
@@ -117,12 +171,13 @@ class AEFfile:
         Extracts SSAM frequency bin percentages and converts to energy.
         """
         F = {
-            "frequency_bands": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 30.0],
+            "frequency_bands": [0.1, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 30.0],
             "percentages": [],
             "energies": []
         }
 
-        while startindex < len(line) and len(F["percentages"]) < 12:
+        N = len(F['frequency_bands'])-1 # frequency bands defines bin edges. So N actual measurements.
+        while startindex < len(line) and len(F["percentages"]) < N:
             valstr = line[startindex:startindex + 3].strip()
             if "." not in valstr:
                 try:

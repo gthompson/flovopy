@@ -1,20 +1,23 @@
 import os
-import datetime as dt
+#import datetime as dt
 from obspy import UTCDateTime
 
 
 def spath2datetime(spath):
     """Extract datetime from SEISAN S-file path."""
     basename = os.path.basename(spath)
-    fbs = basename.split('.S')
-    yyyy = int(fbs[1][0:4])
-    mm = int(fbs[1][4:6])
-    dd = int(fbs[0][0:2])
-    HH = int(fbs[0][3:5])
-    MM = int(fbs[0][5:7])
-    SS = float(fbs[0][8:10])
-    base_dt = dt.datetime(yyyy, mm, dd, HH, MM, 0)
-    return base_dt + dt.timedelta(seconds=SS)
+    if '.S' in spath: # 
+        parts = basename.split('.S')
+        yyyy = int(parts[1][0:4])
+        mm = int(parts[1][4:6])
+        parts = parts[0].split('-')
+        dd = int(parts[0])
+        HH = int(parts[1][0:2])
+        MM = int(parts[1][2:4])
+        SS = float(parts[2][0:2])
+        return UTCDateTime(yyyy, mm, dd, HH, MM, SS)
+    else:
+        return None
 
 
 def filetime2spath(filetime, mainclass='L', db=None, seisan_data=None, fullpath=True):
@@ -84,7 +87,7 @@ def parse_string(line, pos0, pos1, astype='float', stripstr=True):
     except ValueError:
         return None
 
-
+'''
 def correct_nslc(traceID, sampling_rate=100.0, shortperiod=False):
     """
     Fix NSLC code for a waveform based on sampling rate and whether it's shortperiod.
@@ -120,3 +123,4 @@ def correct_nslc(traceID, sampling_rate=100.0, shortperiod=False):
             "location_code": "",
             "channel_code": "???"
         }
+'''

@@ -82,9 +82,12 @@ def generate_error_summary(df_errors, outdir):
         print("\n--- WAV PROCESSING ERRORS SUMMARY ---")
         print(counts)
         counts.to_csv(os.path.join(outdir, "wav_processing_errors_summary.csv"))
-        fig = px.bar(counts.reset_index(), x='index', y='error_message',
-                     title="Top WAV Processing Errors",
-                     labels={'index': 'Error Message', 'error_message': 'Count'})
+        counts_df = counts.reset_index()
+        counts_df.columns = ['error_message', 'count']
+        fig = px.bar(counts_df, x='error_message', y='count',
+             title="Top WAV Processing Errors",
+             labels={'error_message': 'Error Message', 'count': 'Count'})
+
         fig.update_layout(xaxis_tickangle=-45)
         fig.write_html(os.path.join(outdir, "wav_processing_errors_summary.html"))
         try:

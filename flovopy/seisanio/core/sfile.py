@@ -8,11 +8,12 @@ from flovopy.seisanio.core.wavfile import Wavfile
 from flovopy.seisanio.core.aeffile import AEFfile
 from flovopy.seisanio.utils.helpers import spath2datetime
 from flovopy.core.mvo import correct_nslc_mvo
-from flovopy.core.enhanced_catalog import EnhancedEvent
-import json
+from flovopy.core.enhanced import EnhancedEvent
+#import json
+import pprint
 
 class Sfile:
-    def __init__(self, path, use_mvo_parser=False, fast_mode=False):
+    def __init__(self, path, use_mvo_parser=False, fast_mode=False, verbose=False, parse_aef=True):
         self.path = path.strip()
         self.filetime = spath2datetime(self.path)
         self.otime = None
@@ -66,17 +67,19 @@ class Sfile:
 
         if _is_sfile(self.path):
             self.event = readheader(self.path)
+            self.mainclass = self.event.event_descriptions[-1].get('text')
+            self.agency=self.event.creation_info.get("agency_id")
             wavnames = readwavename(self.path)
             wavpath = os.path.dirname(self.path).replace("REA", "WAV")
             for wavfile in wavnames:
-                self.wavfiles.append(Wavfile(os.path.join(wavpath, wavfile)))   
+                self.wavfiles.append(Wavfile(os.path.join(wavpath, wavfile)))
 
             # pick up extra information        
             if fast_mode:
                 self._parse_sfile_fast()
                 self.to_obspyevent()
             elif use_mvo_parser:
-                self.parse_sfile()
+                self.parse_sfile(verbose=verbose, parse_aef=parse_aef)
                 self.to_obspyevent()
 
     def _parse_sfile_fast(self):
@@ -96,7 +99,7 @@ class Sfile:
                 self.subclass = line.split("VOLC MAIN")[-1].strip()[0]
                 print(self.subclass)
 
-    def parse_sfile(self, verbose=False):
+    def parse_sfile(self, verbose=False, parse_aef=True):
         if verbose:
             print('Parsing ', self.path)
         fptr = open(self.path, 'r')
@@ -130,7 +133,7 @@ class Sfile:
                     print("Processing %s: ignoring this line: %s" % (self.path, line))
                 continue
 
-            if line[79] == '1':
+            if line[-1] == '1':
                 # Parse origin time and event details
                 try:
                     oyear, omonth, oday = int(line[1:5]), int(line[6:8]), int(line[8:10])
@@ -147,6 +150,7 @@ class Sfile:
                     if verbose:
                         print('Failed 1-21:\n01233456789' * 8 + f"\n{line}")
 
+                print(line)
                 self.mainclass = line[21:23].strip()
                 self.latitude = parse_string(line, 23, 30, 'float')
                 self.longitude = parse_string(line, 30, 38, 'float')
@@ -168,10 +172,10 @@ class Sfile:
                         if verbose:
                             print(f'Failed {i[0]}-{i[4]}:\n01233456789' * 8 + f"\n{line}")
 
-            if line[79] == '2':
+            if line[-1] == '2':
                 self.maximum_intensity = int(line[27:29])
 
-            if line[79] == '6':
+            if line[-1] == '6':
                 wavfiles = line[1:79].split()
                 for wavfile in wavfiles:
                     wavfullpath = os.path.join(os.path.dirname(self.path).replace('REA', 'WAV'), wavfile)
@@ -180,7 +184,7 @@ class Sfile:
                     if os.path.exists(aeffullpath) and aeffullpath not in _aeffiles:
                         _aeffiles.append(aeffullpath)
 
-            if line[79] == 'E':
+            if line[-1] == 'E':
                 self.gap = parse_string(line, 5, 8, 'int', default=-1)
                 self.error['origintime'] = parse_string(line, 14, 20, 'float')
                 self.error['latitude'] = parse_string(line, 24, 30, 'float')
@@ -190,7 +194,7 @@ class Sfile:
                 self.error['covxz'] = parse_string(line, 55, 67, 'float')
                 self.error['covyz'] = parse_string(line, 67, 79, 'float')
 
-            if line[79] == 'F' and 'dip' not in self.focmec:
+            if line[-1] == 'F' and 'dip' not in self.focmec:
                 self.focmec['strike'] = float(line[0:10])
                 self.focmec['dip'] = float(line[10:20])
                 self.focmec['rake'] = float(line[20:30])
@@ -198,7 +202,7 @@ class Sfile:
                 self.focmec['source'] = line[70:77]
                 self.focmec['quality'] = line[77]
 
-            if line[79] == 'H':
+            if line[-1] == 'H':
                 _osec = float(line[16:22])
                 _yyyy = int(line[1:5])
                 _mm = int(line[6:8])
@@ -213,13 +217,14 @@ class Sfile:
                 self.depth = float(line[44:52].strip())
                 self.rms = float(line[53:59].strip())
 
-            if line[79] == 'I':
+            if line[-1] == 'I':
+                input('Analyst line found')
                 self.last_action = line[8:11]
                 self.action_time = line[12:26]
                 self.analyst = line[30:33]
                 self.id = int(line[60:74])
 
-            if line[79] == ' ' and line[1] == 'M':
+            if line[-1] == ' ' and line[1] == 'M':
                 asta = line[1:5].strip()
                 achan = line[5:8].strip()
                 aphase = line[8:16].strip()
@@ -276,7 +281,8 @@ class Sfile:
                     self.picks.append(p)
 
         for _aeffile in _aeffiles:
-            self.aeffiles.append(AEFfile(_aeffile))
+            if parse_aef:
+                self.aeffiles.append(AEFfile(_aeffile))
 
 
     def maximum_magnitude(self):

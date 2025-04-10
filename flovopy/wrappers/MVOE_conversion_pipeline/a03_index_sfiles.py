@@ -1,43 +1,42 @@
-# 03_index_sfiles.py
 '''
 The script 03_index_sfiles.py will:
 
     Index all S-files in the specified REA directory.
-
     Track whether they were parsed successfully.
-
     Extract key metadata.
-
     Link up to 2 WAV files and 1 AEF file (if present).
-
     Support separate tables for the bgs and mvo archives based on the --archive argument.
-
-03_index_sfiles.py will now:
-
     Parse AEF lines and trigger/average windows if present in the S-file (via your Sfile and AEFfile classes).
-
     Save extracted information (metadata, aefrows, trigger/average window) as a .json file per S-file, in a parallel directory structure.
 '''
 
-
 import os
 import sqlite3
-#import json
 from datetime import datetime
 from flovopy.seisanio.core.sfile import Sfile
-#from flovopy.core.enhanced import EnhancedEvent
 from tqdm import tqdm
+import json
+
+def add_column_if_not_exists(conn, table, column, coltype):
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    columns = [row[1] for row in cur.fetchall()]
+    if column not in columns:
+        print(f"[INFO] Adding column '{column}' to table '{table}'")
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        conn.commit()
 
 def index_sfiles(conn, sfile_dir, archive_type, json_output_dir):
     assert archive_type in ["bgs", "mvo"], "archive_type must be 'bgs' or 'mvo'"
 
     cur = conn.cursor()
     table = f"sfiles_{archive_type}"
+    add_column_if_not_exists(conn, "aef_metrics", "sfile_path", "TEXT")
 
     for root, _, files in os.walk(sfile_dir):
         files.sort()
         for fname in tqdm(files, desc=f"Indexing S-files ({archive_type}) in {root}"):
-            if not fname.endswith("S"):
+            if not '.S' in fname:
                 continue
 
             full_path = os.path.join(root, fname)
@@ -54,24 +53,25 @@ def index_sfiles(conn, sfile_dir, archive_type, json_output_dir):
 
             # Try parsing the S-file
             try:
+                print('0123456789'*8)
+                os.system(f'cat {full_path}')
                 s = Sfile(full_path, use_mvo_parser=True)
                 d = s.to_dict()
+                print(d)
 
                 aef_file = s.aeffiles[0].path if s.aeffiles else None
                 wavfile1 = d.get("wavfile1")
                 wavfile2 = d.get("wavfile2")
 
                 cur.execute(f'''
-                    INSERT INTO {table} (path, event_id, parsed_successfully, parsed_time, error, trigger_window, average_window, wavfile1, wavfile2, aef_file)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO {table} (path, event_id, parsed_successfully, parsed_time, error, wavfile1, wavfile2, aef_file)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     full_path,
                     d.get("id"),
                     1,
                     datetime.utcnow().isoformat(),
                     None,
-                    s.aeffiles[0].trigger_window if s.aeffiles else None,
-                    s.aeffiles[0].average_window if s.aeffiles else None,
                     wavfile1,
                     wavfile2,
                     aef_file
@@ -81,6 +81,18 @@ def index_sfiles(conn, sfile_dir, archive_type, json_output_dir):
                 rel_path = os.path.relpath(full_path, sfile_dir)
                 enh = s.to_enhancedevent()
                 enh.save(json_output_dir, os.path.splitext(rel_path)[0])
+
+                # If AEF data was embedded in the S-file, insert metrics directly
+                if s.aeffiles:
+                    aef = s.aeffiles[0]
+                    for row in aef.aefrows:
+                        ssam_json = json.dumps(row['ssam']) if row.get('ssam') else None
+                        cur.execute('''
+                            INSERT INTO aef_metrics (aef_file_id, trace_id, station, channel,
+                                                    amplitude, energy, maxf, ssam_json, sfile_path)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (None, row.get('fixed_id', ''), row.get('station'), row.get('channel'),
+                            row.get('amplitude'), row.get('energy'), row.get('maxf'), ssam_json, full_path))
 
 
             except Exception as e:
@@ -108,3 +120,13 @@ if __name__ == "__main__":
     parser.add_argument("--archive", choices=["bgs", "mvo"], required=True, help="Which archive to index")
     args = parser.parse_args()
     main(args)
+
+
+'''
+python 03_index_sfiles.py \
+  --sfile_dir /data/SEISAN_DB/REA/MVOE_ \
+  --json_output /data/SEISAN_DB/JSON/MVOE_SFILES \
+  --db /home/thompsong/public_html/index_sfile_test.sqlite \
+  --archive bgs \
+  --verbose
+'''

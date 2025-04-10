@@ -1,8 +1,8 @@
 import os
 import datetime as dt
 from obspy import read
-from flovopy.seisanio.utils.helpers import filetime2spath, correct_nslc
-
+from flovopy.seisanio.utils.helpers import filetime2spath
+from flovopy.core.mvo import correct_nslc_mvo
 
 class Wavfile:
     def __init__(self, path=''):
@@ -48,10 +48,13 @@ class Wavfile:
             evtime = self.filetime
         return blanksfile(self.path, evtype, userid, overwrite=overwrite, evtime=evtime)
 
-    def read(self):
+    def read(self, fixid=True):
         if os.path.exists(self.path):
             try:
                 self.st = read(self.path)
+                if fixid:
+                    for tr in self.st:
+                        tr.id = correct_nslc_mvo(tr, tr.stats.sampling_rate)
                 return True
             except Exception as e:
                 print(f"[Wavfile.read] Failed to read {self.path}: {e}")

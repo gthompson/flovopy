@@ -95,6 +95,14 @@ def correct_nslc_mvo(traceID, Fs, shortperiod=None):
     loc = oldloc.strip()
     chan = oldcha.strip()
 
+    if 'J' in loc or 'J' in chan:
+        Fs = 75.0
+    # Deal with AEF files which have channel 'S JZ' or channel 'SBJZ'
+    if chan[0:3] == 'S J':
+        chan = 'SH' + chan[3:]
+    elif chan[0:3] == 'SBJ':
+        chan = 'BH' + chan[3:]
+
     # Deal with the weird microbarometer ids
     # from the old DSN
     if chan == 'A N' and loc == 'J':

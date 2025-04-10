@@ -19,8 +19,11 @@ TABLES = [
     "sfiles_mvo", "sfiles_bgs", "wav_processing_errors"
 ]
 
-START_DATE = pd.Timestamp("1996-10-01", tz='UTC')
-END_DATE = pd.Timestamp("2008-09-01", tz='UTC')
+START_DATE = pd.Timestamp("1996-10-01")
+END_DATE = pd.Timestamp("2008-09-01")
+START_DATE_TZ = pd.Timestamp("1996-10-01", tz='UTC')
+END_DATE_TZ = pd.Timestamp("2008-09-01", tz='UTC')
+
 
 DB_PATH = "/home/thompsong/public_html/index_mvoe.sqlite"
 
@@ -83,7 +86,7 @@ def load_time_series_data(resample_rule):
 
     try:
         df = pd.read_sql_query("SELECT start_time FROM wav_files", conn, parse_dates=['start_time'])
-        df = df[(df['start_time'] >= START_DATE) & (df['start_time'] < END_DATE)]
+        df = df[(df['start_time'] >= START_DATE_TZ) & (df['start_time'] < END_DATE_TZ)]
         df['count'] = 1
         data['wav_files'] = df.set_index('start_time').resample(resample_rule).count().rename(columns={'count': 'wav_count'})
     except Exception as e:
@@ -109,7 +112,9 @@ def load_time_series_data(resample_rule):
         print("[WARN] Could not load sfiles_bgs time series:", e)
 
     try:
-        df = pd.read_sql_query("SELECT DISTINCT DATE(parsed_time) as date, corrected_id FROM trace_id_corrections", conn, parse_dates=['date'])
+        #df = pd.read_sql_query("SELECT DISTINCT DATE(parsed_time) as date, corrected_id FROM trace_id_corrections", conn, parse_dates=['date'])
+        df = pd.read_sql_query("SELECT date, corrected_id FROM trace_id_corrections", conn, parse_dates=['date'])
+
         df = df[(df['date'] >= START_DATE) & (df['date'] < END_DATE)]
         data['corrected_ids'] = df.groupby('date').agg({'corrected_id': 'nunique'})
         data['corrected_ids'].rename(columns={'corrected_id': 'unique_corrected_ids'}, inplace=True)
@@ -118,7 +123,9 @@ def load_time_series_data(resample_rule):
         print("[WARN] Could not load corrected_ids time series:", e)
 
     try:
-        df = pd.read_sql_query("SELECT DISTINCT DATE(parsed_time) as date, corrected_id FROM trace_id_corrections", conn, parse_dates=['date'])
+        #df = pd.read_sql_query("SELECT DISTINCT DATE(parsed_time) as date, corrected_id FROM trace_id_corrections", conn, parse_dates=['date'])
+        df = pd.read_sql_query("SELECT date, corrected_id FROM trace_id_corrections", conn, parse_dates=['date'])
+
         df = df[(df['date'] >= START_DATE) & (df['date'] < END_DATE)]
         df['station'] = df['corrected_id'].apply(lambda x: x.split('.')[1] if isinstance(x, str) and '.' in x else None)
         data['station_counts'] = df.groupby('date').agg({'station': pd.Series.nunique})
@@ -140,18 +147,24 @@ def load_time_series_data(resample_rule):
 def update_time_series(resample_value):
     data = load_time_series_data(resample_value)
     plots = []
-    if not data['wav_files'].empty:
-        plots.append(generate_plot(data['wav_files'].reset_index(), 'start_time', 'wav_count', "WAV Files Indexed"))
-    if not data['aef_files'].empty:
-        plots.append(generate_plot(data['aef_files'].reset_index(), 'parsed_time', 'aef_count', "AEF Files Indexed"))
-    if not data['sfiles_bgs'].empty:
-        plots.append(generate_plot(data['sfiles_bgs'].reset_index(), 'parsed_time', 'sfile_count', "S-Files (BGS) Indexed"))
-    if not data['corrected_ids'].empty:
-        plots.append(generate_plot(data['corrected_ids'].reset_index(), 'date', 'unique_corrected_ids', "Unique Corrected IDs Per Day"))
-    if not data['station_counts'].empty:
-        plots.append(generate_plot(data['station_counts'].reset_index(), 'date', 'unique_stations', "Unique Stations Per Day"))
-    if not data['station_heatmap'].empty:
-        plots.append(generate_heatmap(data['station_heatmap']))
+
+    for key, df in data.items():
+        if key == 'wav_files' and not df.empty:
+            plots.append(generate_plot(df.reset_index(), 'start_time', 'wav_count', "WAV Files Indexed"))
+        elif key == 'aef_files' and not df.empty:
+            plots.append(generate_plot(df.reset_index(), 'parsed_time', 'aef_count', "AEF Files Indexed"))
+        elif key == 'sfiles_bgs' and not df.empty:
+            plots.append(generate_plot(df.reset_index(), 'parsed_time', 'sfile_count', "S-Files (BGS) Indexed"))
+        elif key == 'corrected_ids' and not df.empty:
+            plots.append(generate_plot(df.reset_index(), 'date', 'unique_corrected_ids', "Unique Corrected IDs"))
+        elif key == 'station_counts' and not df.empty:
+            plots.append(generate_plot(df.reset_index(), 'date', 'unique_stations', "Unique Stations Reporting"))
+        elif key == 'station_heatmap' and not df.empty:
+            plots.append(generate_heatmap(df))
+
+    if not plots:
+        plots.append(html.Div("No data available for the selected time resolution."))
+
     return plots
 
 conn = sqlite3.connect(DB_PATH)
