@@ -20,7 +20,7 @@ def fix_trace_mvo(trace, legacy=False, netcode='MV'):
     mvo_id = trace.id
     fix_trace_id(trace, legacy=legacy, netcode=netcode)
     fixed_id = trace.id
-    print(f'{original_id} -> {mvo_id} -> {fixed_id}')
+    #print(f'{original_id} -> {mvo_id} -> {fixed_id}')
 
 def load_mvo_master_inventory(XMLDIR):
     master_station_xml = os.path.join(XMLDIR, 'MontserratDigitalSeismicNetwork.xml')
@@ -94,6 +94,8 @@ def correct_nslc_mvo(traceID, Fs, shortperiod=None):
     sta = oldsta.strip()
     loc = oldloc.strip()
     chan = oldcha.strip()
+    if not chan:
+       chan = 'SHZ'
 
     if 'J' in loc or 'J' in chan:
         Fs = 75.0
@@ -102,6 +104,7 @@ def correct_nslc_mvo(traceID, Fs, shortperiod=None):
         chan = 'SH' + chan[3:]
     elif chan[0:3] == 'SBJ':
         chan = 'BH' + chan[3:]
+
 
     # Deal with the weird microbarometer ids
     # from the old DSN
@@ -130,15 +133,27 @@ def correct_nslc_mvo(traceID, Fs, shortperiod=None):
             loc = ''
 
     else: # Now deal with seismic channels
+        # deal with picks in Seisan S-files
+        instrumentcode = 'H' 
+        orientationcode = 'x'
+        if len(chan)==2:
+            if chan[1] in 'ZNE':
+                orientationcode = chan[1]
+            elif chan[1] == 'H' and loc in 'ZNE':
+                chan = chan + loc
+                loc = ''
+
         if loc == '--' or loc == 'J' or loc=='I':
             loc = ''    
 
         if not shortperiod:
-            if 'SB' in chan or chan[0] in 'BH':
-                shortperiod = False
-                chan = 'BH' + chan[2:]
-            else:
-                shortperiod = True
+            if chan:
+                if 'SB' in chan or chan[0] in 'BH':
+                    shortperiod = False
+                    chan = 'BH' + chan[2:]
+                else:
+                    shortperiod = True
+
         #print(f'shortperiod: {shortperiod}')
 
         # Determine the correct band code
@@ -150,10 +165,10 @@ def correct_nslc_mvo(traceID, Fs, shortperiod=None):
         #print(f'band_code 2: {expected_band_code}')
         chan = expected_band_code + chan[1:]    
 
-        instrumentcode = 'H' 
-        if shortperiod and 'L' in chan or sta[-1]=='L': # trying to account for a low gain sensor, but this should be dealt with by processing legacy IDs
+        
+        if sta[0:2] != 'MB' and (shortperiod and 'L' in chan or sta[-1]=='L'): # trying to account for a low gain sensor, but this should be dealt with by processing legacy IDs
             print(f'Warning: {traceID} might be a legacy ID for a low gain sensor from an old analog network')
-        orientationcode = 'x'
+        
         if 'Z' in loc or 'Z' in chan:
             orientationcode = 'Z'
         elif 'N' in loc or 'N' in chan:

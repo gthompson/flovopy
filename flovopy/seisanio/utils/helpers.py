@@ -1,26 +1,9 @@
 import os
 #import datetime as dt
-from obspy import UTCDateTime
+#from obspy import UTCDateTime
 
-
-def spath2datetime(spath):
-    """Extract datetime from SEISAN S-file path."""
-    basename = os.path.basename(spath)
-    if '.S' in spath: # 
-        parts = basename.split('.S')
-        yyyy = int(parts[1][0:4])
-        mm = int(parts[1][4:6])
-        parts = parts[0].split('-')
-        dd = int(parts[0])
-        HH = int(parts[1][0:2])
-        MM = int(parts[1][2:4])
-        SS = float(parts[2][0:2])
-        return UTCDateTime(yyyy, mm, dd, HH, MM, SS)
-    else:
-        return None
-
-
-def filetime2spath(filetime, mainclass='L', db=None, seisan_data=None, fullpath=True):
+# need to leave this here to prevent circular imports between Wavfile and Sfile
+def filetime2spath(filetime, mainclass='L', db=None, seisan_top=None, fullpath=True):
     """Create full path to a SEISAN S-file from a datetime object."""
     spath = '%02d-%02d%02d-%02d%s.S%4d%02d' % (
         filetime.day, filetime.hour, filetime.minute, filetime.second,
@@ -30,54 +13,33 @@ def filetime2spath(filetime, mainclass='L', db=None, seisan_data=None, fullpath=
         spath = os.path.join(f"{filetime.year}", f"{filetime.month:02d}", spath)
         if db:
             spath = os.path.join("REA", db, spath)
-            if seisan_data:
-                spath = os.path.join(seisan_data, spath)
+            if seisan_top:
+                spath = os.path.join(seisan_top, spath)
     return spath
 
-
-def filetime2wavpath(filetime, mainclass='L', db=None, seisan_data=None,
-                     fullpath=True, y2kfix=False, numchans=0):
-    """Create full path to a WAV file from datetime object."""
-    dbstring = db or ''
-    if db == 'MVOE_':
-        dbstring = 'MVO__'
-    elif db == 'ASNE_':
-        dbstring = 'SPN__'
-
-    if len(dbstring) < 5:
-        dbstring += '_' * (5 - len(dbstring))
-
-    if not y2kfix and filetime.year < 2000:
-        basename = '%2d%02d-%02d-%02d%02d-%02dS.%s_%03d' % (
-            filetime.year - 1900, filetime.month, filetime.day,
-            filetime.hour, filetime.minute, filetime.second,
-            dbstring, numchans
-        )
+def legacy_or_not(fname):
+    fnamelower = os.path.basename(fname).lower()
+    if 'mvo' in fnamelower or 'asne' in fnamelower or 'dsne' in fnamelower or 'spn' in fnamelower:
+        print(f'Processing {fname}')
     else:
-        basename = '%4d-%02d-%02d-%02d%02d-%02dS.%s_%03d' % (
-            filetime.year, filetime.month, filetime.day,
-            filetime.hour, filetime.minute, filetime.second,
-            dbstring, numchans
-        )
+        print(f'Not processing {fname}')          
+        return None, None
 
-    if fullpath:
-        wavpath = os.path.join(f"{filetime.year}", f"{filetime.month:02d}", basename)
-        if db:
-            wavpath = os.path.join("WAV", db, wavpath)
-            if seisan_data:
-                wavpath = os.path.join(seisan_data, wavpath)
-        return wavpath
-
-    return basename
+    legacy = False
+    network = 'DSN'
+    if 'asne' in fnamelower or 'spn' in fnamelower:
+        legacy = True # WAV file from the analog network
+        network = 'ASN'
+    return legacy, network
 
 
-def parse_string(line, pos0, pos1, astype='float', stripstr=True):
+def parse_string(line, pos0, pos1, astype='float', stripstr=True, default=None):
     """Safely extract a substring from a line and convert to int/float/str."""
     _s = line[pos0:pos1]
     if stripstr:
         _s = _s.strip()
     if not _s:
-        return None
+        return default
     try:
         if astype == 'float':
             return float(_s)
@@ -85,7 +47,7 @@ def parse_string(line, pos0, pos1, astype='float', stripstr=True):
             return int(_s)
         return _s
     except ValueError:
-        return None
+        return default
 
 '''
 def correct_nslc(traceID, sampling_rate=100.0, shortperiod=False):
@@ -124,3 +86,27 @@ def correct_nslc(traceID, sampling_rate=100.0, shortperiod=False):
             "channel_code": "???"
         }
 '''
+
+def filetime2wavpath(filetime, sfilepath, y2kfix=False, numchans=0, dbstring='MVO__'):
+    """Create full path to a WAV file from datetime object."""
+
+    if len(dbstring) < 5:
+        dbstring += '_' * (5 - len(dbstring))
+
+    wavdir = os.path.dirname(sfilepath).replace('REA', 'WAV')
+
+
+    if not y2kfix and filetime.year < 2000:
+        basename = '%2d%02d-%02d-%02d%02d-%02dS.%s_%03d' % (
+            filetime.year - 1900, filetime.month, filetime.day,
+            filetime.hour, filetime.minute, filetime.second,
+            dbstring, numchans
+        )
+    else:
+        basename = '%4d-%02d-%02d-%02d%02d-%02dS.%s_%03d' % (
+            filetime.year, filetime.month, filetime.day,
+            filetime.hour, filetime.minute, filetime.second,
+            dbstring, numchans
+        )
+
+    return os.path.join(wavdir, basename)

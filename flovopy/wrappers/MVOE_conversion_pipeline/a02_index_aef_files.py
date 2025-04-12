@@ -75,13 +75,41 @@ from datetime import datetime
 from flovopy.seisanio.core.aeffile import AEFfile
 from tqdm import tqdm
 
-def index_aef_files(conn, aef_dir, json_output_dir, verbose=False):
-    cur = conn.cursor()
+def index_aef_files(conn, aef_dir, json_output_dir, verbose=False, filename_filter=None, limit=None):
+    """
+    Index SEISAN AEF files for metadata and conversion.
 
-    for root, dirs, files in os.walk(aef_dir):
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        SQLite database connection.
+    aef_dir : str
+        Root directory containing AEF files.
+    json_output_dir : str
+        Output directory to store converted JSON files.
+    filename_filter : callable or str or None
+        A function or string used to filter filenames. E.g., lambda f: 'MB' in f
+    limit : int or None
+        Stop after indexing this many files (useful for testing).
+    """
+    cur = conn.cursor()
+    count = 0
+
+    walker = os.walk(aef_dir)
+
+    for root, dirs, files in walker:
         dirs.sort()
         files.sort()
+
         for fname in tqdm(files, desc=f"Indexing AEF files in {root}"):
+            if limit is not None and count >= limit:
+                return
+            if isinstance(filename_filter, str):
+                if filename_filter not in fname:
+                    continue
+            elif callable(filename_filter):
+                if not filename_filter(fname):
+                    continue
             print('\n\n')
             if not fname.upper().endswith('.AEF'):
                 continue
@@ -89,10 +117,15 @@ def index_aef_files(conn, aef_dir, json_output_dir, verbose=False):
             full_path = os.path.join(root, fname)
 
             try:
-                full_path.encode("utf-8")
+                encoded_path = full_path.encode("utf-8")
             except UnicodeEncodeError:
                 print(f"[WARN] Skipping file with invalid encoding: {full_path}")
-                continue
+                # We log failed AEF files into a separate table with the specific error
+                cur.execute(
+                    '''INSERT INTO aef_processing_errors (path, error_message) VALUES (?, ?)''',
+                    (encoded_path, 'UnicodeEncodeError')
+                )              
+                continue            
 
             # Check if already indexed in aef_files
             cur.execute("SELECT id FROM aef_files WHERE path = ?", (full_path,))
@@ -120,6 +153,8 @@ def index_aef_files(conn, aef_dir, json_output_dir, verbose=False):
                     raise e
                 trigger = aef.trigger_window
                 avg = aef.average_window
+                filetime = aef.filetime.isoformat()
+                network = aef.network
 
                 print(f"[INFO] Extracted trigger={trigger}, average={avg}")
 
@@ -136,46 +171,53 @@ def index_aef_files(conn, aef_dir, json_output_dir, verbose=False):
                     json.dump(metrics_out, f, indent=2, default=str)
 
                 parsed_successfully = 1
+
                 aef_error = None
+                last_op = ''
+                if not existing_file:
+                    last_op = 'insert aef_files'
+                    print((full_path, filetime, network, trigger, avg, json_path, None,  None,
+                                parsed_successfully, datetime.utcnow().isoformat(), aef_error))
+                    cur.execute('''INSERT INTO aef_files (path, filetime, network, trigger_window, average_window, json_path, 
+                                                        sfile_path, wav_file_path, parsed_successfully, parsed_time, error)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                (full_path, filetime, network, trigger, avg, json_path, None,  None,
+                                parsed_successfully, datetime.utcnow().isoformat(), aef_error))
+                    aef_file_id = cur.lastrowid
+                else:
+                    last_op = 'update aef_files'
+                    cur.execute('''UPDATE aef_files SET filetime=?, network=?, trigger_window=?, average_window=?, json_path=?,
+                                parsed_successfully=?, parsed_time=?, error=? WHERE id=?''',
+                                (filetime, network, trigger, avg, json_path, parsed_successfully, datetime.utcnow().isoformat(), aef_error, aef_file_id))
 
-            except Exception as e:
-                print(f"[ERROR] Failed to parse {full_path}: {e}")
-                trigger = avg = None
-                parsed_successfully = 0
-                json_path = None
-                aef = None
-                aef_error = str(e)
+                if aef:
+                    for row in aef.aefrows:
+                        ssam_json = json.dumps(row.get('ssam')) if row.get('ssam') else None
+                        last_op = 'insert aef_metrics'
+                        cur.execute('''INSERT INTO aef_metrics (time, aef_file_id, sfile_path, trace_id,
+                                                            amplitude, energy, maxf, ssam_json)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                                    (filetime, aef_file_id, None, row.get('fixed_id', ''),
+                                    row.get('amplitude'), row.get('energy'), row.get('maxf'), ssam_json))
+                    print(f"[INFO] Inserted {len(aef.aefrows)} metrics for file {full_path}")
+                else:
+                    print(f"[WARN] No rows parsed from AEF file: {full_path}")
+                count += 1
 
-            if not existing_file:
-                cur.execute('''INSERT INTO aef_files (path, trigger_window, average_window, json_path, sfile_bgs_path,
-                                                      sfile_mvo_path, wav_file_path, parsed_successfully, parsed_time, error)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                            (full_path, trigger, avg, json_path, None, None, None,
-                             parsed_successfully, datetime.utcnow().isoformat(), aef_error))
-                aef_file_id = cur.lastrowid
-            else:
-                cur.execute('''UPDATE aef_files SET trigger_window=?, average_window=?, json_path=?,
-                               parsed_successfully=?, parsed_time=?, error=? WHERE id=?''',
-                            (trigger, avg, json_path, parsed_successfully, datetime.utcnow().isoformat(), aef_error, aef_file_id))
-
-            if parsed_successfully and aef:
-                for row in aef.aefrows:
-                    ssam_json = json.dumps(row.get('ssam')) if row.get('ssam') else None
-                    cur.execute('''INSERT INTO aef_metrics (aef_file_id, trace_id, station, channel,
-                                                           amplitude, energy, maxf, ssam_json)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                                (aef_file_id, row.get('fixed_id', ''), row.get('station'), row.get('channel'),
-                                 row.get('amplitude'), row.get('energy'), row.get('maxf'), ssam_json))
-                print(f"[INFO] Inserted {len(aef.aefrows)} metrics for file {full_path}")
-            elif parsed_successfully:
-                print(f"[WARN] No rows parsed from AEF file: {full_path}")
+            except Exception as e: # If AEF file cannot be read or parsed
+                print(f"[ERROR] Failed to parse {full_path}: {e} {last_op}")
+                # We log failed AEF files into a separate table with the specific error, as well as below in the wav_files table
+                cur.execute(
+                    '''INSERT INTO aef_processing_errors (path, error_message) VALUES (?, ?)''',
+                    (encoded_path, str(e))
+                )                        
 
     conn.commit()
 
 def main(args):
     if os.path.exists(args.db):
         conn = sqlite3.connect(args.db)
-        index_aef_files(conn, args.aef_dir, args.json_output)
+        index_aef_files(conn, args.aef_dir, args.json_output, limit=args.limit)
         conn.close()    
 
 if __name__ == "__main__":
@@ -184,6 +226,7 @@ if __name__ == "__main__":
     parser.add_argument("--aef_dir", required=True, help="Top-level AEF directory")
     parser.add_argument("--json_output", required=True, help="Output directory for JSON files")
     parser.add_argument("--db", required=True, help="SQLite database path")
+    parser.add_argument("--limit", type=int, default=None, help="stop after this number of files")
     args = parser.parse_args()
-    main(args)
-
+    print(args)
+    #main(args)

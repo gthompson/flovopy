@@ -33,7 +33,10 @@ returning a structured list of dictionaries, one per station-channel. Each entry
 
 import os
 import re
+from obspy import read
 from flovopy.core.mvo import correct_nslc_mvo
+from flovopy.seisanio.core.wavfile import wavpath2datetime
+from flovopy.seisanio.utils.helpers import legacy_or_not
 
 class AEFfile:
     def __init__(self, path=None, filetime=None, verbose=False):
@@ -41,7 +44,19 @@ class AEFfile:
         self.trigger_window = None
         self.average_window = None
         self.path = path.strip() if path else None
-        self.filetime = filetime
+        if filetime:
+            self.filetime = filetime
+        else:
+            self.filetime = wavpath2datetime(self.path)
+        self.legacy, self.network = legacy_or_not(self.path)
+        self.wavpath = self.path.replace('AEF', 'WAV').replace('aef','')
+        self.ids = []
+        if os.path.isfile(self.wavpath):
+            st = read(self.wavpath)
+            for tr in st:
+                correct_nslc_mvo(tr.id, tr.stats.sampling_rate)
+            self.ids = [tr.id for tr in st]            
+            del st
 
         if not os.path.exists(self.path):
             print(f"[WARN] {self.path} does not exist")
@@ -49,8 +64,7 @@ class AEFfile:
 
         try:
             with open(self.path, 'r') as f:
-                lines = f.readlines()
-             
+                lines = f.readlines()            
         except IOError as e:
             print(f"[ERROR] Could not read {self.path}: {e}")
             return
@@ -82,9 +96,7 @@ class AEFfile:
             if not line.startswith("VOLC"):
                 if verbose:
                     print('other line found')
-                continue
 
-            # Parse actual AEF data line
             if verbose:
                 print('Trying to parse AEF line')
 
@@ -93,6 +105,7 @@ class AEFfile:
                 if verbose:
                     print(aefrow)
                 self.aefrows.append(aefrow)
+
 
     def _extract_window(self, line, keyword):
         i_start = line.lower().find(keyword)
@@ -108,15 +121,44 @@ class AEFfile:
                     print(f"[WARN] Could not parse value for {keyword} in line: {line.strip()}")
         return None
 
+    def to_dict(self, include_ssam=False):
+        """
+        Return a dictionary of all public attributes of the AEFfile object.
+        """
+        import json
+        aefdict = {}
+        for key, value in self.__dict__.items():
+            if key.startswith("_"):
+                continue  # skip private attributes
+            elif key == "ssam" and not include_ssam:
+                continue
+            else:
+                try:
+                    json.dumps(value)  # check if it's JSON-serializable
+                    aefdict[key] = value
+                except (TypeError, ValueError):
+                    aefdict[key] = str(value)  # fallback to string representation
+        return aefdict
+
+    
     def __str__(self):
-        info = f"AEF file: {self.path}"
-        if self.trigger_window:
-            info += f"\n  Trigger window: {self.trigger_window:.1f} s"
-        if self.average_window:
-            info += f"\n  Avg window:     {self.average_window:.1f} s"
-        for aefrow in self.aefrows:
-            info += "\n  " + str(aefrow)
-        return info
+        """
+        Return a pretty-printed string summary of the AEFfile object, using to_dict().
+        Automatically includes all public attributes.
+        """
+        from pprint import pformat
+
+        try:
+            summary = f"AEFfile object: {self.path}\n"
+        except AttributeError:
+            summary = "AEFfile object\n"
+
+        try:
+            summary += pformat(self.to_dict(), indent=4)
+        except Exception as e:
+            summary += f"[ERROR] Could not generate summary: {e}"
+
+        return summary
 
     def parse_aefline(self, line):
         line = line.split('VOLC ')[-1]
@@ -135,12 +177,19 @@ class AEFfile:
             trace_id = f"MV.{station}..{channel}"
 
             # Determine analog/digital network based on station prefix
-            analognet = (station[:2] != 'MB')
-            if analognet:
+            if self.legacy:
                 fixed_id = correct_nslc_mvo(trace_id, 100.0, shortperiod=True)
             else:
                 sr = 75.0 if self.filetime and self.filetime.year <= 2004 else 100.0
                 fixed_id = correct_nslc_mvo(trace_id, sr, shortperiod=None)
+
+            if self.ids: # we use ids from stream to check we have correct sampling rate and id
+                fnet, fsta, floc, fchan = fixed_id.split('.')
+                for id in self.ids:
+                    tnet, tsta, tloc, tchan = id.split('.')
+                    if fsta == tsta:
+                        if fchan[-1] == tchan[-1]:
+                            fixed_id = id
 
             # Parse SSAM bins
             ssam = self.parse_F(line, energy, f_idx + 1)
@@ -184,7 +233,8 @@ class AEFfile:
                     val = int(valstr)
                     F["percentages"].append(val)
                     F["energies"].append(val / 100.0 * energy)
-                except ValueError:
+                except ValueError as e:
+                    #raise e
                     break
             startindex += 3
         return F

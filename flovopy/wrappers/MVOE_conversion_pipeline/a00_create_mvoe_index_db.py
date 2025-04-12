@@ -1,89 +1,29 @@
 import os
 import sqlite3
-from datetime import datetime
+#from datetime import datetime
 
 def create_index_schema(conn):
     cur = conn.cursor()
 
-    cur.execute('''CREATE TABLE IF NOT EXISTS sfiles_bgs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        path TEXT UNIQUE,
-        event_id TEXT,
-        parsed_successfully INTEGER DEFAULT 0,
-        parsed_time TEXT,
-        error TEXT
-    )''')
+    ######################################################
+    ###################### From WAV files ################
+    ######################################################
 
-    cur.execute('''CREATE TABLE IF NOT EXISTS sfiles_mvo (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        path TEXT UNIQUE,
-        event_id TEXT,
-        parsed_successfully INTEGER DEFAULT 0,
-        parsed_time TEXT,
-        error TEXT
-    )''')
-
-
-    # Raw WAV file registry
+    ''' Raw WAV file registry
+        network is ASN or DSN
+        associated_sfile is so we can map both ways later, if needed
+    '''
     cur.execute('''CREATE TABLE IF NOT EXISTS wav_files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         path TEXT UNIQUE,
+        filetime TEXT,
         start_time TEXT,
         end_time TEXT,
         associated_sfile TEXT,
         used_in_event_id TEXT,
+        network TEXT,
         parsed_successfully INTEGER DEFAULT 0,
         parsed_time TEXT,
-        error TEXT
-    )''')
-
-    # Mapping between S-files and WAVs
-    cur.execute('''CREATE TABLE IF NOT EXISTS sfile_wav_map (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sfile_path TEXT,
-        wav_path TEXT,
-        FOREIGN KEY(sfile_path) REFERENCES sfiles(path),
-        FOREIGN KEY(wav_path) REFERENCES wav_files(path)
-    )''')
-
-    # Table for AEF files
-    cur.execute('''CREATE TABLE IF NOT EXISTS aef_files (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        path TEXT UNIQUE,
-        trigger_window REAL,
-        average_window REAL,
-        json_path TEXT,
-        sfile_bgs_path TEXT,
-        sfile_mvo_path TEXT,
-        wav_file_path TEXT,
-        parsed_successfully INTEGER DEFAULT 0,
-        parsed_time TEXT,
-        error TEXT
-    )''')
-
-    # Table for per-trace AEF metrics
-    cur.execute('''CREATE TABLE IF NOT EXISTS aef_metrics (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        aef_file_id INTEGER,
-        trace_id TEXT,
-        station TEXT,
-        channel TEXT,
-        amplitude REAL,
-        energy REAL,
-        maxf REAL,
-        ssam_json TEXT,
-        FOREIGN KEY(aef_file_id) REFERENCES aef_files(id)
-    )''')
-
-    # Processing log
-    cur.execute('''CREATE TABLE IF NOT EXISTS processing_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sfile_path TEXT,
-        wav_path TEXT,
-        enhanced_event_saved INTEGER DEFAULT 0,
-        enhanced_stream_saved INTEGER DEFAULT 0,
-        catalog_inserted INTEGER DEFAULT 0,
-        processing_time TEXT,
         error TEXT
     )''')
 
@@ -100,9 +40,121 @@ def create_index_schema(conn):
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         path TEXT,
         error_message TEXT,
-        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(path) REFERENCES wav_files(path)
+    )''')    
+
+    ######################################################
+    ###################### From AEF files ################
+    ######################################################
+
+    '''
+    wav_file_path 
+    '''
+
+    # Table for AEF files
+    cur.execute('''CREATE TABLE IF NOT EXISTS aef_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT UNIQUE,
+        filetime TEXT,
+        network TEXT,
+        trigger_window REAL,
+        average_window REAL,
+        json_path TEXT,
+        sfile_path TEXT,
+        wav_file_path TEXT,
+        parsed_successfully INTEGER DEFAULT 0,
+        parsed_time TEXT,
+        error TEXT,
+        FOREIGN KEY(wav_file_path) REFERENCES wav_files(path),
+        FOREIGN KEY(sfile_path) REFERENCES sfiles(path)        
     )''')
 
+    # Table for per-trace AEF metrics (1 row per aefrow)
+    cur.execute('''CREATE TABLE IF NOT EXISTS aef_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        time TEXT,
+        aef_file_id INTEGER,
+        sfile_path TEXT,
+        trace_id TEXT,
+        amplitude REAL,
+        energy REAL,
+        maxf REAL,
+        ssam_json TEXT,
+        FOREIGN KEY(aef_file_id) REFERENCES aef_files(id),
+        FOREIGN KEY(sfile_path) REFERENCES sfiles(path)        
+    )''')    
+
+    # AEFfile processing errors
+    cur.execute('''CREATE TABLE IF NOT EXISTS aef_processing_errors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT,
+        error_message TEXT,
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')        
+
+    ######################################################
+    ###################### From S-files ##################
+    ######################################################
+
+    cur.execute('''CREATE TABLE IF NOT EXISTS sfiles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT UNIQUE,
+        filetime TEXT,
+        event_id TEXT,
+        mainclass TEXT,
+        subclass TEXT,
+        agency TEXT,
+        last_action TEXT,
+        action_time TEXT,
+        analyst TEXT,
+        analyst_delay REAL,
+        dsnwavfile TEXT,
+        asnwavfile TEXT,
+        aeffile TEXT,
+        qml_path TEXT,
+        json_path TEXT,
+        sfilearchive TEXT, 
+        parsed_successfully INTEGER DEFAULT 0,
+        parsed_time TEXT,
+        error TEXT,
+        FOREIGN KEY(dsnwavfile) REFERENCES wav_files(path),
+        FOREIGN KEY(asnwavfile) REFERENCES wav_files(path)             
+    )''')    
+
+    """
+    # Mapping between S-files and WAVs
+    cur.execute('''CREATE TABLE IF NOT EXISTS sfile_wav_map (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sfile_path TEXT,
+        wav_path TEXT,
+        FOREIGN KEY(sfile_path) REFERENCES sfiles(path),
+        FOREIGN KEY(wav_path) REFERENCES wav_files(path)
+    )''')
+    """
+
+    # Processing log
+    cur.execute('''CREATE TABLE IF NOT EXISTS processing_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sfile_path TEXT,
+        wav_path TEXT,
+        enhanced_event_saved INTEGER DEFAULT 0,
+        enhanced_stream_saved INTEGER DEFAULT 0,
+        catalog_inserted INTEGER DEFAULT 0,
+        processing_time TEXT,
+        error TEXT,
+        FOREIGN KEY(sfile_path) REFERENCES sfiles(path),
+        FOREIGN KEY(wav_path) REFERENCES wav_files(path)                
+    )''')
+
+    # S-file processing errors
+    cur.execute('''CREATE TABLE IF NOT EXISTS sfile_processing_errors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT,
+        error_message TEXT,
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(path) REFERENCES sfiles(path)        
+    )''')     
 
     conn.commit()
 

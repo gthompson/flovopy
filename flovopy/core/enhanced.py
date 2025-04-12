@@ -196,10 +196,10 @@ class EnhancedStream(Stream):
             s = tr.stats
             row = {}
 
-            if include_id:
-                row['id'] = tr.id
-            if include_starttime:
-                row['starttime'] = s.starttime
+            #if include_id:
+            row['id'] = tr.id
+            #if include_starttime:
+            row['starttime'] = s.starttime
 
             row['Fs'] = s.sampling_rate
             row['calib'] = getattr(s, 'calib', None)
@@ -1856,7 +1856,7 @@ class EnhancedEvent:
         trigger_window : float, optional
             Trigger window duration in seconds.
         average_window : float, optional
-            Averaging window duration in seconds.
+            Averaging window duration in seconds. Used for AEF amplitude
         stream : obspy.Stream or EnhancedStream, optional
             Associated waveform stream.
         """
@@ -1896,14 +1896,17 @@ class EnhancedEvent:
         base_name : str
             Base filename (no extension).
         """
-
         qml_path = os.path.join(outdir, base_name + ".qml")
+        os.makedirs(os.path.dirname(qml_path), exist_ok=True)
         json_path = os.path.join(outdir, base_name + ".json")
-
+        print(f'Writing obspy event to {qml_path}')
+        print(f'Writing json to {json_path}')
+        json_dict = self.to_json()
         Catalog(events=[self.event]).write(qml_path, format="QUAKEML")
 
         with open(json_path, "w") as f:
-            json.dump(self.to_json(), f, indent=2, default=str)
+            json.dump(json_dict, f, indent=2, default=str)
+        return qml_path, json_path
 
 
     @classmethod

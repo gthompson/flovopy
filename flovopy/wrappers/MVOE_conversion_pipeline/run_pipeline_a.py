@@ -19,18 +19,20 @@ def run_pipeline(args):
     sfile_root : str
         Root directory containing S-files.
     """
+    print(args)
+    #return
 
     print("Running Step 00: Create MVOE index database...")
-    #main00(args)
+    main00(args)
     
     print("Running Step 01: Index WAV files...")
-    #main01(args)
+    main01(args)
 
     print("Running Step 02: Index AEF files...")
     main02(args)
 
     print("Running Step 03: Index S-files...")
-    #main03(args)
+    main03(args)
 
     print("All steps completed successfully.")   
 
@@ -45,6 +47,7 @@ if __name__ == "__main__":
     parser.add_argument("--mseed_output", required=True, help="Output directory for MiniSEED files")
     parser.add_argument("--json_output", required=True, help="Output directory for JSON files")    
     parser.add_argument("--db", required=True, help="SQLite database path")
+    parser.add_argument("--limit", type=int, default=None, help="stop after this number of files")
     args = parser.parse_args()
     run_pipeline(args)
 '''

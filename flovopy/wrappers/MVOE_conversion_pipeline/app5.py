@@ -16,7 +16,7 @@ except Exception:
 TABLES = [
     "wav_files", "aef_files", "aef_metrics",
     "sfile_wav_map", "processing_log", "trace_id_corrections",
-    "sfiles_mvo", "sfiles_bgs", "wav_processing_errors"
+    "sfiles", "wav_processing_errors", "aef_processing_errors", "sfile_processing_errors"
 ]
 
 START_DATE = pd.Timestamp("1996-10-01")
@@ -103,13 +103,13 @@ def load_time_series_data(resample_rule):
         print("[WARN] Could not load aef_files time series:", e)
 
     try:
-        df = pd.read_sql_query("SELECT path, parsed_time FROM sfiles_bgs", conn, parse_dates=['parsed_time'])
+        df = pd.read_sql_query("SELECT path, parsed_time FROM sfiles, conn, parse_dates=['parsed_time'])
         df = df[(df['parsed_time'] >= START_DATE) & (df['parsed_time'] < END_DATE)]
         df['count'] = 1
-        data['sfiles_bgs'] = df.set_index('parsed_time').resample(resample_rule).count().rename(columns={'count': 'sfile_count'})
+        data['sfiles'] = df.set_index('parsed_time').resample(resample_rule).count().rename(columns={'count': 'sfile_count'})
     except Exception as e:
-        data['sfiles_bgs'] = pd.DataFrame()
-        print("[WARN] Could not load sfiles_bgs time series:", e)
+        data['sfiles'] = pd.DataFrame()
+        print("[WARN] Could not load sfiles time series:", e)
 
     try:
         #df = pd.read_sql_query("SELECT DISTINCT DATE(parsed_time) as date, corrected_id FROM trace_id_corrections", conn, parse_dates=['date'])
@@ -153,7 +153,7 @@ def update_time_series(resample_value):
             plots.append(generate_plot(df.reset_index(), 'start_time', 'wav_count', "WAV Files Indexed"))
         elif key == 'aef_files' and not df.empty:
             plots.append(generate_plot(df.reset_index(), 'parsed_time', 'aef_count', "AEF Files Indexed"))
-        elif key == 'sfiles_bgs' and not df.empty:
+        elif key == 'sfiles' and not df.empty:
             plots.append(generate_plot(df.reset_index(), 'parsed_time', 'sfile_count', "S-Files (BGS) Indexed"))
         elif key == 'corrected_ids' and not df.empty:
             plots.append(generate_plot(df.reset_index(), 'date', 'unique_corrected_ids', "Unique Corrected IDs"))
