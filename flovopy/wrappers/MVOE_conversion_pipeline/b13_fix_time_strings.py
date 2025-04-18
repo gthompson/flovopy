@@ -1,20 +1,11 @@
 import sqlite3
-import os
-import shutil
-
-# === Configuration ===
+from flovopy.wrappers.MVOE_conversion_pipeline.db_backup import backup_db
 DB_PATH = "/home/thompsong/public_html/seiscomp_like.sqlite"
-TEST_MODE = True
-TEST_DB_COPY = DB_PATH.replace('.sqlite', '_test.sqlite')
-
-# === Setup Database Connection ===
-if TEST_MODE:
-    if os.path.exists(TEST_DB_COPY):
-        os.remove(TEST_DB_COPY)
-    shutil.copy(DB_PATH, TEST_DB_COPY)
-    DB_PATH = TEST_DB_COPY
-    print(f"[TEST MODE] Using temporary DB: {DB_PATH}")
-
+if not backup_db(DB_PATH, __file__):
+    exit()
+    
+# === Configuration ===
+TEST_MODE = False
 conn = sqlite3.connect(DB_PATH)
 cur = conn.cursor()
 
@@ -47,7 +38,8 @@ cur.execute(update_mseed_time)
 cur.execute(update_mseed_endtime)
 cur.execute(update_wfdisc_time)
 cur.execute(update_wfdisc_endtime)
-conn.commit()
+if not TEST_MODE:
+    conn.commit()
 
 # === Verification ===
 def count_non_z_suffix(table, column):

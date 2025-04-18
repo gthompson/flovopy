@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
+
+
 # ObsPy
 from obspy import read, Stream, UTCDateTime
 from obspy.signal.trigger import (
@@ -32,6 +34,14 @@ from flovopy.processing.metrics import (
 from flovopy.core.preprocessing import _pad_trace
 
 from flovopy.core.enhanced import get_bandwidth
+
+
+# for picker - everything else is for detection
+from obspy.core import read, UTCDateTime, Stream
+from obspy.signal.trigger import pk_baer, ar_pick, aic_simple
+import matplotlib.pyplot as plt
+import numpy as np
+from collections import defaultdict
 
 class SeismicGUI:
     def __init__(self, master, stream):
@@ -727,3 +737,186 @@ def trim_to_event(st, mintime, maxtime, pretrig=10, posttrig=10):
     ```
     """
     st.trim(starttime=mintime-pretrig, endtime=maxtime+posttrig)
+
+
+def picker(st):
+
+    # Group by station code
+    station_groups = defaultdict(list)
+    for tr in st:
+        station = tr.stats.station
+        station_groups[station].append(tr)
+
+    # Convert to ObsPy Stream objects per station
+    station_streams = {sta: Stream(traces) for sta, traces in station_groups.items()}
+    print(station_streams)
+    for station, stream in station_streams.items():
+        if len(stream)==3:
+            p_pick, s_pick = ar_pick(stream.select(component='Z')[0].data, stream.select(component='N')[0].data, stream.select(component='E')[0].data, stream[0].stats.sampling_rate, 1.0, 20.0, 1.0, 0.1, 4.0, 1.0, 2, 8, 0.1, 0.2)
+            print(f'ar_pick P for {station}: ', p_pick, 'S: ', s_pick)
+        else:
+
+            for tr in stream:
+                p_pick, phase_info = pk_baer(tr.data, tr.stats.sampling_rate, 20, 60, 7.0, 12.0, 100, 100)
+                print(f'pk_baer P for {tr.id}: ', p_pick, phase_info)
+                aic_f = aic_simple(tr.data)
+                p_idx = aic_f.argmin()
+                print(f'aic_simple P for {tr.id}: ',tr.stats.starttime + p_idx / tr.stats.sampling_rate)
+
+def filter_picks(tr, p_sec, s_sec, starttime):
+    picks = {}
+    p_time = starttime + p_sec
+    s_time = starttime + s_sec    
+    if p_sec < 1.0:
+        p_sec = None
+    if s_sec < 1.0:
+        s_sec = None
+    #print(p_sec, s_sec, p_time, s_time)
+    if s_sec and p_sec:
+        if s_sec > p_sec:
+            picks[tr.id] = {'P': p_time, 'S': s_time} 
+    elif p_sec:
+        picks[tr.id] = {'P': p_time}
+    elif s_sec:
+        picks[tr.id] = {'S': s_time}
+    return picks
+    
+def stream_picker(stream):
+    picks = {}
+
+    if len(stream) == 3:
+        try:
+            z = stream.select(component='Z')[0]
+            n = stream.select(component='N')[0]
+            e = stream.select(component='E')[0]
+        except:
+            return picks
+        p_sec, s_sec = ar_pick(z.data, n.data, e.data, z.stats.sampling_rate, 1.0, 20.0, 1.0, 0.1, 4.0, 1.0, 2, 8, 0.1, 0.2)
+        new_picks = filter_picks(z, p_sec, s_sec, z.stats.starttime)
+        picks.update(new_picks)
+    else:
+        try:
+            tr = stream.select(component='Z')[0]
+        except:
+            return picks
+        '''
+        p_baer, _ = pk_baer(tr.data, tr.stats.sampling_rate, 20, 60, 7.0, 12.0, 100, 100)
+        aic_f = aic_simple(tr.data)
+        p_baer = tr.stats.starttime + p_baer/tr.stats.sampling_rate
+        aic_idx = aic_f.argmin()
+        p_aic = tr.stats.starttime + aic_idx / tr.stats.sampling_rate
+        p_sec, s_sec = ar_pick(tr.data, tr.data, tr.data, tr.stats.sampling_rate,
+                            1.0, 20.0, 1.0, 0.1, 4.0, 1.0, 2, 8, 0.1, 0.2)
+        p_time = tr.stats.starttime + p_sec
+        s_time = tr.stats.starttime + s_sec                
+        # Use pk_baer if it returns something usable, else fallback to AIC
+        if p_baer:
+            picks[tr.id] = {'P': p_baer}
+        else:
+            picks[tr.id] = {'P': p_aic}
+        print(tr.id, p_baer-tr.stats.starttime, p_aic-tr.stats.starttime, p_time-tr.stats.starttime, s_time-tr.stats.starttime)
+        '''
+        p_sec, s_sec = ar_pick(tr.data, tr.data, tr.data, tr.stats.sampling_rate, 1.0, 20.0, 1.0, 0.1, 4.0, 1.0, 2, 8, 0.1, 0.2)
+        new_picks = filter_picks(tr, p_sec, s_sec, tr.stats.starttime)
+        picks.update(new_picks)
+
+    return picks
+
+
+def picker_with_plot(st, plot=False):
+    from collections import defaultdict
+    picks = {}
+
+    station_groups = defaultdict(list)
+    for tr in st:
+        station = tr.stats.station
+        station_groups[station].append(tr)
+
+    station_streams = {sta: Stream(traces) for sta, traces in station_groups.items()}
+
+    for station, stream in station_streams.items():
+        new_picks = stream_picker(stream)
+        picks.update(new_picks)
+
+    p_threshold = 3.0
+    s_threshold = p_threshold * 1.7
+    p_outliers, p_median_time = identify_outlier_picks(picks, phase='P', threshold=p_threshold)
+    s_outliers, s_median_time = identify_outlier_picks(picks, phase='S', threshold=s_threshold)
+    all_outliers = list(set(p_outliers+s_outliers))
+    if all_outliers:
+        for trace_id in all_outliers:
+            if p_median_time:
+                stime = UTCDateTime(p_median_time)-p_threshold
+            else:
+                stime = st[0].stats.starttime
+            if s_median_time:
+                etime = UTCDateTime(s_median_time)+s_threshold
+            else:
+                etime = st[0].stats.endtime
+            this_stream = st.select(id=trace_id).copy().trim(starttime=stime, endtime=etime)
+            new_picks = stream_picker(this_stream)
+            picks.update(new_picks)
+    if plot:
+        plot_picks_on_stream(st, picks, title="P & S Picks Overlayed on Waveform")
+    return picks
+
+def identify_outlier_picks(picks, phase='P', threshold=2.0):
+    if len(picks)<3:
+        return [], None
+    pick_times = []
+    pick_ids = []
+    for tr_id, phases in picks.items():
+        if phase in phases:
+            pick_times.append(phases[phase].timestamp)
+            pick_ids.append(tr_id)
+
+    if len(pick_times) < 3:
+        return [], 0.0  # Not enough data to determine outliers
+
+    pick_times = np.array(pick_times)
+    median_time = np.median(pick_times)
+    abs_diff = np.abs(pick_times - median_time)
+
+    outliers = [pick_ids[i] for i, diff in enumerate(abs_diff) if diff > threshold]
+
+    return outliers, median_time
+
+
+def plot_picks_on_stream(stream: Stream, picks: dict, title="Waveform with Picks (Relative Time)"):
+    """
+    Plot traces with vertical lines at pick times (relative time in seconds).
+
+    Parameters
+    ----------
+    stream : obspy.Stream
+        The stream of traces to plot.
+    picks : dict
+        Dictionary of picks: {trace.id: {'P': UTCDateTime, 'S': UTCDateTime (optional)}}
+    title : str
+        Title for the plot.
+    """
+    fig, axes = plt.subplots(len(stream), 1, figsize=(12, 2.5 * len(stream)), sharex=True)
+    if len(stream) == 1:
+        axes = [axes]  # Ensure iterable
+
+    for i, tr in enumerate(stream):
+        t = tr.times("relative")
+        axes[i].plot(t, tr.data, "k-", linewidth=0.8)
+        axes[i].set_ylabel(tr.id, fontsize=9)
+
+        # Add vertical lines for picks if availnew_pick['']]able
+        if tr.id in picks:
+            tr_picks = picks[tr.id]
+            if "P" in tr_picks:
+                p_rel = (tr_picks["P"] - tr.stats.starttime)
+                axes[i].axvline(p_rel, color="b", linestyle="--", label="P")
+            if "S" in tr_picks:
+                s_rel = (tr_picks["S"] - tr.stats.starttime)
+                axes[i].axvline(s_rel, color="r", linestyle="--", label="S")
+
+            axes[i].legend(loc="upper right", fontsize=8)
+
+    axes[-1].set_xlabel("Time (s since trace start)", fontsize=10)
+    plt.suptitle(title, fontsize=14)
+    plt.tight_layout()
+    plt.show()

@@ -3,8 +3,13 @@
 
 import sqlite3
 
-# Path to your SQLite database
-DB_PATH = "/home/thompsong/public_html/seiscomp_like_test.sqlite"
+from flovopy.wrappers.MVOE_conversion_pipeline.db_backup import backup_db
+DB_PATH = "/home/thompsong/public_html/seiscomp_like.sqlite"
+if not backup_db(DB_PATH, __file__):
+    exit()
+    
+# === Configuration ===
+TEST_MODE = False
 
 def remove_unique_constraint():
     conn = sqlite3.connect(DB_PATH)
@@ -47,11 +52,13 @@ def remove_unique_constraint():
         cur.execute("DROP TABLE old_event_classifications;")
 
         # Commit the transaction
-        conn.commit()
+        if not TEST_MODE:
+            conn.commit()
 
     except sqlite3.Error as e:
         print(f"An error occurred: {e}")
-        conn.rollback()
+        if not TEST_MODE:
+            conn.rollback()
     finally:
         # Re-enable foreign key constraints
         cur.execute("PRAGMA foreign_keys=ON;")

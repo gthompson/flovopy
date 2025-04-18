@@ -2,26 +2,18 @@
 # update_event_waveform_links.py
 # Populate event_classifications.dfile and insert into event_waveform_map by matching on event_classifications.time ≈ mseed_file_status.time
 
-import os
-import shutil
 import sqlite3
 from obspy import UTCDateTime
 from pprint import pprint
-
-# === USER CONFIG ===
+from flovopy.wrappers.MVOE_conversion_pipeline.db_backup import backup_db
 DB_PATH = "/home/thompsong/public_html/seiscomp_like.sqlite"
+if not backup_db(DB_PATH, __file__):
+    exit()
+    
+# === Configuration ===
 TEST_MODE = True
-N = 10  # Set to None for all
-TEST_DB_COPY = DB_PATH.replace('.sqlite', '_test.sqlite')
+N = None  # Set to None for all
 TIME_TOLERANCE = 1.05  # seconds
-
-# === TEST MODE: Copy DB ===
-if TEST_MODE:
-    #if os.path.exists(TEST_DB_COPY):
-    #    os.remove(TEST_DB_COPY)
-    #shutil.copy(DB_PATH, TEST_DB_COPY)
-    DB_PATH = TEST_DB_COPY
-    print(f"[TEST MODE] Using temporary DB: {DB_PATH}")
 
 # Connect to the database
 conn = sqlite3.connect(DB_PATH)
@@ -41,6 +33,8 @@ mseed_times = [(dfile, UTCDateTime(time)) for dfile, time in mseed_file_status]
 updated = 0
 inserted = 0
 
+i = 0
+total = len(event_classifications)
 for event_id, ec_time_str in event_classifications:
     ec_time = UTCDateTime(ec_time_str)
     match_found = False
@@ -56,8 +50,15 @@ for event_id, ec_time_str in event_classifications:
             break  # Assuming one match is sufficient
     if TEST_MODE and match_found:
         pprint({'event_id': event_id, 'matched_dfile': dfile})
+    i += 1
+    if i % 100 == 0 and i > 0:
+        print(f"[Progress] {i}/{total} processed")
+        if not TEST_MODE:
+            print('Committing')
+            conn.commit()
 
-conn.commit()
+if not TEST_MODE:
+    conn.commit()
 conn.close()
 
 print(f"[INFO] Updated {updated} rows in event_classifications.")

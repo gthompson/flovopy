@@ -23,12 +23,20 @@ from obspy.geodetics.base import gps2dist_azimuth
 from flovopy.core.preprocessing import add_to_trace_history
 from flovopy.processing.metrics import compute_amplitude_spectra, estimate_snr #, compute_stationEnergy
 #from flovopy.seisanio.core.ampengfft import compute_ampengfft_stream, write_aef_file
-class EnhancedStream(Stream):
 
-    def __init__(self, stream=None):
-        if stream is None:
-            stream = Stream()
-        super().__init__(traces=stream.traces)
+
+class EnhancedStream(Stream):
+    def __init__(self, stream=None, traces=None):
+        if traces is not None:
+            # Allow ObsPy internal logic to pass 'traces='
+            super().__init__(traces=traces)
+        elif stream is not None:
+            # Fallback for manual use with stream=...
+            super().__init__(traces=stream.traces)
+        else:
+            # Empty stream
+            super().__init__()
+
 
 
 
@@ -501,7 +509,7 @@ class EnhancedStream(Stream):
         if verbose:
             print("[5] Summarizing network magnitude statistics...")
         df = self.magnitudes2dataframe()
-        print(df.describe())
+        #print(df.describe())
 
         '''
         if verbose and not df.empty:
