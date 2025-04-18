@@ -70,11 +70,12 @@ def index_sfiles(conn, sfile_dir, archive_type, json_output_dir, filename_filter
                 if not filename_filter(fname):
                     continue        
 
+            errorstr = None
             if not '.S' in fname:
                 continue
 
             full_path = os.path.join(root, fname)
-            print(f'Processing {full_path}')
+            
             try:
                 full_path.encode("utf-8")
             except UnicodeEncodeError:
@@ -87,20 +88,23 @@ def index_sfiles(conn, sfile_dir, archive_type, json_output_dir, filename_filter
                 continue
 
             # Try parsing the S-file
-            if True: # try
-                #print('0123456789'*8)
-                #os.system(f'cat {full_path}')
+            print(f'Parsing S-file {full_path}')
+            try:
                 s = Sfile(full_path, use_mvo_parser=True)
                 filetime = s.filetime.isoformat()
-
+                enh = s.to_enhancedevent()
+            except Exception as e:
+                errorstr = f"Parsing S-file {full_path} failed - {e}"
+                continue               
+            else:
+                
                 aef_file = s.aeffileobj.path if s.aeffileobj else None
                 dsn_file = s.dsnwavfileobj.path if s.dsnwavfileobj else None
                 asn_file = s.asnwavfileobj.path if s.asnwavfileobj else None
+                action_time = s.action_time.isoformat() if s.action_time else None
 
-                
                 # Save JSON dump of extra info (including AEF data)
                 rel_path = os.path.relpath(full_path, sfile_dir)
-                enh = s.to_enhancedevent()
                 qml_path, json_path = enh.save(json_output_dir, os.path.splitext(rel_path)[0])
 
                 cur.execute(f'''
@@ -116,7 +120,7 @@ def index_sfiles(conn, sfile_dir, archive_type, json_output_dir, filename_filter
                     s.subclass,
                     s.agency,
                     s.last_action,
-                    s.action_time.isoformat(),
+                    action_time,
                     s.analyst,
                     s.analyst_delay,
                     dsn_file,
@@ -138,21 +142,31 @@ def index_sfiles(conn, sfile_dir, archive_type, json_output_dir, filename_filter
                         cur.execute('''
                             INSERT INTO aef_metrics (time, aef_file_id, sfile_path, trace_id,
                                                     amplitude, energy, maxf, ssam_json)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (filetime, None, full_path, row.get('fixed_id', ''),
-                            row.get('amplitude'), row.get('energy'), row.get('maxf'), ssam_json, full_path))
+                            row.get('amplitude'), row.get('energy'), row.get('maxf'), ssam_json))
 
                 count += 1
+                print('\n')
 
-            #except Exception as e:
-            else:
-                cur.execute(f'''
-                    INSERT INTO {table} (path, parsed_successfully, parsed_time, error)
-                    VALUES (?, ?, ?, ?)
-                ''', (
-                    full_path, 0, datetime.utcnow().isoformat(), str(e)
-                ))
+            finally:
 
+                if errorstr:
+                    print('ERROR')
+                    print(errorstr)
+                    print('0123456789'*8)
+                    os.system(f'cat {full_path}')                    
+                    print('\n')
+                    cur.execute(f'''
+                        INSERT INTO {table} (path, parsed_successfully, parsed_time, error)
+                        VALUES (?, ?, ?, ?)
+                    ''', (
+                        full_path, 0, datetime.utcnow().isoformat(), str(errorstr)
+                    ))
+
+                # Commit all changes for this S-File
+                conn.commit()
+                print("[INFO] Committed changes.")
     conn.commit()
 
 def main(args):
@@ -181,4 +195,4 @@ python 03_index_sfiles.py \
   --db /home/thompsong/public_html/index_sfile_test.sqlite \
   --archive bgs \
   --verbose
-'''
+'''  

@@ -112,8 +112,11 @@ def correct_nslc_mvo(traceID, Fs, shortperiod=None):
         chan = 'SDO' # barometer, or maybe acoustic pressure sensor, at 75 Hz
         loc = ""
     elif chan == 'PRS': 
-        chan ='SD' + loc[0]
-        loc = loc[1:]
+        if loc:
+            chan ='SD' + loc[0]
+            loc = loc[1:]
+        else:
+            chan = 'SDO'
     # from the new DSN
     elif loc == 'S' and chan == 'AP': 
         chan = 'EDO'

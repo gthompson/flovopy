@@ -87,50 +87,29 @@ def apply_custom_function_to_each_event(
     for sfile_path in sfiles:
         print(sfile_path)
         try:
-            s = Sfile(sfile_path, fast_mode=True)
-            d = s.to_dict()
-            print(d)
+            s = Sfile(sfile_path, use_mvo_parser=True, parse_aef=False)
             if valid_subclasses and not (
-                d['mainclass'] == 'LV' and d['subclass'] in valid_subclasses
+                s.mainclass == 'LV' and s.subclass in valid_subclasses
             ):
                 print('Failed test')
                 continue
         except Exception as e:
             print(f"[WARN] Failed to parse Sfile {sfile_path}: {e}")
             continue
-
-        
-        for item in ['wavfile1', 'wavfile2']:
-            wavfile = d.get(item)
-            wavfound = False
-
-            if wavfile and DB[:3] in os.path.basename(wavfile):
-                if os.path.isfile(wavfile):
-                    wavfound = True
-                else:
-                    altbase = os.path.basename(wavfile).split('.')[0][:-3]
-                    candidates = glob.glob(os.path.join(os.path.dirname(wavfile), altbase + '*'))
-                    if len(candidates) == 1:
-                        wavfile = candidates[0]
-                        wavfound = True
-
-            if not wavfound:
-                if verbose:
-                    print(f"Sfile: {os.path.basename(sfile_path)}; WAVfile: None")
-                continue
-
-            try:
-                st = read_mvo_waveform_file(
-                    wavfile,
-                    bool_ASN=False,
-                    verbose=verbose,
-                    seismic_only=seismic_only,
-                    vertical_only=vertical_only
-                )
-            except Exception as e:
-                print(f"[ERROR] Could not load {wavfile}: {e}")
-                continue
-
+        if not s.dsnwavfileobj:
+            continue
+        try:
+            st = read_mvo_waveform_file(
+                s.dsnwavfileobj.path,
+                bool_ASN=False,
+                verbose=verbose,
+                seismic_only=seismic_only,
+                vertical_only=vertical_only
+            )
+        except Exception as e:
+            print(f"[ERROR] Could not load {s.dsnwavfileobj.path}: {e}")
+            continue
+        else:
             raw_st = st.copy()
             preprocess_stream(
                 st,

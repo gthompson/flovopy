@@ -126,9 +126,12 @@ def preprocess_trace(tr, bool_despike=True, bool_clean=True, inv=None, quality_t
         _compute_trace_metrics(tr)
 
     # Adjust quality factor based on gaps, overlaps, and availability
-    tr.stats.quality_factor -= tr.stats.metrics['num_gaps']
-    tr.stats.quality_factor -= tr.stats.metrics['num_overlaps']
-    tr.stats.quality_factor *= tr.stats.metrics['percent_availability'] / 100.0
+    if 'num_gaps' in tr.stats.metrics:
+        tr.stats.quality_factor -= tr.stats.metrics['num_gaps']
+    if 'num_overlaps'  in tr.stats.metrics:
+        tr.stats.quality_factor -= tr.stats.metrics['num_overlaps']
+    if 'percent_availability' in tr.stats.metrics:
+        tr.stats.quality_factor *= tr.stats.metrics['percent_availability'] / 100.0
 
     # Step 3: Detect Bit-Level Noise
     num_unique_values = np.unique(tr.data).size
@@ -162,7 +165,7 @@ def preprocess_trace(tr, bool_despike=True, bool_clean=True, inv=None, quality_t
         tr.stats.quality_factor += 1.0
     else:
         #add_to_trace_history(tr, f'{artifacts["spike_count"]} outliers found')
-        add_to_trace_history(tr, f'{spike_count} outliers (spikes) found')
+        #add_to_trace_history(tr, f'{spike_count} outliers (spikes) found')
         tr.stats['outlier_indices'] = artifacts.get("spike_indices", [])
 
     # Step 7: Final Quality Check
@@ -366,6 +369,8 @@ def _can_write_to_miniseed_and_read_back(tr, return_metrics=True):
 
     try:
         # Attempt to write to MiniSEED
+        if hasattr(tr.stats, "mseed") and "encoding" in tr.stats.mseed:
+            del tr.stats.mseed["encoding"]
         tr.write(tmpfilename)
 
         # Try reading it back
@@ -1340,9 +1345,9 @@ def fill_all_gaps(trace, verbose=False):
     tr.plot()
     ```
     """
-    if trace.stats.station == 'MBSS':
-        verbose = True
-        trace.plot(outfile='MBSS_before_gap_filling.png')
+    #if trace.stats.station == 'MBSS':
+    #    verbose = True
+    #    trace.plot(outfile='MBSS_before_gap_filling.png')
     if verbose:
         print(f'filling gaps for {trace}')
     stream = Stream(traces=[trace])  # Wrap the trace in a stream
@@ -1365,8 +1370,8 @@ def fill_all_gaps(trace, verbose=False):
             if verbose:
                 print(f'gap start={gap_start}, end={gap_end}, adding spectral noise')            
             _fill_gap_with_filtered_noise(trace, gap_start, gap_end)
-    if trace.stats.station == 'MBSS':
-        trace.plot(outfile='MBSS_after_gap_filling.png')
+    #if trace.stats.station == 'MBSS':
+    #    trace.plot(outfile='MBSS_after_gap_filling.png')
 
 def _fill_gap_with_repeat_previous_data(trace, gap_start, gap_end):
     """
@@ -1642,7 +1647,8 @@ def _detect_and_handle_gaps(tr, gap_threshold=10, null_values=[0, np.nan], verbo
             data[start:end] = np.interp(
                 np.arange(start, end),
                 [start - 1, end],
-                [data[start - 1], data[end]]
+                [data[start - 1], data[end] if end < len(data) else data[start - 1]]
+
             )
         else:
             if verbose:

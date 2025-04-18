@@ -37,7 +37,7 @@ def asl_event(st: Stream, raw_st: Stream, inv: Inventory, **kwargs):
     interactive = kwargs.get("interactive", False)
     freq = [1.0, 15.0]
     compute_DRS_at_fixed_source = kwargs.get("compute_DRS_at_fixed_source", True)
-    numtrials = kwargs.get("numtrials", 500)
+    numtrials = kwargs.get("numtrials", 200)
 
     if not isinstance(Q, list):
         Q = [Q, 1000]
