@@ -36,7 +36,7 @@ import re
 from obspy import read
 from flovopy.core.mvo import correct_nslc_mvo
 from flovopy.seisanio.core.wavfile import wavpath2datetime
-from flovopy.seisanio.utils.helpers import legacy_or_not
+from flovopy.seisanio.utils.helpers import legacy_or_not, find_matching_wavfiles, spath2datetime
 
 class AEFfile:
     def __init__(self, path=None, filetime=None, verbose=False):
@@ -46,16 +46,23 @@ class AEFfile:
         self.path = path.strip() if path else None
         if filetime:
             self.filetime = filetime
-        else:
-            self.filetime = wavpath2datetime(self.path)
         self.legacy, self.network = legacy_or_not(self.path)
-        self.wavpath = self.path.replace('AEF', 'WAV').replace('aef','')
-        self.ids = []
+        if 'AEF' in self.path: # we are processing AEF data from a WAV file
+            self.filetime = wavpath2datetime(self.path)
+            self.wavpath = self.path.replace('AEF', 'WAV').replace('aef','')
+        elif 'REA' in self.path: # we are processing AEF data from an S-File
+            self.filetime = spath2datetime(self.path)
+            matching_wavfiles = find_matching_wavfiles(self.filetime, self.path, y2kfix=False)
+            if len(matching_wavfiles)>0:
+                self.wavpath = matching_wavfiles[0]
+        self.wav_ids = []
+        self.aef_ids = []
+        
         if os.path.isfile(self.wavpath):
             st = read(self.wavpath)
             for tr in st:
-                correct_nslc_mvo(tr.id, tr.stats.sampling_rate)
-            self.ids = [tr.id for tr in st]            
+                tr.id = correct_nslc_mvo(tr.id, tr.stats.sampling_rate)
+            self.wav_ids = [tr.id for tr in st]            
             del st
 
         if not os.path.exists(self.path):
@@ -72,20 +79,24 @@ class AEFfile:
         for line in lines:
             if verbose:
                 print(line)
-            if len(line) < 60:
-                if verbose:
-                    print('line length too short')
+            if len(line) < 80: 
                 continue
-
+            line = line.strip()
+            if not line:
+                continue
+            if line[-1]!='3':
+                continue
             if 'trigger window' in line.lower():
                 if verbose:
                     print('trigger window found')
                 self.trigger_window = self._extract_window(line, 'trigger window')
+                continue
 
             if 'average window' in line.lower():
                 if verbose:
                     print('average window found')
                 self.average_window = self._extract_window(line, 'average window')
+                continue
 
             # Skip header lines
             line = line.lstrip()
@@ -96,6 +107,7 @@ class AEFfile:
             if not line.startswith("VOLC"):
                 if verbose:
                     print('other line found')
+                continue
 
             if verbose:
                 print('Trying to parse AEF line')
@@ -104,6 +116,7 @@ class AEFfile:
             if aefrow:
                 if verbose:
                     print(aefrow)
+                self.aef_ids.append(aefrow['fixed_id'])
                 self.aefrows.append(aefrow)
 
 
@@ -175,7 +188,6 @@ class AEFfile:
             energy = float(line[e_idx + 1:f_idx].strip())
 
             trace_id = f"MV.{station}..{channel}"
-
             # Determine analog/digital network based on station prefix
             if self.legacy:
                 fixed_id = correct_nslc_mvo(trace_id, 100.0, shortperiod=True)
@@ -183,9 +195,9 @@ class AEFfile:
                 sr = 75.0 if self.filetime and self.filetime.year <= 2004 else 100.0
                 fixed_id = correct_nslc_mvo(trace_id, sr, shortperiod=None)
 
-            if self.ids: # we use ids from stream to check we have correct sampling rate and id
+            if self.wav_ids: # we use ids from stream to check we have correct sampling rate and id
                 fnet, fsta, floc, fchan = fixed_id.split('.')
-                for id in self.ids:
+                for id in self.wav_ids:
                     tnet, tsta, tloc, tchan = id.split('.')
                     if fsta == tsta:
                         if fchan[-1] == tchan[-1]:

@@ -1,6 +1,7 @@
 import os
+from glob import glob
 #import datetime as dt
-#from obspy import UTCDateTime
+from obspy import UTCDateTime
 
 # need to leave this here to prevent circular imports between Wavfile and Sfile
 def filetime2spath(filetime, mainclass='L', db=None, seisan_top=None, fullpath=True):
@@ -17,14 +18,31 @@ def filetime2spath(filetime, mainclass='L', db=None, seisan_top=None, fullpath=T
                 spath = os.path.join(seisan_top, spath)
     return spath
 
+def spath2datetime(spath):
+    """Extract datetime from SEISAN S-file path."""
+    basename = os.path.basename(spath)
+    if '.S' in spath: # 
+        parts = basename.split('.S')
+        yyyy = int(parts[1][0:4])
+        mm = int(parts[1][4:6])
+        parts = parts[0].split('-')
+        dd = int(parts[0])
+        HH = int(parts[1][0:2])
+        MM = int(parts[1][2:4])
+        SS = float(parts[2][0:2])
+        return UTCDateTime(yyyy, mm, dd, HH, MM, SS)
+    else:
+        return None    
+
 def legacy_or_not(fname):
     fnamelower = os.path.basename(fname).lower()
+    """ This part fails because of 1997 files like /data/SEISAN_DB/REA/MVOE_/1997/04/04-0231-34L.S199704 
     if 'mvo' in fnamelower or 'asne' in fnamelower or 'dsne' in fnamelower or 'spn' in fnamelower:
         print(f'Processing {fname}')
     else:
         print(f'Not processing {fname}')          
         return None, None
-
+    """
     legacy = False
     network = 'DSN'
     if 'asne' in fnamelower or 'spn' in fnamelower:
@@ -110,3 +128,13 @@ def filetime2wavpath(filetime, sfilepath, y2kfix=False, numchans=0, dbstring='MV
         )
 
     return os.path.join(wavdir, basename)
+
+def find_matching_wavfiles(filetime, sfilepath, y2kfix=False):
+    # Should match any wavfile (even SPN) within 1-s of filetime
+    matching_wavfiles = []
+    for timeshift in [0, -1, 1]:
+        wavpattern = filetime2wavpath(filetime + timeshift, sfilepath, y2kfix=y2kfix)
+        potentialwavfiles = glob(wavpattern.split('.')[0]+".*")
+        matching_wavfiles.extend(potentialwavfiles)
+    return matching_wavfiles
+

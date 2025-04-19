@@ -53,7 +53,8 @@ class SAM:
             print('creating blank SAM object')
             return
         
-        good_stream = self.check_units(stream)
+        #good_stream = self.check_units(stream)
+        good_stream = stream
         if verbose:
             print('good_stream:\n',good_stream)
 

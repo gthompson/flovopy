@@ -21,14 +21,22 @@ from obspy.core.util.attribdict import AttribDict
 from obspy.geodetics.base import gps2dist_azimuth
 
 from flovopy.core.preprocessing import add_to_trace_history
-from flovopy.processing.metrics import compute_amplitude_spectra #, compute_stationEnergy
-from flovopy.seisanio.core.ampengfft import compute_ampengfft_stream, write_aef_file
-class EnhancedStream(Stream):
+from flovopy.processing.metrics import compute_amplitude_spectra, estimate_snr #, compute_stationEnergy
+#from flovopy.seisanio.core.ampengfft import compute_ampengfft_stream, write_aef_file
 
-    def __init__(self, stream=None):
-        if stream is None:
-            stream = Stream()
-        super().__init__(traces=stream.traces)
+
+class EnhancedStream(Stream):
+    def __init__(self, stream=None, traces=None):
+        if traces is not None:
+            # Allow ObsPy internal logic to pass 'traces='
+            super().__init__(traces=traces)
+        elif stream is not None:
+            # Fallback for manual use with stream=...
+            super().__init__(traces=stream.traces)
+        else:
+            # Empty stream
+            super().__init__()
+
 
 
 
@@ -38,7 +46,7 @@ class EnhancedStream(Stream):
         write_aef_file(self, filepath, trigger_window=trigger_window, average_window=average_window)
 
 
-    def ampengfft(self, threshold=0.707, window_length=9, polyorder=2, differentiate=True):
+    def ampengfft(self, threshold=0.707, window_length=9, polyorder=2, differentiate=False):
         """
         Compute amplitude, energy, and frequency metrics for all traces in a stream.
         Note that we generally will want stream to be a displacement seismogram, and 
@@ -61,8 +69,6 @@ class EnhancedStream(Stream):
 
         Parameters
         ----------
-        stream : obspy.Stream
-            Stream of Trace objects to analyze.
         threshold : float, optional
             Fraction of peak amplitude to define bandwidth cutoff (default is 0.707 for -3 dB).
         window_length : int, optional
@@ -74,25 +80,20 @@ class EnhancedStream(Stream):
 
         Returns
         -------
-        stream : obspy.Stream
-            Modified stream with frequency metrics stored per trace.
+        Modifies self.stream in place.
         """
-        if not isinstance(stream, Stream):
-            if isinstance(stream, Trace):
-                stream = Stream([stream])
-            else:
-                return
             
-        if len(stream)==0:
+        if len(self)==0:
             return
         
-        if not 'detrended' in stream[0].stats.history: # change this to use better detrend from libseis?
-            for tr in stream:
+        '''
+        if not 'detrended' in self[0].stats.history: # change this to use better detrend from libseis?
+            for tr in self:
                 tr.detrend(type='linear')
                 add_to_trace_history(tr, 'detrended')    
-
-        if not hasattr(stream[0].stats, 'spectral'):
-            compute_amplitude_spectra(stream)
+        '''
+        if not hasattr(self[0].stats, 'spectral'):
+            compute_amplitude_spectra(self)
 
         for tr in self:
             dt = tr.stats.delta
@@ -115,7 +116,7 @@ class EnhancedStream(Stream):
             # Amplitude and energy metrics
             y = np.abs(tr.data)
             tr.stats.metrics['peakamp'] = np.max(y)
-            tr.stats.metrics['peaktime'] = np.argmax(y) / tr.stats.sampling_rate + tr.stats.starttime
+            tr.stats.metrics['peaktime'] = tr.stats.starttime + np.argmax(y) / tr.stats.sampling_rate
             if differentiate:
                 y = np.diff(y)
             tr.stats.metrics['energy'] = np.sum(y**2) / tr.stats.sampling_rate
@@ -159,14 +160,13 @@ class EnhancedStream(Stream):
 
             # Scipy descriptive stats
             try:
-                from scipy.stats import describe
                 stats = describe(tr.data, nan_policy='omit')._asdict()
                 tr.stats.metrics['skewness'] = stats['skewness']
                 tr.stats.metrics['kurtosis'] = stats['kurtosis']
             except Exception as e:
                 print(f"[{tr.id}] scipy.stats failed: {e}")
 
-            add_to_trace_history(tr, 'ampengfft')
+            #add_to_trace_history(tr, 'ampengfft')
 
 
     def save(self, basepath, save_pickle=False):
@@ -393,20 +393,14 @@ class EnhancedStream(Stream):
             except Exception as e:
                 print(f"[{tr.id}] Magnitude estimation failed: {e}")
 
-    def summarize_magnitudes(self, include_network=True):
+    def magnitudes2dataframe(self):
         """
         Summarize trace-level and network-averaged magnitude values.
-
-        Parameters
-        ----------
-        include_network : bool
-            If True, append a summary row with network-average magnitudes.
 
         Returns
         -------
         df : pandas.DataFrame
             Columns: id, starttime, distance, local_magnitude (ML), energy_magnitude (ME),
-                    plus network_mean_* and network_std_* if include_network is True.
         """
         rows = []
 
@@ -428,21 +422,6 @@ class EnhancedStream(Stream):
             rows.append(row)
 
         df = pd.DataFrame(rows)
-
-        if include_network:
-            network_stats = {}
-            for col in ['ML', 'ME']:
-                valid = df[col].dropna()
-                if not valid.empty:
-                    network_stats[f'network_mean_{col}'] = valid.mean()
-                    network_stats[f'network_mean_{col}'] = valid.median()
-                    network_stats[f'network_std_{col}'] = valid.std()
-                    network_stats[f'network_n_{col}'] = valid.count()
-
-            # Add a summary row at the bottom
-            summary_row = {col: np.nan for col in df.columns}
-            summary_row.update(network_stats)
-            df = pd.concat([df, pd.DataFrame([summary_row])], ignore_index=True)
 
         return df
 
@@ -504,12 +483,16 @@ class EnhancedStream(Stream):
                 except Exception as e:
                     if verbose:
                         print(f"[{tr.id}] SNR estimation failed: {e}")
+            
 
-        if snr_min is not None:
+        if snr_min: #is not None:
             if verbose:
                 print(f"[3] Filtering traces with SNR < {snr_min:.1f}...")
             filtered = [tr for tr in self if tr.stats.metrics.get('snr', 0) >= snr_min]
             self._traces = filtered
+            for tr in self:
+                if tr.stats.metrics.snr < snr_min:
+                    self.remove(tr)
 
         if verbose:
             print("[1] Computing amplitude and spectral metrics...")
@@ -525,16 +508,51 @@ class EnhancedStream(Stream):
 
         if verbose:
             print("[5] Summarizing network magnitude statistics...")
-        df = self.summarize_magnitudes(include_network=True)
+        df = self.magnitudes2dataframe()
+        #print(df.describe())
 
+        '''
         if verbose and not df.empty:
             net_ml = df.iloc[-1].get('network_mean_ML', np.nan)
             net_me = df.iloc[-1].get('network_mean_ME', np.nan)
             print(f"    → Network ML: {net_ml:.2f} | Network ME: {net_me:.2f}")
+        '''
 
         return self, df
 
-    def build_event(self, source_coords, event_id=None, creation_time=None,
+
+    def to_pickle(self, outdir, remove_data=True, mseed_path=None):
+        """
+        Save EnhancedStream to a pickle file with optional data removal.
+
+        Parameters
+        ----------
+        outdir : str
+            Directory to write .pkl file to.
+        remove_data : bool
+            If True, remove trace.data to reduce file size.
+        mseed_path : str
+            Path to the original MiniSEED file (for reference).
+        """
+        os.makedirs(outdir, exist_ok=True)
+        stream_copy = self.copy()
+
+        for tr in stream_copy:
+            if remove_data:
+                tr.data = []
+            tr.stats['mseed_path'] = mseed_path
+
+        # Compose filename
+        filename = os.path.basename(mseed_path or "stream") + ".pkl"
+        outfile = os.path.join(outdir, filename)
+
+        with open(outfile, "wb") as f:
+            pickle.dump(stream_copy, f)
+        
+        print(f"[✓] Saved pickle: {outfile}")
+
+
+    def to_obspyevent(self, source_coords, event_id=None, creation_time=None,
                     event_type='volcanic eruption', mainclass='LV', subclass=None):
         """
         Convert EnhancedStream and source metadata into ObsPy Event object.
@@ -577,7 +595,7 @@ class EnhancedStream(Stream):
         event.origins.append(origin)
 
         # Add network magnitudes
-        df = self.summarize_magnitudes(include_network=True)
+        df = self.magnitudes2dataframe()
         if df is not None and not df.empty:
             net_ml = df.iloc[-1].get('network_mean_ML')
             net_me = df.iloc[-1].get('network_mean_ME')
@@ -626,6 +644,49 @@ class EnhancedStream(Stream):
                 text=json.dumps(class_comment, indent=2), force_resource_id=False))
 
         return event
+
+
+    def to_enhancedevent(self, event_id=None, dfile=None, origin_time=None):
+        """
+        Convert EnhancedStream to an EnhancedEvent object.
+
+        Parameters
+        ----------
+        event_id : str
+            Event ID this stream belongs to.
+        dfile : str
+            Filename of associated waveform file.
+        origin_time : UTCDateTime
+            Time of event origin (optional).
+
+        Returns
+        -------
+        EnhancedEvent
+        """
+        event = EnhancedEvent()
+        event.event = self.to_obspyevent()
+        event.event_id = event_id
+        event.dfile = dfile
+        event.origin_time = origin_time
+        event.traces = []
+
+        for tr in self:
+            trace_info = {
+                'id': tr.id,
+                'network': tr.stats.network,
+                'station': tr.stats.station,
+                'location': tr.stats.location,
+                'channel': tr.stats.channel,
+                'starttime': str(tr.stats.starttime),
+                'sampling_rate': tr.stats.sampling_rate,
+                'distance_m': tr.stats.get('distance'),
+                'metrics': tr.stats.get('metrics', {}),
+                'spectral': tr.stats.get('spectral', {}),
+            }
+            event.traces.append(trace_info)
+
+        return event
+
 
 ########################## METRICS FUNCTIONS FOLLOW ######################
 
@@ -805,11 +866,10 @@ def get_bandwidth(frequencies, amplitudes, threshold=0.707,
     }
 
     if trace is not None:
-        if not hasattr(trace.stats, 'metrics') or not isinstance(trace.stats.metrics, dict):
+        if not hasattr(trace.stats, 'metrics') or not isinstance(trace.stats.metrics, AttribDict):
             trace.stats.metrics = {}
         for key, val in metrics.items():
             trace.stats.metrics[key] = val
-
     return metrics
 
 
@@ -929,40 +989,26 @@ def Eseismic_Boatwright(val, R, rho_earth=2000, c_earth=2500, S=1.0, A=1.0):
     #
     # These equations seem to be valid for body waves only, that spread like hemispherical waves in a flat earth.
     # But if surface waves dominate, they would spread like ripples on a pond, so energy density of wavefront like 2*pi*R
-    if isinstance(val,Stream): # Stream
-        Eseismic = []
-        for tr in val:
-            Eseismic.append(Eseismic_Boatwright(tr, R, rho_earth, c_earth, S, A))
-    elif isinstance(val,Trace): # Trace
-        stationEnergy = compute_stationEnergy(val) 
+    if isinstance(val,Trace): # Trace
+        stationEnergy = val.stats.metrics.energy
         Eseismic = Eseismic_Boatwright(stationEnergy, R, rho_earth, c_earth, S, A)
-    elif isinstance(val, list): # list of stationEnergy
-        Eseismic = []
-        for thisval in val:
-            Eseismic.append(Eseismic_Boatwright(thisval, R, rho_earth, c_earth, S, A))
-    else: # stationEnergy
+    elif isinstance(val, float): # stationEnergy
         Eseismic = 2 * pi * (R ** 2) * rho_earth * c_earth * (S ** 2) * val / A 
     return Eseismic
 
 def Eacoustic_Boatwright(val, R, rho_atmos=1.2, c_atmos=340, z=100000):
-    # val can be a Stream, Trace, a stationEnergy or a list of stationEnergy
+    # val can be a Trace, or a float (a station energy)
     # R in m
     # Following values assumed by Johnson and Aster, 2005:
     # rho_atmos 1.2 kg/m^3
     # c_atmos 340 m/s  
     # z is just an estimate of the atmospheric vertical scale length - the height of ripples of infrasound energy spreading globally
-    if isinstance(val,Stream): # Stream
-        Eacoustic = []
-        for tr in val:
-            Eacoustic.append(Eacoustic_Boatwright(tr, R, rho_atmos, c_atmos))
-    elif isinstance(val, Trace): # Trace
-        stationEnergy = compute_stationEnergy(val) 
+    if isinstance(val, Trace): # Trace
+        #stationEnergy = compute_stationEnergy(val) 
+        stationEnergy = val.stats.metrics.energy
         Eacoustic = Eacoustic_Boatwright(stationEnergy, R, rho_atmos, c_atmos)
-    elif isinstance(val, list): # list of stationEnergy
-        for thisval in val:
-            Eacoustic.append(Eacoustic_Boatwright(thisval, R, rho_atmos, c_atmos, S, A))
-    else:
-        if R > 100000: # beyond distance z (e.g. 100 km), assume spreading like 2*pi*R
+    elif isinstance(val, float): # list of stationEnergy
+        if R>100000:
             E_if_station_were_at_z = 2 * pi * (z ** 2) / (rho_atmos * c_atmos) * val
             Eacoustic = E_if_station_were_at_z* R/1e5
         else:
@@ -1388,7 +1434,7 @@ class EnhancedCatalog(Catalog):
         import matplotlib.pyplot as plt
 
         if force_update:
-            self.update_dataframe(force=True)
+            self.update_dataframe(forcethese=True)
 
         df = self.dataframe
         df = df.dropna(subset=['datetime'])  # Ensure time is available
@@ -1835,7 +1881,11 @@ def classify_and_add_event(stream, catalog, trigger=None, save_stream=False, cla
     return ev, subclass, features
 
 
-class EnhancedEvent:
+class EnhancedEvent: # currently this is for the Seisan REA, WAV, AEF combo. Not for trace metrics.
+    @property
+    def event_id(self):
+        return self.event.resource_id.id
+
     def __init__(self, obspy_event, metrics=None, sfile_path=None, wav_paths=None,
                  aef_path=None, trigger_window=None, average_window=None, stream=None):
         """
@@ -1873,6 +1923,12 @@ class EnhancedEvent:
     def to_quakeml(self):
         return self.event'
     '''
+
+    def __str__(self):
+        summary = ''
+        for key, value in self.__dict__.items():
+            summary += f"{key}->{value}" + '\n'
+        return summary
 
     def to_json(self):
         return {
@@ -1938,7 +1994,7 @@ class EnhancedEvent:
             metadata = json.load(f)
 
         return cls(
-            event=event,
+            obspy_event=event,
             sfile_path=metadata.get("sfile_path"),
             wav_paths=metadata.get("wav_paths", []),
             aef_path=metadata.get("aef_path"),
@@ -1946,6 +2002,46 @@ class EnhancedEvent:
             average_window=metadata.get("average_window"),
             metrics=metadata.get("metrics", {})
         )
+    
+    def write_to_db(self, conn):
+        """
+        Write EnhancedEvent trace metrics to a database.
+
+        Parameters
+        ----------
+        conn : sqlite3.Connection
+            Open database connection.
+        """
+        cur = conn.cursor()
+
+        for trace in self.traces:
+            metrics = trace.get('metrics', {})
+            spectral = trace.get('spectral', {})
+
+            cur.execute('''INSERT OR REPLACE INTO aef_metrics 
+                (event_id, trace_id, network, station, location, channel, starttime,
+                distance_m, snr, peakamp, energy, peakf, meanf, skewness, kurtosis)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
+                self.event_id,
+                trace['id'],
+                trace['network'],
+                trace['station'],
+                trace['location'],
+                trace['channel'],
+                trace['starttime'],
+                trace.get('distance_m'),
+                metrics.get('snr'),
+                metrics.get('peakamp'),
+                metrics.get('energy'),
+                metrics.get('peakf'),
+                metrics.get('meanf'),
+                metrics.get('skewness'),
+                metrics.get('kurtosis')
+            ))
+
+        conn.commit()
+        print(f"[✓] Inserted {len(self.traces)} trace metrics into DB for event {self.event_id}")
+
 
 
 if  __name__ == '__main__':

@@ -21,7 +21,7 @@ from obspy.geodetics import locations2degrees, degrees2kilometers
 # Your internal or local modules (assumed to exist)
 # For example:
 from flovopy.core.inventory import inventory2traceid
-from flovopy.processing.sam import DSAM  # DSAM class for corrections and simulation
+from flovopy.processing.sam import VSAM  # VSAM class for corrections and simulation
 from flovopy.core.mvo import dome_location
 
 
@@ -178,7 +178,7 @@ def make_grid(center_lat=dome_location['lat'], center_lon=dome_location['lon'], 
     return Grid(center_lat, center_lon, nlat, nlon, node_spacing_m)  
 
 
-def simulate_DSAM(inv, source, units='m', surfaceWaves=False, wavespeed_kms=1.5, peakf=8.0, Q=None, noise_level_percent=0.0):
+def simulate_VSAM(inv, source, units='m/s', surfaceWaves=False, wavespeed_kms=1.5, peakf=8.0, Q=None, noise_level_percent=0.0):
     npts = len(source['DR'])
     seed_ids = inventory2seedids(inv, force_location_code='')
     st = obspy.Stream()
@@ -192,17 +192,17 @@ def simulate_DSAM(inv, source, units='m', surfaceWaves=False, wavespeed_kms=1.5,
         tr.id = id
         tr.stats.starttime = source['t'][0]
         tr.stats.delta = source['t'][1] - source['t'][0]
-        gsc = DSAM.compute_geometrical_spreading_correction(distance_km, tr.stats.channel, surfaceWaves=surfaceWaves, wavespeed_kms=wavespeed_kms, peakf=peakf)
-        isc = DSAM.compute_inelastic_attenuation_correction(distance_km, peakf, wavespeed_kms, Q)
+        gsc = VSAM.compute_geometrical_spreading_correction(distance_km, tr.stats.channel, surfaceWaves=surfaceWaves, wavespeed_kms=wavespeed_kms, peakf=peakf)
+        isc = VSAM.compute_inelastic_attenuation_correction(distance_km, peakf, wavespeed_kms, Q)
         tr.data = source['DR'] / (gsc * isc) * 1e-7
         if noise_level_percent > 0.0:
             tr.data += np.multiply(np.nanmax(tr.data), np.random.uniform(0, 1, size=npts) )
             pass # do something here
         tr.stats['units'] = units
         st.append(tr)
-    return DSAM(stream=st, sampling_interval=tr.stats.delta)
+    return VSAM(stream=st, sampling_interval=tr.stats.delta)
 
-def plot_DSAM(dsamobj, gridobj, nodenum, metric='mean', DEM_DIR=None):
+def plot_VSAM(dsamobj, gridobj, nodenum, metric='mean', DEM_DIR=None):
     x = [id for id in dsamobj.dataframes]
     st = dsamobj.to_stream(metric=metric)
     y = [tr.data[nodenum] for tr in st]
@@ -221,16 +221,16 @@ class ASL:
     def __init__(self, samobject, metric, inventory, gridobj, window_seconds):
         ''' 
         ASL: Simple amplitude-based source location for volcano-seismic data 
-        This program takes a DSAM object as input
+        This program takes a VSAM object as input
         Then armed with an inventory that provides station coordinates, it attempts
         to find a location for each sample by reducing amplitudes based on the grid
         node to station distance. Grid nodes are contained in a Grid object.
 
-        ASL can use any one of the mean, max, median, VLP, LP, or VT metrics from a DSAM object
+        ASL can use any one of the mean, max, median, VLP, LP, or VT metrics from a VSAM object
 
         '''
 
-        if isinstance(samobject, DSAM):
+        if isinstance(samobject, VSAM):
             pass
         else:
             print('invalid type passed as samobject. Aborting')
@@ -258,28 +258,64 @@ class ASL:
         self.compute_grid_distances()
         self.compute_amplitude_corrections(surfaceWaves = surfaceWaves)
 
-    def compute_grid_distances(self):
-        st = self.samobject.to_stream()
-        coordinates = {}
+    def compute_grid_distances(self, use_stream=False):
+        """
+        Computes and stores distances from each grid node to each station/channel.
+
+        If `use_stream=True`, it will compute only for trace IDs in self.samobject.to_stream().
+        Otherwise, it uses all available channels in self.inventory.
+
+        Results are stored in:
+            - self.node_distances_km: dict of {seed_id: np.array of distances in km}
+            - self.station_coordinates: dict of {seed_id: {latitude, longitude, elevation}}
+        """
+
+
         node_distances_km = {}
-        for tr in st:
-            d_list = []
+        station_coordinates = {}
+
+        gridlat = self.gridobj.gridlat.reshape(-1)
+        gridlon = self.gridobj.gridlon.reshape(-1)
+        nodelatlon = list(zip(gridlat, gridlon))
+
+        if use_stream:
+            st = self.samobject.to_stream()
+            trace_ids = list({tr.id for tr in st})
+            print(f"[INFO] Computing distances using {len(trace_ids)} trace IDs from stream.")
+        else:
+            trace_ids = []
+            for net in self.inventory:
+                for sta in net:
+                    for cha in sta:
+                        trace_ids.append(f"{net.code}.{sta.code}..{cha.code}")
+            print(f"[INFO] Computing distances using {len(trace_ids)} channels from inventory.")
+
+        for seed_id in trace_ids:
             try:
-                coordinates[tr.id] = self.inventory.get_coordinates(tr.id)
-                stalat = coordinates[tr.id]['latitude']
-                stalon = coordinates[tr.id]['longitude']
-                #print(tr.id, stalat, stalon)
+                coords = self.inventory.get_coordinates(seed_id)
+                stalat = coords['latitude']
+                stalon = coords['longitude']
+                station_coordinates[seed_id] = coords
             except Exception as e:
-                #print(e)
+                print(f"[WARN] Skipping {seed_id}: {e}")
                 continue
-            gridlat = self.gridobj.gridlat.reshape(-1)
-            gridlon = self.gridobj.gridlon.reshape(-1)
-            nodelatlon = zip(gridlat, gridlon)
-            distances = np.array([locations2degrees(nodelat, nodelon, stalat, stalon) for nodelat, nodelon in nodelatlon])       
-            node_distances_km[tr.id] = np.array([degrees2kilometers(thisdistance) for thisdistance in distances])
+
+            try:
+                distances_deg = [
+                    locations2degrees(nlat, nlon, stalat, stalon)
+                    for nlat, nlon in nodelatlon
+                ]
+                distances_km = [degrees2kilometers(d) for d in distances_deg]
+                node_distances_km[seed_id] = np.array(distances_km)
+            except Exception as e:
+                print(f"[ERROR] Distance calc failed for {seed_id}: {e}")
+                continue
+
         self.node_distances_km = node_distances_km
-        self.station_coordinates = coordinates 
-        
+        self.station_coordinates = station_coordinates
+        print(f"[DONE] Grid distances computed for {len(node_distances_km)} trace IDs.")
+
+            
     @staticmethod
     def set_peakf(metric, df):
         if metric in ['mean', 'median', 'max', 'rms']:
@@ -292,37 +328,88 @@ class ASL:
         elif metric == 'VT':
             peakf = 8.0
         return peakf
-             
-    def compute_amplitude_corrections(self, surfaceWaves=False, wavespeed_kms=None, Q=None, fix_peakf=None):
-        #st = self.samobject.to_stream()
-        corrections = {}
+
+
+    def compute_amplitude_corrections(
+        self,
+        surfaceWaves=False,
+        wavespeed_kms=None,
+        Q=None,
+        fix_peakf=None,
+        cache_dir="asl_cache",
+        # force_recompute=False,
+    ):
+        """
+        Compute amplitude corrections using geometric spreading and inelastic attenuation.
+        Results are cached on disk using parameters as the cache key.
+
+        Parameters
+        ----------
+        surfaceWaves : bool
+            Whether to use surface wave assumptions.
+        wavespeed_kms : float or None
+            Wave speed in km/s. Default is 1.5 for surface, 3.0 otherwise.
+        Q : float or None
+            Attenuation factor. Required if inelastic corrections are used.
+        fix_peakf : float or None
+            Fixed peak frequency to use in calculations. If None, inferred from metric.
+        cache_dir : str
+            Directory for saving and loading cached corrections.
+        """
         if not wavespeed_kms:
-            if surfaceWaves:
-                wavespeed_kms = 1.5
-            else:
-                wavespeed_kms = 3.0
+            wavespeed_kms = 1.5 if surfaceWaves else 3.0
+        if not os.path.isdir(cache_dir):
+            os.makedirs(cache_dir)
+
+        cache_key = f"ampcorr_Q{int(round(Q or 99))}_V{int(round(wavespeed_kms))}_f{int(round(fix_peakf or 1.0))}_{'surf' if surfaceWaves else 'body'}.pkl"
+        cache_path = os.path.join(cache_dir, cache_key)
+
+        # Load from cache if possible
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "rb") as f:
+                    self.amplitude_corrections = pickle.load(f)
+                print(f"[CACHE HIT] Loaded amplitude corrections from {cache_path}")
+                return
+            except Exception as e:
+                print(f"[WARN] Failed to load cache: {e}")
+
+        # Compute corrections
+        corrections = {}
+        peakf_last = None  # for diagnostic/debug only
         for seed_id, df in self.samobject.dataframes.items():
-            if fix_peakf:
-                peakf = fix_peakf
-            else:
-                peakf = self.set_peakf(self.metric, df)
+            peakf = fix_peakf or self.set_peakf(self.metric, df)
+            peakf_last = peakf  # will overwrite until last iteration
             wavelength_km = peakf * wavespeed_kms
             distance_km = self.node_distances_km[seed_id]
 
-            gsc = DSAM.compute_geometrical_spreading_correction(distance_km, seed_id[-3:], \
-                                                       surfaceWaves=surfaceWaves, \
-                                                       wavespeed_kms=wavespeed_kms, peakf=peakf)
+            gsc = VSAM.compute_geometrical_spreading_correction(
+                distance_km, seed_id[-3:], surfaceWaves=surfaceWaves,
+                wavespeed_kms=wavespeed_kms, peakf=peakf
+            )
 
-            isc = DSAM.compute_inelastic_attenuation_correction(distance_km, peakf, wavespeed_kms, Q) 
+            isc = VSAM.compute_inelastic_attenuation_correction(
+                distance_km, peakf, wavespeed_kms, Q
+            )
 
             corrections[seed_id] = gsc * isc
 
+        # Save corrections to cache
+        try:
+            with open(cache_path, "wb") as f:
+                pickle.dump(corrections, f)
+            print(f"[CACHE SAVE] Amplitude corrections saved to {cache_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to save cache: {e}")
+
+        # Save attributes
         self.amplitude_corrections = corrections
         self.surfaceWaves = surfaceWaves
         self.wavespeed_kms = wavespeed_kms
-        self.wavelength_km = wavelength_km
+        self.wavelength_km = peakf_last * wavespeed_kms if peakf_last else None
         self.Q = Q
-        self.peakf = peakf
+        self.peakf = fix_peakf or peakf_last
+
 
     def metric2stream(self):
         st = self.samobject.to_stream(metric=self.metric)

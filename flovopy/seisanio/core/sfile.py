@@ -6,7 +6,7 @@ from obspy import UTCDateTime, read
 from obspy.core.event import Event, Origin, Magnitude, WaveformStreamID #, Catalog, Pick, QuantityError
 from flovopy.seisanio.core.wavfile import Wavfile
 from flovopy.seisanio.core.aeffile import AEFfile
-from flovopy.seisanio.utils.helpers import filetime2wavpath
+from flovopy.seisanio.utils.helpers import filetime2wavpath, spath2datetime
 from flovopy.core.mvo import correct_nslc_mvo
 from flovopy.core.enhanced import EnhancedEvent
 import json
@@ -180,6 +180,14 @@ class Sfile:
         for key, value in self.__dict__.items():
             if key.startswith("_"):
                 continue  # skip private attributes
+            elif key.endswith('obj'):
+                if key == 'aeffileobj':
+                    if hasattr(value, 'aef_ids'):
+                        sdict[key] = getattr(value, 'aef_ids', None)
+                elif hasattr(value, 'path'):
+                    sdict[key] = getattr(value, 'path')
+                else:
+                    sdict[key] = None
             else:
                 try:
                     json.dumps(value)  # check if it's JSON-serializable
@@ -204,6 +212,7 @@ class Sfile:
         try:
             summary += pformat(self.to_dict(), indent=4)
         except Exception as e:
+            print('crashed here')
             summary += f"[ERROR] Could not generate summary: {e}"
 
         return summary
@@ -285,21 +294,7 @@ class Sfile:
             stream=stream
         )
 
-def spath2datetime(spath):
-    """Extract datetime from SEISAN S-file path."""
-    basename = os.path.basename(spath)
-    if '.S' in spath: # 
-        parts = basename.split('.S')
-        yyyy = int(parts[1][0:4])
-        mm = int(parts[1][4:6])
-        parts = parts[0].split('-')
-        dd = int(parts[0])
-        HH = int(parts[1][0:2])
-        MM = int(parts[1][2:4])
-        SS = float(parts[2][0:2])
-        return UTCDateTime(yyyy, mm, dd, HH, MM, SS)
-    else:
-        return None    
+
 
 def get_sfile_list(SEISAN_DATA, DB, startdate, enddate): 
     """
@@ -409,159 +404,157 @@ def read_pickle(picklefile):
                 if len(line.strip()) > 0 and verbose:
                     print("Processing %s: ignoring this line: %s" % (self.path, line))
                 continue
-
-            if line[-1] == '1':
-                # Parse origin time and event details
-                try:
-                    oyear, omonth, oday = int(line[1:5]), int(line[6:8]), int(line[8:10])
-                    ohour, ominute = int(line[11:13]), int(line[13:15])
-                    dummy = line[15:20].strip()
-                    osecond = float(dummy) if dummy else 0.0
-                    if int(osecond) == 60:
-                        ominute += 1
-                        osecond -= 60.0
-                    if osecond > 60:
-                        osecond /= 100
-                    self.otime = dt.datetime(oyear, omonth, oday, ohour, ominute, int(osecond), int((osecond % 1) * 1e6))
-                except:
-                    if verbose:
-                        print('Failed 1-21:\n01233456789' * 8 + f"\n{line}")
-
-                print(line)
-                self.mainclass = line[21:23].strip()
-                self.latitude = parse_string(line, 23, 30, 'float')
-                self.longitude = parse_string(line, 30, 38, 'float')
-                self.depth = parse_string(line, 38, 43, 'float')
-                self.z_indicator = line[43].strip()
-                self.agency = line[45:48].strip()
-                self.no_sta = parse_string(line, 49, 51, 'int', default=0)
-                self.rms = parse_string(line, 51, 55, 'float')
-
-                for i in [(55, 59, 59, 60, 63), (63, 67, 67, 68, 71), (71, 75, 75, 76, 79)]:
-                    try:
-                        mag = float(line[i[0]:i[1]])
-                        mag_type = line[i[2]]
-                        mag_agency = line[i[3]:i[4]].strip()
-                        self.magnitude.append(mag)
-                        self.magnitude_type.append(mag_type)
-                        self.magnitude_agency.append(mag_agency)
-                    except:
-                        if verbose:
-                            print(f'Failed {i[0]}-{i[4]}:\n01233456789' * 8 + f"\n{line}")
-
-            if line[-1] == '2':
-                self.maximum_intensity = int(line[27:29])
-
-            if line[-1] == '6':
-                wavfiles = line[1:79].split()
-                for wavfile in wavfiles:
-                    wavfullpath = os.path.join(os.path.dirname(self.path).replace('REA', 'WAV'), wavfile)
-                    self.wavfiles.append(Wavfile(wavfullpath))
-                    aeffullpath = wavfullpath.replace('WAV', 'AEF')
-                    if os.path.exists(aeffullpath) and aeffullpath not in _aeffiles:
-                        _aeffiles.append(aeffullpath)
-
-            if line[-1] == 'E':
-                self.gap = parse_string(line, 5, 8, 'int', default=-1)
-                self.error['origintime'] = parse_string(line, 14, 20, 'float')
-                self.error['latitude'] = parse_string(line, 24, 30, 'float')
-                self.error['longitude'] = parse_string(line, 32, 38, 'float')
-                self.error['depth'] = parse_string(line, 38, 43, 'float')
-                self.error['covxy'] = parse_string(line, 43, 55, 'float')
-                self.error['covxz'] = parse_string(line, 55, 67, 'float')
-                self.error['covyz'] = parse_string(line, 67, 79, 'float')
-
-            if line[-1] == 'F' and 'dip' not in self.focmec:
-                self.focmec['strike'] = float(line[0:10])
-                self.focmec['dip'] = float(line[10:20])
-                self.focmec['rake'] = float(line[20:30])
-                self.focmec['agency'] = line[66:69]
-                self.focmec['source'] = line[70:77]
-                self.focmec['quality'] = line[77]
-
-            if line[-1] == 'H':
-                _osec = float(line[16:22])
-                _yyyy = int(line[1:5])
-                _mm = int(line[6:8])
-                _dd = int(line[8:10])
-                _hh = int(line[11:13])
-                _mi = int(line[13:15])
-                _ss = int(_osec)
-                _ms = int((_osec - _ss) * 1.e6)
-                self.otime = dt.datetime(_yyyy, _mm, _dd, _hh, _mi, _ss, _ms)
-                self.latitude = float(line[23:32].strip())
-                self.longitude = float(line[33:43].strip())
-                self.depth = float(line[44:52].strip())
-                self.rms = float(line[53:59].strip())
-
-            if line[-1] == 'I':
-
-                self.last_action = line[8:11]
-                self.action_time = line[12:26]
-                self.analyst = line[30:33]
-                self.id = int(line[60:74])
-
-            if line[-1] == ' ' and line[1] == 'M':
-                asta = line[1:5].strip()
-                achan = line[5:8].strip()
-                aphase = line[8:16].strip()
-                ahour = int(line[18:20].strip())
-                aminute = int(line[20:22].strip())
-                asecond = line[22:28].strip()
-                amillisecond = int(asecond.split('.')[1]) if '.' in asecond else 0
-                asecond = int(float(asecond))
-                if asecond >= 60:
-                    aminute += 1
-                    asecond -= 60
-                    if aminute >= 60:
-                        aminute -= 60
-                        ahour += 1
-                if ahour > 23:
-                    ahour -= 24
-                atime = self.otime or self.filetime
-                try:
-                    atime = dt.datetime(atime.year, atime.month, atime.day, ahour, aminute, asecond, 1000 * amillisecond)
-                except:
-                    if verbose:
-                        print('Failed 18-29:\n01233456789' * 8 + f"\n{line}")
-
-                thispick = {
-                    'sta': asta,
-                    'chan': achan,
-                    'phase': aphase,
-                    'time': atime
-                }
-                if line[64:79].strip():
-                    thispick['time_residual'] = parse_string(line, 64, 68, 'float')
-                    thispick['weight'] = parse_string(line, 68, 70, 'int')
-                    thispick['distance_km'] = parse_string(line, 72, 75, 'float')
-                    thispick['azimuth'] = parse_string(line, 77, 79, 'int')
-
-                onset = 'questionable'
-                if aphase.startswith('I'):
-                    onset = 'impulsive'
-                    aphase = aphase[1:]
-                elif aphase.startswith('E'):
-                    onset = 'emergent'
-                    aphase = aphase[1:]
-
-                if achan:
-                    traceID = f".{asta}..{achan}"
-                    Fs = 75 if asta[:2] == 'MB' and self.filetime.year < 2005 else 100
-                    fixedID = correct_nslc_mvo(traceID, Fs, shortperiod=False)
-                    if 'time_residual' in thispick:
-                        tres = QuantityError(uncertainty=thispick['time_residual'])
-                        p = Pick(time=atime, waveform_id=fixedID, onset=onset, phase_hint=aphase,
-                                time_errors=tres, backazimuth=(180 + thispick['azimuth']) % 360)
-                    else:
-                        p = Pick(time=atime, waveform_id=fixedID, onset=onset, phase_hint=aphase)
-                    self.picks.append(p)
-                
             
-        if _aeffile in _aeffiles:
-            if parse_aef:
-                self.aeffiles.append(AEFfile(_aeffile))
-            
+    def parse_1(self, line, verbose=False):
+        # Parse origin time and event details
+        try:
+            oyear, omonth, oday = int(line[1:5]), int(line[6:8]), int(line[8:10])
+            ohour, ominute = int(line[11:13]), int(line[13:15])
+            dummy = line[15:20].strip()
+            osecond = float(dummy) if dummy else 0.0
+            if int(osecond) == 60:
+                ominute += 1
+                osecond -= 60.0
+            if osecond > 60:
+                osecond /= 100
+            self.otime = UTCDateTime(oyear, omonth, oday, ohour, ominute, int(osecond), int((osecond % 1) * 1e6))
+        except:
+            if verbose:
+                print('Failed 1-21:\n01233456789' * 8 + f"\n{line}")
+
+        #self.mainclass = line[21:23].strip()
+        self.mvo_parser.latitude = parse_string(line, 23, 30, 'float')
+        self.mvo_parser.longitude = parse_string(line, 30, 38, 'float')
+        self.mvo_parser.depth = parse_string(line, 38, 43, 'float')
+        self.mvo_parser.z_indicator = line[43].strip()
+        self.mvo_parser.agency = line[45:48].strip()
+        self.mvo_parser.no_sta = parse_string(line, 49, 51, 'int', default=0)
+        self.mvo_parser.rms = parse_string(line, 51, 55, 'float')
+
+        for i in [(55, 59, 59, 60, 63), (63, 67, 67, 68, 71), (71, 75, 75, 76, 79)]:
+            try:
+                mag = parse_string(line, i[0], i[1], 'float', default=None)
+                mag_type = line[i[2]]
+                mag_agency = line[i[3]:i[4]].strip()
+                self.mvo_parser.magnitude.append(mag)
+                self.mvo_parser.magnitude_type.append(mag_type)
+                self.mvo_parser.magnitude_agency.append(mag_agency)
+            except:
+                if verbose:
+                    print(f'Failed {i[0]}-{i[4]}:\n01233456789' * 8 + f"\n{line}")
+    '''
+    def parse_2(self, line):
+        self.mvo_parser.maximum_intensity = parse_string(line, 27, 29, 'int', default=0)
+
+    def parse_6(self, line):
+        self.wavfiles = line[1:79].split()
+
+    
+    def parse_E(self, line):
+        self.mvo_parser.gap = parse_string(line, 5, 8, 'int', default=-1)
+        errors = {}
+        errors['origintime'] = parse_string(line, 14, 20, 'float')
+        errors['latitude'] = parse_string(line, 24, 30, 'float')
+        errors['longitude'] = parse_string(line, 32, 38, 'float')
+        errors['depth'] = parse_string(line, 38, 43, 'float')
+        errors['covxy'] = parse_string(line, 43, 55, 'float')
+        errors['covxz'] = parse_string(line, 55, 67, 'float')
+        errors['covyz'] = parse_string(line, 67, 79, 'float')
+        self.mvo_parser.error = errors
+
+    def parse_F(self, line):
+        if 'dip' in self.mvo_parser.focmec:
+            return
+        focmec = {}
+        focmec['strike'] = float(line[0:10])
+        focmec['dip'] = float(line[10:20])
+        focmec['rake'] = float(line[20:30])
+        focmec['agency'] = line[66:69]
+        focmec['source'] = line[70:77]
+        focmec['quality'] = line[77]
+        self.mvo_parser.focmec = focmec
+
+    def parse_H(self, line):
+        _osec = float(line[16:22])
+        _yyyy = int(line[1:5])
+        _mm = int(line[6:8])
+        _dd = int(line[8:10])
+        _hh = int(line[11:13])
+        _mi = int(line[13:15])
+        _ss = int(_osec)
+        _ms = int((_osec - _ss) * 1.e6)
+        self.mvo_parser.otime = UTCDateTime(_yyyy, _mm, _dd, _hh, _mi, _ss, _ms)
+        self.mvo_parser.latitude = float(line[23:32].strip())
+        self.mvo_parser.longitude = float(line[33:43].strip())
+        self.mvo_parser.depth = float(line[44:52].strip())
+        self.mvo_parser.rms = float(line[53:59].strip())
+
+    def parse_I(self, line):
+        self.mvo_parser.last_action = line[8:11]
+        self.mvo_parser.action_time = line[12:26]
+        self.mvo_parser.analyst = line[30:33]
+        self.mvo_parser.id = int(line[60:74])
+    
+    def parse_picks(self, line):
+
+        #if line[-1] == ' ' and line[1] == 'M':
+        asta = line[1:5].strip()
+        achan = line[5:8].strip()
+        aphase = line[8:16].strip()
+        ahour = int(line[18:20].strip())
+        aminute = int(line[20:22].strip())
+        asecond = line[22:28].strip()
+        amillisecond = int(asecond.split('.')[1]) if '.' in asecond else 0
+        asecond = int(float(asecond))
+        if asecond >= 60:
+            aminute += 1
+            asecond -= 60
+            if aminute >= 60:
+                aminute -= 60
+                ahour += 1
+        if ahour > 23:
+            ahour -= 24
+        atime = self.mvo_parser.otime or self.filetime
+        try:
+            atime = UTCDateTime(atime.year, atime.month, atime.day, ahour, aminute, asecond, 1000 * amillisecond)
+        except:
+            if verbose:
+                print('Failed 18-29:\n01233456789' * 8 + f"\n{line}")
+
+        thispick = {
+            'sta': asta,
+            'chan': achan,
+            'phase': aphase,
+            'time': atime
+        }
+        if line[64:79].strip():
+            thispick['time_residual'] = parse_string(line, 64, 68, 'float')
+            thispick['weight'] = parse_string(line, 68, 70, 'int')
+            thispick['distance_km'] = parse_string(line, 72, 75, 'float')
+            thispick['azimuth'] = parse_string(line, 77, 79, 'int')
+
+        onset = 'questionable'
+        if aphase.startswith('I'):
+            onset = 'impulsive'
+            aphase = aphase[1:]
+        elif aphase.startswith('E'):
+            onset = 'emergent'
+            aphase = aphase[1:]
+
+        if achan:
+            traceID = f".{asta}..{achan}"
+            Fs = 75 if asta[:2] == 'MB' and self.filetime.year < 2005 else 100
+            fixedID = correct_nslc_mvo(traceID, Fs, shortperiod=False)
+            if 'time_residual' in thispick:
+                tres = QuantityError(uncertainty=thispick['time_residual'])
+                p = Pick(time=atime, waveform_id=fixedID, onset=onset, phase_hint=aphase,
+                        time_errors=tres, backazimuth=(180 + thispick['azimuth']) % 360)
+            else:
+                p = Pick(time=atime, waveform_id=fixedID, onset=onset, phase_hint=aphase)
+            if not hasattr(self.mvo_parser, 'picks'):
+                self.mvo_parser.picks = []
+            self.mvo_parser.picks.append(p)
+
 
     def maximum_magnitude(self):
         mag, mtype, agency = None, None, None
@@ -573,20 +566,20 @@ def read_pickle(picklefile):
         return mag, mtype, agency
     
     def to_obspyevent(self):
-        if self.otime and self.latitude and self.longitude and self.depth is not None:
-            origin = Origin(time=self.otime, latitude=self.latitude, longitude=self.longitude, depth=self.depth)
+        s = self.mvo_parser
+        if s.otime and s.latitude and s.longitude and s.depth is not None:
+            origin = Origin(time=s.otime, latitude=s.latitude, longitude=s.longitude, depth=s.depth)
         else:
-            origin = Origin(time=self.otime)
+            origin = Origin(time=s.otime)
 
-        if self.magnitude:
-            magnitude = Magnitude(mag=self.magnitude[0], magnitude_type=self.magnitude_type[0] if self.magnitude_type else None)
+        if s.magnitude:
+            magnitude = Magnitude(mag=s.magnitude[0], magnitude_type=s.magnitude_type[0] if s.magnitude_type else None)
         else:
             magnitude = None
 
-        self.parsed_event = Event(origins=[origin])
+        s.event = Event(origins=[origin])
         if magnitude:
-            self.parsed_event.magnitudes.append(magnitude)
+            s.event.magnitudes.append(magnitude)
         if self.picks:
-            self.parsed_event.picks = self.picks
-
+            s.event.picks = s.picks
 """
