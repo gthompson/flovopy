@@ -726,58 +726,98 @@ class RSAM(SAM):
         return SAM.get_filename(SAM_DIR, id, year, sampling_interval, ext, name=name)
 
     @classmethod
-    def readRSAMbinary(classref, SAM_DIR, station, stime, etime):
-        ''' read one (or many if station is a list) RSAM binary file(s) recorded by the original RSAM system
-            return corresponding RSAM object '''
-        st = Stream()
+    def readRSAMbinary(classref, SAM_DIR=None, station=None, stime=None, etime=None, filepath=None, sampling_interval=60):
+        ''' 
+        Read RSAM binary file(s) recorded by the original RSAM system.
+        Provide either:
+        (1) SAM_DIR, station, stime, etime — to load from structured files by year
+        OR
+        (2) filepath, stime, etime — to load a single specified file directly.
 
+        Returns a corresponding RSAM object or stream.
+        '''
+        st = Stream()
+        records_per_day = int(86400/sampling_interval)
+
+        if filepath:
+            # Direct file path usage
+            if not os.path.isfile(filepath):
+                raise FileNotFoundError(f"File not found: {filepath}")
+            
+            print(f"Reading {filepath}")
+            values = []
+            with open(filepath, mode="rb") as f:
+                f.seek(4 * records_per_day)  # 1-day header
+                while True:
+                    bytes_read = f.read(4)
+                    if not bytes_read:
+                        break
+                    v = struct.unpack('f', bytes_read)[0]
+                    values.append(v)
+
+            tr = Trace(data=np.array(values))
+
+            # Extract station name and year from filename
+            filename = os.path.basename(filepath)
+            station_code = ''.join(filter(str.isalpha, filename))  # e.g. MBRY from MBRY2003.DAT
+
+            # Find the first numeric group (year) in filename
+            import re
+            match = re.search(r'(\d{2,4})', filename)
+            if match:
+                year_str = match.group(1)
+                if len(year_str) == 4:
+                    year = int(year_str)
+                elif len(year_str) == 2:
+                    y = int(year_str)
+                    year = 2000 + y if y < 50 else 1900 + y
+                else:
+                    raise ValueError(f"Unexpected year format in filename: {year_str}")
+            else:
+                raise ValueError("No year found in filename")
+
+            tr.stats.starttime = UTCDateTime(year, 1, 1, 0, 0, 0)
+            tr.id = f"MV.{station_code}..EHZ"
+            tr.stats.delta = sampling_interval
+            tr.data[tr.data == -998.0] = np.nan
+            tr.trim(starttime=stime, endtime=etime)
+            st = Stream(traces=[tr])
+            return classref(stream=st, sampling_interval = sampling_interval)
+
+        # Handle list of stations
         if isinstance(station, list):
             for this_station in station:
-                tr = classref.readRSAMbinary(SAM_DIR, this_station, stime, etime)
-                if tr.data.size - np.count_nonzero(np.isnan(tr.data)): # throw away Trace objects with only NaNs
+                tr = classref.readRSAMbinary(SAM_DIR=SAM_DIR, station=this_station, stime=stime, etime=etime)
+                if tr.data.size - np.count_nonzero(np.isnan(tr.data)):
                     st.append(tr)
-            samObj = classref(stream=st, sampling_interval = 1/st[0].stats.sampling_rate)
-            return samObj
-        else:
+            return classref(stream=st, sampling_interval=1 / st[0].stats.sampling_rate)
 
-            for year in range(stime.year, etime.year+1):
-            
-                daysPerYear = 365
-                if year % 4 == 0:
-                    daysPerYear += 1
-                    
-                RSAMbinaryFile = os.path.join(SAM_DIR, f"{station}{year}.DAT")
-                
-                values = []
-                if os.path.isfile(RSAMbinaryFile):
-                    print('Reading ',RSAMbinaryFile)
-        
-                    # read the whole file
-                    f = open(RSAMbinaryFile, mode="rb")
-                    f.seek(4*1440) # 1 day header
-                    for day in range(daysPerYear):
-                        for minute in range(60 * 24):
-                            v = struct.unpack('f', f.read(4))[0]
-                            values.append(v)
-                            #print(type(v)) 
-                            #print(v)
-                    f.close()
-        
-                    # convert to Trace object
-                    tr = Trace(data=np.array(values))
-                    tr.stats.starttime = UTCDateTime(year, 1, 1, 0, 0, 0)
-                    tr.id=f'MV.{station}..EHZ'
-                    tr.stats.sampling_rate=1/60
-                    tr.data[tr.data == -998.0] = np.nan
-        
-                    # Trim based on stime & etime & append to Stream
-                    tr.trim(starttime=stime, endtime=etime)
-                    st.append(tr)
-                else:
-                    print(f"{RSAMbinaryFile} not found")
-        
-            return st.merge(method=0, fill_value=np.nan)[0]
+        # Load files based on SAM_DIR and station
+        for year in range(stime.year, etime.year + 1):
+            daysPerYear = 366 if year % 4 == 0 else 365
+            RSAMbinaryFile = os.path.join(SAM_DIR, f"{station}{year}.DAT")
+            values = []
 
+            if os.path.isfile(RSAMbinaryFile):
+                print('Reading', RSAMbinaryFile)
+                with open(RSAMbinaryFile, mode="rb") as f:
+                    f.seek(4 * records_per_day)
+                    for _ in range(daysPerYear * records_per_day):
+                        v = struct.unpack('f', f.read(4))[0]
+                        values.append(v)
+
+                tr = Trace(data=np.array(values))
+                tr.stats.starttime = UTCDateTime(year, 1, 1, 0, 0, 0)
+                tr.id = f'MV.{station}..EHZ'
+                tr.stats.delta = sampling_interval
+                tr.data[tr.data == -998.0] = np.nan
+                tr.trim(starttime=stime, endtime=etime)
+                st.append(tr)
+            else:
+                print(f"{RSAMbinaryFile} not found")
+
+        st.merge(method=0, fill_value=np.nan)[0]
+        return classref(stream=st, sampling_interval = sampling_interval)
 
 class VSAM(SAM):
     # Before calling, make sure tr.stats.units is fixed to correct units.

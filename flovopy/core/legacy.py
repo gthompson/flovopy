@@ -1,9 +1,9 @@
 import numpy as np
-from obspy import read, Stream, Catalog, Event, UTCDateTime
-from obspy.core.event import Origin, Magnitude, Comment
+from obspy import read, Stream,  UTCDateTime #, Catalog, Event,
+#from obspy.core.event import Origin, Magnitude, Comment
 
 
-def _fix_legacy_id(trace):
+def _fix_legacy_id(trace, network=None):
     """
     Fixes legacy trace IDs for old VDAP/analog telemetry networks.
 
@@ -37,14 +37,16 @@ def _fix_legacy_id(trace):
     print(trace.id)  # Corrected SEED-compliant ID
     ```
     """
+    if network:
+        trace.stats.network = network
     if trace.stats.station == 'IRIG':
         trace.stats.channel = 'ACE'
     else:
-        if trace.stats.channel=='v':
+        if trace.stats.channel.lower()=='v':
             trace.stats.channel='EHZ'
-        elif trace.stats.channel=='n':
+        elif trace.stats.channel.lower()=='n':
             trace.stats.channel='EHN'
-        elif trace.stats.channel=='e':
+        elif trace.stats.channel.lower()=='e':
             trace.stats.channel='EHE'                       
         
         orientation = trace.stats.station[3].strip()  # Position 4        
