@@ -13,12 +13,60 @@ from pprint import pprint
 from flovopy.processing.sam import VSAM
 from flovopy.analysis.asl import ASL, initial_source, make_grid, dome_location
 import pickle
-
-from flovopy.wrappers.MVOE_conversion_pipeline.db_backup import backup_db
-
 from math import isnan
 
-####################################################################
+from flovopy.wrappers.MVOE_conversion_pipeline.db_backup import backup_db
+DB_PATH = "/home/thompsong/public_html/seiscomp_like.sqlite"
+if not backup_db(DB_PATH, __file__):
+    exit()
+# === USER CONFIG ===
+TEST_MODE = False # no writing to database if True
+N = None  # Set to None for all
+STATIONXML_PATH = "/data/SEISAN_DB/CAL/MV.xml"
+OUTPUT_JSON_DIR = "/data/metrics_json"
+OUTPUT_PKL_DIR = "/data/metrics_pkl"
+DEFAULT_SOURCE_LOCATION = {"latitude": 16.712, "longitude": -62.177, "depth": 3000.0}
+scriptname = os.path.basename(__file__).replace('.py', '')     
+TOP_DIR = os.path.join('/data', scriptname)
+os.makedirs(TOP_DIR, exist_ok=True)
+# === Ensure output dirs exist ===
+#os.makedirs(OUTPUT_JSON_DIR, exist_ok=True)
+#os.makedirs(OUTPUT_PKL_DIR, exist_ok=True)
+
+# === Connect to DB ===
+conn = sqlite3.connect(DB_PATH)
+# Set the row factory to sqlite3.Row to access columns by name
+#conn.row_factory = sqlite3.Row
+#cur = conn.cursor()
+
+query_result_file = os.path.join(TOP_DIR, f'query_result.pkl')
+
+# === Try loading from .pkl if it exists ===
+if os.path.isfile(query_result_file):
+    print(f"[INFO] Loading cached query result from {query_result_file}")
+    df = pd.read_pickle(query_result_file)
+else:
+    print("[INFO] Running query and saving result to cache.")
+    query = '''
+    SELECT e.public_id, o.latitude, o.longitude, o.depth, ec.time, ec.author, ec.source, ec.dfile, ec.mainclass, ec.subclass, mfs.dir
+    FROM event_classifications ec
+    JOIN events e ON ec.event_id = e.public_id
+    LEFT JOIN origins o ON o.event_id = e.public_id
+    JOIN mseed_file_status mfs ON ec.dfile = mfs.dfile
+    LEFT JOIN magnitudes m ON m.event_id = e.public_id
+    WHERE ec.subclass IS NOT NULL
+    GROUP BY e.public_id
+    '''
+    if N:
+        query += f" LIMIT {N}"
+
+
+    df = pd.read_sql_query(query, conn)
+    df.to_pickle(query_result_file)
+
+# === Load station inventory ===
+inventory = read_inventory(STATIONXML_PATH)
+
 def stream_metrics_to_dataframe(st):
     rows = []
 
@@ -47,72 +95,6 @@ def filter_traces_by_inventory(stream, inventory):
     # Filter manually based on full SEED id
     filtered_traces = [tr for tr in stream if tr.id in inv_ids]
     return stream.__class__(traces=filtered_traces)
-####################################################################
-
-DB_PATH = "/home/thompsong/public_html/seiscomp_like.sqlite"
-if not backup_db(DB_PATH, __file__):
-    exit()
-# === USER CONFIG ===
-TEST_MODE = False # no writing to database if True
-N = None  # Set to None for all
-STATIONXML_PATH = "/data/SEISAN_DB/CAL/MV.xml"
-#OUTPUT_JSON_DIR = "/data/metrics_json"
-#OUTPUT_PKL_DIR = "/data/metrics_pkl"
-scriptname = os.path.basename(__file__).replace('.py', '')     
-TOP_DIR = os.path.join('/data', scriptname)
-os.makedirs(TOP_DIR, exist_ok=True)
-# === Ensure output dirs exist ===
-#os.makedirs(OUTPUT_JSON_DIR, exist_ok=True)
-#os.makedirs(OUTPUT_PKL_DIR, exist_ok=True)
-
-# === Connect to DB ===
-conn = sqlite3.connect(DB_PATH)
-# Set the row factory to sqlite3.Row to access columns by name
-#conn.row_factory = sqlite3.Row
-#cur = conn.cursor()
-
-query_result_file = os.path.join(TOP_DIR, f'query_result.pkl')
-query_dataframe_pkl = os.path.join(TOP_DIR, f'query_dataframe.pkl')
-
-if os.path.isfile(query_dataframe_pkl):
-    df = pd.read_pickle(query_dataframe_pkl)
-else:
-
-    # === Try loading from .pkl if it exists ===
-    if os.path.isfile(query_result_file):
-        print(f"[INFO] Loading cached query result from {query_result_file}")
-        df = pd.read_pickle(query_result_file)
-    else:
-        print("[INFO] Running query and saving result to cache.")
-        query = '''
-        SELECT e.public_id, o.latitude, o.longitude, o.depth, ec.time, ec.author, ec.source, ec.dfile, ec.mainclass, ec.subclass, mfs.dir
-        FROM event_classifications ec
-        JOIN events e ON ec.event_id = e.public_id
-        LEFT JOIN origins o ON o.event_id = e.public_id
-        JOIN mseed_file_status mfs ON ec.dfile = mfs.dfile
-        LEFT JOIN magnitudes m ON m.event_id = e.public_id
-        WHERE ec.subclass IS NOT NULL
-        GROUP BY e.public_id
-        '''
-        if N:
-            query += f" LIMIT {N}"
-
-
-        df = pd.read_sql_query(query, conn)
-        df.to_pickle(query_result_file)
-    
-    # sort dataframe
-    df = df.sort_values(by="time")
-    df.to_pickle(query_dataframe_pkl)
-
-#df=df[df['subclass']=='r']    
-print(f'got {len(df)} rows')
-
-
-# === Load station inventory ===
-inventory = read_inventory(STATIONXML_PATH)
-
-DEFAULT_SOURCE_LOCATION = {"latitude": 16.712, "longitude": -62.177, "depth": 3000.0}
 
 
 # === Set up ASL ===
@@ -138,25 +120,25 @@ else:
         pickle.dump(gridobj, f)
     print(f"[INFO] Saved gridobj to {grid_cache_file}")
 
+df=df[df['subclass']=='r']
+print(f'got {len(df)} rows')
+
+# sort dataframe
+df = df.sort_values(by="time")
+
+chosen_dfile = '9902-09-1658-33S.MVO_14_1.cleaned'
+df = df[df['dfile']==chosen_dfile]
+print(df)
+
+
 # === Process each event ===
 lod = []
 window_seconds = 5
-
 # === Iterate over rows as dicts ===
 for r in df.to_dict(orient="records"):
     
     outdir = os.path.join(TOP_DIR, r['dfile']).replace('.cleaned','')
-    if os.path.isdir(outdir):
-        magcsv = os.path.join(outdir, 'magnitudes.csv')
-        if os.path.isfile(magcsv):
-            magdf = pd.read_csv(magcsv)
-            if magdf['ME'].notna().any():
-                continue
-
     os.makedirs(outdir, exist_ok=True)
-    if TEST_MODE:
-        print("\n[TEST MODE] Row:")
-        pprint(r)
 
     print(f"\n[INFO] Processing {r['public_id']} {r['dfile']}")
 
@@ -190,15 +172,21 @@ for r in df.to_dict(orient="records"):
         "depth": r['depth'] if r['depth'] is not None else DEFAULT_SOURCE_LOCATION["depth"]
     }
 
+
+    print(source_coords)
+    exit()
+
     # Compute metrics
     try:
         est, df = est.ampengfftmag(inventory, source_coords, verbose=True, snr_min=3.0)
-        est.write(os.path.join(outdir, 'enhanced_stream.mseed'), format='MSEED')
-        df.to_csv(os.path.join(outdir, 'magnitudes.csv'))
+        print(est)
+        print(df)
+        #est.write(os.path.join(outdir, 'enhanced_stream.mseed'), format='MSEED')
+        #df.to_csv(os.path.join(outdir, 'magnitudes.csv'))
     except Exception as e:
         print('ampengfftmag failed', e)
         continue
-        
+    continue
     # Classify
     features = {}
     for tr in est:
@@ -307,56 +295,3 @@ for r in df.to_dict(orient="records"):
     except Exception as e:
         print(e)
         
-
-
-    """
-    if TEST_MODE:
-        print(est)
-        print(df)
-        print(source_coords)
-        for tr in est:
-            print()
-            print(tr.id, tr.stats.metrics.snr, tr.stats.metrics.energy_magnitude)
-        #est.plot(outfile=f'{r["dfile"].replace("cleaned", "png")}', equal_scale=False)
-        #print(eev)
-        continue
-
-    
-    # Convert to EnhancedEvent
-    try:
-        eev = est.to_enhancedevent(event_id=r['public_id'], dfile=r['dfile'], origin_time=r['time'])
-        # Write EnhancedEvent to DB
-        eev.write_to_db(conn)
-
-        # Save as JSON
-        json_path = os.path.join(OUTPUT_JSON_DIR, f"{event_id}.json")
-        eev.to_json(json_path)
-
-        # Save as pickle (strip waveform data)
-        est.to_pickle(OUTPUT_PKL_DIR, remove_data=True, mseed_path=mseed_path)
-
-    except Exception as e:
-        print(f"[ERROR] Failed to process {r['public_id']}: {e}")
-
-    
-    # Now we want to create a dataframe
-    this_dict = {'time': r['time'], 'dfile': r['dfile']}
-    for tr in est:
-        this_dict[tr.id] = tr.stats.metrics.peakamp *1e6
-    print(this_dict)
-    lod.append(this_dict)
-    """
-print("\n[✓] Done processing all events.")
-exit()
-
-"""
-df = pd.DataFrame(lod)
-df['time'] = pd.to_datetime(df['time'])
-df.set_index('time', inplace=True)
-df.sort_index(inplace=True)
-
-print(df)
-df.to_csv('trace_metrics_throwaway.csv')   
-
-print("\n[✓] Done processing all events.")
-"""

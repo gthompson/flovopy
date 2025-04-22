@@ -893,7 +893,7 @@ def estimate_distance(trace, source_coords):
     sta = trace.stats.coordinates
     lat1, lon1, elev = sta['latitude'], sta['longitude'], sta.get('elevation', 0)
     lat2, lon2, depth = source_coords['latitude'], source_coords['longitude'], source_coords.get('depth', 0)
-
+    print(trace.id, lat1, lat2, lon1, lon2)
     epic_dist, _, _ = gps2dist_azimuth(lat1, lon1, lat2, lon2)
     dz = (depth + elev)  # add elevation since depth is below surface
     return np.sqrt(epic_dist**2 + dz**2)
