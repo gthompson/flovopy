@@ -3,6 +3,7 @@ import os
 from obspy import read, read_inventory, Stream, Trace, UTCDateTime
 from scipy.signal import welch
 from obspy.signal.quality_control import MSEEDMetadata 
+from legacy import _fix_legacy_id
 
 #######################################################################
 ##                Trace  tools                                       ##
