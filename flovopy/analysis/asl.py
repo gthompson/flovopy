@@ -168,6 +168,7 @@ class Grid:
         
         fig.plot(x=self.gridlon.reshape(-1), y=self.gridlat.reshape(-1), style=stylestr, pen='black')
         fig.show()
+        fig._cleanup()
 
 def initial_source(lat=dome_location['lat'], lon=dome_location['lon']):
     return {'lat':lat, 'lon':lon}
@@ -213,6 +214,7 @@ def plot_VSAM(dsamobj, gridobj, nodenum, metric='mean', DEM_DIR=None):
     #ax = fig.axes()
     #ax[0].plot(gridobj.gridlon[nodenum], gribobj.gridlat[nodenum], 'o')
     fig.plot(gridobj.gridlon[nodenum], gridobj.gridlat[nodenum], 'o')
+    fig._cleanup()
 
 # pretty sure that i had a different version here that worked. this one is crashing because trying to plot nodenum 100 of a 100-length tr.data
 # what I really should be plotting is the corrections at node 100
@@ -570,7 +572,8 @@ class ASL:
                 if outfile:
                     fig.savefig(outfile)
                 else:
-                    fig.show();                
+                    fig.show();     
+                fig._cleanup()           
                 
             else:    
                 # Heatmap
@@ -591,6 +594,7 @@ class ASL:
                     fig.savefig(outfile)
                 else:
                     fig.show();   
+                fig._cleanup()
             
             
 
@@ -606,7 +610,7 @@ class ASL:
             
         else: # no location data      
             fig = montserrat_topo_map(zoom_level=zoom_level, inv=self.inventory, show=True, add_labels=add_labels)
-
+            fig._cleanup()
 
 
     def source_to_obspyevent(self, event_id=None):   

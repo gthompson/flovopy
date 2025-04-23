@@ -1,7 +1,7 @@
 import glob
 import os
 import pandas as pd
-from obspy import read_events
+from obspy import read_events, UTCDateTime
 
 TOPDIR = '/data/b18_waveform_processing'
 all = sorted(glob.glob(os.path.join(TOPDIR, "*MVO*")))
@@ -30,4 +30,4 @@ for thisdir in all:
                         r['amplitude'] = ev.amplitudes[i].generic_amplitude
                         lod.append(r)
 df = pd.DataFrame(lod)
-df.to_csv('/home/thompsong/Dropbox/ASL_results.csv')
+df.to_csv(f'/home/thompsong/Dropbox/ASL_results_{int(UTCDateTime().timestamp)}.csv')
