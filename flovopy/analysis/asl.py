@@ -15,7 +15,7 @@ import pygmt
 # ObsPy core and event tools
 import obspy
 from obspy import Stream, Trace, UTCDateTime, read_events
-from obspy.core.event import Event, Catalog, ResourceIdentifier, Origin, Amplitude, QuantityError, OriginQuality
+from obspy.core.event import Event, Catalog, ResourceIdentifier, Origin, Amplitude, QuantityError, OriginQuality, Comment
 from obspy.geodetics import locations2degrees, degrees2kilometers, gps2dist_azimuth
 # Your internal or local modules (assumed to exist)
 # For example:
@@ -247,7 +247,6 @@ class ASL:
         self.station_coordinates = {}
         self.amplitude_corrections = {}
         self.window_seconds = window_seconds
-        self.amplitude_corrections = None
         self.surfaceWaves = False
         self.wavespeed_kms = None
         self.wavelength_km = None
@@ -340,11 +339,10 @@ class ASL:
         Q=None,
         fix_peakf=None,
         cache_dir="asl_cache",
-        # force_recompute=False,
     ):
         """
-        Compute amplitude corrections using geometric spreading and inelastic attenuation.
-        Results are cached on disk using parameters as the cache key.
+        Compute amplitude corrections for all channels in the inventory using geometric spreading
+        and inelastic attenuation. Results are cached for reuse across events.
 
         Parameters
         ----------
@@ -355,7 +353,7 @@ class ASL:
         Q : float or None
             Attenuation factor. Required if inelastic corrections are used.
         fix_peakf : float or None
-            Fixed peak frequency to use in calculations. If None, inferred from metric.
+            Fixed peak frequency to use in calculations. If None, defaults to 1.0.
         cache_dir : str
             Directory for saving and loading cached corrections.
         """
@@ -364,54 +362,57 @@ class ASL:
         if not os.path.isdir(cache_dir):
             os.makedirs(cache_dir)
 
-        cache_key = f"ampcorr_Q{int(round(Q or 99))}_V{int(round(wavespeed_kms))}_f{int(round(fix_peakf or 1.0))}_{'surf' if surfaceWaves else 'body'}.pkl"
+        peakf = fix_peakf or 2.0
+        cache_key = f"ampcorr_Q{int(round(Q or 99))}_V{int(round(wavespeed_kms))}_f{int(round(peakf))}_{'surf' if surfaceWaves else 'body'}.pkl"
         cache_path = os.path.join(cache_dir, cache_key)
 
-        # Load from cache if possible
+        # Try loading cached corrections
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, "rb") as f:
                     self.amplitude_corrections = pickle.load(f)
                 print(f"[CACHE HIT] Loaded amplitude corrections from {cache_path}")
-                return
             except Exception as e:
                 print(f"[WARN] Failed to load cache: {e}")
+                self.amplitude_corrections = {}
+        else:
+            print(f"[INFO] Creating amplitude corrections for all inventory channels (Q={Q}, f={peakf})")
+            corrections = {}
+            for net in self.inventory:
+                for sta in net:
+                    for cha in sta:
+                        seed_id = f"{net.code}.{sta.code}.{cha.location_code}.{cha.code}"
+                        try:
+                            dist_km = self.node_distances_km[seed_id]
+                        except KeyError:
+                            print(f"[WARN] No node distances for {seed_id}, skipping")
+                            continue
 
-        # Compute corrections
-        corrections = {}
-        peakf_last = None  # for diagnostic/debug only
-        for seed_id, df in self.samobject.dataframes.items():
-            peakf = fix_peakf or self.set_peakf(self.metric, df)
-            peakf_last = peakf  # will overwrite until last iteration
-            wavelength_km = peakf * wavespeed_kms
-            distance_km = self.node_distances_km[seed_id]
+                        gsc = VSAM.compute_geometrical_spreading_correction(
+                            dist_km, cha.code[-3:], surfaceWaves=surfaceWaves,
+                            wavespeed_kms=wavespeed_kms, peakf=peakf
+                        )
+                        isc = VSAM.compute_inelastic_attenuation_correction(
+                            dist_km, peakf, wavespeed_kms, Q
+                        )
+                        corrections[seed_id] = gsc * isc
 
-            gsc = VSAM.compute_geometrical_spreading_correction(
-                distance_km, seed_id[-3:], surfaceWaves=surfaceWaves,
-                wavespeed_kms=wavespeed_kms, peakf=peakf
-            )
+            # Save new cache
+            try:
+                with open(cache_path, "wb") as f:
+                    pickle.dump(corrections, f)
+                print(f"[CACHE SAVE] Amplitude corrections saved to {cache_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to save cache: {e}")
+            self.amplitude_corrections = corrections
 
-            isc = VSAM.compute_inelastic_attenuation_correction(
-                distance_km, peakf, wavespeed_kms, Q
-            )
-
-            corrections[seed_id] = gsc * isc
-
-        # Save corrections to cache
-        try:
-            with open(cache_path, "wb") as f:
-                pickle.dump(corrections, f)
-            print(f"[CACHE SAVE] Amplitude corrections saved to {cache_path}")
-        except Exception as e:
-            print(f"[WARN] Failed to save cache: {e}")
-
-        # Save attributes
-        self.amplitude_corrections = corrections
+        # Assign class attributes
         self.surfaceWaves = surfaceWaves
         self.wavespeed_kms = wavespeed_kms
-        self.wavelength_km = peakf_last * wavespeed_kms if peakf_last else None
         self.Q = Q
-        self.peakf = fix_peakf or peakf_last
+        self.peakf = peakf
+        self.wavelength_km = peakf * wavespeed_kms
+
 
 
     def metric2stream(self):
@@ -484,10 +485,11 @@ class ASL:
         gridlat = self.gridobj.gridlat.reshape(-1)
         gridlon = self.gridobj.gridlon.reshape(-1)
         st = self.metric2stream()
+
         seed_ids = [tr.id for tr in st]
         t = st[0].times('utcdatetime')
-
         n = len(t)
+
         source_DR = np.empty(n, dtype=float)
         source_lat = np.empty(n, dtype=float)
         source_lon = np.empty(n, dtype=float)
@@ -496,10 +498,22 @@ class ASL:
         source_nsta = np.empty(n, dtype=int)
 
         for i in range(n):
-            DR_stations_nodes = np.empty((len(st), len(gridlat)))
-            for j, seed_id in enumerate(seed_ids):
-                tr = st.select(id=seed_id)[0]
-                DR_stations_nodes[j] = self.amplitude_corrections[seed_id] * tr.data[i]
+
+            DR_stations_nodes = np.full((len(st), len(gridlat)), np.nan)
+
+            for j, tr in enumerate(st):
+                seed_id = tr.id
+                station = tr.stats.station
+
+                # Try using seed_id for correction, fallback to station
+                correction = self.amplitude_corrections.get(seed_id)
+                if correction is None:
+                    correction = self.amplitude_corrections.get(station)
+                    if correction is None:
+                        print(f"[WARN] No correction for {seed_id} or {station}, skipping")
+                        continue
+
+                DR_stations_nodes[j] = correction * tr.data[i]
 
             DR_mean_nodes = np.nanmean(DR_stations_nodes, axis=0)
             DR_std_nodes = np.nanstd(DR_stations_nodes, axis=0)
@@ -513,10 +527,11 @@ class ASL:
 
             # Compute azgap & nsta at this location
             station_coords = []
-            for seed_id in seed_ids:
-                coords = self.station_coordinates.get(seed_id)
+            for tr in st:
+                coords = self.station_coordinates.get(tr.id) or self.station_coordinates.get(tr.stats.station)
                 if coords:
                     station_coords.append((coords['latitude'], coords['longitude']))
+
             azgap, nsta = compute_azimuthal_gap(source_lat[i], source_lon[i], station_coords)
             source_azgap[i] = azgap
             source_nsta[i] = nsta
@@ -534,6 +549,9 @@ class ASL:
         self.source_to_obspyevent()
         self.located = True
         return self.source
+
+        # TODO: Refactor module to use station-based amplitude corrections consistently, rather than full SEED IDs.
+
 
 
     def plot(self, zoom_level=1, threshold_DR=0, scale=1, join=False, number=0, add_labels=False, equal_size=False, outfile=None, stations=None):
@@ -684,8 +702,8 @@ class ASL:
             # --- Origin Quality ---
             oq = OriginQuality()
             oq.standard_error = float(misfit_val) if misfit_val is not None else None
-            oq.azimuthal_gap = float(azgap[i]) if isinstance(azgap, (list, np.ndarray)) else float(azgap)
-            oq.used_station_count = int(nsta) if nsta is not None else None
+            oq.azimuthal_gap = float(azgap[i]) if azgap[i] is not None else None
+            oq.used_station_count = int(nsta[i]) if nsta[i] is not None else None
 
             # Distance metrics in km (stored in fields meant for degrees — documented above)
             distances_km = []
@@ -716,6 +734,7 @@ class ASL:
             event.amplitudes.append(amplitude)
 
         self.event = event
+
 
 
     def save_event(self, outfile=None):

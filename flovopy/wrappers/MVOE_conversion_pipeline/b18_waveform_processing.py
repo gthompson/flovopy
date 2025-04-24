@@ -247,35 +247,39 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
         outdir = os.path.join(TOP_DIR, ymdfolder, r['dfile']).replace('.cleaned','')
         if not os.path.isdir(outdir):
             oldoutdir = os.path.join(TOP_DIR, r['dfile']).replace('.cleaned', '')
-            if os.path.isidr(oldoutdir):
+            if os.path.isdir(oldoutdir):
                 shutil.move(oldoutdir, outdir)
             else:
                 os.makedirs(outdir, exist_ok=True)
 
         # === Check if ASL should be re-run ===
+        '''
         if r['subclass'] in 're' and not needs_asl_reprocessing(outdir, r['subclass']):
             print(f"[SKIP] ASL already completed with OriginQuality for: {r['dfile']}")
             return rownum, r['time'], 2, 0.0
-
-        # === Check for magnitudes.csv with ME value (result = 1) ===
-        magcsv = os.path.join(outdir, 'magnitudes.csv')
-        if os.path.isfile(magcsv):
-            magdf = pd.read_csv(magcsv)
-            if magdf['ME'].notna().any():
-                print(f"[SKIP] Magnitudes exist, skipping to ASL decision: {r['dfile']}")
-                success = 1  # we allow partial continuation to ASL
+        '''
+        if r['subclass'] in 're':
+            pass
+        else:
+            # === Check for magnitudes.csv with ME value (result = 1) ===
+            magcsv = os.path.join(outdir, 'magnitudes.csv')
+            if os.path.isfile(magcsv):
+                magdf = pd.read_csv(magcsv)
+                if magdf['ME'].notna().any():
+                    print(f"[SKIP] Magnitudes exist, this event is complete: {r['dfile']}")
+                    return rownum, r['time'], 1, float(UTCDateTime() - start_time)
 
         # === Proceed with waveform and metric processing ===
         mseed_path = os.path.join(r['dir'], r['dfile'])
         if not os.path.exists(mseed_path):
             print(f"[WARN] Missing waveform file: {mseed_path}")
-            return rownum, r['time'], 0, 0.0
+            return rownum, r['time'], 0, float(UTCDateTime() - start_time)
 
         st = read(mseed_path)
         st = st.select(channel="*H*")
         if len(st) == 0:
             print('[WARN] No H-component traces after filtering')
-            return rownum, r['time'], 0, 0.0
+            return rownum, r['time'], 0, float(UTCDateTime() - start_time)
 
         st.filter('highpass', freq=0.5, corners=2, zerophase=True)
         est = EnhancedStream(stream=st)
@@ -285,11 +289,11 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
             if not isnan(r[key]):
                 source_coords[key] = r[key]
 
-        # If not already computed, compute magnitude metrics
-        if success < 1:
-            est, aefdf = est.ampengfftmag(inventory, source_coords, verbose=True, snr_min=3.0)
-            est.write(os.path.join(outdir, 'enhanced_stream.mseed'), format='MSEED')
-            aefdf.to_csv(os.path.join(outdir, 'magnitudes.csv'))
+
+        est, aefdf = est.ampengfftmag(inventory, source_coords, verbose=True, snr_min=3.0)
+        est.write(os.path.join(outdir, 'enhanced_stream.mseed'), format='MSEED')
+        aefdf.to_csv(os.path.join(outdir, 'magnitudes.csv'))
+
 
         # === Classification ===
         features = {}
@@ -321,7 +325,13 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
             return rownum, r['time'], success, float(UTCDateTime() - start_time)
 
         # === Prepare filtered stream for ASL ===
-        peakf = metrics_df['peakf'].median()
+        try:
+            peakf = metrics_df['peakf'].median()
+        except Exception as e:
+            for tr in est:
+                print(tr.id, tr.stats.metrics)
+            print(f'metrics_df={metrics_df}')
+            raise e
         filt_est = est.copy().select(component='Z')
 
         if len(filt_est) < asl_config['min_stations']:
@@ -380,16 +390,16 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
                 pickle.dump(aslobj.node_distances_km, f)
 
         # === Amplitude correction cache ===
-        ampcorr_cache_file = os.path.join(
-            TOP_DIR, f"amplitude_corrections_Q{asl_config['Q']}_F{peakf}.pkl"
-        )
+        #ampcorr_cache_file = os.path.join(
+        #    TOP_DIR, f"amplitude_corrections_Q{asl_config['Q']}_F{peakf}.pkl"
+        #) # filename is made up internally in this function, which computes for whole inventory
         print(f"[INFO] Computing amplitude corrections (Q={asl_config['Q']}, f={peakf})...")
         aslobj.compute_amplitude_corrections(
             surfaceWaves=True,
             wavespeed_kms=asl_config['surfaceWaveSpeed_kms'],
             Q=asl_config['Q'],
             fix_peakf=peakf,
-            cache_dir=os.path.dirname(ampcorr_cache_file)
+            cache_dir=TOP_DIR,
         )
 
         # === Location and plotting ===
