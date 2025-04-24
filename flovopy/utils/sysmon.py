@@ -7,10 +7,10 @@ from datetime import datetime
 import argparse
 import subprocess
 
-SMS_ALERT_ENABLED = True
+SMS_ALERT_ENABLED = False  # Set to False by default
 SMS_ALERT_THRESH = 85  # temperature threshold (°C)
-SMS_GATEWAY = os.environ.get("SYSMON_SMS_GATEWAY")  # e.g., 5551234567@vtext.com
-SMS_SENDER = os.environ.get("SYSMON_SMS_SENDER", "SysMon")  # shows up on some gateways
+SMS_GATEWAY = os.environ.get("SYSMON_SMS_GATEWAY")  # e.g., 5551234567@tmomail.net
+SMS_SENDER = os.environ.get("SYSMON_SMS_SENDER", "SysMon")
 SMS_SENT_ALREADY = False
 
 
@@ -21,17 +21,18 @@ def send_sms_alert(message):
 
     try:
         subprocess.run(
-            [
-                "mail", 
-                "-s", f"SysMon Alert from {SMS_SENDER}", 
-                SMS_GATEWAY
-            ],
+            ["mail", "-s", f"SysMon Alert from {SMS_SENDER}", SMS_GATEWAY],
             input=message.encode("utf-8"),
             check=True
         )
         print(f"[SMS SENT] to {SMS_GATEWAY}")
     except Exception as e:
         print(f"[SMS ERROR] Failed to send alert: {e}")
+
+
+def send_test_sms():
+    message = f"[TEST] SysMon test alert at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+    send_sms_alert(message)
 
 
 def log_system_status_csv(logfile, rownum=None, cooldown=True):
@@ -116,16 +117,20 @@ def plot_system_log(csv_path, out_file=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="System monitor log and plot utility.")
-    parser.add_argument("--log", type=str, help="Path to system monitor CSV log file", required=True)
+    parser.add_argument("--log", type=str, help="Path to system monitor CSV log file", required=False)
     parser.add_argument("--plot", action="store_true", help="Plot system metrics from log")
     parser.add_argument("--rownum", type=int, help="Row number to log (optional)")
     parser.add_argument("--lognow", action="store_true", help="Log system status now")
+    parser.add_argument("--sms-test", action="store_true", help="Send test SMS alert")
     args = parser.parse_args()
 
-    if args.lognow:
+    if args.sms_test:
+        send_test_sms()
+
+    if args.lognow and args.log:
         log_system_status_csv(args.log, rownum=args.rownum)
 
-    if args.plot:
+    if args.plot and args.log:
         plot_system_log(args.log)
 
     '''

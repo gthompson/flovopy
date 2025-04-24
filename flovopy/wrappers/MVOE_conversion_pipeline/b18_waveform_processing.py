@@ -224,6 +224,17 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
         gc.collect()
         return rownum, r['time'], success, float(duration)
 '''
+def needs_asl_reprocessing(outdir, subclass):
+    if subclass not in 're':
+        return False
+    for qml in glob.glob(os.path.join(outdir, 'event*.qml')):
+        try:
+            with open(qml, 'r') as f:
+                if "OriginQuality" not in f.read():
+                    return True
+        except Exception:
+            return True
+    return False
 
 def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_config):
     print(f'\nProcessing row {rownum} of {numrows}')
@@ -241,10 +252,9 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
             else:
                 os.makedirs(outdir, exist_ok=True)
 
-        # === Check for ASL map image (result = 2) ===
-        mapfile = glob.glob(os.path.join(outdir, 'map_Q*.png'))
-        if len(mapfile) == 1 and os.path.isfile(mapfile[0]):
-            print(f"[SKIP] ASL map exists: {mapfile[0]}")
+        # === Check if ASL should be re-run ===
+        if r['subclass'] in 're' and not needs_asl_reprocessing(outdir, r['subclass']):
+            print(f"[SKIP] ASL already completed with OriginQuality for: {r['dfile']}")
             return rownum, r['time'], 2, 0.0
 
         # === Check for magnitudes.csv with ME value (result = 1) ===
@@ -306,9 +316,8 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
         success = 1  # at least the core metric work succeeded
 
         # === Determine if ASL should be run ===
-        subclass = r.get('new_subclass') or r.get('subclass')
-        if subclass not in 're':
-            print(f"[INFO] Skipping ASL: subclass '{subclass}' not in ['r', 'e']")
+        if not (r.get('new_subclass') in 're' or r.get('subclass') in 're'):
+            print(f"[INFO] Skipping ASL: subclass not in ['r', 'e']")
             return rownum, r['time'], success, float(UTCDateTime() - start_time)
 
         # === Prepare filtered stream for ASL ===
@@ -426,13 +435,14 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
 
 
 def process_chunk(chunk_rows, start_idx, numrows, TOP_DIR, source_coords, inventory, asl_config):
+    logfile = os.path.join(TOP_DIR, "system_monitor.csv")
     pid = os.getpid()
     proc_name = multiprocessing.current_process().name
     chunk_start_time = UTCDateTime()
     worker = f'{proc_name} (PID {pid}) at {chunk_start_time}'
     print(f"[INFO] Worker {worker} is processing rows {start_idx} to {start_idx + len(chunk_rows) - 1}")
     #print(f"\n[CHUNK START] Processing rows {start_idx} to {start_idx + len(chunk_rows) - 1} at {chunk_start_time}")
-    logfile = os.path.join(TOP_DIR, "system_monitor.csv")
+
     results = []
     
     for i, row in enumerate(chunk_rows):
