@@ -98,7 +98,8 @@ def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, ce
     # plot the topographic contour lines
     fig.grdcontour(
         grid=ergrid,
-        interval=contour_interval,
+        #interval=contour_interval,
+        levels=contour_interval,
         annotation="%d+f6p" % contour_interval,
         limit="-1300/1300", #to only display it below 
         pen="a0.15p"
@@ -751,6 +752,74 @@ class ASL:
             pprint(self.event)
 
 
+def plot_heatmap_montserrat_colored(df, lat_col='latitude', lon_col='longitude', amp_col='amplitude',
+                                     zoom_level=0, inventory=None, color_scale=0.4,
+                                     cmap='turbo', log_scale=True, contour=False,
+                                     node_spacing_m=50, outfile=None):
+    """
+    Plot ASL heatmap on Montserrat topography using tessellated color-filled squares.
+
+    Parameters:
+    - df: pandas DataFrame with lat/lon and amplitude columns
+    - lat_col, lon_col, amp_col: column names
+    - zoom_level: zoom level for montserrat_topo_map
+    - inventory: ObsPy Inventory for station overlay
+    - color_scale: multiplier for colormap normalization
+    - cmap: GMT colormap name (e.g., 'turbo', 'hot', 'viridis')
+    - log_scale: apply log10 scaling to energy
+    - contour: overlay contour lines on interpolated energy field
+    - node_spacing_m: expected ASL grid spacing in meters (default = 50)
+    - outfile: if given, save the figure; otherwise show it
+    """
+    df = df.copy()
+    df['energy'] = df[amp_col] ** 2
+
+    # Aggregate total energy per node
+    grouped = df.groupby([lat_col, lon_col])['energy'].sum().reset_index()
+    x = grouped[lon_col].to_numpy()
+    y = grouped[lat_col].to_numpy()
+    z = grouped['energy'].to_numpy()
+
+    # Log scale if requested
+    if log_scale:
+        z = np.log10(z + 1e-10)
+
+    # Compute symbol size in degrees (longitude spacing)
+    meters_per_deg_lon = 111320 * np.cos(np.radians(16.7))  # Montserrat lat ~16.7°
+    #node_size_deg = node_spacing_m / meters_per_deg_lon
+    symbol_size_m = node_spacing_m * 0.077/50
+
+    # Build color palette
+    pygmt.makecpt(cmap=cmap,
+                  series=[np.nanmin(z), np.nanmax(z), (np.nanmax(z) - np.nanmin(z)) / 100],
+                  continuous=True)
+
+    # Create base map
+    fig = montserrat_topo_map(zoom_level=zoom_level, inv=inventory, topo_color=False)
+
+    # Plot colored square tiles
+
+    fig.plot(x=x, y=y, style=f"s{symbol_size_m}c", fill=z, cmap=True, pen=None)
+
+    # Optional contours
+    if contour:
+        from scipy.interpolate import griddata
+        xi = np.linspace(min(x), max(x), 200)
+        yi = np.linspace(min(y), max(y), 200)
+        Xi, Yi = np.meshgrid(xi, yi)
+        Zi = griddata((x, y), z, (Xi, Yi), method='linear')
+        fig.grdcontour(grid=Zi, region=fig.region, interval=0.5, pen="0.75p,gray")
+
+    # Add colorbar
+    fig.colorbar(frame='+l"Log10 Total Energy"' if log_scale else '+l"Total Energy"')
+
+    # Save or show
+    if outfile:
+        fig.savefig(outfile)
+    else:
+        fig.show()
+
+    return fig
 
 def compute_azimuthal_gap(origin_lat, origin_lon, station_coords):
     """
