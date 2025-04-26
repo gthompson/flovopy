@@ -2307,7 +2307,7 @@ def plot_event_statistics(
     ax.fill_between(df['time'], df['event_count'], step='mid', color='blue', alpha=0.2)
     ax.set_ylabel('Event Count', color='blue')
     ax.tick_params(axis='y', labelcolor='blue')
-    ax.set_xlabel('Time')
+    ax.set_xlabel('')
 
     # Format time axis
     #format_time_axis(ax, df['time'])
