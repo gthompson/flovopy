@@ -60,10 +60,10 @@ coverage.xml
 .pytest_cache/
 
 # Logs and local
-
+.DS_Store
 logs/
 *.log
 *.png
 *.pkl
 *.sqlite
-
+gmt.history

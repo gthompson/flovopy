@@ -44,18 +44,23 @@ def estimate_station_corrections(df, year, min_num_picks=3, verbose=True):
 
     # Find reference station: the one with the most non-NaN values
     ref_id = df_sta.count().idxmax()
+    ref_id1 = 'MV.MBGB..BHZ'
+    ref_id2 = 'MV.MBGB..HHZ'
+    for ref_id in [ref_id1, ref_id2]:
+        if not ref_id in df_sta.columns:
+            break
 
-    # Compute relative correction ratios
-    ratios = df_sta.div(df_sta[ref_id], axis=0)
-    # Remove extreme or invalid pick values (<0.1s or >10s)
-    ratios = ratios.where((ratios >= 0.1) & (ratios <= 10.0))
+        # Compute relative correction ratios
+        ratios = df_sta.div(df_sta[ref_id], axis=0)
+        # Remove extreme or invalid pick values (<0.1s or >10s)
+        ratios = ratios.where((ratios >= 0.1) & (ratios <= 10.0))
 
-    # Describe statistics per station
-    stats = ratios.describe().transpose()
-    stats = stats[['mean', 'std', 'min', '25%', '50%', '75%', 'max', 'count']]
+        # Describe statistics per station
+        stats = ratios.describe().transpose()
+        stats = stats[['mean', 'std', 'min', '25%', '50%', '75%', 'max', 'count']]
 
-    # Output correction factors (mean ratio per station)
-    correction_factors = stats['mean']
+        # Output correction factors (mean ratio per station)
+        correction_factors = stats['mean']
 
     if verbose:
         print(f"\n[INFO] Reference station: {ref_id}")
@@ -64,24 +69,25 @@ def estimate_station_corrections(df, year, min_num_picks=3, verbose=True):
 
     return correction_factors, stats
 
-df = pd.read_csv('all_regionals_station_corrections.csv')
-for year in range(1996,2010,1):
-    corrections, stats = estimate_station_corrections(df, year=year, min_num_picks=6)
-    if corrections.any():
-        stats.reset_index()
-        stats.to_csv(f'station_corrections_{year}.csv', index=True)
+if __name__ == "__main__":
+    df = pd.read_csv('all_regionals_station_corrections.csv')
+    for year in range(1996,2010,1):
+        corrections, stats = estimate_station_corrections(df, year=year, min_num_picks=6)
+        if corrections.any():
+            stats.reset_index()
+            stats.to_csv(f'station_corrections_{year}.csv', index=True)
 
-import os
-def get_correction(year, trace_id):
-    csv = f'station_corrections_{year}.csv'
-    if os.path.isfile(csv):
-        df2 = pd.read_csv(csv, index_col=0)
-        return df2.loc['MV.MBWH..SHZ', 'mean']
-    else:
-        return None
+    import os
+    def get_correction(year, trace_id):
+        csv = f'station_corrections_{year}.csv'
+        if os.path.isfile(csv):
+            df2 = pd.read_csv(csv, index_col=0)
+            return df2.loc['MV.MBWH..SHZ', 'mean']
+        else:
+            return None
 
-print('\n\n\n')
-trace_id = 'MV.MBWH..SHZ'
-for year in range(1996,2010,1):
-    value = get_correction(year, trace_id)
-    print(f'the correction for {trace_id} in year {year} is {value}')
+    print('\n\n\n')
+    trace_id = 'MV.MBWH..SHZ'
+    for year in range(1996,2010,1):
+        value = get_correction(year, trace_id)
+        print(f'the correction for {trace_id} in year {year} is {value}')
