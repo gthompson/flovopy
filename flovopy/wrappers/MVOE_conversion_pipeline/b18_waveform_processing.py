@@ -33,7 +33,6 @@ print('[STARTUP] modules loaded')
 ####################################################################
 def stream_metrics_to_dataframe(st):
     rows = []
-
     for tr in st:
         metrics = {}
         metrics['id'] = tr.id
@@ -60,170 +59,6 @@ def filter_traces_by_inventory(stream, inventory):
     filtered_traces = [tr for tr in stream if tr.id in inv_ids]
     return stream.__class__(traces=filtered_traces)
 
-'''
-def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_config):
-    start_time = UTCDateTime()
-    print('\n', f'Processing row {rownum} of {numrows}')
-
-    try: # try to process this event
-        success = 0
-        outdir = os.path.join(TOP_DIR, r['dfile']).replace('.cleaned','')
-        if os.path.isdir(outdir):
-            magcsv = os.path.join(outdir, 'magnitudes.csv')
-            if os.path.isfile(magcsv):
-                magdf = pd.read_csv(magcsv)
-                if magdf['ME'].notna().any():
-                    raise IOError(f'Already processed: {r["dfile"]}')
-
-        os.makedirs(outdir, exist_ok=True)
-
-        print(f"\n[INFO] Processing {r['public_id']} {r['dfile']}")
-
-        mseed_path = os.path.join(r['dir'], r['dfile'])
-        if not os.path.exists(mseed_path):
-            raise IOError(f"[WARN] File not found: {mseed_path}")
-
-        # Load waveform
-        st = read(mseed_path)
-        for tr in st:
-            if tr.stats.channel[1]!='H':
-                st.remove(tr)
-        if len(st)==0:
-            raise IOError('Stream has no traces')
-        st.filter('highpass', freq=0.5, corners=2, zerophase=True)
-        
-        try:
-            est = EnhancedStream(stream=st)
-        except Exception as e:
-            print('[ERR] cannot make EnhancedStream object')
-            raise e
-
-        for key in ['latitude', 'longitude', 'depth']:
-            if not isnan(r[key]):
-                source_coords[key] = r[key]
-
-        # Compute metrics
-        try:
-            est, aefdf = est.ampengfftmag(inventory, source_coords, verbose=True, snr_min=3.0)
-            est.write(os.path.join(outdir, 'enhanced_stream.mseed'), format='MSEED')
-            aefdf.to_csv(os.path.join(outdir, 'magnitudes.csv'))
-        except Exception as e:
-            print('[ERR] ampengfftmag failed')
-            raise e
-            
-        # Classify
-        features = {}
-        for tr in est:
-            m = getattr(tr.stats, 'metrics', {})
-            for key in ['peakf', 'meanf', 'skewness', 'kurtosis']:
-                if key in m:
-                    features[key] = m[key]
-        #if trigger and 'duration' in trigger:
-        #    features['duration'] = trigger['duration']
-
-        try:
-            classifier = VolcanoEventClassifier()
-            label, score = classifier.classify(features)
-            r['new_subclass'] = label
-            r['new_score'] = score[label]  # the confidence score of the selected subclass
-            print(f"[INFO] Event classified as '{label}' with score {score:.2f}")
-        except Exception as e:
-            print(f"[WARN] Classification failed: {e}")
-
-        row_df = pd.DataFrame([r])
-        row_df.to_csv(os.path.join(outdir, 'database_row.csv'), index=False)
-
-        metrics_df = stream_metrics_to_dataframe(est)
-        metrics_df.to_csv(os.path.join(outdir, 'stream_metrics.csv'))
-        success = 1
-
-        # === Do ASL? ===
-        if r['subclass'] in 're':
-            pass
-        elif hasattr(r, 'new_subclass') and r['new_subclass'] in 're':
-            pass
-        else:
-            raise ValueError('[WARN] subclass not valid for ASL')
-
-        peakf = metrics_df['peakf'].median()
-        filt_est = est.copy().select(component='Z')
-        if len(filt_est)>=asl_config['min_stations']:
-            filt_est.filter('bandpass', freqmin=peakf/1.5, freqmax=peakf*1.5, corners=2, zerophase=True)
-            filt_est = filter_traces_by_inventory(filt_est, inventory)
-        stations = list(set([tr.stats.station for tr in filt_est]))
-        if len(stations)<asl_config['min_stations']:
-            raise ValueError(f'[WARN]: Not enough stations for ASL after filtering {stations}')
-        print(f'Stations remaining after filtering for ASL: {stations}')
-
-        peakf = int(round(peakf))
-        distance_cache_file = os.path.join(TOP_DIR, "grid_node_distances.pkl")
-        ampcorr_cache_file = os.path.join(TOP_DIR, f"amplitude_corrections_Q{asl_config['Q']}_F{peakf}.pkl")             
-                
-        for tr in filt_est:
-            tr.stats['units'] = 'm/s'
-
-        vsamObj = VSAM(stream=filt_est, sampling_interval=1.0)
-        if len(vsamObj.dataframes)==0:
-            raise IOError('No dataframes in vsamObj')
-        vsamObj.plot(equal_scale=True, outfile=os.path.join(outdir, "VSAM.png"))
-        #vsamObj.write(outdir, ext="csv")
-
-        # Initialize ASL object
-        aslobj = ASL(vsamObj, asl_config['vsam_metric'], inventory, asl_config['gridobj'], asl_config['window_seconds'])
-
-        # === Handle node distance caching ===
-        if os.path.isfile(distance_cache_file):
-            try:
-                with open(distance_cache_file, "rb") as f:
-                    aslobj.node_distances_km = pickle.load(f)
-                print(f"[CACHE HIT] Loaded node distances from {distance_cache_file}")
-            except Exception as e:
-                print(f"[WARN] Failed to load node distances: {e}")
-                print("[INFO] Recomputing node distances...")
-                aslobj.compute_grid_distances()
-                with open(distance_cache_file, "wb") as f:
-                    pickle.dump(aslobj.node_distances_km, f)
-        else:
-            print("[INFO] Computing node distances from scratch...")
-            aslobj.compute_grid_distances()
-            with open(distance_cache_file, "wb") as f:
-                pickle.dump(aslobj.node_distances_km, f)
-
-        # === Compute amplitude corrections with internal caching ===
-        print(f"[INFO] Ensuring amplitude corrections (Q={asl_config['Q']}, f={peakf}) are available...")
-        aslobj.compute_amplitude_corrections(
-            surfaceWaves=True,
-            wavespeed_kms=asl_config['surfaceWaveSpeed_kms'],
-            Q=asl_config['Q'],
-            fix_peakf=peakf,
-            cache_dir=os.path.dirname(ampcorr_cache_file)  # Use the same folder for caching
-        )
-
-        try:
-            aslobj.fast_locate()
-        except Exception as e:
-            print('[ERR] ASL location failed')
-            raise e
-
-        aslobj.print_event()
-        aslobj.save_event(outfile=os.path.join(outdir, f"event_Q{asl_config['Q']}_F{peakf}.qml" ))
-        try:
-            aslobj.plot(zoom_level=0, threshold_DR=0.0, scale=0.2, join=True, number=0,
-                equal_size=False, add_labels=True,
-                stations=[tr.stats.station for tr in est],
-                outfile=os.path.join(outdir, f"map_Q{asl_config['Q']}_F{peakf}.png" )
-                )
-        except Exception as e:
-            print('[ERR] Cannot plot ASL object')
-            raise e
-        success = 2
-    except Exception as e:
-        print(e)
-    finally:
-        duration = UTCDateTime() - start_time  # seconds as float
-        gc.collect()
-        return rownum, r['time'], success, float(duration)
-'''
 def needs_asl_reprocessing(outdir, subclass):
     if subclass not in 're':
         return False
@@ -236,30 +71,150 @@ def needs_asl_reprocessing(outdir, subclass):
             return True
     return False
 
-def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_config):
-    print(f'\nProcessing row {rownum} of {numrows}')
-    start_time = UTCDateTime()
-    success = 0
+def make_enhanced_stream(r, inventory, source_coords):
+    mseed_path = os.path.join(r['dir'], r['dfile'])
+    if not os.path.exists(mseed_path):
+        print(f"[WARN] Missing waveform file: {mseed_path}")
+        return None, None
+
+    st = read(mseed_path)
+    st = st.select(channel="*H*")
+    if len(st) == 0:
+        print('[WARN] No H-component traces after filtering')
+        return None, None
+
+    st.filter('highpass', freq=0.5, corners=2, zerophase=True)
+    est = EnhancedStream(stream=st)
+
+    # Update source_coords if event origin is present
+    for key in ['latitude', 'longitude', 'depth']:
+        if not isnan(r[key]):
+            source_coords[key] = r[key]
+
+    est, aefdf = est.ampengfftmag(inventory, source_coords, verbose=True, snr_min=3.0)
+    return est, aefdf
+
+def reclassify(est, r):
+    # === Classification ===
+    features = {}
+    for tr in est:
+        m = getattr(tr.stats, 'metrics', {})
+        for key in ['peakf', 'meanf', 'skewness', 'kurtosis']:
+            if key in m:
+                features[key] = m[key]
+    try:
+        classifier = VolcanoEventClassifier()
+        label, score = classifier.classify(features)
+        r['new_subclass'] = label
+        r['new_score'] = score[label]
+        print(f"[INFO] Event classified as '{label}' with score {score[label]:.2f}")
+        return True
+    except Exception as e:
+        print(f"[WARN] Classification failed: {e}")
+        return False
+    
+def asl_sausage(peakf, filt_est, outdir, asl_config):
+    # === Prep for ASL ===
+    peakf = int(round(peakf))
+    for tr in filt_est:
+        tr.stats['units'] = 'm/s'
+
+    vsamObj = VSAM(stream=filt_est, sampling_interval=1.0)
+    if len(vsamObj.dataframes) == 0:
+        raise IOError('[ERR] No dataframes in VSAM object')
+    vsamObj.plot(equal_scale=True, outfile=os.path.join(outdir, "VSAM.png"))
+
+    # === ASL object ===
+    aslobj = ASL(
+        vsamObj,
+        asl_config['vsam_metric'],
+        inventory,
+        asl_config['gridobj'],
+        asl_config['window_seconds']
+    )
+
+    # === Distance cache ===
+    distance_cache_file = os.path.join(TOP_DIR, "grid_node_distances.pkl")
+    if os.path.isfile(distance_cache_file):
+        try:
+            with open(distance_cache_file, "rb") as f:
+                aslobj.node_distances_km = pickle.load(f)
+            print(f"[CACHE HIT] Loaded node distances from {distance_cache_file}")
+        except Exception as e:
+            print(f"[WARN] Failed to load node distances: {e}")
+            print("[INFO] Recomputing node distances...")
+            aslobj.compute_grid_distances()
+            with open(distance_cache_file, "wb") as f:
+                pickle.dump(aslobj.node_distances_km, f)
+    else:
+        print("[INFO] Computing grid distances...")
+        aslobj.compute_grid_distances()
+        with open(distance_cache_file, "wb") as f:
+            pickle.dump(aslobj.node_distances_km, f)
+
+    # === Amplitude correction cache ===
+    #ampcorr_cache_file = os.path.join(
+    #    TOP_DIR, f"amplitude_corrections_Q{asl_config['Q']}_F{peakf}.pkl"
+    #) # filename is made up internally in this function, which computes for whole inventory
+    print(f"[INFO] Computing amplitude corrections (Q={asl_config['Q']}, f={peakf})...")
+    aslobj.compute_amplitude_corrections(
+        surfaceWaves=True,
+        wavespeed_kms=asl_config['surfaceWaveSpeed_kms'],
+        Q=asl_config['Q'],
+        fix_peakf=peakf,
+        cache_dir=TOP_DIR,
+    ) # SCAFFOLD GET ALL THESE FROM als_config (Q, surfaceWaves)
+
+    # === Location and plotting ===
+    try:
+        aslobj.fast_locate()
+    except Exception as e:
+        print('[ERR] ASL location failed')
+        raise e
+
+    aslobj.print_event()
+    aslobj.save_event(
+        outfile=os.path.join(outdir, f"event_Q{asl_config['Q']}_F{peakf}.qml")
+    )
 
     try:
+        aslobj.plot(
+            zoom_level=0,
+            threshold_DR=0.0,
+            scale=0.2,
+            join=True,
+            number=0,
+            equal_size=False,
+            add_labels=True,
+            stations=[tr.stats.station for tr in est],
+            outfile=os.path.join(outdir, f"map_Q{asl_config['Q']}_F{peakf}.png")
+        )
+    except Exception as e:
+        print('[ERR] Cannot plot ASL object')
+        raise e
+    return
+
+
+def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_config):
+    print(f'\nProcessing row {rownum} of {numrows}')
+    
+
+    start_time = UTCDateTime()
+    progress = {}
+
+    try:
+        if r['subclass']!='r':
+            raise ValueError('Sorry - only processing rockfalls at this time')
         event_time = UTCDateTime(r['time'])
         ymdfolder = os.path.join(str(event_time.year), f"{event_time.month:02}", f"{event_time.day:02}")
         outdir = os.path.join(TOP_DIR, ymdfolder, r['dfile']).replace('.cleaned','')
-        if not os.path.isdir(outdir):
-            oldoutdir = os.path.join(TOP_DIR, r['dfile']).replace('.cleaned', '')
-            if os.path.isdir(oldoutdir):
-                shutil.move(oldoutdir, outdir)
-            else:
-                os.makedirs(outdir, exist_ok=True)
 
         # === Check if ASL should be re-run ===
         '''
-        if r['subclass'] in 're' and not needs_asl_reprocessing(outdir, r['subclass']):
-            print(f"[SKIP] ASL already completed with OriginQuality for: {r['dfile']}")
-            return rownum, r['time'], 2, 0.0
-        '''
         if r['subclass'] in 're':
-            pass
+            if not needs_asl_reprocessing(outdir, r['subclass']):
+                print(f"[SKIP] ASL already completed with OriginQuality for: {r['dfile']}")
+                return rownum, r['time'], 2, 0.0
         else:
             # === Check for magnitudes.csv with ME value (result = 1) ===
             magcsv = os.path.join(outdir, 'magnitudes.csv')
@@ -268,61 +223,31 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
                 if magdf['ME'].notna().any():
                     print(f"[SKIP] Magnitudes exist, this event is complete: {r['dfile']}")
                     return rownum, r['time'], 1, float(UTCDateTime() - start_time)
-
+        '''
         # === Proceed with waveform and metric processing ===
-        mseed_path = os.path.join(r['dir'], r['dfile'])
-        if not os.path.exists(mseed_path):
-            print(f"[WARN] Missing waveform file: {mseed_path}")
-            return rownum, r['time'], 0, float(UTCDateTime() - start_time)
-
-        st = read(mseed_path)
-        st = st.select(channel="*H*")
-        if len(st) == 0:
-            print('[WARN] No H-component traces after filtering')
-            return rownum, r['time'], 0, float(UTCDateTime() - start_time)
-
-        st.filter('highpass', freq=0.5, corners=2, zerophase=True)
-        est = EnhancedStream(stream=st)
-
-        # Update source_coords if event origin is present
-        for key in ['latitude', 'longitude', 'depth']:
-            if not isnan(r[key]):
-                source_coords[key] = r[key]
-
-
-        est, aefdf = est.ampengfftmag(inventory, source_coords, verbose=True, snr_min=3.0)
+        est, aefdf = make_enhanced_stream(r, start_time, rownum, outdir, inventory, source_coords)
+        if not isinstance(est, EnhancedStream):
+            return rownum, r['time'], progress, float(UTCDateTime() - start_time)
+        progress['enhanced'] = True
         est.write(os.path.join(outdir, 'enhanced_stream.mseed'), format='MSEED')
         aefdf.to_csv(os.path.join(outdir, 'magnitudes.csv'))
 
-
         # === Classification ===
-        features = {}
-        for tr in est:
-            m = getattr(tr.stats, 'metrics', {})
-            for key in ['peakf', 'meanf', 'skewness', 'kurtosis']:
-                if key in m:
-                    features[key] = m[key]
-        try:
-            classifier = VolcanoEventClassifier()
-            label, score = classifier.classify(features)
-            r['new_subclass'] = label
-            r['new_score'] = score[label]
-            print(f"[INFO] Event classified as '{label}' with score {score[label]:.2f}")
-        except Exception as e:
-            print(f"[WARN] Classification failed: {e}")
+        progress['reclassified'] = reclassify(est, r)
 
-
+        # save r (row dict)
         pd.DataFrame([r]).to_csv(os.path.join(outdir, 'database_row.csv'), index=False)
 
+        # save trace metrics via dataframe
         metrics_df = stream_metrics_to_dataframe(est)
+        progress['energy'] = 'energy' in stream_metrics_to_dataframe(est).columns
+        progress['ME'] = 'ME' in stream_metrics_to_dataframe(est).columns
         metrics_df.to_csv(os.path.join(outdir, 'stream_metrics.csv'))
-
-        success = 1  # at least the core metric work succeeded
 
         # === Determine if ASL should be run ===
         if not (r.get('new_subclass') in 're' or r.get('subclass') in 're'):
             print(f"[INFO] Skipping ASL: subclass not in ['r', 'e']")
-            return rownum, r['time'], success, float(UTCDateTime() - start_time)
+            return rownum, r['time'], progress, float(UTCDateTime() - start_time)
 
         # === Prepare filtered stream for ASL ===
         try:
@@ -352,85 +277,9 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
         print(f"[INFO] Stations used for ASL: {stations}")
 
         # === Prep for ASL ===
-        peakf = int(round(peakf))
-        for tr in filt_est:
-            tr.stats['units'] = 'm/s'
+        asl_sausage(peakf, filt_est, outdir, asl_config)
 
-        vsamObj = VSAM(stream=filt_est, sampling_interval=1.0)
-        if len(vsamObj.dataframes) == 0:
-            raise IOError('[ERR] No dataframes in VSAM object')
-        vsamObj.plot(equal_scale=True, outfile=os.path.join(outdir, "VSAM.png"))
-
-        # === ASL object ===
-        aslobj = ASL(
-            vsamObj,
-            asl_config['vsam_metric'],
-            inventory,
-            asl_config['gridobj'],
-            asl_config['window_seconds']
-        )
-
-        # === Distance cache ===
-        distance_cache_file = os.path.join(TOP_DIR, "grid_node_distances.pkl")
-        if os.path.isfile(distance_cache_file):
-            try:
-                with open(distance_cache_file, "rb") as f:
-                    aslobj.node_distances_km = pickle.load(f)
-                print(f"[CACHE HIT] Loaded node distances from {distance_cache_file}")
-            except Exception as e:
-                print(f"[WARN] Failed to load node distances: {e}")
-                print("[INFO] Recomputing node distances...")
-                aslobj.compute_grid_distances()
-                with open(distance_cache_file, "wb") as f:
-                    pickle.dump(aslobj.node_distances_km, f)
-        else:
-            print("[INFO] Computing grid distances...")
-            aslobj.compute_grid_distances()
-            with open(distance_cache_file, "wb") as f:
-                pickle.dump(aslobj.node_distances_km, f)
-
-        # === Amplitude correction cache ===
-        #ampcorr_cache_file = os.path.join(
-        #    TOP_DIR, f"amplitude_corrections_Q{asl_config['Q']}_F{peakf}.pkl"
-        #) # filename is made up internally in this function, which computes for whole inventory
-        print(f"[INFO] Computing amplitude corrections (Q={asl_config['Q']}, f={peakf})...")
-        aslobj.compute_amplitude_corrections(
-            surfaceWaves=True,
-            wavespeed_kms=asl_config['surfaceWaveSpeed_kms'],
-            Q=asl_config['Q'],
-            fix_peakf=peakf,
-            cache_dir=TOP_DIR,
-        )
-
-        # === Location and plotting ===
-        try:
-            aslobj.fast_locate()
-        except Exception as e:
-            print('[ERR] ASL location failed')
-            raise e
-
-        aslobj.print_event()
-        aslobj.save_event(
-            outfile=os.path.join(outdir, f"event_Q{asl_config['Q']}_F{peakf}.qml")
-        )
-
-        try:
-            aslobj.plot(
-                zoom_level=0,
-                threshold_DR=0.0,
-                scale=0.2,
-                join=True,
-                number=0,
-                equal_size=False,
-                add_labels=True,
-                stations=[tr.stats.station for tr in est],
-                outfile=os.path.join(outdir, f"map_Q{asl_config['Q']}_F{peakf}.png")
-            )
-        except Exception as e:
-            print('[ERR] Cannot plot ASL object')
-            raise e
-
-        success = 2
+        progress['asl'] = True
 
 
     except Exception as e:
@@ -441,7 +290,7 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
     finally:
         duration = UTCDateTime() - start_time
         gc.collect()
-        return rownum, r['time'], success, float(duration)
+        return rownum, r['time'], progress, float(duration)
 
 
 def process_chunk(chunk_rows, start_idx, numrows, TOP_DIR, source_coords, inventory, asl_config):
@@ -459,10 +308,10 @@ def process_chunk(chunk_rows, start_idx, numrows, TOP_DIR, source_coords, invent
         rownum = start_idx + i
         # Do your processing here
         result = process_row(rownum, row, numrows, TOP_DIR, source_coords, inventory, asl_config)
-        rownum, _, success, duration = result
+        rownum, _, progress, duration = result
         print(f"Row {rownum+1}/{numrows}")
         results.append(result)
-        if success < 2:
+        if not 'reclassified' in progress:
             with open(os.path.join(TOP_DIR, 'failures.log'), 'a') as f:
                 f.write(f"{rownum},{row['time']},{success}\n")
 
@@ -476,7 +325,7 @@ def process_chunk(chunk_rows, start_idx, numrows, TOP_DIR, source_coords, invent
 
         print(f"[{rownum+1}/{numrows}] Took {duration:.1f}s | ETA: {str(eta_time)[11:19]} | Remaining ~{eta_seconds/60:.1f} min", flush=True)
 
-        if rownum % 100 == 0:
+        if rownum % 1000 == 0:
             log_system_status_csv(logfile, rownum=rownum)
     print(f"[CHUNK DONE] Processed {len(chunk_rows)} rows in {(UTCDateTime() - chunk_start_time) / 60:.2f} minutes at {UTCDateTime()}")
 
