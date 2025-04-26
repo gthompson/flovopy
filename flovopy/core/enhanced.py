@@ -893,7 +893,7 @@ def estimate_distance(trace, source_coords):
     sta = trace.stats.coordinates
     lat1, lon1, elev = sta['latitude'], sta['longitude'], sta.get('elevation', 0)
     lat2, lon2, depth = source_coords['latitude'], source_coords['longitude'], source_coords.get('depth', 0)
-
+    print(trace.id, lat1, lat2, lon1, lon2)
     epic_dist, _, _ = gps2dist_azimuth(lat1, lon1, lat2, lon2)
     dz = (depth + elev)  # add elevation since depth is below surface
     return np.sqrt(epic_dist**2 + dz**2)
@@ -2043,6 +2043,439 @@ class EnhancedEvent: # currently this is for the Seisan REA, WAV, AEF combo. Not
         print(f"[✓] Inserted {len(self.traces)} trace metrics into DB for event {self.event_id}")
 
 
+def catalog_to_dataframe(catalog, mag_type=None):
+    """
+    Convert an ObsPy Catalog to a pandas DataFrame with event info.
+    
+    Parameters:
+    - catalog (obspy.Catalog): The ObsPy catalog to convert.
+    - mag_type (str or None): If provided, filter by magnitude type (e.g., 'ML', 'MD', 'ME').
+
+    Returns:
+    - pd.DataFrame with columns ['time', 'longitude', 'latitude', 'depth', 'magnitude']
+    """
+    records = []
+    for event in catalog:
+        if not event.origins or not event.magnitudes:
+            continue
+
+        origin = event.origins[0]
+
+        # Select magnitude
+        magnitude = None
+        if mag_type:
+            for mag in event.magnitudes:
+                if mag.magnitude_type == mag_type:
+                    magnitude = mag
+                    break
+        else:
+            magnitude = event.magnitudes[0]
+
+        if magnitude is None:
+            continue
+
+        records.append({
+            'time': origin.time.datetime,
+            'longitude': origin.longitude,
+            'latitude': origin.latitude,
+            'depth': origin.depth / 1000.0 if origin.depth is not None else None,
+            'magnitude': magnitude.mag
+        })
+        
+
+    df = pd.DataFrame(records)
+    df['time'] = pd.to_datetime(df['time'])
+    return df
+
+
+def bin_events(df, interval='D', groupby=None, threshold_magnitude=1.0, lowest_magnitude=-2.0):
+    """
+    Bin seismic events and compute statistics per time interval.
+    
+    Parameters:
+    df (pd.DataFrame): Must include 'time' and 'magnitude' columns.
+    interval (str): Resampling frequency ('T', 'H', 'D', 'M', 'Y')
+    groupby (str or None): Optional secondary group, e.g., 'subclass'
+
+    Returns:
+    pd.DataFrame with columns:
+        - time
+        - event_count
+        - average_magnitude
+        - cumulative_energy (Joules)
+        - cumulative_magnitude (log10-scaled)
+        - plus optional group column
+    """
+    df = df.copy()
+    # Track placeholder replacement
+    df['imputed'] = df['magnitude'] < lowest_magnitude
+
+    # Replace magnitudes < -1 with smallest valid value
+    valid_magnitudes = df['magnitude'][df['magnitude'] >= lowest_magnitude]
+    if not valid_magnitudes.empty:
+        min_valid_mag = valid_magnitudes.min()
+        df['magnitude'] = df['magnitude'].where(df['magnitude'] >= -1, min_valid_mag)
+    else:
+        df['magnitude'] = lowest_magnitude
+
+    # Convert to energy
+    df['energy'] = magnitude2Eseismic(df['magnitude'])
+
+    # Replace 0.0 energy with smallest non-zero value
+    nonzero_energy = df['energy'][df['energy'] > 0.0]
+    if not nonzero_energy.empty:
+        min_energy = nonzero_energy.min()
+        df.loc[df['energy'] == 0.0, 'energy'] = min_energy
+
+    df['time'] = pd.to_datetime(df['time'])
+
+    if groupby and groupby in df.columns:
+        group_cols = [pd.Grouper(key='time', freq=interval), groupby]
+    else:
+        group_cols = [pd.Grouper(key='time', freq=interval)]
+
+    grouped = df.groupby(group_cols).agg({
+        'magnitude': ['count', 'min', 'mean', 'max'],
+        'energy': 'sum'
+    })
+    grouped.columns = ['event_count', 'minimum_magnitude', 'average_magnitude', 'maximum_magnitude', 'cumulative_energy']
+    grouped['cumulative_magnitude'] = Eseismic2magnitude(grouped['cumulative_energy'])
+    
+    df_threshold = df[df['magnitude'] >= threshold_magnitude]
+    thresholded = df_threshold.groupby(group_cols).agg({
+        'magnitude': ['count'],
+        'energy': 'sum'
+    })
+    
+    thresholded.columns = ['thresholded_count', 'thresholded_energy']   
+    grouped['thresholded_count'] = thresholded['thresholded_count'].fillna(0)
+    grouped['thresholded_energy'] = thresholded['thresholded_energy'].fillna(0)
+    grouped['thresholded_magnitude'] = Eseismic2magnitude(grouped['thresholded_energy'])
+    
+
+    return grouped.reset_index()
+
+import matplotlib.pyplot as plt
+'''
+def plot_event_statistics(binned_df, ax=None, label=None, outfile=None):
+    """
+    Plot event count and average magnitude. Use provided axes if given.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        own_fig = True
+    else:
+        own_fig = False
+
+    ax2 = ax.twinx()
+    ax.bar(binned_df['time'], binned_df['event_count'], color='blue', alpha=0.5, label='Count' if label is None else label)
+    ax.set_ylabel('Event Count', color='blue')
+    ax.tick_params(axis='y', labelcolor='blue')
+    ax.set_xlabel('Time')
+
+    ax2.plot(binned_df['time'], binned_df['average_magnitude'], color='green', marker='o', label='Avg Mag', markersize=2)
+    ax2.set_ylabel('Avg Magnitude', color='green')
+    ax2.tick_params(axis='y', labelcolor='green')
+
+    if own_fig:
+        ax.set_title('Event Count and Avg Magnitude Over Time')
+        plt.tight_layout()
+        if outfile:
+            plt.savefig(outfile, dpi=300)
+        else:
+            plt.show()
+
+def plot_event_statistics(binned_df, ax=None, label=None, outfile=None):
+    """
+    Plot event count (bar) and average magnitude (line) over time.
+
+    Parameters:
+    - binned_df: DataFrame with time, event_count, and average_magnitude
+    - ax: optional matplotlib axis to draw the bar chart on
+    - label: optional legend label for event count
+    - outfile: optional path to save the figure if ax is None
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Bar chart (left y-axis)
+    #bar = binned_df.plot(kind='bar', x='time', y='event_count', ax=ax, color='blue', alpha=0.5, label=label or 'Count', legend=False)
+    bar = binned_df.plot(x='time', y='event_count', ax=ax, kind='line', drawstyle='steps-mid', color='blue', label=label or 'Count', legend=False)
+    # Twin axis for average magnitude (right y-axis)
+    ax2 = ax.twinx()
+    ax2.plot(binned_df['time'], binned_df['average_magnitude'], color='green', marker='o', markersize=2, label='Avg Mag')
+    
+    ax.set_ylabel('Event Count', color='blue')
+    ax2.set_ylabel('Avg Magnitude', color='green')
+    ax.tick_params(axis='y', labelcolor='blue')
+    ax2.tick_params(axis='y', labelcolor='green')
+    ax.set_xlabel('Time')
+
+    if ax is None and outfile:
+        plt.tight_layout()
+        plt.savefig(outfile, dpi=300)
+        plt.close()
+    elif ax is None:
+        plt.tight_layout()
+        plt.show()
+
+def plot_event_statistics(
+    binned_df,
+    ax=None,
+    label=None,
+    secondary_y='cumulative_magnitude',
+    outfile=None
+):
+    """
+    Plot event count and a second variable (e.g. magnitude, energy) over time.
+    """
+    import matplotlib.dates as mdates
+
+    # Validate time column
+    binned_df = binned_df.copy()
+    binned_df['time'] = pd.to_datetime(binned_df['time'])
+    binned_df = binned_df.sort_values('time')
+
+    if secondary_y not in binned_df.columns:
+        print(f"[WARNING] {secondary_y} not found in DataFrame. Defaulting to 'cumulative_magnitude'.")
+        secondary_y = 'cumulative_magnitude'
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        own_fig = True
+    else:
+        own_fig = False
+
+    # Plot primary: event counts
+    ax.plot(binned_df['time'], binned_df['event_count'], drawstyle='steps-mid',
+            color='blue', label=label or 'Count', linewidth=1.5)
+
+    ax.set_ylabel('Event Count', color='blue')
+    ax.tick_params(axis='y', labelcolor='blue')
+    ax.set_xlabel('Time')
+
+    # Format time axis
+    format_time_axis(ax, binned_df['time'])
+
+    # Plot secondary axis
+    ax2 = ax.twinx()
+    ax2.plot(binned_df['time'], binned_df[secondary_y], color='green',
+             marker='o', linewidth=2, markersize=3, label=secondary_y)
+    ax2.set_ylabel(secondary_y.replace('_', ' ').title(), color='green')
+    ax2.tick_params(axis='y', labelcolor='green')
+
+    if own_fig:
+        plt.tight_layout()
+        if outfile:
+            plt.savefig(outfile, dpi=300)
+            plt.close()
+        else:
+            plt.show()
+'''
+def plot_event_statistics(
+    binned_df,
+    ax=None,
+    label=None,
+    secondary_y='cumulative_magnitude',
+    outfile=None
+):
+    import matplotlib.dates as mdates
+
+    df = binned_df.copy()
+    df['time'] = pd.to_datetime(df['time'])
+    df = df.sort_values('time')
+
+    if secondary_y not in df.columns:
+        print(f"[WARNING] {secondary_y} not found in DataFrame. Skipping.")
+        return
+
+    df = df[np.isfinite(df['event_count']) & np.isfinite(df[secondary_y])]
+
+    if df.empty:
+        print(f"[WARNING] No valid data to plot for {label or 'unknown'} subclass.")
+        return
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        own_fig = True
+    else:
+        own_fig = False
+
+    # Plot left axis: event count
+    ax.plot(df['time'], df['event_count'], drawstyle='steps-mid',
+            color='blue', label=label or 'Event Count', linewidth=1.5)
+    ax.fill_between(df['time'], df['event_count'], step='mid', color='blue', alpha=0.2)
+    ax.set_ylabel('Event Count', color='blue')
+    ax.tick_params(axis='y', labelcolor='blue')
+    ax.set_xlabel('')
+
+    # Format time axis
+    #format_time_axis(ax, df['time'])
+
+    # Plot right axis: secondary metric
+    ax2 = ax.twinx()
+    ax2.plot(df['time'], df[secondary_y], color='green', drawstyle='steps-mid',
+             linewidth=3, label=secondary_y)
+    ax2.set_ylabel(secondary_y.replace('_', ' ').title(), color='green')
+    ax2.tick_params(axis='y', labelcolor='green')
+
+    ax.grid(True, which='major', axis='both', linestyle='--', alpha=0.3)
+    ax.tick_params(axis='x', labelbottom=True)
+    if own_fig:
+        plt.tight_layout()
+        if outfile:
+            plt.savefig(outfile, dpi=300)
+            plt.close()
+        else:
+            plt.show()
+
+import matplotlib.dates as mdates
+'''
+def format_time_axis(ax, time_series):
+    """
+    Automatically format x-axis tick labels based on inferred frequency.
+    """
+    inferred_freq = pd.infer_freq(time_series.sort_values())
+    if inferred_freq is None:
+        inferred_freq = 'D'  # fallback default
+
+    # Set formatter and locator based on inferred frequency
+    if inferred_freq.startswith('T'):  # minute
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=10))
+    elif inferred_freq.startswith('H'):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %Hh'))
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+    elif inferred_freq.startswith('D'):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=7))
+    elif inferred_freq.startswith('W'):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y W%W'))
+        ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO, interval=1))    
+    elif inferred_freq.startswith('M'):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+    elif inferred_freq.startswith('Y'):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        ax.xaxis.set_major_locator(mdates.YearLocator())
+    else:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+
+'''
+def format_time_axis(ax, time_series):
+    """
+    Format time axis based on actual range and resolution of time_series.
+    Assumes time_series is sorted and datetime64[ns].
+    """
+    # Ensure datetime
+    time_series = pd.to_datetime(time_series)
+    time_series = time_series.dropna().sort_values()
+
+    if len(time_series) < 2:
+        return  # nothing to format
+
+    # Calculate actual time step
+    delta = (time_series.iloc[1] - time_series.iloc[0]).total_seconds()
+
+    # Choose format and locator based on delta
+    if delta < 3600:  # less than 1 hour
+        fmt = '%H:%M'
+        locator = mdates.MinuteLocator(interval=10)
+    elif delta < 86400:  # less than 1 day
+        fmt = '%Y-%m-%d %Hh'
+        locator = mdates.HourLocator(interval=6)
+    elif delta < 7 * 86400:  # less than 1 week
+        fmt = '%Y-%m-%d'
+        locator = mdates.DayLocator(interval=1)
+    elif delta < 32 * 86400:
+        fmt = '%Y-%m-%d'
+        locator = mdates.WeekdayLocator(byweekday=mdates.MO)
+    elif delta < 92 * 86400:
+        fmt = '%Y-%m'
+        locator = mdates.MonthLocator(interval=1)
+    else:
+        fmt = '%Y'
+        locator = mdates.YearLocator()
+
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt))
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+'''
+def plot_event_statistics(
+    binned_df,
+    ax=None,
+    label=None,
+    secondary_y='cumulative_magnitude',
+    outfile=None
+):
+    """
+    Plot event count (bars) and a second timeseries (line) on dual axes.
+
+    Parameters:
+    - binned_df: DataFrame with at least 'time', 'event_count', and secondary_y column
+    - ax: optional matplotlib axis
+    - label: label for bar chart (event count)
+    - secondary_y: column to plot on secondary y-axis
+    - outfile: optional file path to save the figure
+    """
+    if secondary_y not in binned_df.columns:
+        print(f"[WARNING] {secondary_y} not found in DataFrame. Defaulting to 'cumulative_magnitude'.")
+        secondary_y = 'cumulative_magnitude'
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        own_fig = True
+    else:
+        own_fig = False
+
+    # Bar plot on primary y-axis
+    binned_df.plot(kind='bar', x='time', y='event_count', ax=ax,
+                   color='blue', alpha=0.5, legend=False, label=label or 'Event Count')
+
+    # Line plot on secondary y-axis
+    ax2 = ax.twinx()
+    binned_df.plot(x='time', y=secondary_y, ax=ax2,
+                   color='green', marker='o', linewidth=2, markersize=3, legend=False)
+
+    ax.set_ylabel('Event Count', color='blue')
+    ax2.set_ylabel(secondary_y.replace('_', ' ').title(), color='green')
+    ax.tick_params(axis='y', labelcolor='blue')
+    ax2.tick_params(axis='y', labelcolor='green')
+    ax.set_xlabel('Time')
+
+    #format_time_axis(ax, binned_df['time'])
+
+    if own_fig:
+        plt.tight_layout()
+        if outfile:
+            plt.savefig(outfile, dpi=300)
+            plt.close()
+        else:
+            plt.show()        
+''' 
+def plot_event_energy(binned_df, ax=None, label=None, outfile=None):
+    """
+    Plot cumulative energy per time bin. Use provided axes if given.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        own_fig = True
+    else:
+        own_fig = False
+
+    ax.plot(binned_df['time'], binned_df['cumulative_energy'], linewidth=2, label=label)
+    ax.set_ylabel('Cumulative Energy')
+    ax.set_xlabel('Time')
+    if own_fig:
+        ax.set_title('Total Energy Over Time')
+        ax.grid(True)
+        plt.tight_layout()
+        if outfile:
+            plt.savefig(outfile, dpi=300)
+        else:
+            plt.show()
 
 if  __name__ == '__main__':
     cat = EnhancedCatalog()
