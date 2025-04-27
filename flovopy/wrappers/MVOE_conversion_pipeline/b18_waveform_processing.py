@@ -340,6 +340,7 @@ def chunkify(lst, n):
 
 print('[STARTUP] functions loaded')
 ####################################################################
+"""
 if __name__ == "__main__":
 
     DB_PATH = "/home/thompsong/public_html/seiscomp_like.sqlite"
@@ -493,4 +494,100 @@ if __name__ == "__main__":
 
 
     print("\n[✓] Done processing all events.")
+"""
+# --- Main script execution ---
 
+if __name__ == "__main__":
+    DB_PATH = "/home/thompsong/public_html/seiscomp_like.sqlite"
+    STATIONXML_PATH = "/data/SEISAN_DB/CAL/MV.xml"
+    SCRIPT_NAME = os.path.splitext(os.path.basename(__file__))[0]
+    TOP_DIR = os.path.join('/data', SCRIPT_NAME)
+    os.makedirs(TOP_DIR, exist_ok=True)
+
+    if not backup_db(DB_PATH, __file__):
+        exit()
+
+    conn = sqlite3.connect(DB_PATH)
+    query_result_file = os.path.join(TOP_DIR, 'query_result.pkl')
+    query_dataframe_pkl = os.path.join(TOP_DIR, 'query_dataframe.pkl')
+
+    if os.path.isfile(query_dataframe_pkl):
+        df = pd.read_pickle(query_dataframe_pkl)
+    else:
+        if os.path.isfile(query_result_file):
+            df = pd.read_pickle(query_result_file)
+        else:
+            query = '''
+            SELECT e.public_id, o.latitude, o.longitude, o.depth, ec.time, ec.author, ec.source, ec.dfile, ec.mainclass, ec.subclass, mfs.dir
+            FROM event_classifications ec
+            JOIN events e ON ec.event_id = e.public_id
+            LEFT JOIN origins o ON o.event_id = e.public_id
+            JOIN mseed_file_status mfs ON ec.dfile = mfs.dfile
+            LEFT JOIN magnitudes m ON m.event_id = e.public_id
+            WHERE ec.subclass IS NOT NULL
+            GROUP BY e.public_id
+            '''
+            df = pd.read_sql_query(query, conn)
+            df.to_pickle(query_result_file)
+        df = df.sort_values(by="time")
+        df.to_pickle(query_dataframe_pkl)
+
+    print(f"[INFO] Loaded {len(df)} rows")
+
+    inventory = read_inventory(STATIONXML_PATH)
+
+    source_coords = {
+        'latitude': dome_location['lat'],
+        'longitude': dome_location['lon'],
+        'depth': 3000.0
+    }
+
+    ASL_CONFIG = {
+        'window_seconds': 5,
+        'min_stations': 5,
+        'Q': 100,
+        'surfaceWaveSpeed_kms': 1.5,
+        'vsam_metric': 'mean',
+        'inventory': inventory,
+        'top_dir': TOP_DIR,
+        'source': initial_source(lat=dome_location['lat'], lon=dome_location['lon'])
+    }
+
+    grid_cache_file = os.path.join(TOP_DIR, "gridobj_cache.pkl")
+    if os.path.isfile(grid_cache_file):
+        with open(grid_cache_file, 'rb') as f:
+            ASL_CONFIG['gridobj'] = pickle.load(f)
+    else:
+        ASL_CONFIG['gridobj'] = make_grid(
+            center_lat=dome_location['lat'],
+            center_lon=dome_location['lon'],
+            node_spacing_m=50,
+            grid_size_lat_m=6000,
+            grid_size_lon_m=6000
+        )
+        with open(grid_cache_file, 'wb') as f:
+            pickle.dump(ASL_CONFIG['gridobj'], f)
+
+    rows = df.reset_index(drop=True).to_dict(orient="records")
+    numrows = len(rows)
+    n_workers = max(1, multiprocessing.cpu_count() - 2)
+    row_chunks = [chunk for chunk in np.array_split(rows, n_workers) if chunk]
+
+    chunk_args = [
+        (chunk, sum(len(c) for c in row_chunks[:i]), numrows, ASL_CONFIG, inventory, source_coords)
+        for i, chunk in enumerate(row_chunks)
+    ]
+
+    try:
+        with multiprocessing.Pool(processes=n_workers) as pool:
+            results_nested = pool.starmap(process_chunk, chunk_args)
+    finally:
+        df.to_csv(os.path.join(TOP_DIR, 'interrupted_results.csv'), index=False)
+
+    results = [item for sublist in results_nested for item in sublist]
+    for rownum, _, progress_summary, duration in results:
+        df.at[rownum, 'progress_summary'] = progress_summary
+        df.at[rownum, 'duration_seconds'] = duration
+
+    df.to_csv(os.path.join(TOP_DIR, 'final_results.csv'), index=False)
+    print("\n[✓] Done processing all events.")
