@@ -27,23 +27,31 @@ import glob
 
 
 def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, centerlon=-62.177, centerlat=16.711, contour_interval=100, \
-                        topo_color=True, resolution='03s', DEM_DIR=None, stations=[]):
+                        topo_color=True, resolution='03s', DEM_DIR=None, stations=[], title=None, region=None):
 
     #define etopo data file
     # ergrid = 'path_to_local_data_file'
     #ergrid = '@earth_relief_30s' #30 arc second global relief (SRTM15+V2.1 @ 1.0 km)
     #ergrid = '@earth_relief_15s' #15 arc second global relief (SRTM15+V2.1)
     #ergrid = '@earth_relief_03s' #3 arc second global relief (SRTM3S)
+    if region:
+        centerlon = (region[0]+region[1])/2
+        centerlat = ((region[2]+region[3])/2)
     if DEM_DIR:
         pklfile = os.path.join(DEM_DIR, f'EarthReliefData{centerlon}.{centerlat}.{zoom_level}.{resolution}.pkl')
     else:
         pklfile = None
-    
-    # define plot geographical range
-    diffdeglat = 0.08/(2**zoom_level)
-    diffdeglon = diffdeglat/np.cos(np.deg2rad(centerlat))
-    minlon, maxlon = centerlon-diffdeglon, centerlon+diffdeglon  #-62.25, -62.13
-    minlat, maxlat = centerlat-diffdeglat, centerlat+diffdeglat  # 16.66, 16.83
+    #f stations is None:
+    #    stations = []
+
+    if not region:
+        # define plot geographical range
+        diffdeglat = 0.08/(2**zoom_level)
+        diffdeglon = diffdeglat/np.cos(np.deg2rad(centerlat))
+        minlon, maxlon = centerlon-diffdeglon, centerlon+diffdeglon  #-62.25, -62.13
+        minlat, maxlat = centerlat-diffdeglat, centerlat+diffdeglat  # 16.66, 16.83
+        region=[minlon, maxlon, minlat, maxlat]
+        print(f'montserrat_topo_map: region={region}')
 
     if pklfile:
         if os.path.exists(pklfile):
@@ -53,7 +61,7 @@ def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, ce
     else:        
         try:
             print('Reading topo (earth relief) data from GMT website')
-            ergrid = pygmt.datasets.load_earth_relief(resolution=resolution, region=[minlon, maxlon, minlat, maxlat], registration=None)
+            ergrid = pygmt.datasets.load_earth_relief(resolution=resolution, region=region, registration=None)
             print("ergrid downloaded")
             if pklfile:
                 with open(pklfile, 'wb') as fileptr: 
@@ -81,7 +89,7 @@ def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, ce
         # plot high res topography
         fig.grdimage(
             grid=ergrid,
-            region=[minlon, maxlon, minlat, maxlat],
+            region=region,
             projection='M4i',
             shading=True,
             frame=True
@@ -89,7 +97,7 @@ def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, ce
     
     # plot continents, shorelines, rivers, and borders
     fig.coast(
-        region=[minlon, maxlon, minlat, maxlat],
+        region=region,
         projection='M4i',
         shorelines=True,
         frame=True
@@ -114,7 +122,8 @@ def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, ce
     if inv:
         seed_ids = inventory2traceid(inv, force_location_code='')
         if not stations:
-            stations = invstations
+            stations = [id.split('.')[1] for id in seed_ids]
+            #invstations
         stalat = [inv.get_coordinates(seed_id)['latitude'] for seed_id in seed_ids]
         stalon = [inv.get_coordinates(seed_id)['longitude'] for seed_id in seed_ids]
         
@@ -136,10 +145,21 @@ def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, ce
                             offset="0.2c/0c",)
         else:
             fig.plot(x=stalon, y=stalat, style="s0.3c", fill="dodgerblue4", pen='2p,blue') 
-    
+
+    if title:
+        fig.text(
+            text=title,
+            x=region[0] + (region[1]-region[0]) * 0.60,
+            y=region[2] + (region[3]-region[2]) * 0.90,
+            justify="TC",
+            font="11p,Helvetica-Bold,black"
+        )
+    print('GOT HERE 1')
+    fig.basemap(region=region, frame=True)
+
     if show:
         fig.show();
-
+    print('GOT HERE 2')
     return fig
 
 class Grid:
@@ -169,8 +189,9 @@ class Grid:
         stylestr = f'+{symsize}c'
         
         fig.plot(x=self.gridlon.reshape(-1), y=self.gridlat.reshape(-1), style=stylestr, pen='black')
+        fig.basemap(region=[minlon, maxlon, minlat, maxlat], frame=True)
         fig.show()
-        fig._cleanup()
+        #fig._cleanup()
 
 def initial_source(lat=dome_location['lat'], lon=dome_location['lon']):
     return {'lat':lat, 'lon':lon}
@@ -216,7 +237,7 @@ def plot_VSAM(dsamobj, gridobj, nodenum, metric='mean', DEM_DIR=None):
     #ax = fig.axes()
     #ax[0].plot(gridobj.gridlon[nodenum], gribobj.gridlat[nodenum], 'o')
     fig.plot(gridobj.gridlon[nodenum], gridobj.gridlat[nodenum], 'o')
-    fig._cleanup()
+    #fig._cleanup()
 
 # pretty sure that i had a different version here that worked. this one is crashing because trying to plot nodenum 100 of a 100-length tr.data
 # what I really should be plotting is the corrections at node 100
@@ -555,7 +576,9 @@ class ASL:
 
 
 
-    def plot(self, zoom_level=1, threshold_DR=0, scale=1, join=False, number=0, add_labels=False, equal_size=False, outfile=None, stations=None):
+    def plot(self, zoom_level=1, threshold_DR=0, scale=1, join=False, number=0, \
+             add_labels=False, equal_size=False, outfile=None, 
+             stations=None, title=None, region=None, normalize=True):
         source = self.source
         if source:
                 
@@ -581,25 +604,33 @@ class ASL:
                 DR = source['DR']
                 if equal_size:
                     symsize = scale * np.ones(len(DR))
-                else:
+                elif normalize:
                     symsize = np.divide(DR, np.nanmax(DR))*scale
+                else:
+                    symsize = scale * np.sqrt(DR)
                 #print('symbol size = ',symsize)
      
                     
                 maxi = np.argmax(DR)
-                fig = montserrat_topo_map(zoom_level=zoom_level, inv=self.inventory, centerlat=y[maxi], centerlon=x[maxi], add_labels=add_labels, topo_color=False, stations=stations)
-                
+                print('Got here 0')
+                fig = montserrat_topo_map(zoom_level=zoom_level, inv=self.inventory, \
+                                          centerlat=y[maxi], centerlon=x[maxi], add_labels=add_labels, 
+                                          topo_color=False, stations=stations, title=title, region=region)
+
+                print('Got here 3')
                 if number:
                     if number<len(x):
                         ind = np.argpartition(DR, -number)[-number:]
                         x = x[ind]
                         y = y[ind]
                         DR = DR[ind]
-                        maxi = np.argmax(DR)
+                        mascxi = np.argmax(DR)
                         symsize = symsize[ind]
                 pygmt.makecpt(cmap="viridis", series=[0, len(x)])
                 timecolor = [i for i in range(len(x))]
+                print('Got here 4')
                 fig.plot(x=x, y=y, size=symsize, style="cc", pen=None, fill=timecolor, cmap=True)
+                print('Got here 4.1')
                 fig.colorbar(
                     frame='+l"Sequence"',
                     #     position="x11.5c/6.6c+w6c+jTC+v" #for vertical colorbar
@@ -622,11 +653,15 @@ class ASL:
                     fig.plot(x=x, y=y, style="f1c/0.05c+c", fill='black', pen='0.5p,black')
                     fig.plot(x=x[maxi], y=y[maxi], size=symsize[maxi], style="cc", fill='red', pen='1p,red')
                 '''
+                print('Got here 5')
+                if region:
+                    fig.basemap(region=region, frame=True)
                 if outfile:
                     fig.savefig(outfile)
                 else:
-                    fig.show();     
-                fig._cleanup()           
+                    fig.show();  
+                print('\n')
+                #fig._cleanup()           
                 
             else:    
                 # Heatmap
@@ -647,7 +682,7 @@ class ASL:
                     fig.savefig(outfile)
                 else:
                     fig.show();   
-                fig._cleanup()
+                #fig._cleanup()
             
             
 
@@ -663,7 +698,7 @@ class ASL:
             
         else: # no location data      
             fig = montserrat_topo_map(zoom_level=zoom_level, inv=self.inventory, show=True, add_labels=add_labels)
-            fig._cleanup()
+            #fig._cleanup()
 
 
 

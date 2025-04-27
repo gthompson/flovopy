@@ -143,7 +143,7 @@ if __name__ == '__main__':
     from obspy.core.event import Catalog
 
 
-    db_path = '/home/thompsong/Dropbox/matlab_events.db'
+    db_path = '/home/thompsong/Dropbox/ampmap_events.db'
     catalog_path = '/home/thompsong/Dropbox/ampmap_events_catalog.xml'
 
     # Create Database
