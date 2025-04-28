@@ -662,39 +662,7 @@ class ASL:
                     fig.show();  
                 print('\n')
                 #fig._cleanup()           
-                
-            else:    
-                # Heatmap
-                df = pd.DataFrame()
-                df['time'] = source['t']
-                df['lon'] = source['lon']
-                df['lat'] = source['lat']
-                df['DR'] = source['DR']
-                df['energy'] = np.multiply(source['DR'], source['DR'])
-                unique_locationsDF = df.groupby(['lat', 'lon'])['energy'].sum().reset_index()
-                fig = montserrat_topo_map(zoom_level=zoom_level, inv=self.inventory)
-                x=unique_locationsDF['lon'].to_numpy()
-                y=unique_locationsDF['lat'].to_numpy()
-                symsize = np.sqrt(unique_locationsDF['energy'].to_numpy())
-                symsize = np.divide(symsize, np.nanmax(symsize))*scale
-                fig.plot(x=x, y=y, size=symsize, style='cc', fill='black', pen='2p,black')
-                if outfile:
-                    fig.savefig(outfile)
-                else:
-                    fig.show();   
-                #fig._cleanup()
-            
-            
 
-            '''
-            # time-longitude plot
-            plt.figure()
-            plt.scatter(t_dt, lon, s=source['DR']*cross_scale, marker='x')  
-
-            # time-latitude plot
-            plt.figure()
-            plt.scatter(t_dt, lat, s=source['DR']*cross_scale, marker='x')
-            '''
             
         else: # no location data      
             fig = montserrat_topo_map(zoom_level=zoom_level, inv=self.inventory, show=True, add_labels=add_labels)
@@ -786,11 +754,11 @@ class ASL:
         if self.located:
             pprint(self.event)
 
-
+import xarray as xr
 def plot_heatmap_montserrat_colored(df, lat_col='latitude', lon_col='longitude', amp_col='amplitude',
                                      zoom_level=0, inventory=None, color_scale=0.4,
                                      cmap='turbo', log_scale=True, contour=False,
-                                     node_spacing_m=50, outfile=None):
+                                     node_spacing_m=50, outfile=None, region=None, title=None):
     """
     Plot ASL heatmap on Montserrat topography using tessellated color-filled squares.
 
@@ -830,24 +798,72 @@ def plot_heatmap_montserrat_colored(df, lat_col='latitude', lon_col='longitude',
                   continuous=True)
 
     # Create base map
-    fig = montserrat_topo_map(zoom_level=zoom_level, inv=inventory, topo_color=False)
+    fig = montserrat_topo_map(zoom_level=zoom_level, inv=inventory, topo_color=False, region=region, title=title)
 
     # Plot colored square tiles
 
     fig.plot(x=x, y=y, style=f"s{symbol_size_m}c", fill=z, cmap=True, pen=None)
 
+    """
+    # Create a DataFrame for pygmt
+    points = pd.DataFrame({
+        "longitude": x,
+        "latitude": y,
+        "energy": z,
+    })
+
+    # Create NumPy array directly
+    points = np.column_stack((x, y, z))
+
+    fig.plot(
+        data=points,
+        style=f"s{symbol_size_m}c",  # Squares
+        cmap=True,
+        pen="none"  # You *can* say "none" here now
+    )
+    
+    # Create DataFrame for PyGMT
+    points = pd.DataFrame({
+        "longitude": x,
+        "latitude": y,
+        "size": symbol_size_m  # Size in cm
+    })
+
+    # Plot with constant fill color, no border lines
+    fig.plot(
+        data=points,
+        style="c",                         # Circle, size from 'size' column
+        fill="red",                        # All symbols filled red
+        pen="none",                        # No borders
+    )
+    """
+
+
+
     # Optional contours
+    """
+    contour = False
     if contour:
         from scipy.interpolate import griddata
         xi = np.linspace(min(x), max(x), 200)
         yi = np.linspace(min(y), max(y), 200)
         Xi, Yi = np.meshgrid(xi, yi)
         Zi = griddata((x, y), z, (Xi, Yi), method='linear')
-        fig.grdcontour(grid=Zi, region=fig.region, interval=0.5, pen="0.75p,gray")
+
+        grid = xr.DataArray(
+            Zi,
+            coords={"lat": yi, "lon": xi},
+            dims=["lat", "lon"],
+        )
+
+        fig.grdcontour(grid=grid, region=fig.region, interval=0.5, pen="0.75p,gray")
+    """
 
     # Add colorbar
     fig.colorbar(frame='+l"Log10 Total Energy"' if log_scale else '+l"Total Energy"')
-
+    if region:
+        fig.basemap(region=region, frame=True)
+        
     # Save or show
     if outfile:
         fig.savefig(outfile)
