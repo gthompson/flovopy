@@ -67,3 +67,4 @@ logs/
 *.pkl
 *.sqlite
 gmt.history
+.DS_Store
