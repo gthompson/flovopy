@@ -1,32 +1,45 @@
-#!/usr/bin/env python3
-# b14_ampengfftmag.py
-# Process LV events: compute amp/energy/frequency/magnitude metrics and save as EnhancedEvent JSON + pkl
+"""
+b18_waveform_processing.py
 
+This script processes Local Volcanic (LV) events by computing amplitude, energy, frequency, and 
+magnitude metrics from cleaned MiniSEED waveform files. Events may also be classified using a 
+volcano-seismic classifier and optionally located using an amplitude-based source location (ASL) method.
+
+Each event waveform is enhanced into an `EnhancedStream`, and event-level metrics are saved to CSV. 
+Classification results are stored alongside diagnostic plots. Events classified as rockfalls ('r') or 
+explosions ('e') may be further processed using the ASL system to estimate source locations and generate 
+QuakeML files and spatial plots.
+
+Processing can be parallelized using Python’s multiprocessing module or run in single-threaded mode. 
+Command-line arguments allow control over which processing steps are enabled.
+
+Usage:
+    python b18_waveform_processing.py [--no-energy] [--no-asl] [--single-core]
+
+Options:
+    --no-energy     Skip waveform metric computation (amp, energy, frequency, magnitude)
+    --no-asl        Skip ASL source location and plotting
+    --single-core   Run in single-threaded mode (no multiprocessing)
+"""
 import os
-import shutil
 import sqlite3
-import pandas as pd
-from obspy import read, read_inventory, UTCDateTime
-from flovopy.core.enhanced import EnhancedStream, EnhancedEvent, VolcanoEventClassifier  # assumes EnhancedEvent has .write_to_db() added
-from pprint import pprint
-
-from flovopy.processing.sam import VSAM
-from flovopy.analysis.asl import ASL, initial_source, make_grid, dome_location
 import pickle
-
-from flovopy.wrappers.MVOE_conversion_pipeline.db_backup import backup_db
+import pandas as pd
+import numpy as np
+import multiprocessing
+import argparse
+from obspy import read, read_inventory, UTCDateTime
+from flovopy.core.enhanced import EnhancedStream, VolcanoEventClassifier # EnhancedEvent, 
+from flovopy.config_projects import get_config
+from flovopy.analysis.asl import make_grid, dome_location, initial_source, ASL
+from flovopy.utils.sysmon import log_system_status_csv
+from db_backup import backup_db
+from flovopy.processing.sam import VSAM
 
 from math import isnan
-
 import gc
-
 import multiprocessing
-from functools import partial
-
 import glob
-
-from flovopy.utils.sysmon import log_system_status_csv
-
 
 print('[STARTUP] modules loaded')
 
@@ -113,7 +126,7 @@ def reclassify(est, r):
         print(f"[WARN] Classification failed: {e}")
         return False
     
-def asl_sausage(peakf, filt_est, outdir, asl_config):
+def asl_sausage(peakf, filt_est, outdir, asl_config, inventory, TOP_DIR, dry_run):
     # === Prep for ASL ===
     peakf = int(round(peakf))
     for tr in filt_est:
@@ -122,7 +135,8 @@ def asl_sausage(peakf, filt_est, outdir, asl_config):
     vsamObj = VSAM(stream=filt_est, sampling_interval=1.0)
     if len(vsamObj.dataframes) == 0:
         raise IOError('[ERR] No dataframes in VSAM object')
-    vsamObj.plot(equal_scale=True, outfile=os.path.join(outdir, "VSAM.png"))
+    if not dry_run:
+        vsamObj.plot(equal_scale=True, outfile=os.path.join(outdir, "VSAM.png"))
 
     # === ASL object ===
     aslobj = ASL(
@@ -144,13 +158,15 @@ def asl_sausage(peakf, filt_est, outdir, asl_config):
             print(f"[WARN] Failed to load node distances: {e}")
             print("[INFO] Recomputing node distances...")
             aslobj.compute_grid_distances()
-            with open(distance_cache_file, "wb") as f:
-                pickle.dump(aslobj.node_distances_km, f)
+            if not dry_run:
+                with open(distance_cache_file, "wb") as f:
+                    pickle.dump(aslobj.node_distances_km, f)
     else:
         print("[INFO] Computing grid distances...")
         aslobj.compute_grid_distances()
-        with open(distance_cache_file, "wb") as f:
-            pickle.dump(aslobj.node_distances_km, f)
+        if not dry_run:
+            with open(distance_cache_file, "wb") as f:
+                pickle.dump(aslobj.node_distances_km, f)
 
     # === Amplitude correction cache ===
     #ampcorr_cache_file = os.path.join(
@@ -173,34 +189,34 @@ def asl_sausage(peakf, filt_est, outdir, asl_config):
         raise e
 
     aslobj.print_event()
-    aslobj.save_event(
-        outfile=os.path.join(outdir, f"event_Q{asl_config['Q']}_F{peakf}.qml")
-    )
-
-    try:
-        aslobj.plot(
-            zoom_level=0,
-            threshold_DR=0.0,
-            scale=0.2,
-            join=True,
-            number=0,
-            equal_size=False,
-            add_labels=True,
-            stations=[tr.stats.station for tr in est],
-            outfile=os.path.join(outdir, f"map_Q{asl_config['Q']}_F{peakf}.png")
+    if not dry_run:
+        aslobj.save_event(
+            outfile=os.path.join(outdir, f"event_Q{asl_config['Q']}_F{peakf}.qml")
         )
-    except Exception as e:
-        print('[ERR] Cannot plot ASL object')
-        raise e
+
+        try:
+            aslobj.plot(
+                zoom_level=0,
+                threshold_DR=0.0,
+                scale=0.2,
+                join=True,
+                number=0,
+                equal_size=False,
+                add_labels=True,
+                stations=[tr.stats.station for tr in est],
+                outfile=os.path.join(outdir, f"map_Q{asl_config['Q']}_F{peakf}.png")
+            )
+        except Exception as e:
+            print('[ERR] Cannot plot ASL object')
+            raise e
     return
 
 
-def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_config):
+def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_config, compute_energy, run_asl, dry_run):
     print(f'\nProcessing row {rownum} of {numrows}')
-    
 
     start_time = UTCDateTime()
-    progress = {}
+    progress = {'complete':0}
 
     try:
         if r['subclass']!='r':
@@ -225,27 +241,33 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
                     return rownum, r['time'], 1, float(UTCDateTime() - start_time)
         '''
         # === Proceed with waveform and metric processing ===
-        est, aefdf = make_enhanced_stream(r, start_time, rownum, outdir, inventory, source_coords)
-        if not isinstance(est, EnhancedStream):
-            return rownum, r['time'], progress, float(UTCDateTime() - start_time)
-        progress['enhanced'] = True
-        est.write(os.path.join(outdir, 'enhanced_stream.mseed'), format='MSEED')
-        aefdf.to_csv(os.path.join(outdir, 'magnitudes.csv'))
+        if compute_energy:
+            est, aefdf = make_enhanced_stream(r, start_time, rownum, outdir, inventory, source_coords)
+            if not isinstance(est, EnhancedStream):
+                return rownum, r['time'], progress, float(UTCDateTime() - start_time)
+            progress['enhanced'] = True
+            if not dry_run:
+                est.write(os.path.join(outdir, 'enhanced_stream.mseed'), format='MSEED')
+                aefdf.to_csv(os.path.join(outdir, 'magnitudes.csv'))
 
-        # === Classification ===
-        progress['reclassified'] = reclassify(est, r)
+            # === Classification ===
+            progress['reclassified'] = reclassify(est, r)
 
-        # save r (row dict)
-        pd.DataFrame([r]).to_csv(os.path.join(outdir, 'database_row.csv'), index=False)
+            # save r (row dict)
+            if not dry_run:
+                pd.DataFrame([r]).to_csv(os.path.join(outdir, 'database_row.csv'), index=False)
 
-        # save trace metrics via dataframe
-        metrics_df = stream_metrics_to_dataframe(est)
-        progress['energy'] = 'energy' in stream_metrics_to_dataframe(est).columns
-        progress['ME'] = 'ME' in stream_metrics_to_dataframe(est).columns
-        metrics_df.to_csv(os.path.join(outdir, 'stream_metrics.csv'))
+            # save trace metrics via dataframe
+            metrics_df = stream_metrics_to_dataframe(est)
+            progress['energy'] = 'energy' in stream_metrics_to_dataframe(est).columns
+            progress['ME'] = 'ME' in stream_metrics_to_dataframe(est).columns
+            if not dry_run:
+                metrics_df.to_csv(os.path.join(outdir, 'stream_metrics.csv'))
 
         # === Determine if ASL should be run ===
-        if not (r.get('new_subclass') in 're' or r.get('subclass') in 're'):
+        if run_asl and (r.get('new_subclass') in 're' or r.get('subclass') in 're'):
+            pass
+        else:
             print(f"[INFO] Skipping ASL: subclass not in ['r', 'e']")
             return rownum, r['time'], progress, float(UTCDateTime() - start_time)
 
@@ -277,7 +299,7 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
         print(f"[INFO] Stations used for ASL: {stations}")
 
         # === Prep for ASL ===
-        asl_sausage(peakf, filt_est, outdir, asl_config)
+        asl_sausage(peakf, filt_est, outdir, asl_config, inventory, TOP_DIR, dry_run)
 
         progress['asl'] = True
 
@@ -290,10 +312,11 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
     finally:
         duration = UTCDateTime() - start_time
         gc.collect()
+        progress['complete'] = sum(progress.values())
         return rownum, r['time'], progress, float(duration)
 
 
-def process_chunk(chunk_rows, start_idx, numrows, TOP_DIR, source_coords, inventory, asl_config):
+def process_chunk(chunk_rows, start_idx, numrows, TOP_DIR, source_coords, inventory, asl_config, compute_energy, run_asl, dry_run):
     logfile = os.path.join(TOP_DIR, "system_monitor.csv")
     pid = os.getpid()
     proc_name = multiprocessing.current_process().name
@@ -307,13 +330,14 @@ def process_chunk(chunk_rows, start_idx, numrows, TOP_DIR, source_coords, invent
     for i, row in enumerate(chunk_rows):
         rownum = start_idx + i
         # Do your processing here
-        result = process_row(rownum, row, numrows, TOP_DIR, source_coords, inventory, asl_config)
+        result = process_row(rownum, row, numrows, TOP_DIR, source_coords, inventory, asl_config, compute_energy, run_asl, dry_run)
         rownum, _, progress, duration = result
         print(f"Row {rownum+1}/{numrows}")
         results.append(result)
         if not 'reclassified' in progress:
-            with open(os.path.join(TOP_DIR, 'failures.log'), 'a') as f:
-                f.write(f"{rownum},{row['time']},{success}\n")
+            if not dry_run:
+                with open(os.path.join(TOP_DIR, 'failures.log'), 'a') as f:
+                    f.write(f"{rownum},{row['time']},{progress['complete']}\n")
 
         # ETA estimation
         processed = rownum + 1
@@ -325,7 +349,7 @@ def process_chunk(chunk_rows, start_idx, numrows, TOP_DIR, source_coords, invent
 
         print(f"[{rownum+1}/{numrows}] Took {duration:.1f}s | ETA: {str(eta_time)[11:19]} | Remaining ~{eta_seconds/60:.1f} min", flush=True)
 
-        if rownum % 1000 == 0:
+        if not dry_run and rownum % 1000 == 0:
             log_system_status_csv(logfile, rownum=rownum)
     print(f"[CHUNK DONE] Processed {len(chunk_rows)} rows in {(UTCDateTime() - chunk_start_time) / 60:.2f} minutes at {UTCDateTime()}")
 
@@ -336,180 +360,46 @@ def chunkify(lst, n):
     k, m = divmod(len(lst), n)
     return [lst[i*k + min(i, m):(i+1)*k + min(i+1, m)] for i in range(n)]
 
+def main():
+    """
+    Main entry point for LV waveform processing.
 
+    Loads configuration, backs up the seismic database, queries or loads pre-cached event metadata, 
+    initializes the seismic station inventory and ASL configuration, and processes each event using 
+    either single-threaded or parallel execution.
 
-print('[STARTUP] functions loaded')
-####################################################################
-"""
-if __name__ == "__main__":
+    Depending on user-selected options, this function:
+      - Computes amplitude, energy, and frequency-based metrics for each event
+      - Applies a rule-based volcano event classifier
+      - Optionally performs ASL to estimate source location and generate output products
 
-    DB_PATH = "/home/thompsong/public_html/seiscomp_like.sqlite"
-    if not backup_db(DB_PATH, __file__):
+    Results are saved to structured subdirectories beneath the configured waveform processing directory.
+    """
+
+    parser = argparse.ArgumentParser(description="Process LV events: compute amp/energy/frequency/magnitude and/or run ASL")
+    parser.add_argument("--no-asl", action="store_true", help="Disable ASL processing")
+    parser.add_argument("--no-energy", action="store_true", help="Disable energy/magnitude computation")
+    parser.add_argument("--single-core", action="store_true", help="Disable multiprocessing (run single-core)")
+    parser.add_argument("--dry-run", action="store_true", help="Test mode: no outputs are saved.")
+    args = parser.parse_args()
+    use_multiprocessing = not args.single_core
+    compute_energy = not args.no_energy
+    run_asl = not args.no_asl
+    dry_run = args.dry_run
+
+    config = get_config()
+    dbfile = config['mvo_seiscomp_db']
+    top_dir = config['enhanced_results']
+    os.makedirs(top_dir, exist_ok=True)
+
+    if not backup_db(dbfile, __file__):
         exit()
 
-    print('[STARTUP] backup of database created')
-
-    # === USER CONFIG ===
-    N = None  # Set to None for all
-    STATIONXML_PATH = "/data/SEISAN_DB/CAL/MV.xml"
-    scriptname = os.path.basename(__file__).replace('.py', '')     
-    TOP_DIR = os.path.join('/data', scriptname)
-    os.makedirs(TOP_DIR, exist_ok=True)
-
-    # === Connect to DB ===
-    conn = sqlite3.connect(DB_PATH)
-    print('[STARTUP] connected to database')
-
-    query_result_file = os.path.join(TOP_DIR, f'query_result.pkl')
-    query_dataframe_pkl = os.path.join(TOP_DIR, f'query_dataframe.pkl')
-
-    if os.path.isfile(query_dataframe_pkl):
-        df = pd.read_pickle(query_dataframe_pkl)
-    else:
-
-        # === Try loading from .pkl if it exists ===
-        if os.path.isfile(query_result_file):
-            print(f"[INFO] Loading cached query result from {query_result_file}")
-            df = pd.read_pickle(query_result_file)
-        else:
-            print("[INFO] Running query and saving result to cache.")
-            query = '''
-            SELECT e.public_id, o.latitude, o.longitude, o.depth, ec.time, ec.author, ec.source, ec.dfile, ec.mainclass, ec.subclass, mfs.dir
-            FROM event_classifications ec
-            JOIN events e ON ec.event_id = e.public_id
-            LEFT JOIN origins o ON o.event_id = e.public_id
-            JOIN mseed_file_status mfs ON ec.dfile = mfs.dfile
-            LEFT JOIN magnitudes m ON m.event_id = e.public_id
-            WHERE ec.subclass IS NOT NULL
-            GROUP BY e.public_id
-            '''
-            if N:
-                query += f" LIMIT {N}"
-
-
-            df = pd.read_sql_query(query, conn)
-            df.to_pickle(query_result_file)
-        
-        # sort dataframe
-        df = df.sort_values(by="time")
-        df.to_pickle(query_dataframe_pkl)
-
-    #df=df[df['subclass']=='r']    
-    print(f'got {len(df)} rows')
-
-    print('[STARTUP] dataframe of database query results created')
-
-
-    # === Load station inventory ===
-    inventory = read_inventory(STATIONXML_PATH)
-    print('[STARTUP] inventory loaded')
-
-    #DEFAULT_SOURCE_LOCATION = {"latitude": 16.712, "longitude": -62.177, "depth": 3000.0}
-
-
-    # === Set up ASL ===
-    #source = initial_source(lat=dome_location['lat'], lon=dome_location['lon'])
-    #grid_cache_file = os.path.join(TOP_DIR, "gridobj_cache.pkl")
-    ASL_CONFIG = {
-        'window_seconds':5, 
-        'min_stations':5, 
-        'Q':100, 
-        'surfaceWaveSpeed_kms':1.5,
-        'vsam_metric':'mean',
-        'source': initial_source(lat=dome_location['lat'], lon=dome_location['lon']),
-        'grid_cache_file':os.path.join(TOP_DIR, "gridobj_cache.pkl")
-        }
-    # === Try loading gridobj from pickle ===
-    if os.path.isfile(ASL_CONFIG['grid_cache_file']):
-        print(f"[INFO] Loading gridobj from cache: {ASL_CONFIG['grid_cache_file']}")
-        with open(ASL_CONFIG['grid_cache_file'], 'rb') as f:
-            ASL_CONFIG['gridobj'] = pickle.load(f)
-    else:
-        print("[INFO] Creating new gridobj...")
-        ASL_CONFIG['gridobj'] = make_grid(
-            center_lat=dome_location['lat'],
-            center_lon=dome_location['lon'],
-            node_spacing_m=50,
-            grid_size_lat_m=6000,
-            grid_size_lon_m=6000
-        )
-        with open(ASL_CONFIG['grid_cache_file'], 'wb') as f:
-            pickle.dump(ASL_CONFIG['gridobj'], f)
-        print(f"[INFO] Saved gridobj to {ASL_CONFIG['grid_cache_file']}")
-
-    print('[STARTUP] ASL configured')
-
-
-    # Get source coords
-    source_coords = {
-        'latitude':dome_location['lat'],
-        'longitude':dome_location['lon'],
-        'depth':3000
-    }
-
-    # === Iterate over rows as dicts ===
-    #lod = []
-    df = df.reset_index(drop=True)
-    rows = df.to_dict(orient="records")
-    numrows = len(rows)
-    n_workers = max(1, multiprocessing.cpu_count() - 2)
-    row_chunks = [chunk for chunk in chunkify(rows, n_workers) if chunk]
-
-    chunk_args = [
-        (
-            chunk,
-            sum(len(c) for c in row_chunks[:i]),  # starting index
-            numrows,
-            TOP_DIR,
-            source_coords,
-            inventory,
-            ASL_CONFIG
-        )
-        for i, chunk in enumerate(row_chunks)
-    ]
-
-    try:
-        with multiprocessing.Pool(processes=n_workers) as pool:
-            results_nested = pool.starmap(process_chunk, chunk_args)
-    finally:
-        df.to_csv(os.path.join(TOP_DIR, 'interrupted_results.csv'), index=False)
-
-
-    # Flatten results
-    results = [item for sublist in results_nested for item in sublist]
-
-    # Insert results back into DataFrame
-    for rownum, _, success, duration in results:
-        df.at[rownum, 'result'] = success
-        df.at[rownum, 'duration_seconds'] = duration
-
-
-    print(df.head())
-    print(df['duration_seconds'].describe())
-    total_time = df['duration_seconds'].sum()
-    print(f"[SUMMARY] Total processing time: {total_time/3600:.2f} hours")
-
-    df.to_csv(os.path.join(TOP_DIR, 'final_results.csv'), index=False)
-    #df.to_pickle(os.path.join(TOP_DIR, 'final_results.pkl'))
-
-
-    print("\n[✓] Done processing all events.")
-"""
-# --- Main script execution ---
-
-if __name__ == "__main__":
-    DB_PATH = "/home/thompsong/public_html/seiscomp_like.sqlite"
-    STATIONXML_PATH = "/data/SEISAN_DB/CAL/MV.xml"
-    SCRIPT_NAME = os.path.splitext(os.path.basename(__file__))[0]
-    TOP_DIR = os.path.join('/data', SCRIPT_NAME)
-    os.makedirs(TOP_DIR, exist_ok=True)
-
-    if not backup_db(DB_PATH, __file__):
-        exit()
-
-    conn = sqlite3.connect(DB_PATH)
-    query_result_file = os.path.join(TOP_DIR, 'query_result.pkl')
-    query_dataframe_pkl = os.path.join(TOP_DIR, 'query_dataframe.pkl')
+    # === Connect to DB and load or query dataframe ===
+    conn = sqlite3.connect(dbfile)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    query_result_file = os.path.join(top_dir, 'query_result.pkl')
+    query_dataframe_pkl = os.path.join(top_dir, 'query_dataframe.pkl')
 
     if os.path.isfile(query_dataframe_pkl):
         df = pd.read_pickle(query_dataframe_pkl)
@@ -528,66 +418,97 @@ if __name__ == "__main__":
             GROUP BY e.public_id
             '''
             df = pd.read_sql_query(query, conn)
-            df.to_pickle(query_result_file)
+            if not dry_run:
+                df.to_pickle(query_result_file)
         df = df.sort_values(by="time")
-        df.to_pickle(query_dataframe_pkl)
+        if not dry_run:
+            df.to_pickle(query_dataframe_pkl)
 
     print(f"[INFO] Loaded {len(df)} rows")
 
-    inventory = read_inventory(STATIONXML_PATH)
+    # === Load inventory ===
+    inventory = read_inventory(config['inventory'])
 
+    # === Configure ASL ===
     source_coords = {
         'latitude': dome_location['lat'],
         'longitude': dome_location['lon'],
         'depth': 3000.0
     }
 
-    ASL_CONFIG = {
+    asl_config = {
         'window_seconds': 5,
         'min_stations': 5,
         'Q': 100,
         'surfaceWaveSpeed_kms': 1.5,
         'vsam_metric': 'mean',
-        'inventory': inventory,
-        'top_dir': TOP_DIR,
-        'source': initial_source(lat=dome_location['lat'], lon=dome_location['lon'])
+        'source': initial_source(lat=dome_location['lat'], lon=dome_location['lon']),
+        'top_dir': top_dir
     }
 
-    grid_cache_file = os.path.join(TOP_DIR, "gridobj_cache.pkl")
+    grid_cache_file = os.path.join(top_dir, "gridobj_cache.pkl")
     if os.path.isfile(grid_cache_file):
         with open(grid_cache_file, 'rb') as f:
-            ASL_CONFIG['gridobj'] = pickle.load(f)
+            asl_config['gridobj'] = pickle.load(f)
     else:
-        ASL_CONFIG['gridobj'] = make_grid(
+        asl_config['gridobj'] = make_grid(
             center_lat=dome_location['lat'],
             center_lon=dome_location['lon'],
             node_spacing_m=50,
             grid_size_lat_m=6000,
             grid_size_lon_m=6000
         )
-        with open(grid_cache_file, 'wb') as f:
-            pickle.dump(ASL_CONFIG['gridobj'], f)
+        if not dry_run:
+            with open(grid_cache_file, 'wb') as f:
+                pickle.dump(asl_config['gridobj'], f)
 
+    # === Multiprocessing setup ===
     rows = df.reset_index(drop=True).to_dict(orient="records")
     numrows = len(rows)
     n_workers = max(1, multiprocessing.cpu_count() - 2)
     row_chunks = [chunk for chunk in np.array_split(rows, n_workers) if chunk]
 
     chunk_args = [
-        (chunk, sum(len(c) for c in row_chunks[:i]), numrows, ASL_CONFIG, inventory, source_coords)
+        (
+            chunk,
+            sum(len(c) for c in row_chunks[:i]),
+            numrows,
+            top_dir,
+            source_coords,
+            inventory,
+            asl_config,
+            compute_energy,
+            run_asl,
+            dry_run
+        )
         for i, chunk in enumerate(row_chunks)
     ]
 
-    try:
-        with multiprocessing.Pool(processes=n_workers) as pool:
-            results_nested = pool.starmap(process_chunk, chunk_args)
-    finally:
-        df.to_csv(os.path.join(TOP_DIR, 'interrupted_results.csv'), index=False)
+    results_nested = []
+    if use_multiprocessing and n_workers > 1:
+        try:
+            with multiprocessing.Pool(processes=n_workers) as pool:
+                results_nested = pool.starmap(process_chunk, chunk_args)
+        finally:
+            if not dry_run:
+                df.to_csv(os.path.join(top_dir, 'interrupted_results.csv'), index=False)
+    else:
+        print("[INFO] Running in single-core mode")
+        for args in chunk_args:
+            results_nested.append(process_chunk(*args))    
 
+    # === Collect results ===
     results = [item for sublist in results_nested for item in sublist]
     for rownum, _, progress_summary, duration in results:
         df.at[rownum, 'progress_summary'] = progress_summary
         df.at[rownum, 'duration_seconds'] = duration
 
-    df.to_csv(os.path.join(TOP_DIR, 'final_results.csv'), index=False)
+    if not dry_run:
+        df.to_csv(os.path.join(top_dir, 'final_results.csv'), index=False)
     print("\n[✓] Done processing all events.")
+
+print('[STARTUP] functions loaded')
+####################################################################
+
+if __name__ == "__main__":
+    main()

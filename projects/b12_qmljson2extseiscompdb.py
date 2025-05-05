@@ -214,15 +214,23 @@ def insert_json_metadata(conn, eid, metrics):
         raise
 
 
-if __name__ == "__main__":
 
-    dbfile = "/home/thompsong/public_html/seiscomp_like.sqlite"
-    #clear_seiscomp_tables(dbfile)
+def main():
+    from flovopy.config_projects import get_config
+    from flovopy.core.enhanced import EnhancedEvent  # noqa: F401, future use
+    from db_backup import backup_db
+    config = get_config()
+    dbfile = config['mvo_seiscomp_db']
+    if not backup_db(dbfile, __file__):
+        exit()  
 
+    # Uncomment to wipe existing data:
+    # clear_seiscomp_tables(dbfile)    
     conn = sqlite3.connect(dbfile)
+
     conn.execute("PRAGMA foreign_keys = ON;")
 
-    QML_DIR = "/data/SEISAN_DB/json/MVOE_"
+    QML_DIR = os.path.join(config['json_top'], 'MVOE_')
     qml_files = sorted(glob.glob(os.path.join(QML_DIR, "*", "*", "*.qml")))
 
     succeeded = 0
@@ -234,7 +242,6 @@ if __name__ == "__main__":
         base = qml_path.replace(".qml", "")
         try:
             ev = EnhancedEvent.load(base)
-            #print(ev)
             if not ev:
                 print(f"[SKIP] No enhanced event in {qml_path}")
                 continue
@@ -258,7 +265,6 @@ if __name__ == "__main__":
                 insert_json_metadata(conn, ev.event_id, ev.metrics)
                 print('- metrics succeeded')
 
-
             succeeded += 1
 
         except Exception as e:
@@ -276,3 +282,7 @@ if __name__ == "__main__":
     conn.commit()
     conn.close()
     print(f"[DONE] Inserted {succeeded} events, {failed} failed, from {len(qml_files)} QML files.")
+
+
+if __name__ == "__main__":
+    main()

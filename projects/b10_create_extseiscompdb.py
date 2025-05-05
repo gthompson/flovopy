@@ -463,15 +463,16 @@ def insert_stations_from_inventory(conn, inventory):
 
 
 if __name__ == "__main__":
-
+    from flovopy.config_projects import get_config
     from flovopy.core.enhanced import EnhancedEvent
-    dbfile = "/home/thompsong/public_html/seiscomp_like.sqlite"
+    config = get_config()
+    dbfile = config['mvo_seiscomp_db']
     conn = sqlite3.connect(dbfile)
     create_schema(conn)
     print(f"Initialized schema in {dbfile}")
 
     print('Reading inventory')
-    inv = read_inventory('/data/SEISAN_DB/CAL/MV.xml')
+    inv = read_inventory(config['inventory'])
     print('Inserting inventory into db')
     insert_stations_from_inventory(conn, inv)
     conn.execute("PRAGMA foreign_keys = ON;")

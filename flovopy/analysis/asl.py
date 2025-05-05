@@ -908,7 +908,7 @@ def compute_azimuthal_gap(origin_lat, origin_lon, station_coords):
 
 
 
-def extract_asl_diagnostics(topdir, output_csv=None):
+def extract_asl_diagnostics(topdir, outputcsv, timestamp=True):
     """
     Extracts ASL diagnostics from QuakeML files and associated event directories.
 
@@ -961,14 +961,11 @@ def extract_asl_diagnostics(topdir, output_csv=None):
 
     df = pd.DataFrame(lod)
 
-    if output_csv:
-        output_path = output_csv
-    else:
-        timestamp = int(UTCDateTime().timestamp)
-        output_path = f'/home/thompsong/Dropbox/ASL_results_{timestamp}.csv'
+    if timestamp:
+        outputcsv.replace('.csv', f'{UTCDateTime().timestamp}.csv')
 
-    df.to_csv(output_path, index=False)
-    print(f"[✓] Saved ASL diagnostics to: {output_path}")
+    df.to_csv(outputcsv, index=False)
+    print(f"[✓] Saved ASL diagnostics to: {outputcsv}")
     return df
 
  

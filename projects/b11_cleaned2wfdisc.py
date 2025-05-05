@@ -20,23 +20,11 @@ def is_file_already_processed(conn: sqlite3.Connection, mseed_base: str) -> bool
 def insert_miniseed_file(conn: sqlite3.Connection, cleaned_dict: Dict, stream: Stream, commit: bool = True) -> None:
     """
     Insert metadata and waveform entries for a cleaned MiniSEED file.
-
-    Parameters
-    ----------
-    conn : sqlite3.Connection
-        SQLite database connection.
-    cleaned_dict : dict
-        Metadata fields for the MiniSEED file (for mseed_file_status).
-    stream : obspy Stream
-        The waveform data to insert into the wfdisc table.
-    commit : bool
-        Whether to commit the transaction after insertion (default True).
     """
     cur = conn.cursor()
     completed = ""
 
     try:
-        # Insert into mseed_file_status
         cur.execute('''INSERT OR IGNORE INTO mseed_file_status 
                        (time, endtime, dir, dfile, network, format)
                        VALUES (?, ?, ?, ?, ?, ?)''', (
@@ -49,7 +37,6 @@ def insert_miniseed_file(conn: sqlite3.Connection, cleaned_dict: Dict, stream: S
         ))
         completed = "mseed_file_status"
 
-        # Insert each trace into wfdisc
         for tracenum, tr in enumerate(stream):
             s = tr.stats
             cur.execute('''INSERT OR IGNORE INTO wfdisc 
@@ -62,8 +49,8 @@ def insert_miniseed_file(conn: sqlite3.Connection, cleaned_dict: Dict, stream: S
                 tracenum,
                 s.npts,
                 s.sampling_rate,
-                getattr(s, 'calib', 1.0),  # Fallback if not defined
-                getattr(s, 'units', 'counts')  # Fallback if not defined
+                getattr(s, 'calib', 1.0),
+                getattr(s, 'units', 'counts')
             ))
         completed = "wfdisc"
 
@@ -76,14 +63,19 @@ def insert_miniseed_file(conn: sqlite3.Connection, cleaned_dict: Dict, stream: S
         print(f"[INFO] Inserted: {cleaned_dict['dfile']}")
 
 
-if __name__ == "__main__":
-    dbfile = "/home/thompsong/public_html/seiscomp_like.sqlite"
-    miniseed_dir = "/data/SEISAN_DB/miniseed/MVOE_"
+def main():
+    from flovopy.config_projects import get_config
+    from flovopy.core.enhanced import EnhancedEvent 
+    from db_backup import backup_db
+    config = get_config()
+    dbfile = config['mvo_seiscomp_db']
+    if not backup_db(dbfile, __file__):
+        exit()      
 
     conn = sqlite3.connect(dbfile)
     conn.execute("PRAGMA foreign_keys = ON;")
 
-    miniseed_files = sorted(glob.glob(os.path.join(miniseed_dir, "*", "*", "*.cleaned")))
+    miniseed_files = sorted(glob.glob(os.path.join(config['miniseed_top'], "MVOE_", "*", "*", "*.cleaned")))
     total = len(miniseed_files)
     succeeded, failed, skipped = 0, 0, 0
 
@@ -124,3 +116,8 @@ if __name__ == "__main__":
     conn.commit()
     conn.close()
     print(f"[DONE] Total: {total}, Succeeded: {succeeded}, Failed: {failed}, Skipped: {skipped}")
+
+
+if __name__ == "__main__":
+    main()
+
