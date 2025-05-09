@@ -9,7 +9,7 @@ from flovopy.core.legacy import _fix_legacy_id
 ##                Trace  tools                                       ##
 #######################################################################
 
-def preprocess_trace(tr, bool_despike=True, bool_clean=True, inv=None, quality_threshold=-np.Inf, taperFraction=0.05, \
+def preprocess_trace(tr, bool_despike=True, bool_clean=True, inv=None, quality_threshold=-np.inf, taperFraction=0.05, \
                   filterType="bandpass", freq=[0.5, 30.0], corners=6, zerophase=False, outputType='VEL', \
                     miniseed_qc=True, verbose=False, max_dropout=0.0, units='Counts', bool_detrend=True, min_sampling_rate=20.0):
     """
@@ -1948,7 +1948,7 @@ def Stream_min_starttime(all_traces):
     return min_stime, max_stime, min_etime, max_etime
 
 def preprocess_stream(st, bool_despike=True, bool_clean=True, inv=None, \
-                      quality_threshold=-np.Inf, taperFraction=0.05, \
+                      quality_threshold=-np.inf, taperFraction=0.05, \
                     filterType="bandpass", freq=[0.5, 30.0], corners=6, \
                     zerophase=False, outputType='VEL', \
                     miniseed_qc=True, verbose=False, max_dropout=0.0, \
