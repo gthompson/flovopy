@@ -14,7 +14,7 @@ import pygmt
 
 # ObsPy core and event tools
 import obspy
-from obspy import Stream, Trace, UTCDateTime, read_events
+from obspy import Stream, Trace, UTCDateTime, read_events, Inventory
 from obspy.core.event import Event, Catalog, ResourceIdentifier, Origin, Amplitude, QuantityError, OriginQuality, Comment
 from obspy.geodetics import locations2degrees, degrees2kilometers, gps2dist_azimuth
 # Your internal or local modules (assumed to exist)
@@ -181,15 +181,15 @@ class Grid:
         self.lonrange = lonrange
         self.latrange = latrange
 
-    def plot(self, node_spacing_m, DEM_DIR=None):
-        fig = montserrat_topo_map(DEM_DIR=DEM_DIR)
+    def plot(self, node_spacing_m, DEM_DIR=None, inv=None, add_labels=False):
+        fig = montserrat_topo_map(DEM_DIR=DEM_DIR, inv=inv, add_labels=add_labels)
         #plt.plot(self.gridlon, self.gridlat, marker='+', color='k', linestyle='none')
         #plt.show()
         symsize = node_spacing_m/2000
         stylestr = f'+{symsize}c'
         
         fig.plot(x=self.gridlon.reshape(-1), y=self.gridlat.reshape(-1), style=stylestr, pen='black')
-        fig.basemap(region=[minlon, maxlon, minlat, maxlat], frame=True)
+        #fig.basemap(region=[self.minlon, self.maxlon, self.minlat, self.maxlat], frame=True)
         fig.show()
         #fig._cleanup()
 
@@ -204,7 +204,11 @@ def make_grid(center_lat=dome_location['lat'], center_lon=dome_location['lon'], 
 
 def simulate_VSAM(inv, source, units='m/s', surfaceWaves=False, wavespeed_kms=1.5, peakf=8.0, Q=None, noise_level_percent=0.0):
     npts = len(source['DR'])
-    seed_ids = inventory2seedids(inv, force_location_code='')
+    if isinstance(inv, Inventory):
+        seed_ids = inventory2traceid(inv, force_location_code='')
+    else:
+        seed_ids = []
+        return None
     st = obspy.Stream()
     
     for id in seed_ids:
@@ -955,4 +959,69 @@ def extract_asl_diagnostics(topdir, output_csv=None):
     print(f"[✓] Saved ASL diagnostics to: {output_path}")
     return df
 
- 
+if __name__ == "__main__":
+    import os
+    import sys
+    import numpy as np
+    from obspy import read_inventory
+    RESPONSE_DIR = '/Users/GlennThompson/Dropbox'
+    invMVO = obspy.read_inventory(os.path.join(RESPONSE_DIR,'MV.xml'), format='stationxml')
+    #invMVO=None
+    startt = UTCDateTime(2003,7,12,23,0,0)
+    endt = UTCDateTime(2003,7,13,4,0,0)
+    invMVO = invMVO.select(starttime=startt, endtime=endt)
+    invMVO = invMVO.select(channel='*Z')
+    import pygmt
+    pygmt.config(GMT_DATA_SERVER="https://oceania.generic-mapping-tools.org")
+    montserrat_topo_map(inv=invMVO, show=True, add_labels=True, resolution='03s');
+    
+
+    sampling_interval = 60
+    synthetic_source = {}
+    N = 10
+    synthetic_source['lat'] = 16.69 + np.tile(np.arange(N)/200, N)
+    synthetic_source['lon'] = -62.20 + np.repeat(np.arange(N)/200, N)
+    synthetic_source['DR'] = np.ones(N*N) * 100.0 # 100 cm^2 everywhere
+    synthetic_source['t'] = [UTCDateTime(0) + t * sampling_interval for t in range(N*N)]
+    print(synthetic_source)
+
+    surfaceWaveSpeed_kms = 1.5
+    peakf=8.0
+    Q=9999
+    
+    synthDSAMobj = simulate_VSAM(invMVO, synthetic_source, surfaceWaves=True, wavespeed_kms=surfaceWaveSpeed_kms, \
+                                peakf=peakf, Q=Q, noise_level_percent=0.0)
+    synthDSAMobj.plot(metrics='mean')
+    
+    node_spacing_m = 100
+    grid_size_lat_m = 10000
+    grid_size_lon_m = 8000
+    nlat = int(grid_size_lat_m/node_spacing_m) + 1
+    nlon = int(grid_size_lon_m/node_spacing_m) + 1
+    print(f'Grid size: {nlat} x {nlon} = {nlat * nlon} nodes')
+    gridobj = Grid(np.mean(synthetic_source['lat']), np.mean(synthetic_source['lon']), nlat, nlon, node_spacing_m)  
+    gridobj.plot(node_spacing_m = node_spacing_m, inv=invMVO, add_labels=True)
+    window_seconds = 5
+    aslobj = ASL(synthDSAMobj, 'mean', invMVO, gridobj, window_seconds)
+
+    aslobj.plot(zoom_level=1, threshold_DR=1.0, scale=0.1)    
+    import time
+    aslobj.compute_grid_distances()
+
+    aslobj.compute_amplitude_corrections(surfaceWaves=True, wavespeed_kms=surfaceWaveSpeed_kms, Q=Q, fix_peakf=peakf)
+
+    time1 = time.time()
+    aslobj.locate()
+    time2 = time.time()
+    print(f'Location algorithm took {time2-time1} s')
+    aslobj.plot(zoom_level=1, scale=0.1, threshold_DR=0.0)
+    time1 = time.time()
+    aslobj.fast_locate()
+    time2 = time.time()
+    print(f'Vectorized location algorithm took {time2-time1} s')
+    aslobj.plot(zoom_level=1, scale=0.1, threshold_DR=0.0)
+    '''
+    def plot(self, zoom_level=1, threshold_DR=0, scale=1, join=False, number=0, \
+             add_labels=False, equal_size=False, outfile=None, 
+             stations=None, title=None, region=None, normalize=True):
+    '''
