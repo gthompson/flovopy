@@ -14,12 +14,13 @@ Processing can be parallelized using Python’s multiprocessing module or run in
 Command-line arguments allow control over which processing steps are enabled.
 
 Usage:
-    python b18_waveform_processing.py [--no-energy] [--no-asl] [--single-core]
+    python b18_waveform_processing.py [--no-energy] [--no-asl] [--single-core] [--dry-run]
 
 Options:
     --no-energy     Skip waveform metric computation (amp, energy, frequency, magnitude)
     --no-asl        Skip ASL source location and plotting
     --single-core   Run in single-threaded mode (no multiprocessing)
+    --dry-run       Run but do not save anything
 """
 import os
 import sqlite3
@@ -107,8 +108,8 @@ def make_enhanced_stream(r, inventory, source_coords):
     est, aefdf = est.ampengfftmag(inventory, source_coords, verbose=True, snr_min=3.0)
     return est, aefdf
 
-def reclassify(est, r):
-    # === Classification ===
+    
+def reclassify(est, r, dry_run, conn=None):
     features = {}
     for tr in est:
         m = getattr(tr.stats, 'metrics', {})
@@ -121,12 +122,273 @@ def reclassify(est, r):
         r['new_subclass'] = label
         r['new_score'] = score[label]
         print(f"[INFO] Event classified as '{label}' with score {score[label]:.2f}")
+        
+        if conn and not dry_run:
+            cur = conn.cursor()
+            cur.execute('''
+                INSERT OR REPLACE INTO event_classifications (
+                    event_id, dfile, mainclass, subclass, author, time, source, score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                r['public_id'], r['dfile'], 'LV', label,
+                r.get('author', 'unknown'), r['time'], 'VolcanoEventClassifier', score[label]
+            ))
+            conn.commit()
+
         return True
     except Exception as e:
         print(f"[WARN] Classification failed: {e}")
         return False
     
-def asl_sausage(peakf, filt_est, outdir, asl_config, inventory, TOP_DIR, dry_run):
+import uuid
+def insert_metrics_to_db(est, aefdf, r, conn):
+    cur = conn.cursor()
+    event_id = r['public_id']
+    dfile = r['dfile']
+
+    smagse = []
+    smagsl = []
+    smagsd = []
+
+    for tr in est:
+        metrics = getattr(tr.stats, 'metrics', {})
+        if not metrics:
+            continue
+
+        trace_id = tr.id
+        starttime = tr.stats.starttime.isoformat()
+        endtime = tr.stats.endtime.isoformat()
+        source = 'ampengfftmag'
+
+        # Insert aef_metrics
+        cur.execute('''
+            INSERT OR IGNORE INTO aef_metrics (
+                event_id, trace_id, time, endtime, dfile, snr, peakamp, peaktime, energy, 
+                peakf, meanf, ssam_json, spectrum_id, sgramdir, sgramdfile,
+                band_ratio1, band_ratio2, skewness, kurtosis, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            event_id, trace_id, starttime, endtime, dfile,
+            metrics.get('snr'), metrics.get('peakamp'),
+            metrics.get('peaktime'), metrics.get('energy'),
+            metrics.get('peakf'), metrics.get('meanf'),
+            str(metrics.get('ssam_json')) if 'ssam_json' in metrics else None,
+            metrics.get('spectrum_id'), metrics.get('sgramdir'), metrics.get('sgramdfile'),
+            metrics.get('band_ratio1'), metrics.get('band_ratio2'),
+            metrics.get('skewness'), metrics.get('kurtosis'), source
+        ))
+
+        # Insert amplitude
+        amp_id = str(uuid.uuid4())
+        cur.execute('''
+            INSERT OR IGNORE INTO amplitudes (
+                amplitude_id, event_id, generic_amplitude, unit, type, period, snr, waveform_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            amp_id, event_id, metrics.get('peakamp'), 'm/s', 'peak',
+            metrics.get('period', 1.0), metrics.get('snr'), trace_id
+        ))
+
+        # Insert station_magnitudes
+        if 'ME' in metrics:
+            smag_id = str(uuid.uuid4())
+            smagse.append(metrics['ME'])
+
+            cur.execute('''
+                INSERT OR IGNORE INTO station_magnitudes (
+                    smag_id, event_id, station_code, mag, mag_type, amplitude_id
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                smag_id, event_id, tr.stats.station, metrics['ME'], 'ME', amp_id
+            ))
+
+        # Insert station_magnitudes
+        if 'ML' in metrics:
+            smag_id = str(uuid.uuid4())
+            smagsl.append(metrics['ML'])
+
+            cur.execute('''
+                INSERT OR IGNORE INTO station_magnitudes (
+                    smag_id, event_id, station_code, mag, mag_type, amplitude_id
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                smag_id, event_id, tr.stats.station, metrics['ML'], 'ML', amp_id
+            ))
+
+        # Insert station_magnitudes
+        if 'ML' in metrics:
+            smag_id = str(uuid.uuid4())
+            smagsd.append(metrics['MD'])
+
+            cur.execute('''
+                INSERT OR IGNORE INTO station_magnitudes (
+                    smag_id, event_id, station_code, mag, mag_type, amplitude_id
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                smag_id, event_id, tr.stats.station, metrics['MD'], 'MD', amp_id
+            ))
+
+
+    # Insert average magnitude into magnitudes table
+    if smagse:
+        avg_me = sum(smagse) / len(smagse)
+        mag_id = str(uuid.uuid4())
+        cur.execute('''
+            INSERT OR IGNORE INTO magnitudes (
+                mag_id, event_id, magnitude, mag_type, origin_id
+            ) VALUES (?, ?, ?, ?, ?)
+        ''', (
+            mag_id, event_id, avg_me, 'ME', None  # or link to actual origin_id
+        ))
+
+    if smagsl:
+        avg_ml = sum(smagsl) / len(smagsl)
+        mag_id = str(uuid.uuid4())
+        cur.execute('''
+            INSERT OR IGNORE INTO magnitudes (
+                mag_id, event_id, magnitude, mag_type, origin_id
+            ) VALUES (?, ?, ?, ?, ?)
+        ''', (
+            mag_id, event_id, avg_ml, 'ML', None  # or link to actual origin_id
+        ))  
+
+    if smagsd:
+        avg_md = sum(smagsd) / len(smagsd)
+        mag_id = str(uuid.uuid4())
+        cur.execute('''
+            INSERT OR IGNORE INTO magnitudes (
+                mag_id, event_id, magnitude, mag_type, origin_id
+            ) VALUES (?, ?, ?, ?, ?)
+        ''', (
+            mag_id, event_id, avg_md, 'MD', None  # or link to actual origin_id
+        ))        
+
+    conn.commit()    
+    
+def recreate_asl_tables(cur):
+    # === Drop existing ASL tables ===
+    cur.executescript("""
+        DROP TABLE IF EXISTS asl_grid_station_amplitudes;
+        DROP TABLE IF EXISTS asl_grid;
+        DROP TABLE IF EXISTS asl_node_distances;
+        DROP TABLE IF EXISTS asl_results;
+        DROP TABLE IF EXISTS asl_model;
+        DROP TABLE IF EXISTS asl_grid_definition;
+    """)
+
+    # === Create new streamlined ASL tables ===
+    cur.execute('''CREATE TABLE IF NOT EXISTS asl_grid_definition (
+        grid_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        centerlat REAL,
+        centerlon REAL,
+        nlat INTEGER,
+        nlon INTEGER,
+        ndepth INTEGER DEFAULT 1,
+        node_spacing_m REAL,
+        grid_pickle_path TEXT,
+        UNIQUE(centerlat, centerlon, node_spacing_m)
+    )''')
+
+    cur.execute('''CREATE TABLE IF NOT EXISTS asl_model (
+        model_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        wavetype TEXT,
+        wavespeed REAL,
+        peakf REAL,
+        window_seconds REAL DEFAULT 5.0,
+        q REAL,
+        correction_pickle_path TEXT,
+        UNIQUE(wavetype, wavespeed, peakf, q)
+    )''')
+
+    cur.execute('''CREATE TABLE IF NOT EXISTS asl_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT,
+        model_id INTEGER,
+        grid_id INTEGER,
+        timestamp TEXT,
+        window_seconds REAL,
+        est_lat REAL,
+        est_lon REAL,
+        est_elev REAL DEFAULT 0.0,
+        reduced_displacement REAL,
+        reduced_velocity REAL,
+        reduced_energy REAL,
+        misfit REAL,
+        FOREIGN KEY(grid_id) REFERENCES asl_grid_definition(grid_id),
+        FOREIGN KEY(model_id) REFERENCES asl_model(model_id),
+        FOREIGN KEY(event_id) REFERENCES events(public_id)
+    )''')
+
+    print("[✓] ASL tables recreated.")
+
+
+def insert_asl_results_to_db(aslobj, event_id, grid_pickle_path, correction_pickle_path, conn):
+    cur = conn.cursor()
+
+    # === Insert or get grid_id ===
+    grid = aslobj.gridobj
+    cur.execute("""
+        INSERT OR IGNORE INTO asl_grid_definition (
+            centerlat, centerlon, nlat, nlon, ndepth, node_spacing_m, grid_pickle_path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        grid.centerlat, grid.centerlon,
+        grid.gridlat.shape[0], grid.gridlon.shape[1], 1,
+        grid.spacing_m, grid_pickle_path
+    ))
+    cur.execute("""
+        SELECT grid_id FROM asl_grid_definition
+        WHERE centerlat=? AND centerlon=? AND node_spacing_m=?
+    """, (grid.centerlat, grid.centerlon, grid.spacing_m))
+    grid_id = cur.fetchone()[0]
+
+    # === Insert or get model_id ===
+    cur.execute("""
+        INSERT OR IGNORE INTO asl_model (
+            wavetype, wavespeed, peakf, window_seconds, q, correction_pickle_path
+        ) VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        'surface' if aslobj.surfaceWaves else 'body',
+        aslobj.wavespeed_kms, aslobj.peakf,
+        aslobj.window_seconds, aslobj.Q, correction_pickle_path
+    ))
+    cur.execute("""
+        SELECT model_id FROM asl_model
+        WHERE wavetype=? AND wavespeed=? AND peakf=? AND q=?
+    """, (
+        'surface' if aslobj.surfaceWaves else 'body',
+        aslobj.wavespeed_kms, aslobj.peakf, aslobj.Q
+    ))
+    model_id = cur.fetchone()[0]
+
+    # === Insert results from each timestep ===
+    for i in range(len(aslobj.source['t'])):
+        cur.execute("""
+            INSERT INTO asl_results (
+                event_id, model_id, grid_id, timestamp, window_seconds,
+                est_lat, est_lon, est_elev,
+                reduced_displacement, reduced_velocity, reduced_energy, misfit
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            event_id, model_id, grid_id,
+            aslobj.source['t'][i].isoformat(), aslobj.window_seconds,
+            aslobj.source['lat'][i], aslobj.source['lon'][i], 0.0,
+            aslobj.source['DR'][i], None, None, aslobj.source['misfit'][i]
+        ))
+
+    conn.commit()
+    print(f"[✓] ASL results written for event {event_id}")
+
+def asl_sausage(peakf, filt_est, outdir, asl_config, inventory, TOP_DIR, dry_run, conn=None, event_id=None):
+
+    ''' SCAFFOLD: determine these
+    grid_pickle_path = os.path.join(TOP_DIR, "grid.pkl")
+    correction_pickle_path = os.path.join(
+        TOP_DIR,
+        f"amplitude_corrections_Q{asl_config['Q']}_F{peakf}.pkl"
+    )
+    '''
+
     # === Prep for ASL ===
     peakf = int(round(peakf))
     for tr in filt_est:
@@ -209,18 +471,32 @@ def asl_sausage(peakf, filt_est, outdir, asl_config, inventory, TOP_DIR, dry_run
         except Exception as e:
             print('[ERR] Cannot plot ASL object')
             raise e
+        
+        # SCAFFOLD
+        '''
+        if conn and event_id and aslobj.located:
+            from db.asl_writer import insert_asl_results_to_db  # adjust as needed
+            insert_asl_results_to_db(
+                aslobj,
+                event_id=event_id,
+                grid_pickle_path=grid_pickle_path,
+                correction_pickle_path=correction_pickle_path,
+                conn=conn
+            )
+        '''
+
     return
 
 
-def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_config, compute_energy, run_asl, dry_run):
+def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_config, compute_energy, run_asl, dry_run, conn=None):
     print(f'\nProcessing row {rownum} of {numrows}')
 
     start_time = UTCDateTime()
     progress = {'complete':0}
 
     try:
-        if r['subclass']!='r':
-            raise ValueError('Sorry - only processing rockfalls at this time')
+        #if r['subclass']!='r':
+        #    raise ValueError('Sorry - only processing rockfalls at this time')
         event_time = UTCDateTime(r['time'])
         ymdfolder = os.path.join(str(event_time.year), f"{event_time.month:02}", f"{event_time.day:02}")
         outdir = os.path.join(TOP_DIR, ymdfolder, r['dfile']).replace('.cleaned','')
@@ -242,6 +518,21 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
         '''
         # === Proceed with waveform and metric processing ===
         if compute_energy:
+
+            # Skip if already in DB
+            if not dry_run and conn:
+                try:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT 1 FROM event_classifications 
+                        WHERE event_id = ? AND dfile = ? AND source = ?
+                    """, (r.get('public_id') or r.get('event_id'), r['dfile'], 'VolcanoEventClassifier'))
+                    if cur.fetchone():
+                        print(f"[SKIP] Already classified in DB: {r['dfile']}")
+                        return rownum, r['time'], {'skipped': True}, float(UTCDateTime() - start_time)
+                except Exception as e:
+                    print(f"[WARN] Failed DB check for existing event: {e}")            
+
             est, aefdf = make_enhanced_stream(r, start_time, rownum, outdir, inventory, source_coords)
             if not isinstance(est, EnhancedStream):
                 return rownum, r['time'], progress, float(UTCDateTime() - start_time)
@@ -251,7 +542,7 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
                 aefdf.to_csv(os.path.join(outdir, 'magnitudes.csv'))
 
             # === Classification ===
-            progress['reclassified'] = reclassify(est, r)
+            progress['reclassified'] = reclassify(est, r, dry_run, conn)
 
             # save r (row dict)
             if not dry_run:
@@ -259,14 +550,18 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
 
             # save trace metrics via dataframe
             metrics_df = stream_metrics_to_dataframe(est)
-            progress['energy'] = 'energy' in stream_metrics_to_dataframe(est).columns
-            progress['ME'] = 'ME' in stream_metrics_to_dataframe(est).columns
+            metrics_names = stream_metrics_to_dataframe(est).columns
+            progress['energy'] = 'energy' in metrics_names
+            progress['ME'] = 'ME' in metrics_names
             if not dry_run:
                 metrics_df.to_csv(os.path.join(outdir, 'stream_metrics.csv'))
+                if conn and isinstance(est, EnhancedStream) and aefdf is not None:
+                    insert_metrics_to_db(est, aefdf, r, conn)
 
         # === Determine if ASL should be run ===
         if run_asl and (r.get('new_subclass') in 're' or r.get('subclass') in 're'):
-            pass
+            if not compute_energy:
+                raise ValueError("ASL processing requires energy computation step to run first.")
         else:
             print(f"[INFO] Skipping ASL: subclass not in ['r', 'e']")
             return rownum, r['time'], progress, float(UTCDateTime() - start_time)
@@ -299,7 +594,7 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
         print(f"[INFO] Stations used for ASL: {stations}")
 
         # === Prep for ASL ===
-        asl_sausage(peakf, filt_est, outdir, asl_config, inventory, TOP_DIR, dry_run)
+        asl_sausage(peakf, filt_est, outdir, asl_config, inventory, TOP_DIR, dry_run, conn=conn, event_id=r['event_id'])  # or r['public_id'])
 
         progress['asl'] = True
 
@@ -316,7 +611,7 @@ def process_row(rownum, r, numrows, TOP_DIR, source_coords, inventory, asl_confi
         return rownum, r['time'], progress, float(duration)
 
 
-def process_chunk(chunk_rows, start_idx, numrows, TOP_DIR, source_coords, inventory, asl_config, compute_energy, run_asl, dry_run):
+def process_chunk(chunk_rows, start_idx, numrows, TOP_DIR, source_coords, inventory, asl_config, compute_energy, run_asl, dry_run, conn=None):
     logfile = os.path.join(TOP_DIR, "system_monitor.csv")
     pid = os.getpid()
     proc_name = multiprocessing.current_process().name
@@ -330,7 +625,7 @@ def process_chunk(chunk_rows, start_idx, numrows, TOP_DIR, source_coords, invent
     for i, row in enumerate(chunk_rows):
         rownum = start_idx + i
         # Do your processing here
-        result = process_row(rownum, row, numrows, TOP_DIR, source_coords, inventory, asl_config, compute_energy, run_asl, dry_run)
+        result = process_row(rownum, row, numrows, TOP_DIR, source_coords, inventory, asl_config, compute_energy, run_asl, dry_run, conn=conn)
         rownum, _, progress, duration = result
         print(f"Row {rownum+1}/{numrows}")
         results.append(result)
@@ -390,13 +685,19 @@ def main():
     config = get_config()
     dbfile = config['mvo_seiscomp_db']
     top_dir = config['enhanced_results']
-    os.makedirs(top_dir, exist_ok=True)
-
-    if not backup_db(dbfile, __file__):
-        exit()
-
-    # === Connect to DB and load or query dataframe ===
+    if not dry_run:
+        if not backup_db(dbfile, __file__):
+            exit()
     conn = sqlite3.connect(dbfile)
+    try:
+        conn.cursor().execute('''ALTER TABLE event_classifications ADD COLUMN score REAL''')
+        conn.commit()
+        print("[✓] Column 'score' added to event_classifications.")
+    except sqlite3.OperationalError as e:
+        if 'duplicate column name' in str(e).lower():
+            print("[i] Column 'score' already exists.")
+        else:
+            raise
     conn.execute("PRAGMA foreign_keys = ON;")
     query_result_file = os.path.join(top_dir, 'query_result.pkl')
     query_dataframe_pkl = os.path.join(top_dir, 'query_dataframe.pkl')
@@ -479,7 +780,8 @@ def main():
             asl_config,
             compute_energy,
             run_asl,
-            dry_run
+            dry_run,
+            conn
         )
         for i, chunk in enumerate(row_chunks)
     ]
@@ -506,6 +808,17 @@ def main():
     if not dry_run:
         df.to_csv(os.path.join(top_dir, 'final_results.csv'), index=False)
     print("\n[✓] Done processing all events.")
+
+    if dry_run:
+        print("\n[DRY-RUN SUMMARY]")
+        print("No files were written or modified.")
+        total_processed = len(results)
+        total_success = sum(1 for _, _, p, _ in results if p.get('complete', 0))
+        total_failures = total_processed - total_success
+        print(f"Processed {total_processed} events in dry-run mode.")
+        print(f"✓ {total_success} succeeded (would have saved outputs)")
+        print(f"✗ {total_failures} failed")
+        print("Use without '--dry-run' to save results.\n")
 
 print('[STARTUP] functions loaded')
 ####################################################################

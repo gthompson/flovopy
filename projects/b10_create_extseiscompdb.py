@@ -284,6 +284,7 @@ def create_schema(conn):
         author TEXT,
         time TEXT,
         source TEXT,
+        score REAL,
         FOREIGN KEY(event_id) REFERENCES events(public_id),
         FOREIGN KEY(dfile) REFERENCES mseed_file_status(dfile)
     )''')
