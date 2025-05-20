@@ -13,7 +13,7 @@ from flovopy.config_projects import get_config
 def nearest_sampling_rate(tr):
     return 75.0 if abs(tr.stats.sampling_rate - 75.0) < 5 else 100.0
 
-def index_continuous_wav_files(conn, wav_dir, mseed_output_dir, filename_filter='DSNC_', limit=None):
+def index_continuous_wav_files(conn, wav_dir, mseed_output_dir, filename_filter='S.MVO', limit=None):
     """
     Index SEISAN WAV files from continuous database for metadata and conversion.
 
@@ -41,8 +41,6 @@ def index_continuous_wav_files(conn, wav_dir, mseed_output_dir, filename_filter=
             if limit is not None and count >= limit:
                 return
 
-            if not fname.endswith('.wav'):
-                continue
             if filename_filter not in fname:
                 continue
             if 'dbspn' in root:
