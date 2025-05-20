@@ -5,13 +5,42 @@ from scipy.signal import welch
 from obspy.signal.quality_control import MSEEDMetadata 
 from flovopy.core.legacy import _fix_legacy_id
 
+"""
+
+If you’re processing daily data, call it like:
+
+preprocess_stream(stream, inv=inv, max_dropout=None, outputType='VEL', ...)
+
+If you’re processing event-sized data:
+
+preprocess_stream(stream, inv=inv, max_dropout=0.1, ...)
+
+Optional: In _interpolate_small_gaps(), treat 0 as a null value only when you want to.
+
+If you’re padding 0.0 into gaps in daily data, it’s better to exclude 0 from null values (to avoid masking valid data). When calling detrend_trace(), do:
+
+detrend_trace(tr, null_values=[np.nan], ...)
+
+instead of:
+
+detrend_trace(tr, null_values=[0, np.nan], ...)
+
+
+This change will:
+	•	Preserve event file behavior (aggressively reject bad traces with gaps)
+	•	Allow daily SDS files to retain gappy traces and interpolate later if needed
+	•	Let you process days with partial data coverage, e.g., 12 hours of usable data in a 24-hour trace
+
+
+"""
+
 #######################################################################
 ##                Trace  tools                                       ##
 #######################################################################
 
 def preprocess_trace(tr, bool_despike=True, bool_clean=True, inv=None, quality_threshold=-np.inf, taperFraction=0.05, \
                   filterType="bandpass", freq=[0.5, 30.0], corners=6, zerophase=False, outputType='VEL', \
-                    miniseed_qc=True, verbose=False, max_dropout=0.0, units='Counts', bool_detrend=True, min_sampling_rate=20.0):
+                    miniseed_qc=True, verbose=False, max_dropout=None, units='Counts', bool_detrend=True, min_sampling_rate=20.0):
     """
     Preprocesses a seismic trace by applying quality control, filtering, and instrument response correction.
 
@@ -144,10 +173,11 @@ def preprocess_trace(tr, bool_despike=True, bool_clean=True, inv=None, quality_t
 
     # Step 4: Detect and Handle Dropouts
     tr.stats['gap_report'] = []
-    if not _detect_and_handle_dropouts(tr, max_dropout=max_dropout, verbose=verbose):
-        return False
-    if not _detect_and_handle_gaps(tr, gap_threshold=int(max_dropout * tr.stats.sampling_rate), verbose=verbose):
-        return False
+    if max_dropout is not None:
+        if not _detect_and_handle_dropouts(tr, max_dropout=max_dropout, verbose=verbose):
+            return False
+        if not _detect_and_handle_gaps(tr, gap_threshold=int(max_dropout * tr.stats.sampling_rate), verbose=verbose):
+            return False
 
 
     # Step 5: Detect and Correct Clipping, Spikes, and Step Functions
@@ -1951,7 +1981,7 @@ def preprocess_stream(st, bool_despike=True, bool_clean=True, inv=None, \
                       quality_threshold=-np.inf, taperFraction=0.05, \
                     filterType="bandpass", freq=[0.5, 30.0], corners=6, \
                     zerophase=False, outputType='VEL', \
-                    miniseed_qc=True, verbose=False, max_dropout=0.0, \
+                    miniseed_qc=True, verbose=False, max_dropout=None, \
                     units='Counts', bool_detrend=True):
     """
     Preprocesses a seismic stream by applying quality control, filtering, and instrument response correction.
@@ -2055,3 +2085,59 @@ def preprocess_stream(st, bool_despike=True, bool_clean=True, inv=None, \
 def order_traces_by_id(st):
     sorted_ids = sorted(tr.id for tr in st)
     return Stream([tr.copy() for id in sorted_ids for tr in st if tr.id == id])
+
+
+def clean_velocity_stream(st, max_gap_sec=10.0, verbose=True):
+    """
+    Clean a Stream already in physical units (e.g., from SDS_VEL).
+
+    Parameters
+    ----------
+    st : obspy.Stream
+        Input Stream (already in velocity units).
+    max_gap_sec : float
+        Max gap (in seconds) to fill/interpolate.
+    verbose : bool
+        Print diagnostics.
+
+    Returns
+    -------
+    st_clean : obspy.Stream
+        Cleaned Stream.
+    """
+
+    st_clean = st.copy()
+    for tr in st_clean:
+        if verbose:
+            print(f"\n[INFO] Cleaning trace: {tr.id}")
+
+        # Convert max gap to samples
+        max_gap_samples = int(max_gap_sec * tr.stats.sampling_rate)
+
+        # Handle gaps and dropouts
+        gap_ok = _detect_and_handle_gaps(tr, gap_threshold=max_gap_samples, verbose=verbose)
+        drop_ok = _detect_and_handle_dropouts(tr, max_dropout=1.0, verbose=verbose)
+
+        if not (gap_ok and drop_ok):
+            print(f"[WARN] Trace {tr.id} had large gaps. Consider trimming.")
+            continue
+
+        # Remove artifacts (e.g., clipping, spikes)
+        _detect_and_correct_artifacts(tr, amp_limit=1e10, spike_thresh=4.0, fill_method="interpolate")
+
+        # Detrend and taper (optional)
+        detrend_trace(tr, gap_threshold=10, detrend_type='linear', verbose=verbose)
+
+        add_to_trace_history(tr, "gap-cleaned without response removal")
+
+    return st_clean
+
+if __name__ == "__main__":
+    from obspy.clients.filesystem.sds import Client
+    from obspy import UTCDateTime
+
+    sds_path = "/data/SDS_VEL"
+    client = Client(sds_path)
+
+    st = client.get_waveforms("MV", "MBLG", "", "BHZ", UTCDateTime(1997, 6, 25, 0), UTCDateTime(1997, 6, 25, 23, 59))
+    st_clean = clean_velocity_stream(st, max_gap_sec=15.0, verbose=True)

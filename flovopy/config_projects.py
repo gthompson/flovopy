@@ -25,6 +25,7 @@ def get_config():
         "inventory": None,
         "miniseed_top": None,
         "json_top": None,
+        "sds_top": None,
     }
 
     # --- Mac-specific config ---
@@ -34,6 +35,9 @@ def get_config():
             "box": os.path.join(config["home"], 'Library', 'CloudStorage', 'Box-Box'),
             "seisan_top": os.path.join(tachyon, "SEISAN_DB"),
             "enhanced_results": os.path.join(tachyon, "b18_waveform_processing"),
+            "sds_top": os.path.join(tachyon, "SDS_RAW"),
+            "sds_vel": os.path.join(tachyon, "SDS_VEL"),
+
         })
 
     # --- Ubuntu-specific config ---
@@ -41,12 +45,15 @@ def get_config():
         config.update({
             "seisan_top": os.path.join("/data", "SEISAN_DB"),
             "enhanced_results": "/data/b18_waveform_processing",
+            "sds_top": os.path.join("/data", "SDS_RAW"),
+            "sds_vel": os.path.join("/data", "SDS_VEL"),
         })
     
     config["dropbox"] = os.path.join(config["home"], "Dropbox")
     config["repo"] = os.path.join(config["home"], "Developer", "flovopy-test")
     config["mvo_seiscomp_db"] = os.path.join(config["seisan_top"], "mvo_seiscomp_db.sqlite")
-    config["mvo_seisan_index_db"] = os.path.join(config["seisan_top"], "mvo_seisan_index_db.sqlite")
+    #config["mvo_seisan_index_db"] = os.path.join(config["seisan_top"], "mvo_seisan_index_db.sqlite")
+    config["mvo_seisan_index_db"] = os.path.join(config["seisan_top"], "index_mvoe4.sqlite")
     config["inventory"] = os.path.join(config['seisan_top'], 'CAL', 'MV.xml')
     config["miniseed_top"] = os.path.join(config['seisan_top'], 'miniseed')
     config["json_top"] = os.path.join(config['seisan_top'], 'json')
