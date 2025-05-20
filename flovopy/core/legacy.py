@@ -42,13 +42,28 @@ def _fix_legacy_id(trace, network=None):
     if trace.stats.station == 'IRIG':
         trace.stats.channel = 'ACE'
     else:
-        if trace.stats.channel.lower()=='v':
-            trace.stats.channel='EHZ'
-        elif trace.stats.channel.lower()=='n':
-            trace.stats.channel='EHN'
-        elif trace.stats.channel.lower()=='e':
-            trace.stats.channel='EHE'                       
+        chan = ""
+        if trace.stats.channel:
+            chan = trace.stats.channel.upper() 
+        elif len(trace.stats.station)==4:
+            chan  = trace.stats.station[3].upper()
+            trace.stats.station = trace.stats.station[0:3].strip()
+
+        if chan:
+            if chan in 'VZT':
+                trace.stats.channel='EHZ'
+            elif chan=='N':
+                trace.stats.channel='EHN'
+            elif chan=='E':
+                trace.stats.channel='EHE'   
+            elif chan=='L':
+                trace.stats.channel='ELZ' 
+            elif chan=='P':
+                trace.stats.channel='EDF'
+            else:
+                trace.stats.channel='EH' + chan                         
         
+        """
         orientation = trace.stats.station[3].strip()  # Position 4        
         if orientation in "ZNE":  # Standard orientations
             channel = f"EH{orientation}"
@@ -59,8 +74,11 @@ def _fix_legacy_id(trace, network=None):
         else:
             channel = f'??{orientation}'
             #raise ValueError(f"Unknown orientation '{orientation}' in '{station}'")
+        
         trace.stats.channel = channel
-        trace.stats.station = trace.stats.station[0:3].strip()  # Positions 1-3
+        """
+        #trace.stats.station = trace.stats.station[0:3].strip()  # Positions 1-3
+
 
 #######################################################################
 ##               Read event metadata                                 ##

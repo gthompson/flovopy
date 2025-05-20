@@ -746,6 +746,7 @@ class RSAM(SAM):
         import struct
         #import numpy as np
         import re
+        from flovopy.core.preprocessing import fix_trace_id #_get_band_code
 
         def read_single_file(filepath, stime, etime):
             if not os.path.isfile(filepath):
@@ -781,8 +782,8 @@ class RSAM(SAM):
             tr.trim(stime, etime)
             if convert_legacy_ids_using_this_network and not tr.stats.network:
                 from flovopy.core.legacy import _fix_legacy_id
-                _fix_legacy_id(tr, network=convert_legacy_ids_using_this_network)
-           
+                fix_trace_id(tr, legacy=True, netcode=convert_legacy_ids_using_this_network)
+
             return tr
 
         def read_structured_file(station, year):
@@ -811,9 +812,7 @@ class RSAM(SAM):
             tr.trim(stime, etime)
             if convert_legacy_ids_using_this_network and not tr.stats.network:
                 from flovopy.core.legacy import _fix_legacy_id
-                _fix_legacy_id(tr, network=convert_legacy_ids_using_this_network)
-            tr.stats.channel = "RSAM"
-            tr.stats.location = ""
+                fix_trace_id(tr, legacy=True, netcode=convert_legacy_ids_using_this_network)
             return tr
 
         if filepath:
@@ -1510,6 +1509,8 @@ def energy2magnitude(E, a=-3.2, b=2/3):
 
     ME = b * np.log10(E) + a
     return ME
-    
+
+
+
 if __name__ == "__main__":
     pass

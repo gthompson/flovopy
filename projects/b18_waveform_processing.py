@@ -676,6 +676,7 @@ def main():
     parser.add_argument("--no-energy", action="store_true", help="Disable energy/magnitude computation")
     parser.add_argument("--single-core", action="store_true", help="Disable multiprocessing (run single-core)")
     parser.add_argument("--dry-run", action="store_true", help="Test mode: no outputs are saved.")
+    parser.add_argument("--maxrows", type=int, default=None, help="Maximum number of events to process")
     args = parser.parse_args()
     use_multiprocessing = not args.single_core
     compute_energy = not args.no_energy
@@ -765,6 +766,8 @@ def main():
 
     # === Multiprocessing setup ===
     rows = df.reset_index(drop=True).to_dict(orient="records")
+    if args.maxrows is not None:
+        rows = rows[:args.maxrows]
     numrows = len(rows)
     n_workers = max(1, multiprocessing.cpu_count() - 2)
     row_chunks = [chunk for chunk in np.array_split(rows, n_workers) if chunk]
@@ -825,3 +828,4 @@ print('[STARTUP] functions loaded')
 
 if __name__ == "__main__":
     main()
+    # python b18_waveform_processing.py --no-asl --dry-run --single-core --maxrows 10
