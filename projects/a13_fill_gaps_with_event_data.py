@@ -5,6 +5,7 @@ from obspy.core import UTCDateTime
 from pathlib import Path
 from flovopy.config_projects import get_config
 from tqdm import tqdm
+from collections import defaultdict
 
 GAP_THRESHOLD = 1  # second tolerance for gap detection
 

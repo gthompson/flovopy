@@ -10,6 +10,9 @@ from flovopy.core.mvo import correct_nslc_mvo, fix_trace_mvo
 from flovopy.seisanio.core.wavfile import Wavfile
 from flovopy.config_projects import get_config
 
+def nearest_sampling_rate(tr):
+    return 75.0 if abs(tr.stats.sampling_rate - 75.0) < 5 else 100.0
+
 def index_continuous_wav_files(conn, wav_dir, mseed_output_dir, filename_filter='DSNC_', limit=None):
     """
     Index SEISAN WAV files from continuous database for metadata and conversion.
@@ -76,6 +79,7 @@ def index_continuous_wav_files(conn, wav_dir, mseed_output_dir, filename_filter=
                             '''INSERT INTO trace_id_corrections (date, original_id, corrected_id) VALUES (?, ?, ?)''',
                             (tr.stats.endtime.date.isoformat(), tr.stats.original_id, tr.id)
                         )
+                    nearest_sampling_rate(tr)
 
                 # Write MiniSEED file to matching output structure
                 rel_path = os.path.relpath(full_path, wav_dir)
