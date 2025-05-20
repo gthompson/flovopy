@@ -706,6 +706,9 @@ class SAM:
             contents += "\n"
         return contents   
     
+    def __len__(self):
+        return len(self.dataframes)
+    
 class RSAM(SAM):
         
     @staticmethod
@@ -727,98 +730,125 @@ class RSAM(SAM):
         return SAM.get_filename(SAM_DIR, id, year, sampling_interval, ext, name=name)
 
     @classmethod
-    def readRSAMbinary(classref, SAM_DIR=None, station=None, stime=None, etime=None, filepath=None, sampling_interval=60):
-        ''' 
-        Read RSAM binary file(s) recorded by the original RSAM system.
-        Provide either:
-        (1) SAM_DIR, station, stime, etime — to load from structured files by year
-        OR
-        (2) filepath, stime, etime — to load a single specified file directly.
+    def readRSAMbinary(cls, SAM_DIR=None, station=None, stime=None, etime=None,
+                    filepath=None, sampling_interval=60, verbose=False,
+                    convert_legacy_ids_using_this_network=None):
+        """
+        Read RSAM binary file(s) and return an RSAM object.
+        Either:
+        - provide `filepath`, `stime`, and `etime` to read a single file, or
+        - provide `SAM_DIR`, `station`, `stime`, and `etime` to read from structured archive.
+        `station` may be a string or list.
+        """
+        
+        #from obspy import Trace, Stream, UTCDateTime
+        #import os
+        import struct
+        #import numpy as np
+        import re
 
-        Returns a corresponding RSAM object or stream.
-        '''
-        st = Stream()
-        records_per_day = int(86400/sampling_interval)
-
-        if filepath:
-            # Direct file path usage
+        def read_single_file(filepath, stime, etime):
             if not os.path.isfile(filepath):
                 raise FileNotFoundError(f"File not found: {filepath}")
-            
-            print(f"Reading {filepath}")
+            if verbose:
+                print(f"Reading {filepath}")
+            records_per_day = int(86400 / sampling_interval)
             values = []
-            with open(filepath, mode="rb") as f:
-                f.seek(4 * records_per_day)  # 1-day header
+            with open(filepath, "rb") as f:
+                f.seek(4 * records_per_day)
                 while True:
                     bytes_read = f.read(4)
                     if not bytes_read:
                         break
-                    v = struct.unpack('f', bytes_read)[0]
+                    v = struct.unpack("f", bytes_read)[0]
                     values.append(v)
 
             tr = Trace(data=np.array(values))
-
-            # Extract station name and year from filename
             filename = os.path.basename(filepath)
-            station_code = ''.join(filter(str.isalpha, filename))  # e.g. MBRY from MBRY2003.DAT
+            station_code = ''.join(filter(str.isalpha, filename))
 
-            # Find the first numeric group (year) in filename
-            import re
             match = re.search(r'(\d{2,4})', filename)
             if match:
-                year_str = match.group(1)
-                if len(year_str) == 4:
-                    year = int(year_str)
-                elif len(year_str) == 2:
-                    y = int(year_str)
-                    year = 2000 + y if y < 50 else 1900 + y
-                else:
-                    raise ValueError(f"Unexpected year format in filename: {year_str}")
+                ystr = match.group(1)
+                year = int(ystr) if len(ystr) == 4 else (2000 + int(ystr) if int(ystr) < 50 else 1900 + int(ystr))
             else:
                 raise ValueError("No year found in filename")
 
-            tr.stats.starttime = UTCDateTime(year, 1, 1, 0, 0, 0)
-            tr.id = f"MV.{station_code}..EHZ"
+            tr.stats.starttime = UTCDateTime(year, 1, 1)
+            tr.stats.station = station_code
             tr.stats.delta = sampling_interval
             tr.data[tr.data == -998.0] = np.nan
-            tr.trim(starttime=stime, endtime=etime)
-            st = Stream(traces=[tr])
-            return classref(stream=st, sampling_interval = sampling_interval)
+            tr.trim(stime, etime)
+            if convert_legacy_ids_using_this_network and not tr.stats.network:
+                from flovopy.core.legacy import _fix_legacy_id
+                _fix_legacy_id(tr, network=convert_legacy_ids_using_this_network)
+           
+            return tr
 
-        # Handle list of stations
-        if isinstance(station, list):
-            for this_station in station:
-                tr = classref.readRSAMbinary(SAM_DIR=SAM_DIR, station=this_station, stime=stime, etime=etime)
-                if tr.data.size - np.count_nonzero(np.isnan(tr.data)):
-                    st.append(tr)
-            return classref(stream=st, sampling_interval=1 / st[0].stats.sampling_rate)
+        def read_structured_file(station, year):
+            file_path = os.path.join(SAM_DIR, f"{station}{year}.DAT")
+            if not os.path.isfile(file_path):
+                if verbose:
+                    print(f"{file_path} not found")
+                return None
 
-        # Load files based on SAM_DIR and station
-        for year in range(stime.year, etime.year + 1):
-            daysPerYear = 366 if year % 4 == 0 else 365
-            RSAMbinaryFile = os.path.join(SAM_DIR, f"{station}{year}.DAT")
+            days = 366 if year % 4 == 0 else 365
+            records = days * int(86400 / sampling_interval)
             values = []
+            with open(file_path, "rb") as f:
+                f.seek(4 * int(86400 / sampling_interval))
+                for _ in range(records):
+                    bytes_read = f.read(4)
+                    if not bytes_read:
+                        break
+                    v = struct.unpack("f", bytes_read)[0]
+                    values.append(v)
+            tr = Trace(data=np.array(values))
+            tr.stats.starttime = UTCDateTime(year, 1, 1)
+            tr.stats.station = station
+            tr.stats.delta = sampling_interval
+            tr.data[tr.data == -998.0] = np.nan
+            tr.trim(stime, etime)
+            if convert_legacy_ids_using_this_network and not tr.stats.network:
+                from flovopy.core.legacy import _fix_legacy_id
+                _fix_legacy_id(tr, network=convert_legacy_ids_using_this_network)
+            tr.stats.channel = "RSAM"
+            tr.stats.location = ""
+            return tr
 
-            if os.path.isfile(RSAMbinaryFile):
-                print('Reading', RSAMbinaryFile)
-                with open(RSAMbinaryFile, mode="rb") as f:
-                    f.seek(4 * records_per_day)
-                    for _ in range(daysPerYear * records_per_day):
-                        v = struct.unpack('f', f.read(4))[0]
-                        values.append(v)
+        if filepath:
+            tr = read_single_file(filepath, stime, etime)
+            return cls(stream=Stream([tr]), sampling_interval=sampling_interval)
 
-                tr = Trace(data=np.array(values))
-                tr.stats.starttime = UTCDateTime(year, 1, 1, 0, 0, 0)
-                tr.id = f'MV.{station}..EHZ'
-                tr.stats.delta = sampling_interval
-                tr.data[tr.data == -998.0] = np.nan
-                tr.trim(starttime=stime, endtime=etime)
-                st.append(tr)
-            else:
-                print(f"{RSAMbinaryFile} not found")
+        if isinstance(station, list):
+            traces = []
+            for sta in station:
+                try:
+                    obj = cls.readRSAMbinary(SAM_DIR=SAM_DIR, station=sta, stime=stime, etime=etime,
+                                            sampling_interval=sampling_interval, verbose=verbose,
+                                            convert_legacy_ids_using_this_network=convert_legacy_ids_using_this_network)
+                    if obj and len(obj)>0:
+                        sta_stream = obj.to_stream() # empty if RSAM object contains only  NaN data
+                        if len(sta_stream) > 0:    
+                            tr = sta_stream[0]
+                            if tr.data.size > np.count_nonzero(np.isnan(tr.data)):
+                                traces.append(tr)
+                except Exception as e:
+                    print(f"Error reading station {sta}: {e}")
+            return cls(stream=Stream(traces), sampling_interval=sampling_interval)
 
-        st.merge(method=0, fill_value=np.nan)[0]
-        return classref(stream=st, sampling_interval = sampling_interval)
+        if isinstance(station, str):
+            traces = []
+            for year in range(stime.year, etime.year + 1):
+                tr = read_structured_file(station, year)
+                if tr:
+                    traces.append(tr)
+            if traces:
+                stream = Stream(traces).merge(method=0, fill_value=np.nan)
+                return cls(stream=stream, sampling_interval=sampling_interval)
+
+        raise ValueError("Invalid arguments provided to readRSAMbinary.")
+
 
 class VSAM(SAM):
     # Before calling, make sure tr.stats.units is fixed to correct units.
