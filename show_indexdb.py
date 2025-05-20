@@ -2,7 +2,8 @@ import sqlite3
 import os
 os.system("clear")
 # Connect to your SQLite database file
-conn = sqlite3.connect("/Volumes/tachyon/from_hal/SEISAN_DB/index_mvoe4.sqlite")
+#conn = sqlite3.connect("/Volumes/tachyon/from_hal/SEISAN_DB/index_mvoe4.sqlite")
+conn = sqlite3.connect("/data/SEISAN_DB/index_mvoe4.sqlite")
 cursor = conn.cursor()
 
 # Query for all table names
