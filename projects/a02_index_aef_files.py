@@ -214,19 +214,31 @@ def index_aef_files(conn, aef_dir, json_output_dir, verbose=False, filename_filt
 
     conn.commit()
 
-def main(args):
-    if os.path.exists(args.db):
-        conn = sqlite3.connect(args.db)
-        index_aef_files(conn, args.aef_dir, args.json_output, limit=args.limit)
+def main(aef_top, json_top, dbfile, limit=50):
+    if os.path.exists(dbfile):
+        conn = sqlite3.connect(dbfile)
+        index_aef_files(conn, aef_top, json_top, limit=limit)
         conn.close()    
 
 if __name__ == "__main__":
+    import os
+    import sys
     import argparse
-    parser = argparse.ArgumentParser(description="Index and convert SEISAN AEF files to JSON + DB.")
-    parser.add_argument("--aef_dir", required=True, help="Top-level AEF directory")
-    parser.add_argument("--json_output", required=True, help="Output directory for JSON files")
-    parser.add_argument("--db", required=True, help="SQLite database path")
-    parser.add_argument("--limit", type=int, default=None, help="stop after this number of files")
-    args = parser.parse_args()
-    print(args)
-    #main(args)
+    from flovopy.config_projects import get_config
+    if len(sys.argv) > 1:
+        # Use argparse if there are any command-line arguments
+        parser = argparse.ArgumentParser(description="Index and convert SEISAN WAV files to MiniSEED.")
+        parser.add_argument("--aef_top", required=True, help="Top-level WAV directory")
+        parser.add_argument("--json_top", required=True, help="Output directory for JSON files")
+        parser.add_argument("--dbfile", required=True, help="SQLite database path")
+        parser.add_argument("--limit", type=int, default=None, help="Stop after this number of files")
+        args = parser.parse_args()
+        main(args.aef_top, args.json_top, args.dbfile, args.limit)
+    else:
+        # Fallback to config-based arguments
+        config = get_config()
+        aef_top = os.path.join(config['seisan_top'], 'AEF')
+        json_top = config['json_top']
+        dbfile = config['mvo_seisan_index_db']
+        limit = config.get('limit', 50)
+        main(aef_top, json_top, dbfile, limit)

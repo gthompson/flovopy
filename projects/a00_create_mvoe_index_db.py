@@ -158,8 +158,7 @@ def create_index_schema(conn):
 
     conn.commit()
 
-def main(args):
-    DB_FILENAME = args.db
+def main(DB_FILENAME):
     if not os.path.exists(DB_FILENAME):
         print(f"Creating new database: {DB_FILENAME}")
     else:
@@ -170,8 +169,18 @@ def main(args):
     conn.close()
 
 if __name__ == "__main__":
+    import os
+    import sys
     import argparse
-    parser = argparse.ArgumentParser(description="Create DB.")
-    parser.add_argument("--db", required=True, help="SQLite database path")
-    args = parser.parse_args()
-    main(args)
+    from flovopy.config_projects import get_config
+    if len(sys.argv) > 1:
+        # Use argparse if there are any command-line arguments
+        parser = argparse.ArgumentParser(description="Index and convert SEISAN WAV files to MiniSEED.")
+        parser.add_argument("--dbfile", required=True, help="SQLite database path")
+        args = parser.parse_args()
+        main(args.dbfile)
+    else:
+        # Fallback to config-based arguments
+        config = get_config()
+        dbfile = config['mvo_seisan_index_db']
+        main(dbfile)

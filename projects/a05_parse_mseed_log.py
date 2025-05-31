@@ -228,15 +228,27 @@ def parse_log_file(log_path, conn):
     print(f"[SUMMARY] Files with gaps filled:        {gap_filled}")
     print(f"[SUMMARY] Interpolated small gaps:       {interpolated_gaps}")
 
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Parse MiniSEED processing log into index database.")
-    parser.add_argument("logfile", help="Path to the stdout/stderr log file")
-    parser.add_argument("dbfile", help="SQLite index database to update")
-    args = parser.parse_args()
-
-    conn = sqlite3.connect(args.dbfile)
-    parse_log_file(args.logfile, conn)
+def main(logfile, dbfile):
+    conn = sqlite3.connect(dbfile)
+    parse_log_file(logfile, conn)
     conn.close()
+
+if __name__ == "__main__":
+    import sys
+    import sqlite3
+    from flovopy.config_projects import get_config
+
+    if len(sys.argv) > 1:
+        import argparse
+        parser = argparse.ArgumentParser(description="Parse MiniSEED processing log into index database.")
+        parser.add_argument("logfile", help="Path to the stdout/stderr log file")
+        parser.add_argument("dbfile", help="SQLite index database to update")
+        args = parser.parse_args()
+        main(args.logfile, args.dbfile)
+    else:
+        config = get_config()
+        logfile = config['mseed_processing_log']
+        dbfile = config['mvo_seisan_index_db']
+        main(logfile, dbfile)
 
     # python parse_mseed_log.py miniseed2cleanedVEL.log /home/thompsong/public_html/index_mvoe4.sqlite

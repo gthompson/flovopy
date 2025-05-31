@@ -137,4 +137,3 @@ def find_matching_wavfiles(filetime, sfilepath, y2kfix=False):
         potentialwavfiles = glob(wavpattern.split('.')[0]+".*")
         matching_wavfiles.extend(potentialwavfiles)
     return matching_wavfiles
-

@@ -169,23 +169,35 @@ def index_sfiles(conn, sfile_dir, archive_type, json_output_dir, filename_filter
                 print("[INFO] Committed changes.")
     conn.commit()
 
-def main(args):
-    if os.path.exists(args.db):
-        conn = sqlite3.connect(args.db)
-        index_sfiles(conn, args.sfile_dir, args.archive, args.json_output, limit=args.limit)
-        conn.close() 
+def main(sfile_top, json_top, dbfile, archive, limit=None):
+    if os.path.exists(dbfile):
+        conn = sqlite3.connect(dbfile)
+        index_sfiles(conn, sfile_top, archive, json_top, limit=limit)
+        conn.close()
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Index SEISAN S-files for BGS or MVO archive.")
-    parser.add_argument("--sfile_dir", required=True, help="Top-level S-file directory")
-    parser.add_argument("--json_output", required=True, help="Directory to save extra JSON info")
-    parser.add_argument("--db", required=True, help="SQLite database path")
-    parser.add_argument("--archive", choices=["bgs", "mvo"], required=True, help="Which archive to index")
-    parser.add_argument("--limit", type=int, default=None, help="stop after this number of files")
-    args = parser.parse_args()
-    print(args)
-    #main(args)
+    import os
+    import sys
+    import sqlite3
+    from flovopy.config_projects import get_config
+    if len(sys.argv) > 1:
+        import argparse
+        parser = argparse.ArgumentParser(description="Index SEISAN S-files for BGS or MVO archive.")
+        parser.add_argument("--sfile_top", required=True, help="Top-level S-file directory")
+        parser.add_argument("--json_top", required=True, help="Directory to save extra JSON info")
+        parser.add_argument("--dbfile", required=True, help="SQLite database path")
+        parser.add_argument("--archive", choices=["bgs", "mvo"], required=True, help="Which archive to index")
+        parser.add_argument("--limit", type=int, default=None, help="Stop after this number of files")
+        args = parser.parse_args()
+        main(args.sfile_top, args.json_top, args.dbfile, args.archive, args.limit)
+    else:
+        config = get_config()
+        sfile_top = config['sfile_top']
+        json_top = config['json_top']
+        dbfile = config['mvo_seisan_index_db']
+        archive = config['archive']
+        limit = config.get('limit', None)
+        main(sfile_top, json_top, dbfile, archive, limit)
 
 
 '''

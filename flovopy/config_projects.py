@@ -26,6 +26,8 @@ def get_config():
         "miniseed_top": None,
         "json_top": None,
         "sds_top": None,
+        "event_db": 'MVOE_',
+        "continuous_db": 'DSNC_',
     }
 
     # --- Mac-specific config ---
@@ -58,6 +60,12 @@ def get_config():
     config["miniseed_top"] = os.path.join(config['seisan_top'], 'miniseed')
     config["json_top"] = os.path.join(config['seisan_top'], 'json')
 
+    config["mvo_seiscomp_db"] = os.path.join(config["seisan_top"], "seiscomp_db.sqlite")
+    #config["mvo_seisan_index_db"] = os.path.join(config["seisan_top"], "mvo_seisan_index_db.sqlite")
+    config["mvo_seisan_index_db"] = os.path.join(config["seisan_top"], "seisan_db.sqlite")
+    config["inventory"] = os.path.join(config['seisan_top'], 'CAL', 'MV.xml')
+    config["miniseed_top"] = os.path.join(config['seisan_top'], 'miniseed2')
+    config["json_top"] = os.path.join(config['seisan_top'], 'json2')
     # Add other host-specific overrides here if needed
 
     return config
