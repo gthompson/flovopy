@@ -140,6 +140,7 @@ def replace_sta_loc(inv, sta='DUMM', loc=''):
     # assumes only 1 network with 1 station
 
     # Find the station (you can loop over networks and stations if needed)
+
     network = inv[0]  # Replace with the network code
     station = network[0] #.get_station("STA_CODE")  # Replace with the station code
 
@@ -163,6 +164,259 @@ def infraBSU(HgInThisSensor=0.5):
     selfNoisePa = 5.47e-3;
     voltsPerPa = 46e-6; # from infraBSU quick start guide
     return voltsPerPa
+
+import os
+import tempfile
+import requests
+from obspy import UTCDateTime
+from obspy.clients.nrl import NRL
+from obspy.core.inventory.response import Response
+from obspy.io.xseed import Parser
+
+'''
+import tempfile
+import os
+import requests
+from obspy.clients.nrl import NRL
+from obspy.io.xseed import Parser
+from obspy.core.inventory.response import Response
+
+def build_combined_infrabsu_centaur_response(fsamp: float = 100.0,
+                                              vpp: int = 40,
+                                              fallback_resp_url: str = "https://ds.iris.edu/NRL/sensors/johnson/RESP.XX.IS020..BDF.INFRABSU.0_048.0_000046"
+                                              ) -> Response:
+    """
+    Build a fallback Response object for an infraBSU sensor connected to a Centaur datalogger.
+    Falls back to using a known-good RESP file if NRL lookup fails.
+
+    Parameters:
+        fsamp (float): Sampling rate in Hz.
+        vpp (int): Peak-to-peak input voltage (usually 1 or 40).
+        fallback_resp_url (str): URL to a known-good RESP file for infraBSU sensor.
+
+    Returns:
+        Response: A combined Response object.
+    """
+    print(f'[INFO] Building fallback response for infraBSU from RESP + Centaur\nParams: fsamp={fsamp}, vpp={vpp}, url={fallback_resp_url}')
+
+    # Download the fallback infraBSU RESP file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".resp") as tf:
+        resp_path = tf.name
+        r = requests.get(fallback_resp_url)
+        if r.status_code != 200:
+            raise RuntimeError(f"Failed to download RESP file: {fallback_resp_url}")
+        tf.write(r.content)
+
+    try:
+        parser = Parser(resp_path)
+
+        # --- Patch Blockette 50 (station-level metadata) ---
+        for blk50 in parser.blockettes.get(50, []):
+            if not hasattr(blk50, 'network_identifier_code') or not str(blk50.network_identifier_code).strip():
+                blk50.network_identifier_code = "XX"
+
+            if not hasattr(blk50, 'station_call_letters') or not str(blk50.station_call_letters).strip():
+                blk50.station_call_letters = "DUMM"
+
+            if not hasattr(blk50, 'station_epoch_year'):
+                blk50.station_epoch_year = 2000
+            else:
+                try:
+                    blk50.station_epoch_year = int(blk50.station_epoch_year)
+                except (TypeError, ValueError):
+                    blk50.station_epoch_year = 2000
+
+            if not hasattr(blk50, 'channel_count'):
+                blk50.channel_count = 1
+            else:
+                try:
+                    blk50.channel_count = int(blk50.channel_count)
+                except (ValueError, TypeError):
+                    blk50.channel_count = 1
+
+
+            if not hasattr(blk50, 'latitude') or blk50.latitude in ("", None):
+                blk50.latitude = 0.0
+            if not hasattr(blk50, 'longitude') or blk50.longitude in ("", None):
+                blk50.longitude = 0.0
+            if not hasattr(blk50, 'elevation') or blk50.elevation in ("", None):
+                blk50.elevation = 0.0
+
+        # --- Patch Blockette 52 (channel-level metadata) ---
+        for blk52 in parser.blockettes.get(52, []):
+            if not hasattr(blk52, 'location_identifier') or not str(blk52.location_identifier).strip():
+                blk52.location_identifier = ""
+
+            if not hasattr(blk52, 'channel_identifier') or not str(blk52.channel_identifier).strip():
+                blk52.channel_identifier = "HDF"
+
+            if not hasattr(blk52, 'channel_number'):
+                blk52.channel_number = 1
+            else:
+                try:
+                    blk52.channel_number = int(blk52.channel_number)
+                except (TypeError, ValueError):
+                    blk52.channel_number = 1
+
+            if not hasattr(blk52, 'instrument_depth') or blk52.instrument_depth in ("", None):
+                blk52.instrument_depth = 0.0
+            else:
+                try:
+                    blk52.instrument_depth = float(blk52.instrument_depth)
+                except (TypeError, ValueError):
+                    blk52.instrument_depth = 0.0
+
+            if not hasattr(blk52, 'azimuth') or blk52.azimuth in ("", None):
+                blk52.azimuth = 0.0
+            else:
+                try:
+                    blk52.azimuth = float(blk52.azimuth)
+                except (TypeError, ValueError):
+                    blk52.azimuth = 0.0
+
+            if not hasattr(blk52, 'dip') or blk52.dip in ("", None):
+                blk52.dip = 0.0
+            else:
+                try:
+                    blk52.dip = float(blk52.dip)
+                except (TypeError, ValueError):
+                    blk52.dip = 0.0
+
+
+
+
+        test_response = parser.get_inventory()
+        print(test_response)
+        sensor_response = parser.get_inventory()[0][0][0].response
+
+    except Exception as e:
+        print(f"[ERROR] Could not parse or patch RESP file: {e}")
+        raise
+    finally:
+        os.remove(resp_path)
+
+    # Fetch Centaur datalogger stage from NRL
+    nrl = NRL("http://ds.iris.edu/NRL/")
+    if vpp == 40:
+        datalogger_keys = ['Nanometrics', 'Centaur', '40 Vpp (1)', 'Off', 'Linear phase', f"{int(fsamp)}"]
+    elif vpp == 1:
+        datalogger_keys = ['Nanometrics', 'Centaur', '1 Vpp (40)', 'Off', 'Linear phase', f"{int(fsamp)}"]
+    else:
+        raise ValueError(f"Unsupported Vpp: {vpp}")
+
+    dummy_sensor_keys = ['Generic', 'Broadband', '1.0 V/count']
+
+    try:
+        centaur_response = nrl.get_response(sensor_keys=dummy_sensor_keys, datalogger_keys=datalogger_keys)
+    except Exception as e:
+        raise RuntimeError(f"Failed to get Centaur response from NRL: {e}")
+
+    # Combine sensor and datalogger stages
+    combined_response = Response(
+        instrument_sensitivity=sensor_response.instrument_sensitivity,
+        response_stages=sensor_response.response_stages + centaur_response.response_stages
+    )
+
+    return combined_response
+'''
+
+import os
+import requests
+
+def download_infraBSU_stationxml(save_path='/data/station_metadata/infraBSU_21s_0.5inch.xml'):
+    """
+    Downloads the StationXML file for the 21s infraBSU sensor from IRIS and saves it locally.
+
+    Parameters:
+        save_path (str): Full path to save the StationXML file.
+    """
+    url = (
+        "https://service.iris.edu/irisws/nrl/1/combine?"
+        "instconfig=sensor_JeffreyBJohnson_infraBSU_LP21_SG0.000046_STairPressure"
+        "&format=stationxml"
+    )
+    print(f"[INFO] Downloading infraBSU StationXML from:\n{url}")
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise RuntimeError(f"[ERROR] Failed to download StationXML: HTTP {response.status_code}")
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with open(save_path, "wb") as f:
+        f.write(response.content)
+    print(f"[INFO] Saved infraBSU StationXML to: {save_path}")
+
+from obspy.clients.nrl import NRL
+from obspy.core.inventory import Inventory, read_inventory
+from obspy import UTCDateTime
+#from obspy.core.inventory.util import read_inventory
+
+def build_combined_infrabsu_centaur_stationxml(
+    fsamp=100.0,
+    vpp=40,
+    stationxml_path='/data/station_metadata/infraBSU_21s_0.5inch.xml',
+    network='XX', station='DUMM', location='10', channel='HDF',
+    latitude=0.0, longitude=0.0, elevation=0.0, depth=0.0,
+    start_date=UTCDateTime(1970, 1, 1), end_date=UTCDateTime(2100, 1, 1), sitename=None,
+) -> Inventory:
+    """
+    Combines infraBSU sensor StationXML with a Centaur datalogger stage.
+
+    Returns:
+        Inventory with updated metadata and full response.
+    """
+    print(f"[INFO] Reading infraBSU StationXML from: {stationxml_path}")
+    sensor_inv = read_inventory(stationxml_path)
+    sensor_resp = sensor_inv[0][0][0].response  # Assume 1 net, 1 sta, 1 chan
+
+    # Fetch Centaur response stage
+    nrl = NRL("http://ds.iris.edu/NRL/")
+    if vpp == 40:
+        dl_keys = ['Nanometrics', 'Centaur', '40 Vpp (1)', 'Off', 'Linear phase', f"{int(fsamp)}"]
+    elif vpp == 1:
+        dl_keys = ['Nanometrics', 'Centaur', '1 Vpp (40)', 'Off', 'Linear phase', f"{int(fsamp)}"]
+    else:
+        raise ValueError(f"Unsupported Vpp: {vpp}")
+    
+    # Dummy sensor stage to get only the datalogger
+    dummy_sensor_keys = ['Nanometrics', 'Trillium Compact 120 (Vault, Posthole, OBS)', '754 V/m/s']
+    centaur_resp = nrl.get_response(sensor_keys=dummy_sensor_keys, datalogger_keys=dl_keys)
+
+
+    # Merge response stages
+    combined_resp = sensor_resp
+    combined_resp.response_stages += centaur_resp.response_stages
+
+    # Patch metadata
+    chan_obj = sensor_inv[0][0][0]
+    chan_obj.code = channel
+    chan_obj.location_code = location
+    chan_obj.latitude = latitude
+    chan_obj.longitude = longitude
+    chan_obj.elevation = elevation
+    chan_obj.depth = depth
+    chan_obj.sample_rate = fsamp
+    chan_obj.start_date = start_date
+    chan_obj.end_date = end_date
+    chan_obj.response = combined_resp
+
+    station_obj = sensor_inv[0][0]
+    station_obj.code = station
+    station_obj.latitude = latitude
+    station_obj.longitude = longitude
+    station_obj.elevation = elevation
+    station_obj.start_date = start_date
+    station_obj.end_date = end_date
+    station_obj.creation_date=UTCDateTime()
+    station_obj.site=Site(name=sitename or f"{station}_SITE",
+                description=f"Autogenerated site description for {station}")
+        
+
+    network_obj = sensor_inv[0]
+    network_obj.code = network
+
+
+    return sensor_inv
+
 
 def ChaparralM25():
     # 36 V p2p
@@ -260,7 +514,7 @@ def correctUSFstations(st, apply_calib=False, attach=True, return_inventories=Fa
     if return_inventories:
         return inventories    
      
-
+''' Old version. ChatGPT suggested update below
 def NRL2inventory(net, sta, loc, chans, datalogger='Centaur', sensor='TCP', Vpp=40, fsamp=100.0, \
              lat=0.0, lon=0.0, elev=0.0, depth=0.0, sitename='', \
                 ondate=UTCDateTime(1970,1,1), offdate=UTCDateTime(2025,12,31), sensitivity=None, units=None):
@@ -285,7 +539,89 @@ def NRL2inventory(net, sta, loc, chans, datalogger='Centaur', sensor='TCP', Vpp=
         sensor_keys = ['Chaparral Physics', '25', 'Low: 0.4 V/Pa']
     elif sensor.lower() == 'infrabsu':
         #sensor_keys = ['JeffreyBJohnson', 'sensor_JeffreyBJohnson_infraBSU_LP21_SG0.000046_STairPressure', '0.000046 V/Pa']
+        sensor_keys = ['JeffreyBJohnson', 'infraBSU', '0.000046 V/Pdef NRL2inventory(net, sta, loc, chans,
+                  datalogger='Centaur', sensor='TCP', Vpp=40, fsamp=100.0,
+                  lat=0.0, lon=0.0, elev=0.0, depth=0.0, sitename='',
+                  ondate=UTCDateTime(1970, 1, 1), offdate=UTCDateTime(2025, 12, 31),
+                  sensitivity=None, units=None):
+
+    nrl = NRL("http://ds.iris.edu/NRL/")
+
+    # Define datalogger keys
+    if datalogger == 'Centaur':
+        if Vpp == 40:
+            datalogger_keys = ['Nanometrics', 'Centaur', '40 Vpp (1)', 'Off', 'Linear phase', f"{int(fsamp)}"]
+        elif Vpp == 1:
+            datalogger_keys = ['Nanometrics', 'Centaur', '1 Vpp (40)', 'Off', 'Linear phase', f"{int(fsamp)}"]
+        else:
+            raise ValueError(f"Unsupported Vpp: {Vpp}")
+    elif datalogger == 'RT130':
+        datalogger_keys = ['REF TEK', 'RT 130 & 130-SMA', '1', f"{int(fsamp)}"]
+    else:
+        raise ValueError(f"Unsupported datalogger: {datalogger}")
+
+    # Define sensor keys
+    if sensor == 'TCP':
+        sensor_keys = ['Nanometrics', 'Trillium Compact 120 (Vault, Posthole, OBS)', '754 V/m/s']
+    elif sensor == 'L-22':
+        sensor_keys = ['Sercel/Mark Products', 'L-22D', '2200 Ohms', '10854 Ohms']
+    elif sensor.lower().startswith('chap'):
+        sensor_keys = ['Chaparral Physics', '25', 'Low: 0.4 V/Pa']
+    elif sensor.lower() == 'infrabsu':
         sensor_keys = ['JeffreyBJohnson', 'infraBSU', '0.000046 V/Pa']
+    else:
+        raise ValueError(f"Unsupported sensor: {sensor}")
+
+    try:
+        thisresponse = nrl.get_response(sensor_keys=sensor_keys, datalogger_keys=datalogger_keys)
+    except Exception as e:
+        print(f"[WARNING] NRL lookup failed for {net}.{sta}.{loc} ({sensor}): {e}")
+
+        # Fallback infrasound and Chaparral, if they fail
+        if sensor.lower() == 'infrabsu':
+
+            try:
+                print('Trying to build a response object for InfraBSU from online RESP file')
+                thisresponse = build_combined_infrabsu_centaur_response(fsamp=fsamp, vpp=Vpp)
+                print(thisresponse)
+            except Exception as e: # try PAZ
+                print(e)
+                print('Building from NRL, and then from RESP both failed for infraBSU. Trying to build from poles & zeros')
+                poles = [-0.301593 + 0j]
+                zeros = [0j]
+                if sensitivity is None:
+                    sensitivity = 18400.0  # default
+
+        elif sensor.lower().startswith('chap'):
+            print('Trying to build from poles and zeros for Chaparral M25')
+            poles = [-1.0 + 0j, -3.03 + 0j, -3.03 + 0j]
+            zeros = [0j, 0j, 0j]
+            if sensitivity is None:
+                sensitivity = 160000.0
+        else:
+            raise ValueError(f"No fallback response available for sensor: {sensor}")
+
+        input_units = 'Pa'
+        output_units = 'V'
+        try:
+            thisresponse = Response.from_paz(
+                zeros, poles, sensitivity,
+                input_units=input_units,
+                output_units=output_units
+            )
+        except Exception as err:
+            print(f"[ERROR] Failed to build fallback PAZ response for {net}.{sta}.{loc}: {err}")
+            sens_obj = InstrumentSensitivity(
+                value=sensitivity,
+                frequency=1.0,
+                input_units=input_units,
+                output_units=output_units
+            )
+            thisresponse = Response(instrument_sensitivity=sens_obj)
+
+    # Warn if evalresp won't work
+    if not thisresponse.response_stages:
+        print(f"[WARNING] No response stages defined for {net}.{sta}.{loc} — evalresp/remove_response() will fail.")a']
     else:
         print(sensor, ' not recognized')
         print(nrl.sensors[sensor])
@@ -322,6 +658,246 @@ def NRL2inventory(net, sta, loc, chans, datalogger='Centaur', sensor='TCP', Vpp=
                         elev=elev, depth=depth, start_date=ondate, end_date=offdate)
 
     return inventory
+'''
+
+
+from obspy.core.inventory import Inventory, Network, Station, Channel, Site
+from obspy.core.inventory.response import Response, InstrumentSensitivity
+from obspy.clients.nrl import NRL
+from obspy import UTCDateTime
+
+def NRL2inventory(net, sta, loc, chans,
+                  datalogger='Centaur', sensor='TCP', Vpp=40, fsamp=100.0,
+                  lat=0.0, lon=0.0, elev=0.0, depth=0.0, sitename='',
+                  ondate=UTCDateTime(1970, 1, 1), offdate=UTCDateTime(2025, 12, 31),
+                  sensitivity=None, units=None):
+
+    nrl = NRL("http://ds.iris.edu/NRL/")
+
+    # Define datalogger keys
+    if datalogger == 'Centaur':
+        if Vpp == 40:
+            datalogger_keys = ['Nanometrics', 'Centaur', '40 Vpp (1)', 'Off', 'Linear phase', f"{int(fsamp)}"]
+        elif Vpp == 1:
+            datalogger_keys = ['Nanometrics', 'Centaur', '1 Vpp (40)', 'Off', 'Linear phase', f"{int(fsamp)}"]
+        else:
+            raise ValueError(f"Unsupported Vpp: {Vpp}")
+    elif datalogger == 'RT130':
+        datalogger_keys = ['REF TEK', 'RT 130 & 130-SMA', '1', f"{int(fsamp)}"]
+    else:
+        raise ValueError(f"Unsupported datalogger: {datalogger}")
+
+    # Define sensor keys
+    if sensor == 'TCP':
+        sensor_keys = ['Nanometrics', 'Trillium Compact 120 (Vault, Posthole, OBS)', '754 V/m/s']
+    elif sensor == 'L-22':
+        sensor_keys = ['Sercel/Mark Products', 'L-22D', '2200 Ohms', '10854 Ohms']
+    elif sensor.lower().startswith('chap'):
+        sensor_keys = ['Chaparral Physics', '25', 'Low: 0.4 V/Pa']
+    elif sensor.lower() == 'infrabsu':
+        sensor_keys = ['JeffreyBJohnson', 'infraBSU', '0.000046 V/Pa']
+    else:
+        raise ValueError(f"Unsupported sensor: {sensor}")
+
+    # Try NRL service
+    try:
+        thisresponse = nrl.get_response(sensor_keys=sensor_keys, datalogger_keys=datalogger_keys)
+    except Exception as e:
+        print(f"[WARNING] NRL lookup failed for {net}.{sta}.{loc} ({sensor}): {e}")
+
+        # Fallback infrasound and Chaparral, if they fail
+        if sensor.lower() == 'infrabsu':
+
+            try:
+                print('Trying to build a response object for InfraBSU from online RESP file')
+                thisresponse = build_combined_infrabsu_centaur_response(fsamp=fsamp, vpp=Vpp)
+                #print(thisresponse)
+            except Exception as e: # try PAZ
+                print(e)
+                print('Building from NRL, and then from RESP both failed for infraBSU. Trying to build from poles & zeros')
+                poles = [-0.301593 + 0j]
+                zeros = [0j]
+                if sensitivity is None:
+                    sensitivity = 18400.0  # default
+
+        elif sensor.lower().startswith('chap'):
+            print('Trying to build from poles and zeros for Chaparral M25')
+            poles = [-1.0 + 0j, -3.03 + 0j, -3.03 + 0j]
+            zeros = [0j, 0j, 0j]
+            if sensitivity is None:
+                sensitivity = 160000.0
+        else:
+            raise ValueError(f"No fallback response available for sensor: {sensor}")
+
+        input_units = 'Pa'
+        output_units = 'V'
+        try:
+            thisresponse = Response.from_paz(
+                zeros, poles, sensitivity,
+                input_units=input_units,
+                output_units=output_units
+            )
+        except Exception as err:
+            print(f"[ERROR] Failed to build fallback PAZ response for {net}.{sta}.{loc}: {err}")
+            sens_obj = InstrumentSensitivity(
+                value=sensitivity,
+                frequency=1.0,
+                input_units=input_units,
+                output_units=output_units
+            )
+            thisresponse = Response(instrument_sensitivity=sens_obj)
+
+    # Warn if evalresp won't work
+    if not thisresponse.response_stages:
+        print(f"[WARNING] No response stages defined for {net}.{sta}.{loc} — evalresp/remove_response() will fail.")
+
+    # Build Channel objects
+    channels = []
+    for chan in chans:
+        ch = Channel(
+            code=chan,
+            location_code=loc,
+            latitude=lat,
+            longitude=lon,
+            elevation=elev,
+            depth=depth,
+            sample_rate=fsamp,
+            start_date=ondate,
+            end_date=offdate,
+            response=thisresponse
+        )
+        channels.append(ch)
+
+    # Build Station and Network
+    site = Site(name=sitename or f"{sta}_SITE",
+                description=f"Autogenerated site description for {sta}")
+    station = Station(
+        code=sta,
+        latitude=lat,
+        longitude=lon,
+        elevation=elev,
+        creation_date=UTCDateTime(),
+        channels=channels,
+        site=site,
+        start_date=ondate,
+        end_date=offdate
+    )
+
+    network = Network(code=net, stations=[station])
+    inventory = Inventory(networks=[network], source="NRL2inventory")
+
+    return inventory
+
+import csv
+def apply_coordinates_from_csv(inventory, csv_path):
+    """
+    Updates station coordinates in an ObsPy Inventory from a CSV file with header:
+    Network,Station,Latitude,Longitude,Elevation,Depth
+    """
+    coords = {}
+    with open(csv_path, newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            key = f"{row['Network'].strip()}.{row['Station'].strip()}"
+            coords[key] = {
+                'latitude': float(row['Latitude']),
+                'longitude': float(row['Longitude']),
+                'elevation': float(row['Elevation']),
+                'depth': float(row.get('Depth', 0.0))
+            }
+
+    for net in inventory:
+        for sta in net:
+            key = f"{net.code}.{sta.code}"
+            if key in coords:
+                c = coords[key]
+                sta.latitude = c['latitude']
+                sta.longitude = c['longitude']
+                sta.elevation = c['elevation']
+                sta.depth = c['depth']
+                for ch in sta:
+                    ch.latitude = c['latitude']
+                    ch.longitude = c['longitude']
+                    ch.elevation = c['elevation']
+                    ch.depth = c['depth']
+                print(f"[OK] Updated coordinates for {key}")
+            else:
+                print(f"[WARN] No coordinates found for {key}")
+
+from obspy.core.inventory import Inventory, Network, Station, Site
+from collections import defaultdict
+
+def merge_duplicate_stations_and_patch_site(inventory):
+    """
+    Merges duplicate stations with same network and code, and ensures every statiimport csv
+                    inv = NRL2inventory(
+                        str(row["network"]).strip(),
+                        str(row["station"]).strip(),
+                        str(row["location"]).strip(),
+                        chan_list,          
+                        fsamp=float(row["fsamp"]),
+                        Vpp=int(row["vpp"]),
+                        datalogger=row['datalogger'].strip(),
+                        sensor=row['datalogger'].strip(),
+                        latitude=float(row["lat"]),
+                        longitude=float(row["lon"]),
+                        elevation=float(row["elev"]),
+                        depth=float(row["depth"]),
+                        start_date=UTCDateTime(row["ondate"]),
+                        end_date=UTCDateTime(row["offdate"])
+                    )
+                elif ch[1]=='D':on has a Site.
+    """
+    merged_networks = []
+
+    for net in inventory:
+        station_map = defaultdict(list)
+        for sta in net:
+            station_map[sta.code].append(sta)
+
+        new_stations = []
+        for code, stations in station_map.items():
+            all_channels = []
+            for sta in stations:
+                all_channels.extend(sta.channels)
+            merged_station = Station(
+                code=code,
+                latitude=stations[0].latitude,
+                longitude=stations[0].longitude,
+                elevation=stations[0].elevation,
+                channels=all_channels,
+                site=stations[0].site or Site(name=f"{code}_SITE", description=f"Autogenerated site description for {code}"),
+                creation_date=stations[0].creation_date,
+                start_date=stations[0].start_date,
+                end_date=stations[0].end_date
+            )
+            if not merged_station.site.name:
+                merged_station.site.name = f"{code}_SITE"
+            if not merged_station.site.description:
+                merged_station.site.description = f"Autogenerated site description for {code}"
+            new_stations.append(merged_station)
+
+        merged_networks.append(Network(code=net.code, stations=new_stations))
+
+    return Inventory(networks=merged_networks, source=inventory.source)
+
+from obspy.core.inventory import Inventory
+from obspy.io.xseed import Parser
+
+def write_inventory_as_resp(inventory, seed_tempfile, resp_outdir):
+    """
+    Writes RESP files for all channels in an ObsPy Inventory.
+    Requires writing to Dataless SEED first.
+    """
+    # Write to temporary dataless SEED
+    inventory.write(seed_tempfile, format='SEED')
+
+    # Read with Parser and export
+    sp = Parser(seed_tempfile)
+    sp.write_resp(folder=resp_outdir, zipped=False)
+    print(f"[OK] RESP files written to {resp_outdir}")
+
+
 
 
 def responses2inventory(net, sta, loc, fsamp, responses, lat=None, lon=None, \
@@ -395,65 +971,251 @@ if __name__ == '__main__':
     print('************************************\n\n')
 
 
-    print('Raspberry Boom')
-    inv = get_rboom('R1234', '00')
-    print(inv)
-    show_response(inv)
-    masterinv = inv
 
-    print('Raspberry Shake 3D')
-    inv = get_rs3d_v3('R2345', '00')
-    print(inv)
-    show_response(inv)
-    masterinv = masterinv + inv
 
-    print('Raspberry Shake 1D')
-    inv = get_rs1d_v4('R3456', '00')
-    print(inv)
-    show_response(inv)
-    masterinv = masterinv + inv
+from obspy import UTCDateTime, read_inventory
+#from flovopy.core.usf import NRL2inventory, apply_coordinates_from_csv, merge_duplicate_stations_and_patch_site, write_inventory_as_resp
+import os
 
-    print('Centaur-Trillium')
-    inv = NRL2inventory('FL', 'BCHH', '00', ['HHZ', 'HHN', 'HHE'], datalogger='Centaur', sensor='TCP', Vpp=40, fsamp=100, \
-                        sitename='Beach House original', ondate=UTCDateTime(2016,2,24) )
-    show_response(inv)
-    #inv.write("BCHH_original_seismic.sml", format="stationxml", validate=True)
-    masterinv = masterinv + inv
+import pandas as pd
+from obspy import UTCDateTime
+from flovopy.core.usf import build_combined_infrabsu_centaur_stationxml
+from obspy.core.inventory import Inventory
 
-    print('Chaparral 40V p2p')
-    inv = NRL2inventory('FL', 'BCHH', '10', ['HDF'], datalogger='Centaur', sensor='Chap', Vpp=40, fsamp=100, \
-                        sitename='Beach House Sonic', ondate=UTCDateTime(2017,8,1) )
-    #inv.write("BCHH_sonic_Chap.sml", format="stationxml", validate=True) # Replace PA with Pa and 400,000 in InstrumentSensivitity Value with 160,000
-    show_response(inv)
-    masterinv = masterinv + inv
+from obspy import UTCDateTime
 
-    print('Chaparral 1V p2p')
-    inv = NRL2inventory('FL', 'BCHH2', '10', ['HDF'], datalogger='Centaur', sensor='Chap', Vpp=1, fsamp=100, \
-                        sitename='Beach House Sonic', ondate=UTCDateTime(2017,8,1) )
-    #inv.write("BCHH_sonic_Chap.sml", format="stationxml", validate=True) # Replace PA with Pa and 400,000 in InstrumentSensivitity Value with 160,000
-    show_response(inv)
-    masterinv = masterinv + inv   
-    # note need to apply an extra calib of 0.4 in Trace.stats.calib because this is ignored otherwise
-    # or need to change units in response stages from Pa to m/s
+def expand_channel_code(base: str):
+    """
+    Expands compact channel codes like 'EHZNE' → ['EHZ', 'EHN', 'EHE']
+    or 'HD123456' → ['HD1', 'HD2', ..., 'HD6'].
+    """
+    base = str(base).strip()
+    if len(base) <= 3:
+        return [base]  # Nothing to expand
 
-    print('infraBSU 40V p2p')
-    inv = NRL2inventory('FL', 'BCHH2', '10', ['HD4', 'HD5', 'HD6'], datalogger='Centaur', sensor='infraBSU', Vpp=40, fsamp=100, \
-                    lat=0.0, lon=0.0, elev=0.0, depth=0.0, sitename='', \
-                        ondate=UTCDateTime(1970,1,1), offdate=UTCDateTime(2025,12,31), \
-                            sensitivity=countsPerPa40, units='m/s')
-    show_response(inv)
-    masterinv = masterinv + inv   
+    prefix = base[:2]
+    suffix = base[2:]
+
+    return [prefix + ch for ch in suffix]
+
+def build_inventory_from_csv(csv_path: str,
+                              stationxml_path: str = "/data/station_metadata/infraBSU_21s_0.5inch.xml") -> Inventory:
+    """
+    Reads a CSV of infraBSU sensor entries and builds an ObsPy Inventory by calling
+    build_combined_infrabsu_centaur_stationxml() for each row.
+
+    Parameters:
+        csv_path (str): Path to the CSV file.
+        stationxml_path (str): Path to cached infraBSU StationXML file.
+
+    Returns:
+        Inventory: Combined ObsPy Inventory object.
+    """
+    df = pd.read_csv(csv_path)
+
+
+    # Strip column names and values
+    df.columns = df.columns.str.strip()
+    df['location'] = df['location'].astype(str).str.strip()
+    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
     
-    print('infraBSU 1V p2p')
-    inv = NRL2inventory('FL', 'BCHH3', '20', ['HD7', 'HD8', 'HD9'], datalogger='Centaur', sensor='infraBSU', Vpp=1, fsamp=100, \
-                    lat=0.0, lon=0.0, elev=0.0, depth=0.0, sitename='', \
-                        ondate=UTCDateTime(1970,1,1), offdate=UTCDateTime(2025,12,31), \
-                            sensitivity=countsPerPa40, units='m/s')    
+    # Strip leading/trailing whitespace from string columns only
+    #for col in df.select_dtypes(include=['object']).columns:
+    #    df[col] = df[col].str.strip()
 
+    # Convert dates to UTCDateTime
+    df["ondate"] = df["ondate"].apply(UTCDateTime)
+    df["offdate"] = df["offdate"].apply(UTCDateTime)
+    #print(df.dtypes)
+    master_inventory = Inventory(networks=[], source="build_inventory_from_csv")
+
+    # Updated loop
+    for _, row in df.iterrows():
+        #try:
+            chan_list = expand_channel_code(row["channel"])
+            #print(row['channel'], '->', chan_list)
+            if row['vpp'].strip()=='':
+                row['vpp']=32 # REFTECK RT130 PASSCAL gain
+
+            if row['channel'][1]=='H':
+                inv = NRL2inventory(
+                    str(row["network"]).strip(),
+                    str(row["station"]).strip(),
+                    str(row["location"]).strip(),
+                    chan_list,          
+                    fsamp=float(row["fsamp"]),
+                    Vpp=int(row["vpp"]),
+                    datalogger=row['datalogger'].strip(),
+                    sensor=row['sensor'].strip(),
+                    lat=float(row["lat"]),
+                    lon=float(row["lon"]),
+                    elev=float(row["elev"]),
+                    depth=float(row["depth"]),
+                    ondate=UTCDateTime(row["ondate"]),
+                    offdate=UTCDateTime(row["offdate"])
+                )
+            elif row['channel'][1]=='D':
+                for ch in chan_list:
+                     inv = build_combined_infrabsu_centaur_stationxml(
+                        fsamp=float(row["fsamp"]),
+                        vpp=int(row["vpp"]),
+                        stationxml_path=stationxml_path,
+                        network=str(row["network"]).strip(),
+                        station=str(row["station"]).strip(),
+                        location=str(row["location"]).strip(),
+                        channel=ch.strip(),
+                        latitude=float(row["lat"]),
+                        longitude=float(row["lon"]),
+                        elevation=float(row["elev"]),
+                        depth=float(row["depth"]),
+                        start_date=UTCDateTime(row["ondate"]),
+                        end_date=UTCDateTime(row["offdate"])
+                    )                   
+            master_inventory += inv
+
+        #except Exception as e:
+        #    print(f"[ERROR] Failed for {row['network']}.{row['station']}.{row['location']}.{row['channel']}: {e}")
+    
+    return master_inventory
+
+def get_stationXML_inventory(
+    xmlfile='/data/station_metadata/KSC.xml',
+    seedfile='/data/station_metadata/KSC.dataless',
+    respdir='/data/station_metadata/RESP/',
+    metadata_csv='/data/station_metadata/ksc.csv',
+    coord_csv='/data/station_metadata/ksc_coordinates_only.csv',
+    overwrite=False
+):
+    from obspy import Inventory
+
+    if os.path.isfile(xmlfile) and not overwrite:
+        inv = read_inventory(xmlfile)
+        print(f"[INFO] Loaded existing StationXML: {xmlfile}")
+    else:
+        print("[INFO] Creating new inventory from USF definitions...")
+
+        inv = build_inventory_from_csv(csv_path = metadata_csv, 
+                              stationxml_path = "/data/station_metadata/infraBSU_21s_0.5inch.xml")
+
+        # Apply coordinates from CSV
+        if os.path.isfile(coord_csv):
+            apply_coordinates_from_csv(inv, coord_csv)
+
+        # Merge + site patch
+        inv = merge_duplicate_stations_and_patch_site(inv)
+
+        # Save StationXML
+        inv.write(xmlfile, format='STATIONXML', validate=True)
+        print(f"[OK] Wrote StationXML to {xmlfile}")
+
+    return inv
+
+
+import os
+from obspy import UTCDateTime
+from obspy.core.inventory import Inventory, Network, Station, Channel, Site
+from obspy.io.xseed import Parser
+import shutil
+
+def inventory2dataless_and_resp(inv, output_dir="/data/station_metadata/resp",
+                                stationxml_seed_converter_jar="/home/thompsong/stationxml-seed-converter.jar"):
+    """
+    Splits an ObsPy Inventory into one per channel, saves as StationXML,
+    and attempts to convert each to Dataless SEED and RESP format.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    for net in inv:
+        for sta in net:
+            for cha in sta:
+                try:
+                    # Build a minimal Inventory
+                    new_channel = Channel(
+                        code=cha.code,
+                        location_code=cha.location_code,
+                        latitude=cha.latitude,
+                        longitude=cha.longitude,
+                        elevation=cha.elevation,
+                        depth=cha.depth,
+                        azimuth=cha.azimuth,
+                        dip=cha.dip,
+                        sample_rate=cha.sample_rate,
+                        start_date=cha.start_date,
+                        end_date=cha.end_date,
+                        response=cha.response
+                    )
+
+                    new_station = Station(
+                        code=sta.code,
+                        latitude=sta.latitude,
+                        longitude=sta.longitude,
+                        elevation=sta.elevation,
+                        site=Site(name=sta.site.name if sta.site.name else ""),
+                        channels=[new_channel],
+                        start_date=sta.start_date,
+                        end_date=sta.end_date
+                    )
+
+                    new_network = Network(
+                        code=net.code,
+                        stations=[new_station]
+                    )
+
+                    mini_inv = Inventory(networks=[new_network], source=inv.source)
+
+                    # Create safe filenames
+                    sdt = (cha.start_date or UTCDateTime(0)).format_iris_web_service().replace(":", "-")
+                    edt = (cha.end_date or UTCDateTime(2100, 1, 1)).format_iris_web_service().replace(":", "-")
+                    basename = f"{net.code}.{sta.code}.{cha.location_code}.{cha.code}_{sdt}_{edt}"
+                    xmlfile = os.path.join(output_dir, f"{basename}.xml")
+
+                    # 1. Write StationXML
+                    mini_inv.write(xmlfile, format="stationxml")
+                    print(f"[OK] Wrote StationXML: {xmlfile}")
+
+                    # 2. Convert to Dataless SEED via external JAR
+                    dataless_file = os.path.join(output_dir, f"{basename}.dseed")
+                    java_cmd = f"java -jar {stationxml_seed_converter_jar} -s {xmlfile} -o {dataless_file}"
+                    ret = os.system(java_cmd)
+                    if ret != 0 or not os.path.exists(dataless_file):
+                        raise RuntimeError(f"[WARN] Dataless SEED conversion failed for {xmlfile}")
+                    print(f"[OK] Wrote Dataless SEED: {dataless_file}")
+
+                    # 3. Convert to RESP
+                    resp_dir = os.path.join(output_dir, f"{basename}_resp")
+                    os.makedirs(resp_dir, exist_ok=True)
+                    sp = Parser(dataless_file)
+                    sp.write_resp(folder=resp_dir, zipped=False)
+                    print(f"[OK] Wrote RESP files to: {resp_dir}")
+
+                    # Optionally clean up dataless SEED file
+                    # os.remove(dataless_file)
+
+                except Exception as e:
+                    print(f"[ERROR] Failed for {net.code}.{sta.code}.{cha.location_code}.{cha.code}: {e}")
+
+
+
+if __name__ == '__main__':
+
+    xmlfile = '/data/station_metadata/KSC.xml'
+    #dataless = '/data/station_metadata/KSC.dataless'
+    respdir = '/data/station_metadata/RESP'
+
+    print('### calibrations only ###:')
+    print('trillium+centaur40 = %f' % countsPerMS)        
+    print('infraBSU+centaur40 = %f' % countsPerPa40)        
+    print('infraBSU+centaur1 = %f' % countsPerPa1)        
+    print('chaparralM25+centaur40 = %f' % countsPerPaChap40)        
+    print('chaparralM25+centaur1 = %f' % (countsPerPaChap1))   
+    print('************************************\n\n')
+
+
+    print('### Building full inventories with responses ###')
+    print('First try to get combined response for infraBSU and Centaur:')
+    #download_infraBSU_stationxml()
+    inv = get_stationXML_inventory(xmlfile=xmlfile, overwrite=True)
     print(inv)
-    show_response(inv)
-    masterinv = masterinv + inv      
 
-
-    print('****************************\n\nMaster inventory')
-    print(masterinv)
+    inventory2dataless_and_resp(inv, output_dir=respdir,
+                                stationxml_seed_converter_jar="/home/thompsong/stationxml-seed-converter.jar")

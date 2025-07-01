@@ -9,21 +9,21 @@ from flovopy.core.legacy import _fix_legacy_id
 
 If you’re processing daily data, call it like:
 
-preprocess_stream(stream, inv=inv, max_dropout=None, outputType='VEL', ...)
+    preprocess_stream(stream, inv=inv, max_dropout=None, outputType='VEL', ...)
 
 If you’re processing event-sized data:
 
-preprocess_stream(stream, inv=inv, max_dropout=0.1, ...)
+    preprocess_stream(stream, inv=inv, max_dropout=0.1, ...)
 
 Optional: In _interpolate_small_gaps(), treat 0 as a null value only when you want to.
 
 If you’re padding 0.0 into gaps in daily data, it’s better to exclude 0 from null values (to avoid masking valid data). When calling detrend_trace(), do:
 
-detrend_trace(tr, null_values=[np.nan], ...)
+    detrend_trace(tr, null_values=[np.nan], ...)
 
 instead of:
 
-detrend_trace(tr, null_values=[0, np.nan], ...)
+    detrend_trace(tr, null_values=[0, np.nan], ...)
 
 
 This change will:
@@ -75,7 +75,7 @@ def preprocess_trace(tr, bool_despike=True, bool_clean=True, inv=None, quality_t
     zerophase : bool, optional
         Whether to apply a zero-phase filter (default: False).
     outputType : str, optional
-        Type of output after instrument response removal. Options: "VEL" (velocity), "DISP" (displacement), "ACC" (acceleration), "DEF" (deformation) (default: "VEL").
+        Type of output after instrument response removal. Options: "VEL" (velocity), "DISP" (displacement), "ACC" (acceleration), "DEF" (default) (default: "VEL").
     miniseed_qc : bool, optional
         Whether to perform MiniSEED quality control checks (default: True).
     verbose : bool, optional
@@ -242,24 +242,42 @@ def _clean_trace(tr, taperFraction, filterType, freq, corners, zerophase, inv, o
     add_to_trace_history(tr, 'tapered')
 
     # Filtering
-    if verbose:
-        print('- filtering')
-    if filterType == "bandpass":
-        tr.filter(filterType, freqmin=freq[0], freqmax=freq[1], corners=corners, zerophase=zerophase)
-    else:
-        tr.filter(filterType, freq=freq[0], corners=corners, zerophase=zerophase)
-    _update_trace_filter(tr, filterType, freq, zerophase)
-    add_to_trace_history(tr, filterType)
+    if inv:
+        # Estimate pre_filt based on bandpass
+        nyquist = 0.5 / tr.stats.delta
+        if filterType == "bandpass":
+            fmin, fmax = freq
+        else:
+            fmin = freq
+            fmax = 999999 # unrealistically high
+        pre_filt = (
+            max(0.01, fmin * 0.5),
+            fmin,
+            min(fmax, nyquist * 0.95),
+            min(fmax * 1.5, nyquist * 0.99)
+        )
 
-    # Instrument Response Removal
-    _handle_instrument_response(tr, inv, outputType, verbose)
+        # Instrument Response Removal
+        _handle_instrument_response(tr, inv, pre_filt, outputType, verbose)    
+
+    else: # Filter only, do not remove response
+        if verbose:
+            print('- filtering')
+        if filterType == "bandpass":
+            tr.filter(filterType, freqmin=freq[0], freqmax=freq[1], corners=corners, zerophase=zerophase)
+        else:
+            tr.filter(filterType, freq=freq[0], corners=corners, zerophase=zerophase)
+        _update_trace_filter(tr, filterType, freq, zerophase)
+        add_to_trace_history(tr, filterType)
 
     # Remove Padding
     _unpad_trace(tr)
 
-def _handle_instrument_response(tr, inv, outputType, verbose):
+def _handle_instrument_response(tr, inv, pre_filt, outputType, verbose):
     """
     Removes the instrument response using ObsPy's `remove_response()`.
+
+    Note that water_level=60 means never allow the response amplitude to fall below 1/60th of its maximum during spectral division.
     """
     if inv:
         try:
@@ -268,7 +286,7 @@ def _handle_instrument_response(tr, inv, outputType, verbose):
             if tr.stats.channel[1]=='D':
                 outputType='DEF' # for pressure sensor
             tr.remove_response(inventory=inv, output=outputType, \
-                pre_filt=None, water_level=60, zero_mean=True, \
+                pre_filt=pre_filt, water_level=60, zero_mean=True, \
                 taper=False, taper_fraction=0.0, plot=False, fig=None)      
             add_to_trace_history(tr, 'calibrated')
             tr.stats.calib = 1.0
@@ -1094,7 +1112,7 @@ def _unpad_trace(tr):
         add_to_trace_history(tr, 'unpadded')     
 
 
-def remove_low_quality_traces(st, quality_threshold=1.0):
+def remove_low_quality_traces(st, quality_threshold=1.0, verbose=False):
     """
     Removes traces from an ObsPy Stream based on a quality factor threshold.
 
@@ -1135,6 +1153,8 @@ def remove_low_quality_traces(st, quality_threshold=1.0):
     """
     for tr in st:
         if tr.stats.quality_factor < quality_threshold: 
+            if verbose:
+                print(f'Removing {tr.id} because quality_factor is {tr.stats.quality_factor} and threshold is {quality_threshold}')
             st.remove(tr)
 
 #######################################################################
@@ -2017,7 +2037,7 @@ def preprocess_stream(st, bool_despike=True, bool_clean=True, inv=None, \
     zerophase : bool, optional
         Whether to apply a zero-phase filter (default: False).
     outputType : str, optional
-        Type of output after instrument response removal. Options: "VEL" (velocity), "DISP" (displacement), "ACC" (acceleration), "DEF" (deformation) (default: "VEL").
+        Type of output after instrument response removal. Options: "VEL" (velocity), "DISP" (displacement), "ACC" (acceleration), "DEF" (default) (default: "VEL").
     miniseed_qc : bool, optional
         Whether to perform MiniSEED quality control checks (default: True).
     verbose : bool, optional
