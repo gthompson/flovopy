@@ -87,3 +87,65 @@ def order_traces_by_distance(st, r=None, assert_channel_order=False):
     indices = np.argsort(r)
     return Stream([st[i].copy() for i in indices])
 
+def get_distance(lat1, lon1, lat2, lon2):
+    from obspy.geodetics import gps2dist_azimuth
+
+
+    # Calculate distance and azimuths
+    distance_m, azimuth_deg, back_azimuth_deg = gps2dist_azimuth(lat1, lon1, lat2, lon2)
+
+    # Print results
+    print(f"Distance: {distance_m:.2f} m")
+    print(f"Bearing (azimuth A ➝ B): {azimuth_deg:.2f}°")
+    print(f"Back azimuth (B ➝ A): {back_azimuth_deg:.2f}°")
+
+def plot_arrays():
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    # Load CSV into DataFrame
+    df = pd.read_csv("/Users/glennthompson/Dropbox/DATA/station_metadata/ksc_stations_cleaned.csv", encoding='latin1')
+
+    # Clean whitespace (optional if not already cleaned)
+    df.columns = df.columns.str.strip()
+
+    # Following line deprecated. Next line added.
+    #df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    df = df.apply(lambda col: col.map(str.strip) if col.dtypes == "object" else col)
+
+    # Select rows 
+ 
+    subset = df.iloc[4:18]  #0:47
+
+    # Extract lat/lon and labels
+    rownums = subset['rownum']
+    lats = subset['lat']
+    lons = subset['lon']
+    locations = subset['location']
+    labels = subset['channel']
+
+    origin_lon = -80.572248
+    origin_lat = 28.573614
+    #print(lons-28.573614, lats-80.572248, labels)
+
+    # Plot
+    plt.figure(figsize=(12, 12))
+    for rownum, lon, lat, label, location  in zip(rownums, lons, lats, labels, locations):
+        lon = float(lon)
+        lat = float(lat)
+        if rownum in (5, 7, 9, 10, 18, 19, 23, 20,21,22, 24) or rownum in range(35, 47):
+            plt.plot(lon-origin_lon, lat-origin_lat, 'g*')
+        else:
+            plt.plot(lon-origin_lon, lat-origin_lat, 'ro')
+        plt.text(lon-origin_lon, lat-origin_lat, f' {rownum}', fontsize=14, verticalalignment='bottom')
+
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.title("Station Map with Channel Labels")
+    plt.grid(True)
+    #plt.axis("equal")
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == '__main__':
+    plot_arrays()

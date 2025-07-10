@@ -1,14 +1,50 @@
 # flovopy/core/sds.py
-
 import os
-import re
 import glob
-import shutil
 import numpy as np
-import pandas as pd
 from obspy import read, Stream
+from obspy.core.utcdatetime import UTCDateTime
 import obspy.clients.filesystem.sds
 from flovopy.core.preprocessing import remove_empty_traces, fix_trace_id, _can_write_to_miniseed_and_read_back
+from tqdm import tqdm
+
+
+def split_trace_at_midnight(tr):
+    """
+    Split a Trace at UTC midnight boundaries. Return list of Trace objects.
+    """
+    out = []
+    t1 = tr.stats.starttime
+    t2 = tr.stats.endtime
+
+    while t1 < t2:
+        next_midnight = UTCDateTime(t1.date) + 86400
+        trim_end = min(t2, next_midnight)
+        tr_piece = tr.copy().trim(starttime=t1, endtime=trim_end, nearest_sample=True)
+        out.append(tr_piece)
+        t1 = trim_end
+    return out
+
+def traces_overlap_and_match(tr1, tr2):
+    """
+    Returns (has_overlap, data_matches)
+
+    - has_overlap: True if tr1 and tr2 share any common time samples.
+    - data_matches: True if data values in overlap are equal.
+    """
+    latest_start = max(tr1.stats.starttime, tr2.stats.starttime)
+    earliest_end = min(tr1.stats.endtime, tr2.stats.endtime)
+
+    if latest_start >= earliest_end:
+        return False, True  # No overlap — nothing to compare
+
+    tr1_overlap = tr1.slice(starttime=latest_start, endtime=earliest_end, nearest_sample=True)
+    tr2_overlap = tr2.slice(starttime=latest_start, endtime=earliest_end, nearest_sample=True)
+
+    if len(tr1_overlap.data) != len(tr2_overlap.data):
+        return True, False
+
+    return True, np.array_equal(tr1_overlap.data, tr2_overlap.data)
 
 class SDSobj:
     """
@@ -16,7 +52,7 @@ class SDSobj:
     Allows reading, writing, checking availability, and plotting data from an SDS archive.
     """
 
-    def __init__(self, SDS_TOP, sds_type='D', format='MSEED', streamobj=None):
+    def __init__(self, SDS_TOP, sds_type='D', format='MSEED', streamobj=None, metadata=None):
         """
         Initialize SDSobj.
 
@@ -30,83 +66,130 @@ class SDSobj:
         self.client = obspy.clients.filesystem.sds.Client(SDS_TOP, sds_type=sds_type, format=format)
         self.stream = streamobj or Stream()
         self.topdir = SDS_TOP
+        self.metadata = metadata # for supporting a dataframe of allowable SEED ids (from same Excel spreadsheet used to generate StationXML)
 
-    def read(self, startt, endt, skip_low_rate_channels=True, trace_ids=None, speed=1, verbose=True):
+
+
+    def read(self, startt, endt, skip_low_rate_channels=True, trace_ids=None,
+            speed=1, verbose=True, merge_method=0, progress=False):
         """
         Read data from the SDS archive into the internal stream.
 
         Parameters:
-        - startt, endt: Start and end times (UTCDateTime).
-        - skip_low_rate_channels (bool): Skip channels with 'L' prefix.
+        - startt, endt (UTCDateTime): Time range.
+        - skip_low_rate_channels (bool): Skip channels starting with 'L'.
         - trace_ids (list): Optional list of trace IDs to read.
-        - speed (int): Reading method (1=filename-based, 2=SDS client).
+        - speed (int): 1 = filename-based, 2 = SDS client.
         - verbose (bool): Print messages if True.
+        - merge_method (int): ObsPy merge method (default 0 = concat).
+        - progress (bool): Show progress bar.
 
         Returns:
-        - int: 0 if successful, 1 if stream is empty.
+        - int: 0 if stream is populated, 1 if empty.
         """
         if not trace_ids:
-            trace_ids = self._get_nonempty_traceids(startt, endt, skip_low_rate_channels)
+            trace_ids = self._get_nonempty_traceids(startt, endt, skip_low_rate_channels, speed=speed)
 
         st = Stream()
-        for trace_id in trace_ids:
+        trace_iter = tqdm(trace_ids, desc="Reading traces") if progress else trace_ids
+
+        for trace_id in trace_iter:
             net, sta, loc, chan = trace_id.split('.')
             if chan.startswith('L') and skip_low_rate_channels:
                 continue
+
             try:
                 if speed == 1:
                     sdsfiles = self.client._get_filenames(net, sta, loc, chan, startt, endt)
                     for sdsfile in sdsfiles:
                         if os.path.isfile(sdsfile):
-                            that_st = read(sdsfile)
-                            that_st.merge(method=0)
-                            st += that_st
+                            try:
+                                st += read(sdsfile)
+                            except Exception as e:
+                                if verbose:
+                                    print(f"Failed to read {sdsfile}: {e}")
+
                 elif speed == 2:
                     st += self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
+
             except Exception as e:
                 if verbose:
                     print(f"Failed to read {trace_id}: {e}")
 
-        st.trim(startt, endt)
         st = remove_empty_traces(st)
-        st.merge(method=0)
+
+        if len(st):
+            st.trim(startt, endt)
+            st.merge(method=merge_method)
+
         self.stream = st
         return 0 if len(st) else 1
 
-    def write(self, overwrite=False, debug=False):
+    def write(self, overwrite=False, fallback_to_indexed=True, debug=False):
         """
-        Write internal stream to SDS archive.
+        Write internal stream to SDS archive, splitting across midnights and handling merge conflicts.
 
         Parameters:
         - overwrite (bool): Overwrite existing files if True.
+        - fallback_to_indexed (bool): If True, write .01, .02 files on merge conflict. If False, raise error.
         - debug (bool): Currently unused.
 
         Returns:
-        - bool: True if successful, False otherwise.
+        - bool: True if all writes succeed, False if any fail.
         """
         successful = True
-        for tr in self.stream:
-            try:
-                sdsfile = self.client._get_filename(tr.stats.network, tr.stats.station, tr.stats.location, tr.stats.channel, tr.stats.starttime, 'D')
-                os.makedirs(os.path.dirname(sdsfile), exist_ok=True)
+        for tr_unsplit in self.stream:
+            split_traces = split_trace_at_midnight(tr_unsplit)
+            for tr in split_traces:
 
-                if not overwrite and os.path.isfile(sdsfile):
-                    existing = read(sdsfile)
-                    new_st = existing.copy().append(tr).merge(method=1, fill_value=0)
-                    if len(new_st) == 1:
-                        new_st[0].write(sdsfile, format='MSEED')
+                try:
+                    sdsfile = self.client._get_filename(
+                        tr.stats.network, tr.stats.station,
+                        tr.stats.location, tr.stats.channel,
+                        tr.stats.starttime, 'D'
+                    )
+                    os.makedirs(os.path.dirname(sdsfile), exist_ok=True)
+
+                    if not overwrite and os.path.isfile(sdsfile):
+                        existing = read(sdsfile)
+
+                        can_merge = True
+                        for existing_tr in existing.select(id=tr.id):
+                            has_overlap, matches = traces_overlap_and_match(existing_tr, tr)
+                            if has_overlap and not matches:
+                                can_merge = False
+                                break
+
+                        if can_merge:
+                            combined = existing.copy().append(tr)
+                            combined.merge(method=1, fill_value=None)
+                            if len(combined) == 1:
+                                combined[0].write(sdsfile, format='MSEED')
+                            else:
+                                raise ValueError(f"Merged stream has >1 Trace for {tr.id}")
+                        else:
+                            if fallback_to_indexed:
+                                index = 1
+                                while True:
+                                    sdsindexpath = sdsfile + f'.{index:02d}'
+                                    if not os.path.isfile(sdsindexpath):
+                                        tr.write(sdsindexpath, format='MSEED')
+                                        print(f"Wrote indexed file due to merge conflict: {sdsindexpath}")
+                                        break
+                                    index += 1
+                            else:
+                                raise ValueError(f"Conflict in overlapping data: {tr.id}")
+
                     else:
-                        raise ValueError("Cannot write Stream with more than 1 trace to a single SDS file")
-                else:
-                    tr.write(sdsfile, format='MSEED')
+                        tr.write(sdsfile, format='MSEED')
 
-            except Exception as e:
-                print(f"Write failed for {tr.id}: {e}")
-                successful = False
+                except Exception as e:
+                    print(f"Write failed for {tr.id}: {e}")
+                    successful = False
 
         return successful
 
-    def _get_nonempty_traceids(self, startday, endday=None, skip_low_rate_channels=True):
+    def _get_nonempty_traceids(self, startday, endday=None, skip_low_rate_channels=True, speed=1):
         """
         Get a list of trace IDs that have data between two dates.
 
@@ -114,6 +197,7 @@ class SDSobj:
         - startday (UTCDateTime)
         - endday (UTCDateTime): Optional. Defaults to startday + 1 day.
         - skip_low_rate_channels (bool)
+        - speed (int): If 1, confirm using has_data(); if >1, trust get_all_nslc().
 
         Returns:
         - list: Sorted list of trace IDs.
@@ -121,55 +205,83 @@ class SDSobj:
         endday = endday or startday + 86400
         trace_ids = set()
         thisday = startday
+
         while thisday < endday:
-            for net, sta, loc, chan in self.client.get_all_nslc(sds_type='D', datetime=thisday):
-                if chan.startswith('L') and skip_low_rate_channels:
-                    continue
-                if self.client.has_data(net, sta, loc, chan):
+            try:
+                for net, sta, loc, chan in self.client.get_all_nslc(sds_type='D', datetime=thisday):
+                    if chan.startswith('L') and skip_low_rate_channels:
+                        continue
+                    if speed == 1:
+                        if not self.client.has_data(net, sta, loc, chan):
+                            continue
                     trace_ids.add(f"{net}.{sta}.{loc}.{chan}")
+            except Exception as e:
+                print(f"Error on {thisday.date()}: {e}")
             thisday += 86400
+
         return sorted(trace_ids)
 
-    def find_missing_days(self, stime, etime, net):
+    def find_missing_days(self, stime, etime, net, sta=None):
         """
-        Return list of days with no data for a given network.
+        Return list of days with no data for a given network (or station).
 
         Parameters:
-        - stime, etime: Start and end time range (UTCDateTime).
+        - stime, etime (UTCDateTime): Start and end time range.
         - net (str): Network code.
+        - sta (str): Optional station code. If None, checks any station in net.
 
         Returns:
-        - list of datetime: Missing days.
+        - list of UTCDateTime: Days with no matching files.
         """
         missing_days = []
         dayt = stime
+
         while dayt < etime:
-            jday = dayt.strftime('%j')
-            yyyy = dayt.strftime('%Y')
-            pattern = os.path.join(self.topdir, yyyy, net, '*', '*.D', f"{net}*.{yyyy}.{jday}")
+            year = f"{dayt.year:04d}"
+            jday = f"{dayt.julday:03d}"
+            station_glob = sta or '*'
+            pattern = os.path.join(
+                self.topdir, year, net, station_glob, '*.D',
+                f"{net}*.{year}.{jday}"
+            )
             existingfiles = glob.glob(pattern)
             if not existingfiles:
                 missing_days.append(dayt)
             dayt += 86400
+
         return missing_days
 
-    def get_percent_availability(self, startday, endday, skip_low_rate_channels=True, trace_ids=None, speed=3):
+    def get_percent_availability(self, startday, endday, skip_low_rate_channels=True,
+                                trace_ids=None, speed=3, verbose=False, progress=True):
         """
         Compute data availability percentage for each trace ID per day.
 
         Parameters:
-        - startday, endday (UTCDateTime)
-        - skip_low_rate_channels (bool)
-        - trace_ids (list): Optional trace ID list.
-        - speed (int): Speed method for calculating availability (1, 2, or 3).
+        - startday, endday (UTCDateTime): Date range.
+        - skip_low_rate_channels (bool): Skip L-prefixed channels.
+        - trace_ids (list): Optional list of SEED IDs.
+        - speed (int): Mode (1 = count non-NaN, 2 = use .npts, 3 = SDS client).
+        - verbose (bool): Print errors.
+        - progress (bool): Show progress bar.
 
         Returns:
-        - (DataFrame, list): Availability DataFrame and trace ID list
+        - (DataFrame, list): Availability DataFrame and SEED IDs.
         """
-        trace_ids = trace_ids or self._get_nonempty_traceids(startday, endday, skip_low_rate_channels)
+        from tqdm import tqdm
+        import pandas as pd
+
+        trace_ids = trace_ids or self._get_nonempty_traceids(startday, endday, skip_low_rate_channels, speed=speed)
         lod = []
-        thisday = startday
-        while thisday < endday:
+
+        day_list = []
+        t = startday
+        while t < endday:
+            day_list.append(t)
+            t += 86400
+
+        day_iter = tqdm(day_list, desc="Computing availability") if progress else day_list
+
+        for thisday in day_iter:
             row = {'date': thisday.date()}
             for trace_id in trace_ids:
                 net, sta, loc, chan = trace_id.split('.')
@@ -179,120 +291,74 @@ class SDSobj:
                         sdsfile = self.client._get_filename(net, sta, loc, chan, thisday)
                         if os.path.isfile(sdsfile):
                             st = read(sdsfile)
-                            st.merge(method=0)
-                            tr = st[0]
-                            expected = tr.stats.sampling_rate * 86400
-                            npts = np.count_nonzero(~np.isnan(tr.data)) if speed == 1 else tr.stats.npts
-                            percent = 100 * npts / expected
+                            if len(st) > 0:
+                                st.merge(method=0)
+                                tr = st[0]
+                                expected = tr.stats.sampling_rate * 86400
+                                npts = np.count_nonzero(~np.isnan(tr.data)) if speed == 1 else tr.stats.npts
+                                percent = min(100.0, 100 * npts / expected) if expected > 0 else 0
                     else:
-                        percent = 100 * self.client.get_availability_percentage(net, sta, loc, chan, thisday, thisday + 86400)[0]
-                except:
+                        percent = self.client.get_availability_percentage(net, sta, loc, chan,
+                                                                        thisday, thisday + 86400)[0]
+                except Exception as e:
+                    if verbose:
+                        print(f"Error for {trace_id} on {thisday.date()}: {e}")
                     percent = 0
                 row[trace_id] = percent
             lod.append(row)
-            thisday += 86400
-        return pd.DataFrame(lod), trace_ids
 
-    def plot_availability(self, availabilityDF, outfile=None, FS=12, labels=None):
+        df = pd.DataFrame(lod)
+        df['date'] = pd.to_datetime(df['date'])
+        return df, trace_ids
+
+    def plot_availability(self, availabilityDF, outfile=None, figsize=(12, 8), fontsize=10, labels=None, cmap='viridis'):
         """
-        Plot availability DataFrame as a heatmap.
+        Plot availability heatmap for SEED IDs across time.
 
         Parameters:
-        - availabilityDF (DataFrame): Availability data.
-        - outfile (str): Optional path to save the figure.
-        - FS (int): Font size and figure size.
-        - labels (list): Optional list of y-axis labels.
+        - availabilityDF (DataFrame): output from get_percent_availability
+        - outfile (str): optional path to save the figure
+        - figsize (tuple): figure size in inches
+        - fontsize (int): font size for labels
+        - labels (list): optional list of trace IDs
+        - cmap (str): matplotlib colormap (default 'viridis')
         """
         import matplotlib.pyplot as plt
-        Adf = availabilityDF.iloc[:, 1:] / 100
+
+        if availabilityDF.empty:
+            print("No availability data to plot.")
+            return
+
+        Adf = availabilityDF.set_index('date').T / 100.0
         Adata = Adf.to_numpy()
-        xticklabels = labels or Adf.columns
-        yticks = list(range(len(availabilityDF)))
-        yticklabels = availabilityDF['date'].astype(str)
+        xticklabels = availabilityDF['date'].dt.strftime('%Y-%m-%d').tolist()
+        yticklabels = labels or Adf.index.tolist()
 
-        step = max(1, len(yticks) // 25)
-        yticks = yticks[::step]
-        yticklabels = yticklabels[::step]
+        fig, ax = plt.subplots(figsize=figsize)
+        im = ax.imshow(Adata, aspect='auto', cmap=cmap, interpolation='nearest', vmin=0, vmax=1)
 
-        plt.figure(figsize=(FS, FS))
-        ax = plt.gca()
-        ax.imshow(1.0 - Adata.T, aspect='auto', cmap='gray', interpolation='nearest')
-        ax.set_xticks(yticks)
-        ax.set_xticklabels(yticklabels, rotation=90, fontsize=FS)
-        ax.set_yticks(np.arange(len(xticklabels)))
-        ax.set_yticklabels(xticklabels, fontsize=FS)
-        ax.set_xlabel('Date')
-        ax.set_ylabel('NSLC')
-        ax.grid(True)
+        ax.set_xticks(np.arange(len(xticklabels))[::max(1, len(xticklabels) // 25)])
+        ax.set_xticklabels(xticklabels[::max(1, len(xticklabels) // 25)], rotation=90, fontsize=fontsize)
+
+        ax.set_yticks(np.arange(len(yticklabels)))
+        ax.set_yticklabels(yticklabels, fontsize=fontsize)
+
+        ax.set_xlabel("Date", fontsize=fontsize)
+        ax.set_ylabel("SEED ID", fontsize=fontsize)
+        ax.set_title("SDS Data Availability (%)", fontsize=fontsize + 2)
+
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label("Availability", fontsize=fontsize)
+
+        plt.tight_layout()
         if outfile:
             plt.savefig(outfile, dpi=300)
+            print(f"Saved availability plot to: {outfile}")
 
     def __str__(self):
         return f"client={self.client}, stream={self.stream}"
 
-
-class SDSFileManager:
-    """
-    Class for managing SDS archive operations including filename correction,
-    file relocation, and metadata-based path resolution.
-    """
-    def __init__(self, base_dir):
-        self.base_dir = base_dir
-
-    def get_processed_dirs(self, log_file):
-        """Reads the log file and returns a set of already processed directories."""
-        if os.path.exists(log_file):
-            with open(log_file, "r") as f:
-                return set(line.strip() for line in f)
-        return set()
-
-    def save_processed_dir(self, directory, log_file):
-        """Logs the processed directory to a file."""
-        with open(log_file, "a") as f:
-            f.write(directory + "\n")
-
-    def fix_bad_filenames(self, write=False, networks=None, backup=True, log_file="fix_sds_filenames.log"):
-        """
-        Scan the SDS archive, rename files if necessary.
-        Walks the directory tree in alphanumeric order, resuming from log if interrupted.
-        """
-        processed_dirs = self.get_processed_dirs(log_file)
-        for root, dirs, files in os.walk(self.base_dir, topdown=True):
-            dirs.sort()
-            files.sort()
-
-            if root in processed_dirs:
-                print(f"Skipping already processed: {root}")
-                continue
-
-            print(f"Processing: {root}")
-            for filename in files:
-                if (networks and filename[0:2] in networks) or not networks:
-                    file_path = os.path.join(root, filename)
-                    parts = filename.split('.')
-                    if len(parts) != 7:
-                        print('\n', f'Bad filename {filename}')
-                        if len(parts) > 7:
-                            newfilename = '.'.join(parts[0:7])
-                            newfile_path = os.path.join(root, newfilename)
-
-                            if any(key in parts[7] for key in ['old', 'seed', 'ms', 'part']):
-                                if os.path.isfile(newfile_path):
-                                    self.mergefile(root, file_path, newfile_path, write=write, backup=backup)
-                                else:
-                                    self.movefile(file_path, newfile_path, write=write)
-
-            self.save_processed_dir(root, log_file)
-
-    def get_trace_directory(self, trace):
-        """Returns the correct directory for a trace."""
-        return os.path.dirname(self._trace_to_full_path(trace))
-
-    def get_trace_filename(self, trace):
-        """Returns the correct filename for a trace."""
-        return os.path.basename(self._trace_to_full_path(trace))
-
-    def _trace_to_full_path(self, trace):
+    def get_fullpath(self, trace):
         """
         Build the correct SDS file path for a given trace.
 
@@ -313,202 +379,102 @@ class SDSFileManager:
         filename = f"{net}.{sta}.{loc}.{chan}.D.{year}.{day_of_year}"
         sds_subdir = os.path.join(year, net, sta, f"{chan}.D")
         return os.path.join(self.base_dir, sds_subdir, filename)
-
-    def get_directory_from_filename(self, filename):
-        """Returns the correct directory path from an SDS-style filename."""
-        parts = parse_sds_filename(filename)
-        if parts:
-            network, station, location, channel, dtype, year, jday = parts
-            return os.path.join(self.base_dir, year, network, station, f"{channel}.{dtype}")
-        return None
-
-    def movefile(src, dst, write=False, logfile='movedfiles.log'):
+    
+    def load_metadata_from_excel(self, excel_path, sheet_name=0):
         """
-        Move a file to a new location.
+        Load metadata from an Excel file into the SDSobj, including
+        on/off dates and multi-channel expansion.
 
-        Parameters:
-        - src (str): Source path
-        - dst (str): Destination path
-        - write (bool): If True, perform the move. Else, simulate.
+        Parameters
+        ----------
+        excel_path : str
+            Path to the Excel file.
+        sheet_name : str or int, optional
+            Sheet name or index to load (default is first sheet).
         """
-        print(f'- Will move {src} to {dst}') 
-        if write:
-            os.makedirs(os.path.dirname(dst), exist_ok=True)                                    
-            shutil.move(src, dst)
-            if not os.path.isfile(dst):
-                print('move failed')
-        else:
-            print(f'- Would move {src} to {dst}')
-        with open(logfile, "a") as f:
-            f.write(f'{src} to {dst}' + "\n")           
+        df = pd.read_excel(excel_path, sheet_name=sheet_name, dtype={"location": str})
+        df.columns = [c.strip().lower() for c in df.columns]
 
-    def mergefile(self, root, src, dst, write=False, backup=False, logfile='mergedfiles.log', backupdir='.'):
+        required_cols = {'network', 'station', 'location', 'channel'}
+        id_cols = {'id', 'seedid', 'traceid'}
+
+        if not required_cols.issubset(df.columns) and not id_cols.intersection(df.columns):
+            raise ValueError("Excel file must contain either full IDs ('id', 'seedid') or network/station/location/channel columns")
+
+        if 'id' not in df.columns and id_cols.intersection(df.columns):
+            df = df.rename(columns={list(id_cols.intersection(df.columns))[0]: 'id'})
+
+        # Convert ondate/offdate to UTCDateTime
+        if 'ondate' in df.columns:
+            df['ondate'] = pd.to_datetime(df['ondate'], errors='coerce')
+            df['ondate'] = df['ondate'].apply(lambda x: UTCDateTime(x) if pd.notnull(x) else None)
+        if 'offdate' in df.columns:
+            df['offdate'] = pd.to_datetime(df['offdate'], errors='coerce')
+            df['offdate'] = df['offdate'].apply(lambda x: UTCDateTime(x) if pd.notnull(x) else None)
+
+        # Expand multi-character channel strings (e.g. 'EHZNEZ') into multiple 3-char channels
+        expanded_rows = []
+        for _, row in df.iterrows():
+            chan = row["channel"]
+            if isinstance(chan, str) and len(chan) > 3:
+                basechan = chan[0:2]
+                for ch in chan[2:]:
+                    new_row = row.copy()
+                    new_row["channel"] = basechan + ch
+                    expanded_rows.append(new_row)
+
+        if expanded_rows:
+            expanded_df = pd.DataFrame(expanded_rows)
+            df = df[df["channel"].apply(lambda x: isinstance(x, str) and len(x) == 3)]
+            df = pd.concat([df, expanded_df], ignore_index=True)
+
+        self.metadata = df
+
+    def match_metadata(self, trace):
         """
-        Merge two MiniSEED files if possible. Logs result.
+        Optionally update trace ID fields to match entries in loaded metadata.
 
-        Parameters:
-        - root (str): Root directory (used for logging, e.g., SOH directory check).
-        - file_path (str): Path to the file to merge from.
-        - newfile_path (str): Path to the existing file to merge into.
-        - write (bool): Whether to actually write files.
-        - backup (bool): Whether to backup files before overwriting.
-        - logfile (str): Path to the log file.
-        - BACKUPDIR (str): Directory to save backups in.
+        If metadata is not set, returns trace unmodified.
+        Otherwise, attempts to match by original trace ID or by
+        network/station/location/channel tuple.
+
+        Parameters
+        ----------
+        trace : obspy.Trace
+            Input trace to check and possibly update.
+
+        Returns
+        -------
+        bool
+            True if any updates were made, False otherwise.
         """
-        print(f'- Will try to merge {src} with {dst}')
-        try:
-            oldst = read(dst)
-            partst = read(src)
-            for tr in partst:
-                try:
-                    oldst.append(tr)
-                    oldst.merge(fill_value=0)
-                except:
-                    pass
+        if self.metadata is None or self.metadata.empty:
+            return False
 
-            if len(oldst) == 1 or 'soh' in root.lower():
-                if _can_write_to_miniseed_and_read_back(oldst[0]):
-                    if write:
-                        if backup:
-                            shutil.copy2(dst, os.path.join(backupdir, os.path.basename(dst)))
-                            shutil.copy2(src, os.path.join(backupdir, os.path.basename(src)))
-                        os.makedirs(os.path.dirname(dst), exist_ok=True)
-                        oldst.write(dst, format='MSEED')
-                        os.remove(src)
-                    else:
-                        print(f'- would write merged file to {dst} and remove {src}')
-                    with open(logfile, "a") as f:
-                        f.write(f'{src} to {dst} SUCCESS\n')
-                else:
-                    print('- merge/write/read failed')
-                    with open(logfile, "a") as f:
-                        f.write(f'{src} to {dst} FAILED\n')
-            else:
-                print(f'- got {len(oldst)} Trace objects from merging. should be 1')
-                with open(logfile, "a") as f:
-                    f.write(f'{src} to {dst} but got {len(oldst)} traces\n')
-        except Exception as e:
-            print(f'- merge failed for {dst} and {src}?')
-            print(e)
-            with open(logfile, "a") as f:
-                f.write(f'{src} to {dst} CRASHED\n')
+        updated = False
+        tr_id = trace.id
+        net, sta, loc, chan = trace.stats.network, trace.stats.station, trace.stats.location, trace.stats.channel
 
-    def fix_sds_ids(self, write=False, networks=None, log_file='sdsfilemanager.log'):
-        """
-        Scan the SDS archive, correct band codes, and rename files if necessary.
-        Walks the directory tree in alphanumeric order, resuming from log if interrupted.
-        """
-            
-        processed_dirs = self.get_processed_dirs(log_file)
+        # Try to match by full ID
+        match = self.metadata[self.metadata['id'] == tr_id]
+        if match.empty:
+            # Try to match by components
+            match = self.metadata[
+                (self.metadata['network'] == net) &
+                (self.metadata['station'] == sta) &
+                (self.metadata['location'] == loc) &
+                (self.metadata['channel'] == chan)
+            ]
 
-        for root, dirs, files in os.walk(self.base_dir, topdown=True):
-            dirs.sort()
-            files.sort()
+        if not match.empty:
+            match = match.iloc[0]
+            for key in ['network', 'station', 'location', 'channel']:
+                val = match[key]
+                if val != getattr(trace.stats, key):
+                    setattr(trace.stats, key, val)
+                    updated = True
 
-            if root in processed_dirs:
-                print(f"Skipping already processed: {root}")
-                continue
-
-            print(f"Processing: {root}")
-            for filename in files:
-                if (networks and filename[0:2] in networks) or not networks:
-                    file_path = os.path.join(root, filename)
-                    parts = filename.split('.')
-                    if len(parts) != 7:
-                        continue
-                    try:
-                        stream = read(file_path)
-                        for trace in stream:
-                            if fix_trace_id(trace):
-                                new_file_path = trace2correct_sdsfullpath(self.base_dir, trace)
-                                if write:
-                                    os.makedirs(os.path.dirname(new_file_path), exist_ok=True)
-                                    stream.write(new_file_path, format="MSEED")
-                                    os.remove(file_path)
-                                    print(f"Renamed to: {new_file_path}")
-                                else:
-                                    print(f'Would write {file_path} to {new_file_path}')
-                    except Exception as e:
-                        print(f"Error processing {file_path}: {e}")
-
-            self.save_processed_dir(root, log_file)
-
-    def move_files_to_correct_directory(self, write=False):
-        """ 
-        Walks through the SDS archive and moves MiniSEED files to the correct channel directory.
-        Walks the directory tree in alphanumeric order, resuming from log if interrupted.
-        """        
-        log_file = self._get_log_file()
-        processed_dirs = self._get_processed_dirs(log_file)
-
-        for root, dirs, files in os.walk(self.base_dir, topdown=True):
-            dirs.sort()
-            files.sort()
-
-            if root in processed_dirs:
-                print(f"Skipping already processed: {root}")
-                continue
-
-            print(f"Processing: {root}")
-            current_channel_dir = find_channel_directory(root)
-            if not current_channel_dir:
-                continue
-
-            for filename in files:
-                file_path = os.path.join(root, filename)
-                sds_tuple = parse_sds_filename(filename)
-                if sds_tuple:
-                    network, station, location, channel, dtype, year, jday = sds_tuple
-                    expected_dir = f'{channel}.{dtype}'
-                    if current_channel_dir != expected_dir:
-                        print(f"Moving: {file_path} -> {expected_dir}")
-                        if write:
-                            os.makedirs(expected_dir, exist_ok=True)
-                            shutil.move(file_path, os.path.join(expected_dir, filename))
-
-            self.save_processed_dir(root, log_file)
-
-    @staticmethod
-    def find_channel_directory(path):
-        """
-        Extracts the channel directory (e.g., 'HHZ.D') from a file path.
-        Assumes the directory structure is in SDS format.
-        """
-        parts = path.split(os.sep)
-        for part in parts:
-            if part.endswith(".D"):
-                return part
-        return None
-
-    def move_files_to_structure(self, source_dir, write=False, backup=False, fix_filename_only=False):
-        """
-        Moves MiniSEED files from a flat directory into the correct SDS archive structure.
-        If `fix_filename_only` is True, it just corrects the filename in the current directory.
-        """
-        for filename in os.listdir(source_dir):
-            if parse_sds_filename(filename) or fix_filename_only:
-                print(f'Processing {filename}')
-                file_path = os.path.join(source_dir, filename)
-                try:
-                    this_st = read(file_path, format='MSEED')
-                except Exception as e:
-                    print(e)
-                    print('Cannot read ', file_path)
-                    continue
-
-                if len(this_st) == 1:
-                    fix_trace_id(this_st[0])
-                    target_path = self._trace_to_full_path(this_st[0]) if not fix_filename_only else \
-                                  SDSFileManager(self.base_dir)._trace_to_full_path(this_st[0])
-                    if file_path != target_path:
-                        if os.path.isfile(target_path):
-                            mergefile(self.base_dir, file_path, target_path, write=write, backup=backup)
-                        else:
-                            movefile(file_path, target_path, write=write)
-                else:
-                    print(f'got {len(this_st)} traces')
-            else:
-                print(f"Skipping file (does not match SDS format): {filename}")
+        return updated
 
 def parse_sds_filename(filename):
     """

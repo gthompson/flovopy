@@ -356,8 +356,8 @@ class icewebSpectrogram:
                 ax[c*2+1].set_xticklabels([])
 
             # add a ylabel
-            #ax[c*2+1].set_ylabel('     ' + tr.stats.station + '.' + tr.stats.channel, rotation=80)
-            ax[c*2+1].set_ylabel('     ' + tr.id, rotation=70, fontsize=10)
+            ax[c*2+1].set_ylabel('     ' + tr.stats.station + '.' + tr.stats.channel, rotation=90)
+            #ax[c*2+1].set_ylabel('     ' + tr.stats.id, rotation=70, fontsize=10)
         
             # Plot colorbar
             if add_colorbar:
@@ -489,7 +489,7 @@ class icewebSpectrogram:
 
                        
     
-    def plot_amplitude_spectrum(self, normalize=False, title=None):
+    def plot_amplitude_spectrum(self, normalize=False, title=None, outfile=None, logx=False, logy=False):
         '''
         fig, ax = plt.subplots(len(self.stream), 1);
         for c, tr in enumerate(self.stream):
@@ -506,6 +506,8 @@ class icewebSpectrogram:
         '''
         
         fig, ax = plt.subplots(1, 1);
+        
+
         for c, tr in enumerate(self.stream):
             if not 'spectrum' in tr.stats:
                 continue
@@ -513,7 +515,14 @@ class icewebSpectrogram:
             F = tr.stats.spectrum.F
             if normalize:
             	A = A/max(A)
-            ax.semilogy(F,  A, label=tr.id);
+            if logy and logx:
+                ax.loglog(F, A, label=tr.id)
+            elif logy:
+                ax.semilogy(F,  A, label=tr.id)
+            elif logx:
+                ax.semilogx(F, A, label=tr.id)
+            else:
+                ax.plot(F, A, label=tr.id)
         if normalize:
         	ax.set_ylabel('Normalized Spectral Amplitude')
         else:
@@ -522,7 +531,11 @@ class icewebSpectrogram:
         if title:
         	ax.set_title(title)
         ax.grid()
-        ax.legend()       
+        ax.legend()    
+        if outfile:
+            fig.savefig(outfile)  
+        else:
+            fig.show() 
        
 
     def compute_band_ratio(self, freqlims=[0.8, 4.0, 18.0], plot=True):
@@ -606,8 +619,19 @@ def compute_metrics_TFS(T, F, S, freqlims=[0.8, 4.0, 18.0]):
     fmetrics = pd.DataFrame([{'sam':sam, 'VT':sam_high, 'LP':sam_low, 'fratio':fratio, 'meanf':meanf, 'peakf':peakf, 'bw_sum':bw_sum, 'bw_min':bw_min, 'bw_max':bw_max}])
     return fmetrics
           
+def _nearest_pow_2(x):
+    """
+    Return the next power of 2 greater than or equal to x.
 
-def compute_spectrogram(tr, per_lap=0.9, wlen=None, mult=8.0):
+    Parameters:
+    - x: float or int
+
+    Returns:
+    - int: the nearest power of 2 >= x
+    """
+    return 2 ** int(np.ceil(np.log2(x)))
+
+def compute_spectrogram(tr, per_lap=0.99, wlen=None, mult=8.0):
     """
         Computes spectrogram of the input data.
         Modified from obspy.imaging.spectrogram because we want the plotting part
