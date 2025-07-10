@@ -1312,22 +1312,6 @@ def fix_trace_id(trace, legacy=False, netcode=None, verbose=False):
     sampling_rate = trace.stats.sampling_rate
     current_band_code = chan[0]
 
-    # if not an analog QC channel, fix band code
-    if chan[0]=='A':
-        pass
-    else:
-
-        # Determine the correct band code
-        expected_band_code = _get_band_code(sampling_rate) # this assumes broadband sensor
-
-        # adjust if short-period sensor
-        expected_band_code = _adjust_band_code_for_sensor_type(current_band_code, expected_band_code)
-        chan = expected_band_code + chan[1:]
-
-    # make sure location is 0 or 2 characters
-    if len(loc)==1:
-        loc = loc.zfill(2)
-
     # KSC network fixes
     if net=='FL' or net=='1R': # KSC
         if sta=='CARL1':
@@ -1345,7 +1329,27 @@ def fix_trace_id(trace, legacy=False, netcode=None, verbose=False):
             trace.stats.network = '1R'
 
         if trace.stats.location in ['00', '0', '--', '', '10']:
-            trace.stats.location = '00'           
+            trace.stats.location = '00'  
+        net, sta, loc, chan = trace.id.split('.')  
+
+
+    # if not an analog QC channel, fix band code
+    if chan[0]=='A':
+        pass
+    else:
+
+        # Determine the correct band code
+        expected_band_code = _get_band_code(sampling_rate) # this assumes broadband sensor
+
+        # adjust if short-period sensor
+        expected_band_code = _adjust_band_code_for_sensor_type(current_band_code, expected_band_code)
+        chan = expected_band_code + chan[1:]
+
+    # make sure location is 0 or 2 characters
+    if len(loc)==1:
+        loc = loc.zfill(2)
+
+      
 
     expected_id = '.'.join([net,sta,loc,chan])
     #print(current_id, expected_id)

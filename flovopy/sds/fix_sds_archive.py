@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import os
 import argparse
-from obspy import read, UTCDateTime
+from obspy import read, UTCDateTime, Stream
 from flovopy.sds.sds import SDSobj
+from flovopy.core.preprocessing import fix_trace_id
 
 def is_valid_sds_filename(filename):
     """Check if the filename matches NET.STA.LOC.CHAN.D.YYYY.JJJ format."""
@@ -28,9 +29,15 @@ def fix_sds_archive(
     start_date=None,
     end_date=None,
     write=False,
-    log_file='fix_sds_archive.log',
+    log_file=None,
     metadata_excel_path=None
 ):
+    if not log_file:
+        if dest_dir:
+            log_file = os.path.join(dest_dir,'fix_sds_archive.log')
+        else:
+            log_file = os.path.join(src_dir,'fix_sds_archive.log')
+
     networks = [networks] if isinstance(networks, str) else networks
     stations = [stations] if isinstance(stations, str) else stations
     start_date = UTCDateTime(start_date) if start_date else None
@@ -67,17 +74,34 @@ def fix_sds_archive(
                 file_path = os.path.join(root, filename)
                 stream = read(file_path)
 
+
+                stream2 = Stream()
                 for tr in stream:
                     if start_date and tr.stats.endtime < start_date:
                         continue
                     if end_date and tr.stats.starttime > end_date:
                         continue
 
+
+                    if tr.stats.sampling_rate < 50.0 or tr.stats.station == 'LLS02':
+                        continue
+                    fix_trace_id(tr)
+                    stream2.append(tr)
+
+                try:
+                    stream2.merge(fill_value=None, method=0)
+                except:
+                    pass
+
+
+                for tr in stream2:
+
                     if sdsout.metadata is not None:
                         sdsout.match_metadata(tr)
 
                     if write:
-                        sdsout.write(tr, overwrite=True)
+                        sdsout.stream = Stream(traces=[tr])
+                        sdsout.write(overwrite=True)
                         print(f"✔ Wrote: {tr.id} to {sdsout.get_fullpath(tr)}")
 
                 if write:

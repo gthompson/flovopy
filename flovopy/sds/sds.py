@@ -7,6 +7,8 @@ from obspy.core.utcdatetime import UTCDateTime
 import obspy.clients.filesystem.sds
 from flovopy.core.preprocessing import remove_empty_traces, fix_trace_id, _can_write_to_miniseed_and_read_back
 from tqdm import tqdm
+import pandas as pd
+import numpy as np
 
 
 def split_trace_at_midnight(tr):
@@ -46,6 +48,58 @@ def traces_overlap_and_match(tr1, tr2):
 
     return True, np.array_equal(tr1_overlap.data, tr2_overlap.data)
 
+def mark_gaps_and_fill(trace, fill_value=0.0):
+    trace = trace.copy()
+    
+    # Ensure float dtype to avoid merge fill errors
+    if not np.issubdtype(trace.data.dtype, np.floating):
+        trace.data = trace.data.astype(np.float32)
+
+    st = Stream([trace])
+    st.merge(method=1, fill_value=fill_value)
+    gaps = st.get_gaps()
+    tr = st[0]
+    if gaps:
+        if not hasattr(tr.stats, "processing"):
+            tr.stats.processing = []
+        tr.stats.processing.append(f"Filled {len(gaps)} gaps with {fill_value}")
+        tr.stats.processing.extend(
+            [f"GAP {gap[4]}s from {gap[2]} to {gap[3]}" for gap in gaps]
+        )
+    if np.ma.isMaskedArray(tr.data):
+        tr.data = tr.data.filled(fill_value)
+    return tr
+
+
+
+
+def restore_gaps(trace, fill_value=0.0):
+    """
+    Masks regions filled by `fill_value` based on stored gap metadata in trace.stats.processing.
+    """
+    if not hasattr(trace.stats, "processing"):
+        return trace
+
+    processing_lines = [p for p in trace.stats.processing if p.startswith("GAP")]
+    if not processing_lines:
+        return trace
+
+    data = np.ma.masked_array(trace.data, mask=False)
+
+    for line in processing_lines:
+        try:
+            parts = line.split()
+            t1 = UTCDateTime(parts[3])
+            t2 = UTCDateTime(parts[5])
+            idx1 = int((t1 - trace.stats.starttime) * trace.stats.sampling_rate)
+            idx2 = int((t2 - trace.stats.starttime) * trace.stats.sampling_rate)
+            data.mask[idx1:idx2] = True
+        except Exception as e:
+            print(f"✘ Could not parse gap line '{line}': {e}")
+
+    trace.data = data
+    return trace
+
 class SDSobj:
     """
     A class to manage an SDS (SeisComP Data Structure) archive.
@@ -71,7 +125,7 @@ class SDSobj:
 
 
     def read(self, startt, endt, skip_low_rate_channels=True, trace_ids=None,
-            speed=1, verbose=True, merge_method=0, progress=False):
+            speed=1, verbose=True, merge_method=0, progress=False, fill_value=0.0):
         """
         Read data from the SDS archive into the internal stream.
 
@@ -83,6 +137,7 @@ class SDSobj:
         - verbose (bool): Print messages if True.
         - merge_method (int): ObsPy merge method (default 0 = concat).
         - progress (bool): Show progress bar.
+        - fill_value (float): Fill value to treat as gaps (default 0.0).
 
         Returns:
         - int: 0 if stream is populated, 1 if empty.
@@ -97,21 +152,19 @@ class SDSobj:
             net, sta, loc, chan = trace_id.split('.')
             if chan.startswith('L') and skip_low_rate_channels:
                 continue
-
             try:
                 if speed == 1:
                     sdsfiles = self.client._get_filenames(net, sta, loc, chan, startt, endt)
                     for sdsfile in sdsfiles:
                         if os.path.isfile(sdsfile):
                             try:
-                                st += read(sdsfile)
+                                st += restore_gaps(read(sdsfile)[0], fill_value=fill_value)
                             except Exception as e:
                                 if verbose:
                                     print(f"Failed to read {sdsfile}: {e}")
-
                 elif speed == 2:
-                    st += self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
-
+                    traces = self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
+                    st += Stream([restore_gaps(tr, fill_value=fill_value) for tr in traces])
             except Exception as e:
                 if verbose:
                     print(f"Failed to read {trace_id}: {e}")
@@ -120,73 +173,92 @@ class SDSobj:
 
         if len(st):
             st.trim(startt, endt)
+            # Ensure all Traces are in float32 dtype to avoid merge errors
+            for tr in st:
+                if not np.issubdtype(tr.data.dtype, np.floating) or tr.data.dtype != np.float32:
+                    tr.data = tr.data.astype(np.float32)
+
             st.merge(method=merge_method)
 
         self.stream = st
         return 0 if len(st) else 1
 
-    def write(self, overwrite=False, fallback_to_indexed=True, debug=False):
+
+    def write(self, overwrite=False, fallback_to_indexed=True, debug=False, fill_value=0.0):
         """
-        Write internal stream to SDS archive, splitting across midnights and handling merge conflicts.
+        Write internal stream to SDS archive, marking gaps with fill_value and preserving metadata.
 
         Parameters:
         - overwrite (bool): Overwrite existing files if True.
         - fallback_to_indexed (bool): If True, write .01, .02 files on merge conflict. If False, raise error.
-        - debug (bool): Currently unused.
+        - debug (bool): Print debug messages if True.
+        - fill_value (float): Value to insert in gaps when merging (default 0.0).
 
         Returns:
-        - bool: True if all writes succeed, False if any fail.
+        - bool: True if all writes succeed, False otherwise.
         """
         successful = True
+        if debug:
+            print(f'SDSobj.write(): Processing {self.stream}')
         for tr_unsplit in self.stream:
             split_traces = split_trace_at_midnight(tr_unsplit)
             for tr in split_traces:
-
-                try:
-                    sdsfile = self.client._get_filename(
-                        tr.stats.network, tr.stats.station,
-                        tr.stats.location, tr.stats.channel,
-                        tr.stats.starttime, 'D'
-                    )
+                if debug:
+                    print(f'SDSobj.write(): Processing {tr}')
+                sdsfile = self.client._get_filename(
+                    tr.stats.network, tr.stats.station,
+                    tr.stats.location, tr.stats.channel,
+                    tr.stats.starttime, 'D'
+                )
+                if debug:
+                    print(f'SDSobj.write(): Will attempt to write {tr} to {sdsfile}')
+                if not debug:
                     os.makedirs(os.path.dirname(sdsfile), exist_ok=True)
 
-                    if not overwrite and os.path.isfile(sdsfile):
-                        existing = read(sdsfile)
+                if not overwrite and os.path.isfile(sdsfile):
+                    existing = read(sdsfile)
+                    can_merge = True
+                    for existing_tr in existing.select(id=tr.id):
+                        has_overlap, matches = traces_overlap_and_match(existing_tr, tr)
+                        if has_overlap and not matches:
+                            can_merge = False
+                            break
+                    if can_merge:
+                        combined = existing.copy().append(tr)
+                        # Ensure all Traces are in float32 dtype to avoid merge errors
+                        for tr in combined:
+                            if not np.issubdtype(tr.data.dtype, np.floating) or tr.data.dtype != np.float32:
+                                tr.data = tr.data.astype(np.float32)
 
-                        can_merge = True
-                        for existing_tr in existing.select(id=tr.id):
-                            has_overlap, matches = traces_overlap_and_match(existing_tr, tr)
-                            if has_overlap and not matches:
-                                can_merge = False
-                                break
-
-                        if can_merge:
-                            combined = existing.copy().append(tr)
-                            combined.merge(method=1, fill_value=None)
-                            if len(combined) == 1:
-                                combined[0].write(sdsfile, format='MSEED')
-                            else:
-                                raise ValueError(f"Merged stream has >1 Trace for {tr.id}")
+                        combined.merge(method=0, fill_value=None)
+                        if len(combined) == 1:
+                            final_trace = mark_gaps_and_fill(combined[0], fill_value=fill_value)
+                            if debug:
+                                print(f'- writing {sdsfile}')
+                            if not debug:
+                                final_trace.write(sdsfile, format='MSEED')
                         else:
-                            if fallback_to_indexed:
-                                index = 1
-                                while True:
-                                    sdsindexpath = sdsfile + f'.{index:02d}'
-                                    if not os.path.isfile(sdsindexpath):
-                                        tr.write(sdsindexpath, format='MSEED')
-                                        print(f"Wrote indexed file due to merge conflict: {sdsindexpath}")
-                                        break
-                                    index += 1
-                            else:
-                                raise ValueError(f"Conflict in overlapping data: {tr.id}")
-
+                            raise ValueError(f"Merged stream has >1 Trace for {tr.id}")
                     else:
-                        tr.write(sdsfile, format='MSEED')
-
-                except Exception as e:
-                    print(f"Write failed for {tr.id}: {e}")
-                    successful = False
-
+                        if fallback_to_indexed:
+                            index = 1
+                            while True:
+                                sdsindexpath = sdsfile + f'.{index:02d}'
+                                if not os.path.isfile(sdsindexpath):
+                                    marked = mark_gaps_and_fill(tr, fill_value=fill_value)
+                                    if debug:
+                                        print(f'- writing {sdsindexpath}')
+                                    if not debug:
+                                        marked.write(sdsindexpath, format='MSEED')
+                                    print(f"Wrote indexed file due to merge conflict: {sdsindexpath}")
+                                    break
+                                index += 1
+                        else:
+                            raise ValueError(f"Conflict in overlapping data: {tr.id}")
+                else:
+                    marked = mark_gaps_and_fill(tr, fill_value=fill_value)
+                    if not debug:
+                        marked.write(sdsfile, format='MSEED')
         return successful
 
     def _get_nonempty_traceids(self, startday, endday=None, skip_low_rate_channels=True, speed=1):
@@ -292,6 +364,11 @@ class SDSobj:
                         if os.path.isfile(sdsfile):
                             st = read(sdsfile)
                             if len(st) > 0:
+                                # Ensure all Traces are in float32 dtype to avoid merge errors
+                                for tr in st:
+                                    if not np.issubdtype(tr.data.dtype, np.floating) or tr.data.dtype != np.float32:
+                                        tr.data = tr.data.astype(np.float32)
+
                                 st.merge(method=0)
                                 tr = st[0]
                                 expected = tr.stats.sampling_rate * 86400
@@ -378,7 +455,7 @@ class SDSobj:
         day_of_year = str(trace.stats.starttime.julday).zfill(3)
         filename = f"{net}.{sta}.{loc}.{chan}.D.{year}.{day_of_year}"
         sds_subdir = os.path.join(year, net, sta, f"{chan}.D")
-        return os.path.join(self.base_dir, sds_subdir, filename)
+        return os.path.join(self.topdir, sds_subdir, filename)
     
     def load_metadata_from_excel(self, excel_path, sheet_name=0):
         """
@@ -401,8 +478,15 @@ class SDSobj:
         if not required_cols.issubset(df.columns) and not id_cols.intersection(df.columns):
             raise ValueError("Excel file must contain either full IDs ('id', 'seedid') or network/station/location/channel columns")
 
-        if 'id' not in df.columns and id_cols.intersection(df.columns):
-            df = df.rename(columns={list(id_cols.intersection(df.columns))[0]: 'id'})
+        # i think this turns a column headed seedid or traceid into id
+        if 'id' not in df.columns:
+            if id_cols.intersection(df.columns):
+                df = df.rename(columns={list(id_cols.intersection(df.columns))[0]: 'id'})
+            else:
+                df['id'] = df.apply(
+                    lambda row: f"{row['network']}.{row['station']}.{str(row['location']).zfill(2)}.{row['channel']}",
+                    axis=1
+                )
 
         # Convert ondate/offdate to UTCDateTime
         if 'ondate' in df.columns:
@@ -432,49 +516,39 @@ class SDSobj:
 
     def match_metadata(self, trace):
         """
-        Optionally update trace ID fields to match entries in loaded metadata.
-
-        If metadata is not set, returns trace unmodified.
-        Otherwise, attempts to match by original trace ID or by
-        network/station/location/channel tuple.
-
-        Parameters
-        ----------
-        trace : obspy.Trace
-            Input trace to check and possibly update.
+        Match trace metadata and update trace.stats.location if needed.
 
         Returns
         -------
-        bool
-            True if any updates were made, False otherwise.
+        bool : True if metadata was matched and updated, False otherwise.
         """
         if self.metadata is None or self.metadata.empty:
             return False
 
-        updated = False
-        tr_id = trace.id
-        net, sta, loc, chan = trace.stats.network, trace.stats.station, trace.stats.location, trace.stats.channel
+        net = trace.stats.network
+        sta = trace.stats.station
+        cha = trace.stats.channel
+        start = trace.stats.starttime
+        end = trace.stats.endtime
 
-        # Try to match by full ID
-        match = self.metadata[self.metadata['id'] == tr_id]
-        if match.empty:
-            # Try to match by components
-            match = self.metadata[
-                (self.metadata['network'] == net) &
-                (self.metadata['station'] == sta) &
-                (self.metadata['location'] == loc) &
-                (self.metadata['channel'] == chan)
-            ]
+        df = self.metadata
+
+        # Match only on net, sta, cha, and date overlap (ignore location)
+        match = df[
+            (df["network"] == net) &
+            (df["station"] == sta) &
+            (df["channel"] == cha) &
+            (df["ondate"] <= start) &
+            (df["offdate"] >= end - 86400)
+        ]
 
         if not match.empty:
-            match = match.iloc[0]
-            for key in ['network', 'station', 'location', 'channel']:
-                val = match[key]
-                if val != getattr(trace.stats, key):
-                    setattr(trace.stats, key, val)
-                    updated = True
+            loc = match.iloc[0]["location"]
+            trace.stats.location = str(loc).zfill(2)
+            return True
+        else:
+            return False
 
-        return updated
 
 def parse_sds_filename(filename):
     """
