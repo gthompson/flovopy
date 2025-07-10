@@ -1328,12 +1328,24 @@ def fix_trace_id(trace, legacy=False, netcode=None, verbose=False):
     if len(loc)==1:
         loc = loc.zfill(2)
 
-    # change CARL1 to TANK
-    if net=='FL':
+    # KSC network fixes
+    if net=='FL' or net=='1R': # KSC
         if sta=='CARL1':
             sta = 'TANK'
         elif sta=='CARL0':
             sta = 'BCHH'
+        if trace.stats.station == 'CARL0':
+            trace.stats.station = 'BCHH'
+        if trace.stats.station == '378':
+            trace.stats.station = 'DVEL1'
+        if trace.stats.station == 'FIRE' and trace.stats.starttime.year == 2018:
+            trace.stats.station = 'DVEL2'
+
+        if trace.stats.network == 'FL':
+            trace.stats.network = '1R'
+
+        if trace.stats.location in ['00', '0', '--', '', '10']:
+            trace.stats.location = '00'           
 
     expected_id = '.'.join([net,sta,loc,chan])
     #print(current_id, expected_id)
