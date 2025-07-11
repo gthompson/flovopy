@@ -74,7 +74,6 @@ def fix_sds_archive(
                 file_path = os.path.join(root, filename)
                 stream = read(file_path)
 
-
                 stream2 = Stream()
                 for tr in stream:
                     if start_date and tr.stats.endtime < start_date:
@@ -101,11 +100,13 @@ def fix_sds_archive(
 
                     if write:
                         sdsout.stream = Stream(traces=[tr])
-                        sdsout.write(overwrite=True)
-                        print(f"✔ Wrote: {tr.id} to {sdsout.get_fullpath(tr)}")
+                        successful = sdsout.write(overwrite=True)
+                        if successful:
+                            print(f"✔ Wrote: {tr.id} to {sdsout.get_fullpath(tr)}")
+                        else:
+                            print(f"✔ Failed to write: {tr.id} to {sdsout.get_fullpath(tr)}")
 
-                if write:
-                    os.remove(file_path)
+
             except Exception as e:
                 print(f"✘ Error processing {filename}: {e}")
 

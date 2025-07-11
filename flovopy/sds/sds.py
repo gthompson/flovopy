@@ -2,14 +2,29 @@
 import os
 import glob
 import numpy as np
-from obspy import read, Stream
+from obspy import read, Stream, Trace
 from obspy.core.utcdatetime import UTCDateTime
 import obspy.clients.filesystem.sds
 from flovopy.core.preprocessing import remove_empty_traces, fix_trace_id, _can_write_to_miniseed_and_read_back
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
+import shutil
 
+
+def safe_remove(filepath):
+    """Remove file if it exists."""
+    try:
+        if os.path.isfile(filepath):
+            os.remove(filepath)
+    except Exception as e:
+        print(f"Warning: Failed to remove file {filepath}: {e}")
+
+def ensure_float32(tr):
+    """Convert trace data to float32 if not already."""
+    if not np.issubdtype(tr.data.dtype, np.floating) or tr.data.dtype != np.float32:
+        tr.data = tr.data.astype(np.float32)
+    return tr
 
 def split_trace_at_midnight(tr):
     """
@@ -184,6 +199,9 @@ class SDSobj:
         return 0 if len(st) else 1
 
 
+
+
+
     def write(self, overwrite=False, fallback_to_indexed=True, debug=False, fill_value=0.0):
         """
         Write internal stream to SDS archive, marking gaps with fill_value and preserving metadata.
@@ -197,69 +215,114 @@ class SDSobj:
         Returns:
         - bool: True if all writes succeed, False otherwise.
         """
-        successful = True
+        success = True  # assume success unless failure occurs
+
+        # Setup subdirectories
+        tempdir = os.path.join(self.topdir, 'temporarily_move_while_merging')
+        unmergeddir = os.path.join(self.topdir, 'unable_to_merge')
+        obsoletedir = os.path.join(self.topdir, 'obsolete')
+        unwrittendir = os.path.join(self.topdir, 'failed_to_write_to_sds')
+        multitracedir = os.path.join(self.topdir, 'multitrace')
+
+        for d in [tempdir, unmergeddir, obsoletedir, unwrittendir, multitracedir]:
+            os.makedirs(d, exist_ok=True)
+
         if debug:
-            print(f'SDSobj.write(): Processing {self.stream}')
+            print(f'SDSobj.write(): Processing stream with {len(self.stream)} traces')
+
         for tr_unsplit in self.stream:
             split_traces = split_trace_at_midnight(tr_unsplit)
             for tr in split_traces:
-                if debug:
-                    print(f'SDSobj.write(): Processing {tr}')
+                tr = ensure_float32(tr)
                 sdsfile = self.client._get_filename(
                     tr.stats.network, tr.stats.station,
                     tr.stats.location, tr.stats.channel,
                     tr.stats.starttime, 'D'
                 )
+
+                basename = os.path.basename(sdsfile)
+                tempfile = os.path.join(tempdir, basename)
+                unmergedfile = os.path.join(unmergeddir, basename)
+                obsoletefile = os.path.join(obsoletedir, basename)
+                unwrittenfile = os.path.join(unwrittendir, basename)
+                multitracefile = os.path.join(multitracedir, basename)
+
+                os.makedirs(os.path.dirname(sdsfile), exist_ok=True)
+
                 if debug:
-                    print(f'SDSobj.write(): Will attempt to write {tr} to {sdsfile}')
-                if not debug:
-                    os.makedirs(os.path.dirname(sdsfile), exist_ok=True)
+                    print(f'SDSobj.write(): Attempting to write {tr.id} to {sdsfile}')
 
                 if not overwrite and os.path.isfile(sdsfile):
-                    existing = read(sdsfile)
+                    try:
+                        existing = read(sdsfile)
+                    except Exception as e:
+                        print(f"⚠ Error reading existing file {sdsfile}: {e}")
+                        existing = Stream()
+
+                    shutil.copy2(sdsfile, tempfile)
+
                     can_merge = True
                     for existing_tr in existing.select(id=tr.id):
                         has_overlap, matches = traces_overlap_and_match(existing_tr, tr)
                         if has_overlap and not matches:
                             can_merge = False
+                            safe_remove(tempfile)
+                            tr.write(unmergedfile, format='MSEED')
+                            if debug:
+                                print(f"✘ Cannot merge {tr.id} — conflict found.")
+                            success = False
                             break
+
                     if can_merge:
                         combined = existing.copy().append(tr)
-                        # Ensure all Traces are in float32 dtype to avoid merge errors
-                        for tr in combined:
-                            if not np.issubdtype(tr.data.dtype, np.floating) or tr.data.dtype != np.float32:
-                                tr.data = tr.data.astype(np.float32)
-
+                        combined = Stream([ensure_float32(t) for t in combined])
                         combined.merge(method=0, fill_value=None)
+
                         if len(combined) == 1:
                             final_trace = mark_gaps_and_fill(combined[0], fill_value=fill_value)
-                            if debug:
-                                print(f'- writing {sdsfile}')
-                            if not debug:
+                            try:
                                 final_trace.write(sdsfile, format='MSEED')
+                                shutil.move(tempfile, obsoletefile)
+                                if debug:
+                                    print(f"✔ Merged and wrote: {sdsfile}")
+                            except Exception as e:
+                                final_trace.write(unwrittenfile, format='MSEED')
+                                safe_remove(tempfile)
+                                print(f"✘ Failed to write merged file: {sdsfile}: {e}")
+                                success = False
                         else:
-                            raise ValueError(f"Merged stream has >1 Trace for {tr.id}")
+                            safe_remove(tempfile)
+                            combined.write(multitracefile, format='MSEED')
+                            print(f"✘ Merge produced multiple traces: {tr.id}")
+                            success = False
                     else:
                         if fallback_to_indexed:
                             index = 1
                             while True:
-                                sdsindexpath = sdsfile + f'.{index:02d}'
-                                if not os.path.isfile(sdsindexpath):
+                                indexed = f"{unmergedfile}.{index:02d}"
+                                if not os.path.isfile(indexed):
                                     marked = mark_gaps_and_fill(tr, fill_value=fill_value)
+                                    marked.write(indexed, format='MSEED')
                                     if debug:
-                                        print(f'- writing {sdsindexpath}')
-                                    if not debug:
-                                        marked.write(sdsindexpath, format='MSEED')
-                                    print(f"Wrote indexed file due to merge conflict: {sdsindexpath}")
+                                        print(f"✔ Indexed file written due to merge conflict: {indexed}")
                                     break
                                 index += 1
                         else:
                             raise ValueError(f"Conflict in overlapping data: {tr.id}")
                 else:
                     marked = mark_gaps_and_fill(tr, fill_value=fill_value)
-                    if not debug:
+                    try:
                         marked.write(sdsfile, format='MSEED')
-        return successful
+                        safe_remove(tempfile)
+                        if debug:
+                            print(f"✔ New file written: {sdsfile}")
+                    except Exception as e:
+                        marked.write(unwrittenfile, format='MSEED')
+                        print(f"✘ Failed to write new file: {sdsfile}: {e}")
+                        success = False
+
+        return success
+
 
     def _get_nonempty_traceids(self, startday, endday=None, skip_low_rate_channels=True, speed=1):
         """
