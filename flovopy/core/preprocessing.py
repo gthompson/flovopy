@@ -1360,7 +1360,9 @@ def fix_trace_id(trace, legacy=False, netcode=None, verbose=False):
             print(f"Current ID: {current_id}, Expected: {expected_id}) based on fs={sampling_rate}")
         trace.id = expected_id
     #print(trace)
-    return changed 
+    return changed
+
+
 
 #######################################################################
 ###                        Gap filling tools                        ###

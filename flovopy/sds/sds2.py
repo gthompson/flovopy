@@ -12,8 +12,9 @@ import numpy as np
 import shutil
 from itertools import groupby
 from operator import itemgetter
+from flovopy.core.merge import sanitize_trace, smart_merge, trace_equals, ensure_float32, mask_gaps, read_mseed_with_gap_masking, write_safely
 
-
+'''
 def write_safely(tr, mseedfile, fill_value=0, overwrite_ok=False):
     try:
         if isinstance(tr, Stream):
@@ -46,6 +47,7 @@ def write_safely(tr, mseedfile, fill_value=0, overwrite_ok=False):
                 print(f'Could not write {pklfile}')
         return False
 
+
 def detect_zero_gaps(tr, threshold_samples=100):
     """
     Annotate long zero spans in Trace.data as heuristic gaps using stats.processing,
@@ -73,7 +75,7 @@ def detect_zero_gaps(tr, threshold_samples=100):
 
     return tr
 
-
+'''
 def safe_remove(filepath):
     """Remove file if it exists."""
     try:
@@ -81,13 +83,13 @@ def safe_remove(filepath):
             os.remove(filepath)
     except Exception as e:
         print(f"Warning: Failed to remove file {filepath}: {e}")
+'''
 
 def ensure_float32(tr):
     """Convert trace data to float32 if not already."""
     if not np.issubdtype(tr.data.dtype, np.floating) or tr.data.dtype != np.float32:
         tr.data = tr.data.astype(np.float32)
-    return tr
-
+'''
 def split_trace_at_midnight(tr):
     """
     Split a Trace at UTC midnight boundaries. Return list of Trace objects.
@@ -103,34 +105,13 @@ def split_trace_at_midnight(tr):
         out.append(tr_piece)
         t1 = trim_end
     return out
-
-def traces_overlap_and_match(tr1, tr2):
-    """
-    Returns (has_overlap, data_matches)
-
-    - has_overlap: True if tr1 and tr2 share any common time samples.
-    - data_matches: True if data values in overlap are equal.
-    """
-    latest_start = max(tr1.stats.starttime, tr2.stats.starttime)
-    earliest_end = min(tr1.stats.endtime, tr2.stats.endtime)
-
-    if latest_start >= earliest_end:
-        return False, True  # No overlap — nothing to compare
-
-    tr1_overlap = tr1.slice(starttime=latest_start, endtime=earliest_end, nearest_sample=True)
-    tr2_overlap = tr2.slice(starttime=latest_start, endtime=earliest_end, nearest_sample=True)
-
-    if len(tr1_overlap.data) != len(tr2_overlap.data):
-        return True, False
-
-    return True, np.array_equal(tr1_overlap.data, tr2_overlap.data)
+'''
 
 def mark_gaps_and_fill(trace, fill_value=0.0):
     trace = trace.copy()
     
     # Ensure float dtype to avoid merge fill errors
-    if not np.issubdtype(trace.data.dtype, np.floating):
-        trace.data = trace.data.astype(np.float32)
+    ensure_float32(tr)
 
     st = Stream([trace])
     st.merge(method=1, fill_value=fill_value)
@@ -171,7 +152,7 @@ def restore_gaps(trace, fill_value=0.0):
             data.mask[idx1:idx2] = True
         except Exception as e:
             print(f"✘ Could not parse gap line '{line}': {e}")
-
+'''
 class SDSobj:
     """
     A class to manage an SDS (SeisComP Data Structure) archive.
@@ -196,73 +177,54 @@ class SDSobj:
 
 
     def read(self, startt, endt, skip_low_rate_channels=True, trace_ids=None,
-            speed=1, verbose=True, merge_method=0, progress=False, fill_value=0.0, detect_zero_padding=True):
-        """
-        Read data from the SDS archive into the internal stream.
+                speed=1, verbose=True, merge_method=0, progress=False,
+                fill_value=0.0, detect_zero_padding=True):
+            """
+            Read data from the SDS archive into the internal stream.
+            """
+            if not trace_ids:
+                trace_ids = self._get_nonempty_traceids(startt, endt, skip_low_rate_channels, speed=speed)
 
-        Parameters:
-        - startt, endt (UTCDateTime): Time range.
-        - skip_low_rate_channels (bool): Skip channels starting with 'L'.
-        - trace_ids (list): Optional list of trace IDs to read.
-        - speed (int): 1 = filename-based, 2 = SDS client.
-        - verbose (bool): Print messages if True.
-        - merge_method (int): ObsPy merge method (default 0 = concat).
-        - progress (bool): Show progress bar.
-        - fill_value (float): Fill value to treat as gaps (default 0.0).
+            st = Stream()
+            trace_iter = tqdm(trace_ids, desc="Reading traces") if progress else trace_ids
 
-        Returns:
-        - int: 0 if stream is populated, 1 if empty.
-        """
-        if not trace_ids:
-            trace_ids = self._get_nonempty_traceids(startt, endt, skip_low_rate_channels, speed=speed)
+            for trace_id in trace_iter:
+                net, sta, loc, chan = trace_id.split('.')
+                if chan.startswith('L') and skip_low_rate_channels:
+                    continue
 
-        st = Stream()
-        trace_iter = tqdm(trace_ids, desc="Reading traces") if progress else trace_ids
+                try:
+                    if speed == 1:
+                        sdsfiles = self.client._get_filenames(net, sta, loc, chan, startt, endt)
+                        for sdsfile in sdsfiles:
+                            if os.path.isfile(sdsfile):
+                                try:
+                                    traces = read_mseed_with_gap_masking(sdsfile)
+                                    for tr in traces:
+                                        st += tr
+                                except Exception as e:
+                                    if verbose:
+                                        print(f"Failed to read (v1) {sdsfile}: {e}")
+                    elif speed == 2:
+                        traces = self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
+                        for tr in traces:
+                            tr = mask_gaps(tr, fill_value=fill_value)
+                            st += tr
 
-        for trace_id in trace_iter:
-            net, sta, loc, chan = trace_id.split('.')
-            if chan.startswith('L') and skip_low_rate_channels:
-                continue
+                except Exception as e:
+                    if verbose:
+                        print(f"Failed to read (v2) {trace_id}: {e}")
 
-            try:
-                if speed == 1:
-                    sdsfiles = self.client._get_filenames(net, sta, loc, chan, startt, endt)
-                    for sdsfile in sdsfiles:
-                        if os.path.isfile(sdsfile):
-                            try:
-                                tr = restore_gaps(read(sdsfile)[0], fill_value=fill_value)
-                                #if detect_zero_padding and "Gap filled:" not in " ".join(tr.stats.processing):
-                                #    tr = detect_zero_gaps(tr)
-                                st += tr
+            st = remove_empty_traces(st)
 
-                            except Exception as e:
-                                if verbose:
-                                    print(f"Failed to read (v1) {sdsfile}: {e}")
-                elif speed == 2:
-                    traces = self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
-                    for tr in traces:
-                        tr = restore_gaps(tr, fill_value=fill_value)
-                        #if detect_zero_padding and "Gap filled:" not in " ".join(tr.stats.processing):
-                        #    tr = detect_zero_gaps(tr)
-                        st += tr
+            if len(st):
+                st.trim(startt, endt)
+                for tr in st:
+                    ensure_float32(tr)
+                st.merge(method=merge_method)
 
-            except Exception as e:
-                if verbose:
-                    print(f"Failed to read (v2) {trace_id}: {e}")
-
-        st = remove_empty_traces(st)
-
-        if len(st):
-            st.trim(startt, endt)
-            # Ensure all Traces are in float32 dtype to avoid merge errors
-            for tr in st:
-                if not np.issubdtype(tr.data.dtype, np.floating) or tr.data.dtype != np.float32:
-                    tr.data = tr.data.astype(np.float32)
-
-            st.merge(method=merge_method)
-
-        self.stream = st
-        return 0 if len(st) else 1
+            self.stream = st
+            return 0 if len(st) else 1
 
     def write(self, overwrite=False, fallback_to_indexed=True, debug=False, fill_value=0.0):
         """
@@ -294,6 +256,7 @@ class SDSobj:
         if debug:
             print(f'SDSobj.write(): Processing stream with {len(self.stream)} traces')
 
+        print(self.stream)
         for tr_unsplit in self.stream:
             try:
                 split_traces = split_trace_at_midnight(tr_unsplit)
@@ -301,6 +264,7 @@ class SDSobj:
                 print(e)
                 print(f'self.stream={self.stream}')
                 raise e
+
             for tr in split_traces:
                 tr = ensure_float32(tr)
                 sdsfile = self.client._get_filename(
@@ -330,39 +294,36 @@ class SDSobj:
 
                     shutil.copy2(sdsfile, tempfile)
 
-                    can_merge = True
-                    for existing_tr in existing.select(id=tr.id):
-                        has_overlap, matches = traces_overlap_and_match(existing_tr, tr)
-                        if has_overlap and not matches:
-                            can_merge = False
-                            safe_remove(tempfile)
-                            write_safely(tr, unmergedfile)
-                            if debug:
-                                print(f"✘ Cannot merge {tr.id} — conflict found.")
-                            success = False
-                            break
+                    merged, merge_info = smart_merge([tr], existing)
 
-                    if can_merge:
-                        combined = existing.copy().append(tr)
-                        combined = Stream([ensure_float32(t) for t in combined])
-                        combined.merge(method=0, fill_value=None)
+                    if merge_info["status"] == "identical":
+                        print("Duplicate of existing SDS record — skipping")
+                        safe_remove(tempfile)
+                        continue
 
-                        if len(combined) == 1:
-                            success = write_safely(combined[0], sdsfile, overwrite_ok=True)
+                    elif merge_info["status"] == "conflict":
+                        print(f"✘ Cannot merge {tr.id} — conflict found.")
+                        write_safely(tr, unmergedfile)
+                        safe_remove(tempfile)
+                        success = False
+                        continue
+
+                    elif merge_info["status"] == "merged":
+                        if len(merged) == 1:
+                            success = write_safely(merged[0], sdsfile, overwrite_ok=True)
                             shutil.move(tempfile, obsoletefile)
                             if debug:
                                 print(f"✔ Merged and wrote: {sdsfile}")
-
                         else:
+                            write_safely(merged, multitracefile)
                             safe_remove(tempfile)
-                            write_safely(combined, multitracefile)
                             print(f"✘ Merge produced multiple traces: {tr.id}. Written to {multitracefile}")
                             success = False
                     else:
-                        write_safely(tr, unmergedfile)
+                        print(f"✘ Unexpected merge status: {merge_info['status']}")
+                        write_safely(tr, unwrittenfile)
                         safe_remove(tempfile)
-                        print(f"✘ Could not merge {tr} with {sdsfile}: Saved to {unmergedfile} instead")
-
+                        success = False
                 else:
                     success = write_safely(tr, sdsfile, overwrite_ok=True)
                     if debug:
@@ -477,8 +438,7 @@ class SDSobj:
                             if len(st) > 0:
                                 # Ensure all Traces are in float32 dtype to avoid merge errors
                                 for tr in st:
-                                    if not np.issubdtype(tr.data.dtype, np.floating) or tr.data.dtype != np.float32:
-                                        tr.data = tr.data.astype(np.float32)
+                                    ensure_float32(tr)
 
                                 st.merge(method=0)
                                 tr = st[0]
