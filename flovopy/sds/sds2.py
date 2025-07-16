@@ -12,70 +12,9 @@ import numpy as np
 import shutil
 from itertools import groupby
 from operator import itemgetter
-from flovopy.core.merge import sanitize_trace, smart_merge, trace_equals, ensure_float32, mask_gaps, read_mseed_with_gap_masking, write_safely
+from flovopy.core.miniseed_io import smart_merge, read_mseed, write_mseed
+#from flovopy.core.trace_utils import ensure_float32
 
-'''
-def write_safely(tr, mseedfile, fill_value=0, overwrite_ok=False):
-    try:
-        if isinstance(tr, Stream):
-            marked = Stream()
-            for real_tr in tr:
-                marked.append(mark_gaps_and_fill(real_tr, fill_value=fill_value))
-        elif isinstance(tr, Trace):
-            marked = mark_gaps_and_fill(tr, fill_value=fill_value)
-
-        if overwrite_ok:
-            marked.write(mseedfile, format='MSEED')
-            return True
-        else:
-            index = 1
-            while True:
-                indexed = f"{mseedfile}.{index:02d}"
-                if not os.path.isfile(indexed):
-                    marked.write(indexed, format='MSEED')
-                    print(f"✔ Indexed file written due to merge conflict: {indexed}")
-                    break
-                index += 1
-            return False
-    except Exception as e:
-        print(e)
-        pklfile=mseedfile + '.pkl'
-        if not os.path.isfile(pklfile):
-            try:
-                tr.write(pklfile, format='PICKLE')
-            except:
-                print(f'Could not write {pklfile}')
-        return False
-
-
-def detect_zero_gaps(tr, threshold_samples=100):
-    """
-    Annotate long zero spans in Trace.data as heuristic gaps using stats.processing,
-    without modifying the data directly.
-    """
-    data = tr.data
-    zero_mask = data == 0.0
-
-    if not np.any(zero_mask):
-        return tr
-
-    indices = np.where(zero_mask)[0]
-    groups = []
-    for k, g in groupby(enumerate(indices), lambda x: x[0] - x[1]):
-        group = list(map(itemgetter(1), g))
-        if len(group) >= threshold_samples:
-            groups.append((group[0], group[-1]))
-
-    for start_idx, end_idx in groups:
-        start_time = tr.stats.starttime + (start_idx / tr.stats.sampling_rate)
-        end_time = tr.stats.starttime + (end_idx / tr.stats.sampling_rate)
-        note = f"Heuristic gap: {start_time} to {end_time} (zero padding)"
-        if note not in tr.stats.processing:
-            tr.stats.processing.append(note)
-
-    return tr
-
-'''
 def safe_remove(filepath):
     """Remove file if it exists."""
     try:
@@ -83,13 +22,7 @@ def safe_remove(filepath):
             os.remove(filepath)
     except Exception as e:
         print(f"Warning: Failed to remove file {filepath}: {e}")
-'''
 
-def ensure_float32(tr):
-    """Convert trace data to float32 if not already."""
-    if not np.issubdtype(tr.data.dtype, np.floating) or tr.data.dtype != np.float32:
-        tr.data = tr.data.astype(np.float32)
-'''
 def split_trace_at_midnight(tr):
     """
     Split a Trace at UTC midnight boundaries. Return list of Trace objects.
@@ -105,54 +38,7 @@ def split_trace_at_midnight(tr):
         out.append(tr_piece)
         t1 = trim_end
     return out
-'''
 
-def mark_gaps_and_fill(trace, fill_value=0.0):
-    trace = trace.copy()
-    
-    # Ensure float dtype to avoid merge fill errors
-    ensure_float32(tr)
-
-    st = Stream([trace])
-    st.merge(method=1, fill_value=fill_value)
-    gaps = st.get_gaps()
-    tr = st[0]
-    if gaps:
-        if not hasattr(tr.stats, "processing"):
-            tr.stats.processing = []
-        tr.stats.processing.append(f"Filled {len(gaps)} gaps with {fill_value}")
-        tr.stats.processing.extend(
-            [f"GAP {gap[4]}s from {gap[2]} to {gap[3]}" for gap in gaps]
-        )
-    if np.ma.isMaskedArray(tr.data):
-        tr.data = tr.data.filled(fill_value)
-    return tr
-
-
-def restore_gaps(trace, fill_value=0.0):
-    """
-    Masks regions filled by `fill_value` based on stored gap metadata in trace.stats.processing.
-    """
-    if not hasattr(trace.stats, "processing"):
-        return trace
-
-    processing_lines = [p for p in trace.stats.processing if p.startswith("GAP")]
-    if not processing_lines:
-        return trace
-
-    data = np.ma.masked_array(trace.data, mask=False)
-
-    for line in processing_lines:
-        try:
-            parts = line.split()
-            t1 = UTCDateTime(parts[3])
-            t2 = UTCDateTime(parts[5])
-            idx1 = int((t1 - trace.stats.starttime) * trace.stats.sampling_rate)
-            idx2 = int((t2 - trace.stats.starttime) * trace.stats.sampling_rate)
-            data.mask[idx1:idx2] = True
-        except Exception as e:
-            print(f"✘ Could not parse gap line '{line}': {e}")
-'''
 class SDSobj:
     """
     A class to manage an SDS (SeisComP Data Structure) archive.
@@ -177,8 +63,7 @@ class SDSobj:
 
 
     def read(self, startt, endt, skip_low_rate_channels=True, trace_ids=None,
-                speed=1, verbose=True, merge_method=0, progress=False,
-                fill_value=0.0, detect_zero_padding=True):
+                speed=2, verbose=True, progress=False, max_sampling_rate=250.0):
             """
             Read data from the SDS archive into the internal stream.
             """
@@ -186,20 +71,29 @@ class SDSobj:
                 trace_ids = self._get_nonempty_traceids(startt, endt, skip_low_rate_channels, speed=speed)
 
             st = Stream()
-            trace_iter = tqdm(trace_ids, desc="Reading traces") if progress else trace_ids
+            #trace_iter = tqdm(trace_ids, desc="Reading traces") if progress else trace_ids
 
-            for trace_id in trace_iter:
+            #for trace_id in trace_iter:
+            
+            for trace_id in trace_ids:
                 net, sta, loc, chan = trace_id.split('.')
                 if chan.startswith('L') and skip_low_rate_channels:
                     continue
 
+                print(f'\n**************\nReading SDS for {trace_id}: {startt}-{endt}')
                 try:
                     if speed == 1:
                         sdsfiles = self.client._get_filenames(net, sta, loc, chan, startt, endt)
+                        if verbose:
+                            print(f'Found {len(sdsfiles)} matching SDS files')
                         for sdsfile in sdsfiles:
                             if os.path.isfile(sdsfile):
                                 try:
-                                    traces = read_mseed_with_gap_masking(sdsfile)
+                                    if verbose:
+                                        print(f'Reading {sdsfile}')
+                                    traces = read_mseed(sdsfile, starttime=startt, endtime=endt)
+                                    if verbose:
+                                        print(traces)
                                     for tr in traces:
                                         st += tr
                                 except Exception as e:
@@ -208,7 +102,21 @@ class SDSobj:
                     elif speed == 2:
                         traces = self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
                         for tr in traces:
-                            tr = mask_gaps(tr, fill_value=fill_value)
+                            if tr.stats.sampling_rate > max_sampling_rate:
+                                try:
+                                    factor = int(round(tr.stats.sampling_rate / max_sampling_rate))
+                                    if factor > 1:
+                                        tr.decimate(factor)  # Applies low-pass filter internally
+                                        tr.stats.processing.append(f"Decimated by factor {factor} to {tr.stats.sampling_rate} Hz")
+                                    else:
+                                        tr.stats.processing.append("Sampling rate OK, no decimation needed")
+                                except Exception as e:
+                                    tr.stats.processing.append(f"Decimation failed: {e}")
+                                    continue
+                        traces, report = smart_merge(traces)
+                        if verbose:
+                            print(traces)
+                        for tr in traces:
                             st += tr
 
                 except Exception as e:
@@ -216,32 +124,32 @@ class SDSobj:
                         print(f"Failed to read (v2) {trace_id}: {e}")
 
             st = remove_empty_traces(st)
+            print(f'\nAfter remove blank traces:\n{st}')
 
             if len(st):
                 st.trim(startt, endt)
-                for tr in st:
-                    ensure_float32(tr)
-                st.merge(method=merge_method)
+                st, report = smart_merge(st)
+                print(f'\nAfter final smart_merge:\n{st}')
 
             self.stream = st
             return 0 if len(st) else 1
 
-    def write(self, overwrite=False, fallback_to_indexed=True, debug=False, fill_value=0.0):
+    def write(self, force_overwrite=False, fallback_to_indexed=True, debug=False):
         """
-        Write internal stream to SDS archive, marking gaps with fill_value and preserving metadata.
+        Write internal stream to SDS archive, marking gaps with 0.0 and preserving metadata.
 
         Parameters:
-        - overwrite (bool): Overwrite existing files if True.
+        - force_overwrite (bool): Overwrite existing files if True.
         - fallback_to_indexed (bool): If True, write .01, .02 files on merge conflict. If False, raise error.
         - debug (bool): Print debug messages if True.
-        - fill_value (float): Value to insert in gaps when merging (default 0.0).
 
         Returns:
         - bool: True if all writes succeed, False otherwise.
         """
         if isinstance(self.stream, Trace):
-            self.stream=Stream(traces=[self.stream])
-        success = False  
+            self.stream = Stream(traces=[self.stream])
+
+        write_status = {}  # Per-trace success flag
 
         # Setup subdirectories
         tempdir = os.path.join(self.topdir, 'temporarily_move_while_merging')
@@ -254,19 +162,14 @@ class SDSobj:
             os.makedirs(d, exist_ok=True)
 
         if debug:
-            print(f'SDSobj.write(): Processing stream with {len(self.stream)} traces')
+            print('> SDSobj.write()')
 
-        print(self.stream)
         for tr_unsplit in self.stream:
-            try:
-                split_traces = split_trace_at_midnight(tr_unsplit)
-            except Exception as e:
-                print(e)
-                print(f'self.stream={self.stream}')
-                raise e
+            split_traces = split_trace_at_midnight(tr_unsplit)
 
             for tr in split_traces:
-                tr = ensure_float32(tr)
+                trace_id = tr.id
+
                 sdsfile = self.client._get_filename(
                     tr.stats.network, tr.stats.station,
                     tr.stats.location, tr.stats.channel,
@@ -283,54 +186,67 @@ class SDSobj:
                 os.makedirs(os.path.dirname(sdsfile), exist_ok=True)
 
                 if debug:
-                    print(f'SDSobj.write(): Attempting to write {tr.id} to {sdsfile}')
+                    print(f'- Attempting to write {trace_id} to {sdsfile}')
 
-                if not overwrite and os.path.isfile(sdsfile):
+                if force_overwrite or not os.path.isfile(sdsfile):
+                    ok = write_mseed(tr, sdsfile, overwrite_ok=True)
+                    write_status[trace_id] = ok
+                    if debug:
+                        if ok:
+                            print(f"- ✔ New file written: {sdsfile}")
+                        else:
+                            print(f"- ✘ Failed to write {sdsfile} even in overwrite mode")                   
+
+                else: # output file already exists
                     try:
                         existing = read(sdsfile)
                     except Exception as e:
-                        print(f"⚠ Error reading existing file {sdsfile}: {e}")
+                        print(f"- Error reading existing file {sdsfile}: {e}")
                         existing = Stream()
 
                     shutil.copy2(sdsfile, tempfile)
 
-                    merged, merge_info = smart_merge([tr], existing)
+                    merged, merge_info = smart_merge(Stream([tr]) + existing)
 
                     if merge_info["status"] == "identical":
-                        print("Duplicate of existing SDS record — skipping")
+                        if debug:
+                            print("- Duplicate of existing SDS file — skipping")
                         safe_remove(tempfile)
+                        write_status[trace_id] = True
                         continue
 
                     elif merge_info["status"] == "conflict":
-                        print(f"✘ Cannot merge {tr.id} — conflict found.")
-                        write_safely(tr, unmergedfile)
+                        if debug:
+                            print(f"- ✘ Cannot merge {trace_id} — conflict found. Writing to {unmergedfile}")
+                        write_mseed(tr, unmergedfile)
                         safe_remove(tempfile)
-                        success = False
+                        write_status[trace_id] = False
                         continue
 
-                    elif merge_info["status"] == "merged":
+                    elif merge_info["status"] == "ok":
                         if len(merged) == 1:
-                            success = write_safely(merged[0], sdsfile, overwrite_ok=True)
-                            shutil.move(tempfile, obsoletefile)
-                            if debug:
-                                print(f"✔ Merged and wrote: {sdsfile}")
+                            ok = write_mseed(merged[0], sdsfile, overwrite_ok=True)
+                            write_status[trace_id] = ok
+                            if ok:
+                                shutil.move(tempfile, obsoletefile)
+                                if debug:
+                                    print(f"- ✔ Merged and wrote: {sdsfile}")
+                            else:
+                                print(f"- ✘ Failed to write merged trace to {sdsfile}")
                         else:
-                            write_safely(merged, multitracefile)
+                            print(f"- ✘ Merge produced multiple traces for {trace_id}, saving to {multitracefile}")
+                            write_mseed(merged, multitracefile)
                             safe_remove(tempfile)
-                            print(f"✘ Merge produced multiple traces: {tr.id}. Written to {multitracefile}")
-                            success = False
+                            write_status[trace_id] = False
                     else:
-                        print(f"✘ Unexpected merge status: {merge_info['status']}")
-                        write_safely(tr, unwrittenfile)
-                        safe_remove(tempfile)
-                        success = False
-                else:
-                    success = write_safely(tr, sdsfile, overwrite_ok=True)
-                    if debug:
-                        print(f"✔ New file written: {sdsfile}")
+                        print(f"- ✘ Unexpected merge status: {merge_info['status']}")
+                        write_status[trace_id] = False
 
 
-        return success
+        if debug:
+            print('< SDSobj.write()>')
+
+        return all(write_status.values())
 
 
     def _get_nonempty_traceids(self, startday, endday=None, skip_low_rate_channels=True, speed=1):
@@ -436,15 +352,14 @@ class SDSobj:
                         if os.path.isfile(sdsfile):
                             st = read(sdsfile)
                             if len(st) > 0:
-                                # Ensure all Traces are in float32 dtype to avoid merge errors
-                                for tr in st:
-                                    ensure_float32(tr)
-
-                                st.merge(method=0)
-                                tr = st[0]
-                                expected = tr.stats.sampling_rate * 86400
-                                npts = np.count_nonzero(~np.isnan(tr.data)) if speed == 1 else tr.stats.npts
-                                percent = min(100.0, 100 * npts / expected) if expected > 0 else 0
+                                st = smart_merge(st)
+                                if len(st)==1:
+                                    tr = st[0]
+                                    expected = tr.stats.sampling_rate * 86400
+                                    npts = np.count_nonzero(~np.isnan(tr.data)) if speed == 1 else tr.stats.npts
+                                    percent = min(100.0, 100 * npts / expected) if expected > 0 else 0
+                                else:
+                                    percent = np.nan
                     else:
                         percent = self.client.get_availability_percentage(net, sta, loc, chan,
                                                                         thisday, thisday + 86400)[0]

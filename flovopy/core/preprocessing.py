@@ -1362,8 +1362,7 @@ def fix_trace_id(trace, legacy=False, netcode=None, verbose=False):
     #print(trace)
     return changed
 
-
-
+'''
 #######################################################################
 ###                        Gap filling tools                        ###
 #######################################################################
@@ -1730,6 +1729,7 @@ def _detect_and_handle_gaps(tr, gap_threshold=10, null_values=[0, np.nan], verbo
 
     tr.data = data
     return tr
+'''
 
 #######################################################################
 ##                Stream tools                                       ##
@@ -1784,7 +1784,7 @@ def remove_empty_traces(stream):
     return Stream(tr for tr in stream if not _is_empty_trace(tr))   
 
 
-
+'''
 def smart_merge(st, verbose=False, interactive=False):
     """
     Merges overlapping or adjacent traces in an ObsPy Stream, handling gaps and conflicts intelligently.
@@ -1964,6 +1964,7 @@ def _smart_merge_traces(trace_pair):
     merged_trace.data = merged_data
 
     return merged_trace
+'''
         
 def Stream_min_starttime(all_traces):
     """
@@ -2169,6 +2170,59 @@ def clean_velocity_stream(st, max_gap_sec=10.0, verbose=True):
         add_to_trace_history(tr, "gap-cleaned without response removal")
 
     return st_clean
+
+def prepare_stream_for_analysis(st: Stream,
+                                zero_gap_threshold=500,
+                                artifact_kwargs=None,
+                                fill_method="smart",
+                                use_smart_merge=True) -> Stream:
+    """
+    Detect and correct artifacts, fill short gaps, and return a merged, clean Stream.
+    This is designed for use on a raw Stream, and to prepare the Stream for further processing
+    It could optionally be used instead, or in combination with, preprocess_Stream from flovopy.core.preprocessing
+
+    Parameters:
+    -----------
+    st : Stream
+        Input Stream object.
+    zero_gap_threshold : int
+        Number of consecutive zeros to consider a gap.
+    artifact_kwargs : dict
+        Keyword args for `detect_and_correct_artifacts()`.
+    fill_method : str
+        How to fill gaps: "smart", "interpolate", "zero", etc.
+    use_smart_merge : bool
+        Whether to use custom `smart_merge()` instead of `Stream.merge()`.
+
+    Returns:
+    --------
+    Stream
+        Cleaned, filled, and merged stream.
+    """
+    # 1. Mask zeros
+    st = mask_zeros_as_gaps(st, zero_gap_threshold=zero_gap_threshold)
+
+    # 2. Correct artifacts per trace
+    for tr in st:
+        detect_and_correct_artifacts(tr, **(artifact_kwargs or {}))
+
+    # 3. Sort traces by start time for deterministic merging
+    st.traces.sort(key=lambda tr: tr.stats.starttime)
+
+    # 4. Merge and preserve masking
+    if use_smart_merge:
+        st, _ = smart_merge(st)
+    else:
+        st.merge(method=1, fill_value=None)
+
+    # 5. Ensure masking was preserved
+    for tr in st:
+        ensure_masked(tr)
+
+    # 6. Fill short gaps with specified method
+    st = smart_fill(st, method=fill_method)
+
+    return st
 
 if __name__ == "__main__":
     from obspy.clients.filesystem.sds import Client
