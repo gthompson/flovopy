@@ -3,15 +3,17 @@ import os
 import argparse
 import pandas as pd
 from obspy import read, UTCDateTime, Stream
-from flovopy.sds.sds import SDSobj, write_safely, restore_gaps
+from flovopy.sds.sds import SDSobj
 from flovopy.core.preprocessing import fix_trace_id
 import traceback
 import gc
 import tracemalloc
 import numpy as np
+from flovopy.core.miniseed_io import read_mseed
 
 tracemalloc.start()
-
+# Initialize an empty DataFrame to track skipped files
+files_not_processed_df = pd.DataFrame(columns=["file", "reason"])
 
 def write_sds_archive(
     src_dir,
@@ -25,7 +27,8 @@ def write_sds_archive(
     metadata_excel_path=None,
     csv_log_path="fix_sds_archive_log.csv",
     use_sds_structure=True,
-    custom_file_list=None
+    custom_file_list=None,
+    debug=True
 ):
     """
     Processes and reorganizes seismic waveform data from an SDS (SeisComP Data Structure) or arbitrary file list.
@@ -73,8 +76,9 @@ def write_sds_archive(
     end_date = UTCDateTime(end_date) if end_date else None
 
     log_file = log_file or os.path.join(dest_dir, 'fix_sds_archive.log')
-    sdsin = SDSobj(src_dir)
+    #sdsin = SDSobj(src_dir)
     sdsout = SDSobj(dest_dir)
+    sdsunmatched = SDSobj(os.path.join(dest_dir, 'unmatched'))
 
     if metadata_excel_path:
         sdsout.load_metadata_from_excel(metadata_excel_path)
@@ -96,99 +100,132 @@ def write_sds_archive(
             save_processed_dir(log_file, root)
     else:
         file_list = [(os.path.dirname(f), os.path.basename(f)) for f in custom_file_list]
+    print(f'Found {len(file_list)} files to process')
 
     for root, filename in file_list:
         gc.collect()
-        current, peak = tracemalloc.get_traced_memory()
-        print(f"Current memory usage: {current / 1024:.1f} KiB; Peak: {peak / 1024:.1f} KiB")
+        #current, peak = tracemalloc.get_traced_memory()
+        #print(f"Current memory usage: {current / 1024:.1f} KiB; Peak: {peak / 1024:.1f} KiB")
+        file_path = os.path.join(root, filename)
+        print(file_path)
 
         if use_sds_structure and not is_valid_sds_filename(filename):
+            add_to_files_not_processed(file_path, reason="Invalid SDS filename")
             continue
-        
-        file_path = os.path.join(root, filename)
-        print(f'Processing {file_path}')
 
+        if debug:
+            print(f'\n*****\nProcessing {file_path}')
+
+        # Try reading the file with ObsPy, remember this could be from anywhere, not just an SDS archive
+        st_in = Stream()
         try:
-            st = read(file_path, format='MSEED')
-        except:
+            st_in = read_mseed(file_path)
+        except Exception:
+            #print(f'✘ Not a valid MiniSEED file that ObsPy can read: {file_path}')
+            add_to_files_not_processed(file_path, reason="Unreadable by ObsPy")
+            continue
+
+        if len(st_in)==0:
+            add_to_files_not_processed(file_path, reason="No data in Stream")
+
+        if debug:
+            print(f'- Source Stream={st_in}')
+
+        # Extract metadata from filename if needed
+        net,sta,loc,chan = st_in[0].id.split('.')
+
+        if not net and use_sds_structure:
             try:
-                st = read(file_path)
-            except:
-                print(f'Not a valid seismic file that ObsPy can read: {filename}')
-                continue
-        
-        net = st.stats.network
-        if not net:
-            if use_sds_structure:
                 parts = filename.split('.')
                 net, sta, loc, chan, _, yyyy, jjj = parts[0:7]
+            except Exception:
+                add_to_files_not_processed(file_path, reason="Filename parsing failed")
+                continue
 
+        # Network and station filtering
         if networks != ['*'] and net not in networks:
+            add_to_files_not_processed(file_path, reason=f"Filtered by network {net}")
             continue
         if stations != ['*'] and sta not in stations:
+            add_to_files_not_processed(file_path, reason=f"Filtered by station {sta}")
             continue
 
-        stream2 = Stream()
-        for tr in st:
-            if start_date and tr.stats.endtime < start_date:
+        # Per-trace filtering
+        st_out = Stream()
+        for tr in st_in:
+            if (start_date and tr.stats.endtime < start_date) or \
+            (end_date and tr.stats.starttime > end_date):
+                add_to_files_not_processed(file_path, reason=f"Outside of time range {start_date} to {end_date}")
                 continue
-            if end_date and tr.stats.starttime > end_date:
+            if tr.stats.sampling_rate < 50.0:
+                add_to_files_not_processed(file_path, reason=f"Sampling rate below 50 Hz")
                 continue
-            if tr.stats.sampling_rate < 50.0 or tr.stats.station == 'LLS02':
+            if tr.stats.station == 'LLS02':
+                add_to_files_not_processed(file_path, reason=f"Station LLS02 ignored")
                 continue
+            st_out.append(tr)
 
-            restore_gaps(tr, fill_value=0.0)
+        if len(st_out)==0:
+            add_to_files_not_processed(file_path, reason="No valid traces after filtering")
+            return
+        
+        if debug:
+            print(f'- Stream after filtering: {st_out}')
 
-            # Ensure float dtype to avoid merge fill errors
-            if not np.issubdtype(tr.data.dtype, np.floating):
-                tr.data = tr.data.astype(np.float32)
+        try:
+        
+            for tr in st_out:
+                source_id = tr.id
+                print(f'- Processing {tr}')
 
-            fix_trace_id(tr)
-            
-            metadata_matched = True # default
-            if sdsout.metadata is not None:
-                metadata_matched = sdsout.match_metadata(tr)
+                fix_trace_id(tr)
+                fixed_id = tr.id
+                
+                metadata_matched = True # default
+                if sdsout.metadata is not None:
+                    metadata_matched = sdsout.match_metadata(tr)
+                    if debug:
+                        print(f'- {source_id} -> {fixed_id} -> {tr.id}')
+                elif debug:
+                    print(f'- {source_id} -> {fixed_id}')
 
-            full_dest_path = sdsout.get_fullpath(tr)
-            if not metadata_matched:
-                unmatchedfile = os.path.join(dest_dir, 'unmatched', os.path.basename(full_dest_path))
-                os.makedirs(os.pathsep.dirname(unmatchedfile))  
-                write_safely(tr, unmatchedfile, fill_value=0, overwrite_ok=False)
-                continue      
 
-            if full_dest_path in output_path_set:
-                output_path_set[full_dest_path] += 1
-            else:
-                output_path_set[full_dest_path] = 1
+                full_dest_path = sdsout.get_fullpath(tr)
+                
+                if not metadata_matched:
+                    raise IOError(f'- NO METADATA MATCH FOR {tr}')
+                    sdsunmatched.stream = Stream(traces=[tr])
+                    sdsunmatched.write(debug=True)
+                    continue
 
-            csv_rows.append({
-                "source_path": file_path,
-                "dest_path": full_dest_path,
-                "trace_id": tr.id,
-                "starttime": tr.stats.starttime.isoformat(),
-                "endtime": tr.stats.endtime.isoformat(),
-                "sampling_rate": tr.stats.sampling_rate,
-                "npts": tr.stats.npts
-            })
-
-            if write:
-                sdsout.stream = Stream(traces=[tr])
-                try:
-                    success = sdsout.write(overwrite=False)
-                except Exception as e:
-                    traceback.print_exc()
-                    print(f"✘ Failed to write: {tr.id} → {full_dest_path}")
-                    raise e
+                if full_dest_path in output_path_set:
+                    output_path_set[full_dest_path] += 1
                 else:
-                    if success:
-                        print(f"✔ Wrote: {tr.id} → {full_dest_path}")
-                    else:
-                        print(f"✘ Failed to write: {tr.id} → {full_dest_path}")
+                    output_path_set[full_dest_path] = 1
 
+                csv_rows.append({
+                    "source_path": file_path,
+                    "dest_path": full_dest_path,
+                    "trace_id": tr.id,
+                    "starttime": tr.stats.starttime.isoformat(),
+                    "endtime": tr.stats.endtime.isoformat(),
+                    "sampling_rate": tr.stats.sampling_rate,
+                    "npts": tr.stats.npts
+                })
+
+                if write:
+                    sdsout.stream = Stream(traces=[tr])
+                    success = sdsout.write(debug=True)
+                    if debug:
+                        if success:
+                            print(f"  ✔ Wrote: {tr.id} → {full_dest_path}")
+                        else:
+                            print(f"  ✘ Failed to write: {tr.id} → {full_dest_path}")
         except Exception as e:
-            print(f"✘ Error processing {filename}: {e}")
-            traceback.print_exc()
-            raise e
+            raise
+        finally:
+            save_skipped_files_to_csv(os.path.join(dest_dir, "skipped_files.csv"))
+
 
     df = pd.DataFrame(csv_rows)
     df.to_csv(csv_log_path, index=False)
@@ -228,175 +265,6 @@ def confirm_same_directory():
         print("Aborting.")
         exit(1)
 
-'''
-def fix_sds_archive(
-    src_dir,
-    dest_dir,
-    networks='*',
-    stations='*',
-    start_date=None,
-    end_date=None,
-    write=False,
-    log_file=None,
-    metadata_excel_path=None,
-    csv_log_path="fix_sds_archive_log.csv"
-):
-    if os.path.abspath(src_dir) == os.path.abspath(dest_dir):
-        confirm_same_directory()
-
-    networks = [networks] if isinstance(networks, str) else networks
-    stations = [stations] if isinstance(stations, str) else stations
-    start_date = UTCDateTime(start_date) if start_date else None
-    end_date = UTCDateTime(end_date) if end_date else None
-
-    log_file = log_file or os.path.join(dest_dir, 'fix_sds_archive.log')
-    sdsin = SDSobj(src_dir)
-    sdsout = SDSobj(dest_dir)
-
-    if metadata_excel_path:
-        sdsout.load_metadata_from_excel(metadata_excel_path)
-
-    processed_dirs = get_processed_dirs(log_file)
-    csv_rows = []
-    output_path_set = {}
-
-    for root, dirs, files in os.walk(src_dir, topdown=True):
-        dirs.sort()
-        files.sort()
-
-        if root in processed_dirs:
-            print(f"Skipping already processed: {root}")
-            continue
-
-        for filename in files:
-            gc.collect()
-
-            current, peak = tracemalloc.get_traced_memory()
-            print(f"Current memory usage: {current / 1024:.1f} KiB; Peak: {peak / 1024:.1f} KiB")
-
-            if not is_valid_sds_filename(filename):
-                continue
-            print(f'Processing {filename}')
-
-            parts = filename.split('.')
-            net, sta, loc, chan, _, yyyy, jjj = parts
-
-            if networks != ['*'] and net not in networks:
-                continue
-            if stations != ['*'] and sta not in stations:
-                continue
-
-            try:
-                file_path = os.path.join(root, filename)
-
-                # check if by mistake, the file has more than 24 hours of data
-                st_test = read(file_path).merge(fill_value=0, method=1)
-                
-                if len(st_test)!=1:
-                    raise IOError(f'expected 1 trace at {file_path} {st_test}')
-                tr_test = st_test[0]
-                trace_id = tr_test.id
-
-
-                #trace_id = f'{net}.{sta}.{loc}.{chan}'  # write helper if needed
-
-                # Compute the expected start and end time from SDS naming
-                startt = UTCDateTime(f"{yyyy}-{jjj}")
-                endt = startt + 86400  # 1 day later
-                if tr_test.stats.starttime < startt - 1:
-                    tr_extra_start = tr_test.copy().trim(endtime=startt)
-                    sdsout.stream = tr_extra_start
-                    sdsout.write()
-                if tr_test.stats.endtime > endt + 1:
-                    tr_extra_end = tr_test.copy().trim(starttime=endt)
-                    sdsout.stream = tr_extra_end
-                    sdsout.write() 
-                del st_test, tr_test                  
-                
-
-                sdsin.read(startt, endt, trace_ids=[trace_id], fill_value=0.0, \
-                   skip_low_rate_channels=True, speed=1, verbose=True, merge_method=0, \
-                    progress=False,  detect_zero_padding=True)
-                stream = sdsin.stream
-
-                stream2 = Stream()
-                for tr in stream:
-                    if start_date and tr.stats.endtime < start_date:
-                        continue
-                    if end_date and tr.stats.starttime > end_date:
-                        continue
-                    if tr.stats.sampling_rate < 50.0 or tr.stats.station == 'LLS02':
-                        continue
-
-                    fix_trace_id(tr)
-                    stream2.append(tr)
-                del stream
-
-                try:
-                    stream2.merge(fill_value=None, method=0)
-                except Exception:
-                    pass
-
-
-                for tr in stream2:
-                    if sdsout.metadata is not None:
-                        sdsout.match_metadata(tr)
-
-                    full_dest_path = sdsout.get_fullpath(tr)
-
-                    # Collision detection
-                    if full_dest_path in output_path_set:
-                        output_path_set[full_dest_path] += 1
-                    else:
-                        output_path_set[full_dest_path] = 1
-
-                    # Log the trace metadata
-                    csv_rows.append({
-                        "source_path": file_path,
-                        "dest_path": full_dest_path,
-                        "trace_id": tr.id,
-                        "starttime": tr.stats.starttime.isoformat(),
-                        "endtime": tr.stats.endtime.isoformat(),
-                        "sampling_rate": tr.stats.sampling_rate,
-                        "npts": tr.stats.npts
-                    })
-
-                    if write:
-                        sdsout.stream = Stream(traces=[tr])
-                        try:
-                            success = sdsout.write(overwrite=False)
-                        except Exception as e:
-                            traceback.print_exc()
-                            print(f"✘ Failed to write: {tr.id} → {full_dest_path}")
-                            raise e
-                        else:
-                            if success:
-                                print(f"✔ Wrote: {tr.id} → {full_dest_path}")
-                            else:
-                                print(f"✘ Failed to write: {tr.id} → {full_dest_path}")
-
-            except Exception as e:
-                print(f"✘ Error processing {filename}: {e}")
-                traceback.print_exc()
-                raise e
-
-        save_processed_dir(log_file, root)
-
-    # Save log CSV
-    df = pd.DataFrame(csv_rows)
-    df.to_csv(csv_log_path, index=False)
-    print(f"🔍 Log CSV saved to {csv_log_path}")
-
-    # Check for filename collisions
-    collisions = {k: v for k, v in output_path_set.items() if v > 1}
-    if collisions:
-        print("⚠️  Detected potential filename collisions:")
-        for path, count in collisions.items():
-            print(f"  - {path} ({count} traces)")
-        print("Review collisions in the CSV log before running with --write.")
-
-    tracemalloc.stop()
-'''
 
 def check_for_collisions(log_csv_path):
     # Load the log CSV file
@@ -417,6 +285,42 @@ def check_for_collisions(log_csv_path):
                 print(f"  ↳ {src}")
     else:
         print("✅ No filename collisions detected. Safe to proceed.")
+
+
+def add_to_files_not_processed(file_path, reason=None):
+    """
+    Add a skipped file to the global DataFrame, with an optional reason.
+
+    Parameters
+    ----------
+    file_path : str
+        Full path to the file that could not be processed.
+    reason : str, optional
+        Explanation for why the file was skipped.
+    """
+    global files_not_processed_df
+
+    new_entry = pd.DataFrame([{"file": file_path, "reason": reason}])
+    if not ((files_not_processed_df["file"] == file_path) & (files_not_processed_df["reason"] == reason)).any():
+        files_not_processed_df = pd.concat([files_not_processed_df, new_entry], ignore_index=True)
+        print(f"⚠️ Skipped: {file_path} ({reason})" if reason else f"⚠️ Skipped: {file_path}")
+
+def save_skipped_files_to_csv(csv_path="skipped_files.csv"):
+    """
+    Save the skipped files DataFrame to a CSV file.
+
+    Parameters
+    ----------
+    csv_path : str
+        Destination path for the CSV output.
+    """
+    if files_not_processed_df.empty:
+        print("No skipped files to save.")
+        return
+
+    files_not_processed_df.to_csv(csv_path, index=False)
+    print(f"📝 Skipped files written to {csv_path}")
+
 # ------------------------------
 # Command-line interface
 # ------------------------------

@@ -22,6 +22,7 @@ import os
 import numpy as np
 from obspy import read, Stream, Trace, UTCDateTime
 from collections import defaultdict
+from math import ceil
 
 def sanitize_trace(tr, unmask_short_zeros=False, zero_gap_threshold=100):
     data = np.asarray(tr.data, dtype=np.float32)
@@ -65,8 +66,8 @@ def smart_merge(traces, debug=False, strategy='obspy'):
 
     Parameters
     ----------
-    traces : list of Trace
-        List of ObsPy Trace objects to merge.
+    traces : Stream
+        Stream of ObsPy Trace objects to merge.
     debug : bool, optional
         If True, print detailed debug information.
     strategy : {'obspy', 'max'}
@@ -311,21 +312,12 @@ def read_mseed(
     stream_in = read(mseedfile)
     if starttime or endtime:
         stream_in.trim(starttime=starttime, endtime=endtime)
+    stream_in = downsample_stream_to_min_rate(stream_in)
 
     stream_out = Stream()
     for tr in stream_in:
 
-        if tr.stats.sampling_rate > max_sampling_rate:
-            try:
-                factor = int(round(tr.stats.sampling_rate / max_sampling_rate))
-                if factor > 1:
-                    tr.decimate(factor)  # Applies low-pass filter internally
-                    tr.stats.processing.append(f"Decimated by factor {factor} to {tr.stats.sampling_rate} Hz")
-                else:
-                    tr.stats.processing.append("Sampling rate OK, no decimation needed")
-            except Exception as e:
-                tr.stats.processing.append(f"Decimation failed: {e}")
-                continue
+        decimate(tr, max_sampling_rate=max_sampling_rate)
 
         # Apply sanitization: trim zeros, mask zeros/NaNs, unmask short gaps if requested
         tr = sanitize_trace(tr, unmask_short_zeros=unmask_short_zeros, zero_gap_threshold=zero_gap_threshold)
@@ -347,3 +339,69 @@ def read_mseed(
         stream_out, _ = smart_merge(stream_out)
 
     return stream_out
+
+def decimate(tr, max_sampling_rate=250.0):
+    if tr.stats.sampling_rate > max_sampling_rate:
+        try:
+            factor = int(ceil(tr.stats.sampling_rate / max_sampling_rate))
+            if factor > 1:
+                tr.decimate(factor)  # Applies low-pass filter internally
+                tr.stats.processing.append(f"Decimated by factor {factor} to {tr.stats.sampling_rate} Hz")
+            else:
+                tr.stats.processing.append("Sampling rate OK, no decimation needed")
+        except Exception as e:
+            tr.stats.processing.append(f"Decimation failed: {e}")
+
+def get_min_sampling_rate(st):
+    if len(st) == 0:
+        raise ValueError("Stream is empty")
+    return min(tr.stats.sampling_rate for tr in st)
+
+def downsample_trace(tr, target_rate):
+    sr = tr.stats.sampling_rate
+    if sr == target_rate:
+        return tr
+    elif sr > target_rate:
+        factor = int(sr // target_rate)
+        if sr / factor == target_rate:
+            tr = tr.copy()
+            tr.decimate(factor=factor, no_filter=False)
+        else:
+            tr = tr.copy()
+            tr.resample(sampling_rate=target_rate)
+        return tr
+    else:
+        raise ValueError(f"Upsampling not supported: {sr} Hz → {target_rate} Hz")
+
+def downsample_stream_to_min_rate(st):
+    """
+    Downsamples all traces in a Stream to the lowest sampling rate among them.
+    Traces with lower-than-minimum sampling rate are excluded.
+
+    Parameters
+    ----------
+    st : obspy.Stream
+        Stream with potentially mixed sampling rates.
+
+    Returns
+    -------
+    st_out : obspy.Stream
+        Stream with all traces downsampled to the minimum sampling rate.
+    """
+    if len(st) == 0:
+        return st
+
+    min_rate = get_min_sampling_rate(st)
+    st_out = Stream()
+
+    for tr in st:
+        try:
+            if tr.stats.sampling_rate >= min_rate:
+                tr_ds = downsample_trace(tr, min_rate)
+                st_out += tr_ds
+            else:
+                print(f"⚠️ Skipping {tr.id} — sampling rate too low ({tr.stats.sampling_rate} Hz)")
+        except Exception as e:
+            print(f"⚠️ Failed to downsample {tr.id}: {e}")
+
+    return st_out

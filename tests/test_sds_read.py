@@ -1,4 +1,4 @@
-from flovopy.sds.sds2 import SDSobj
+from flovopy.sds.sds import SDSobj
 import obspy
 sdsin=SDSobj('/data/KSC/beforePASSCAL/CONTINUOUS')
 sdsin.read(obspy.UTCDateTime(2016,2,26,18,0,0), obspy.UTCDateTime(2016,2,26,19,0,0), speed=1)

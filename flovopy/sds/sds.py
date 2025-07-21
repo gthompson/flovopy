@@ -5,74 +5,17 @@ import numpy as np
 from obspy import read, Stream, Trace
 from obspy.core.utcdatetime import UTCDateTime
 import obspy.clients.filesystem.sds
-from flovopy.core.preprocessing import remove_empty_traces, fix_trace_id, _can_write_to_miniseed_and_read_back
+from flovopy.core.preprocessing import remove_empty_traces #, fix_trace_id, _can_write_to_miniseed_and_read_back
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
 import shutil
 from itertools import groupby
 from operator import itemgetter
-
-
-def write_safely(tr, mseedfile, fill_value=0, overwrite_ok=False):
-    try:
-        if isinstance(tr, Stream):
-            marked = Stream()
-            for real_tr in tr:
-                marked.append(mark_gaps_and_fill(real_tr, fill_value=fill_value))
-        elif isinstance(tr, Trace):
-            marked = mark_gaps_and_fill(tr, fill_value=fill_value)
-
-        if overwrite_ok:
-            marked.write(mseedfile, format='MSEED')
-            return True
-        else:
-            index = 1
-            while True:
-                indexed = f"{mseedfile}.{index:02d}"
-                if not os.path.isfile(indexed):
-                    marked.write(indexed, format='MSEED')
-                    print(f"✔ Indexed file written due to merge conflict: {indexed}")
-                    break
-                index += 1
-            return False
-    except Exception as e:
-        print(e)
-        pklfile=mseedfile + '.pkl'
-        if not os.path.isfile(pklfile):
-            try:
-                tr.write(pklfile, format='PICKLE')
-            except:
-                print(f'Could not write {pklfile}')
-        return False
-
-def detect_zero_gaps(tr, threshold_samples=100):
-    """
-    Annotate long zero spans in Trace.data as heuristic gaps using stats.processing,
-    without modifying the data directly.
-    """
-    data = tr.data
-    zero_mask = data == 0.0
-
-    if not np.any(zero_mask):
-        return tr
-
-    indices = np.where(zero_mask)[0]
-    groups = []
-    for k, g in groupby(enumerate(indices), lambda x: x[0] - x[1]):
-        group = list(map(itemgetter(1), g))
-        if len(group) >= threshold_samples:
-            groups.append((group[0], group[-1]))
-
-    for start_idx, end_idx in groups:
-        start_time = tr.stats.starttime + (start_idx / tr.stats.sampling_rate)
-        end_time = tr.stats.starttime + (end_idx / tr.stats.sampling_rate)
-        note = f"Heuristic gap: {start_time} to {end_time} (zero padding)"
-        if note not in tr.stats.processing:
-            tr.stats.processing.append(note)
-
-    return tr
-
+from flovopy.core.miniseed_io import smart_merge, read_mseed, write_mseed, decimate
+from math import ceil
+#from flovopy.core.trace_utils import ensure_float32
+import re
 
 def safe_remove(filepath):
     """Remove file if it exists."""
@@ -81,12 +24,6 @@ def safe_remove(filepath):
             os.remove(filepath)
     except Exception as e:
         print(f"Warning: Failed to remove file {filepath}: {e}")
-
-def ensure_float32(tr):
-    """Convert trace data to float32 if not already."""
-    if not np.issubdtype(tr.data.dtype, np.floating) or tr.data.dtype != np.float32:
-        tr.data = tr.data.astype(np.float32)
-    return tr
 
 def split_trace_at_midnight(tr):
     """
@@ -104,205 +41,127 @@ def split_trace_at_midnight(tr):
         t1 = trim_end
     return out
 
-def traces_overlap_and_match(tr1, tr2):
-    """
-    Returns (has_overlap, data_matches)
-
-    - has_overlap: True if tr1 and tr2 share any common time samples.
-    - data_matches: True if data values in overlap are equal.
-    """
-    latest_start = max(tr1.stats.starttime, tr2.stats.starttime)
-    earliest_end = min(tr1.stats.endtime, tr2.stats.endtime)
-
-    if latest_start >= earliest_end:
-        return False, True  # No overlap — nothing to compare
-
-    tr1_overlap = tr1.slice(starttime=latest_start, endtime=earliest_end, nearest_sample=True)
-    tr2_overlap = tr2.slice(starttime=latest_start, endtime=earliest_end, nearest_sample=True)
-
-    if len(tr1_overlap.data) != len(tr2_overlap.data):
-        return True, False
-
-    return True, np.array_equal(tr1_overlap.data, tr2_overlap.data)
-
-def mark_gaps_and_fill(trace, fill_value=0.0):
-    trace = trace.copy()
-    
-    # Ensure float dtype to avoid merge fill errors
-    if not np.issubdtype(trace.data.dtype, np.floating):
-        trace.data = trace.data.astype(np.float32)
-
-    st = Stream([trace])
-    st.merge(method=1, fill_value=fill_value)
-    gaps = st.get_gaps()
-    tr = st[0]
-    if gaps:
-        if not hasattr(tr.stats, "processing"):
-            tr.stats.processing = []
-        tr.stats.processing.append(f"Filled {len(gaps)} gaps with {fill_value}")
-        tr.stats.processing.extend(
-            [f"GAP {gap[4]}s from {gap[2]} to {gap[3]}" for gap in gaps]
-        )
-    if np.ma.isMaskedArray(tr.data):
-        tr.data = tr.data.filled(fill_value)
-    return tr
-
-
-def restore_gaps(trace, fill_value=0.0):
-    """
-    Masks regions filled by `fill_value` based on stored gap metadata in trace.stats.processing.
-    """
-    if not hasattr(trace.stats, "processing"):
-        return trace
-
-    processing_lines = [p for p in trace.stats.processing if p.startswith("GAP")]
-    if not processing_lines:
-        return trace
-
-    data = np.ma.masked_array(trace.data, mask=False)
-
-    for line in processing_lines:
-        try:
-            parts = line.split()
-            t1 = UTCDateTime(parts[3])
-            t2 = UTCDateTime(parts[5])
-            idx1 = int((t1 - trace.stats.starttime) * trace.stats.sampling_rate)
-            idx2 = int((t2 - trace.stats.starttime) * trace.stats.sampling_rate)
-            data.mask[idx1:idx2] = True
-        except Exception as e:
-            print(f"✘ Could not parse gap line '{line}': {e}")
-
 class SDSobj:
     """
     A class to manage an SDS (SeisComP Data Structure) archive.
     Allows reading, writing, checking availability, and plotting data from an SDS archive.
     """
 
-    def __init__(self, SDS_TOP, sds_type='D', format='MSEED', streamobj=None, metadata=None):
+    def __init__(self, basedir, sds_type='D', format='MSEED', streamobj=None, metadata=None):
         """
         Initialize SDSobj.
 
         Parameters:
-        - SDS_TOP (str): Root directory of the SDS archive.
+        - basedir (str): Root directory of the SDS archive.
         - sds_type (str): SDS file type (default 'D' for daily files).
         - format (str): File format (default 'MSEED').
         - streamobj (obspy Stream): Optional preloaded stream object.
         """
-        os.makedirs(SDS_TOP, exist_ok=True)
-        self.client = obspy.clients.filesystem.sds.Client(SDS_TOP, sds_type=sds_type, format=format)
+        os.makedirs(basedir, exist_ok=True)
+        self.client = obspy.clients.filesystem.sds.Client(basedir, sds_type=sds_type, format=format)
         self.stream = streamobj or Stream()
-        self.topdir = SDS_TOP
+        self.basedir = basedir
         self.metadata = metadata # for supporting a dataframe of allowable SEED ids (from same Excel spreadsheet used to generate StationXML)
 
 
     def read(self, startt, endt, skip_low_rate_channels=True, trace_ids=None,
-            speed=1, verbose=True, merge_method=0, progress=False, fill_value=0.0, detect_zero_padding=True):
+                speed=2, verbose=True, progress=False, max_sampling_rate=250.0):
+            """
+            Read data from the SDS archive into the internal stream.
+            """
+            if not trace_ids:
+                trace_ids = self._get_nonempty_traceids(startt, endt, skip_low_rate_channels, speed=speed)
+
+            st = Stream()
+            #trace_iter = tqdm(trace_ids, desc="Reading traces") if progress else trace_ids
+
+            #for trace_id in trace_iter:
+            
+            for trace_id in trace_ids:
+                net, sta, loc, chan = trace_id.split('.')
+                if chan.startswith('L') and skip_low_rate_channels:
+                    continue
+
+                print(f'\n**************\nReading SDS for {trace_id}: {startt}-{endt}')
+                try:
+                    if speed == 1:
+                        sdsfiles = self.client._get_filenames(net, sta, loc, chan, startt, endt)
+                        if verbose:
+                            print(f'Found {len(sdsfiles)} matching SDS files')
+                        for sdsfile in sdsfiles:
+                            if os.path.isfile(sdsfile):
+                                try:
+                                    if verbose:
+                                        print(f'Reading {sdsfile}')
+                                    traces = read_mseed(sdsfile, starttime=startt, endtime=endt)
+                                    if verbose:
+                                        print(traces)
+                                    for tr in traces:
+                                        st += tr
+                                except Exception as e:
+                                    if verbose:
+                                        print(f"Failed to read (v1) {sdsfile}: {e}")
+                    elif speed == 2:
+                        traces = self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
+                        for tr in traces:
+                            decimate(tr, max_sampling_rate=max_sampling_rate)
+                        traces, report = smart_merge(traces)
+                        if verbose:
+                            print(traces)
+                        for tr in traces:
+                            st += tr
+
+                except Exception as e:
+                    if verbose:
+                        print(f"Failed to read (v2) {trace_id}: {e}")
+
+            st = remove_empty_traces(st)
+            print(f'\nAfter remove blank traces:\n{st}')
+
+            if len(st):
+                st.trim(startt, endt)
+                st, report = smart_merge(st)
+                print(f'\nAfter final smart_merge:\n{st}')
+
+            self.stream = st
+            return 0 if len(st) else 1
+
+    def write(self, force_overwrite=False, fallback_to_indexed=True, debug=False):
         """
-        Read data from the SDS archive into the internal stream.
+        Write internal stream to SDS archive, marking gaps with 0.0 and preserving metadata.
 
         Parameters:
-        - startt, endt (UTCDateTime): Time range.
-        - skip_low_rate_channels (bool): Skip channels starting with 'L'.
-        - trace_ids (list): Optional list of trace IDs to read.
-        - speed (int): 1 = filename-based, 2 = SDS client.
-        - verbose (bool): Print messages if True.
-        - merge_method (int): ObsPy merge method (default 0 = concat).
-        - progress (bool): Show progress bar.
-        - fill_value (float): Fill value to treat as gaps (default 0.0).
-
-        Returns:
-        - int: 0 if stream is populated, 1 if empty.
-        """
-        if not trace_ids:
-            trace_ids = self._get_nonempty_traceids(startt, endt, skip_low_rate_channels, speed=speed)
-
-        st = Stream()
-        trace_iter = tqdm(trace_ids, desc="Reading traces") if progress else trace_ids
-
-        for trace_id in trace_iter:
-            net, sta, loc, chan = trace_id.split('.')
-            if chan.startswith('L') and skip_low_rate_channels:
-                continue
-
-            try:
-                if speed == 1:
-                    sdsfiles = self.client._get_filenames(net, sta, loc, chan, startt, endt)
-                    for sdsfile in sdsfiles:
-                        if os.path.isfile(sdsfile):
-                            try:
-                                tr = restore_gaps(read(sdsfile)[0], fill_value=fill_value)
-                                #if detect_zero_padding and "Gap filled:" not in " ".join(tr.stats.processing):
-                                #    tr = detect_zero_gaps(tr)
-                                st += tr
-
-                            except Exception as e:
-                                if verbose:
-                                    print(f"Failed to read (v1) {sdsfile}: {e}")
-                elif speed == 2:
-                    traces = self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
-                    for tr in traces:
-                        tr = restore_gaps(tr, fill_value=fill_value)
-                        #if detect_zero_padding and "Gap filled:" not in " ".join(tr.stats.processing):
-                        #    tr = detect_zero_gaps(tr)
-                        st += tr
-
-            except Exception as e:
-                if verbose:
-                    print(f"Failed to read (v2) {trace_id}: {e}")
-
-        st = remove_empty_traces(st)
-
-        if len(st):
-            st.trim(startt, endt)
-            # Ensure all Traces are in float32 dtype to avoid merge errors
-            for tr in st:
-                if not np.issubdtype(tr.data.dtype, np.floating) or tr.data.dtype != np.float32:
-                    tr.data = tr.data.astype(np.float32)
-
-            st.merge(method=merge_method)
-
-        self.stream = st
-        return 0 if len(st) else 1
-
-    def write(self, overwrite=False, fallback_to_indexed=True, debug=False, fill_value=0.0):
-        """
-        Write internal stream to SDS archive, marking gaps with fill_value and preserving metadata.
-
-        Parameters:
-        - overwrite (bool): Overwrite existing files if True.
+        - force_overwrite (bool): Overwrite existing files if True.
         - fallback_to_indexed (bool): If True, write .01, .02 files on merge conflict. If False, raise error.
         - debug (bool): Print debug messages if True.
-        - fill_value (float): Value to insert in gaps when merging (default 0.0).
 
         Returns:
         - bool: True if all writes succeed, False otherwise.
         """
         if isinstance(self.stream, Trace):
-            self.stream=Stream(traces=[self.stream])
-        success = False  
+            self.stream = Stream(traces=[self.stream])
+
+        write_status = {}  # Per-trace success flag
 
         # Setup subdirectories
-        tempdir = os.path.join(self.topdir, 'temporarily_move_while_merging')
-        unmergeddir = os.path.join(self.topdir, 'unable_to_merge')
-        obsoletedir = os.path.join(self.topdir, 'obsolete')
-        unwrittendir = os.path.join(self.topdir, 'failed_to_write_to_sds')
-        multitracedir = os.path.join(self.topdir, 'multitrace')
+        tempdir = os.path.join(self.basedir, 'temporarily_move_while_merging')
+        unmergeddir = os.path.join(self.basedir, 'unable_to_merge')
+        obsoletedir = os.path.join(self.basedir, 'obsolete')
+        unwrittendir = os.path.join(self.basedir, 'failed_to_write_to_sds')
+        multitracedir = os.path.join(self.basedir, 'multitrace')
 
         for d in [tempdir, unmergeddir, obsoletedir, unwrittendir, multitracedir]:
             os.makedirs(d, exist_ok=True)
 
         if debug:
-            print(f'SDSobj.write(): Processing stream with {len(self.stream)} traces')
+            print('> SDSobj.write()')
 
         for tr_unsplit in self.stream:
-            try:
-                split_traces = split_trace_at_midnight(tr_unsplit)
-            except Exception as e:
-                print(e)
-                print(f'self.stream={self.stream}')
-                raise e
+            split_traces = split_trace_at_midnight(tr_unsplit)
+
             for tr in split_traces:
-                tr = ensure_float32(tr)
+                trace_id = tr.id
+
                 sdsfile = self.client._get_filename(
                     tr.stats.network, tr.stats.station,
                     tr.stats.location, tr.stats.channel,
@@ -319,57 +178,67 @@ class SDSobj:
                 os.makedirs(os.path.dirname(sdsfile), exist_ok=True)
 
                 if debug:
-                    print(f'SDSobj.write(): Attempting to write {tr.id} to {sdsfile}')
+                    print(f'- Attempting to write {trace_id} to {sdsfile}')
 
-                if not overwrite and os.path.isfile(sdsfile):
+                if force_overwrite or not os.path.isfile(sdsfile):
+                    ok = write_mseed(tr, sdsfile, overwrite_ok=True)
+                    write_status[trace_id] = ok
+                    if debug:
+                        if ok:
+                            print(f"- ✔ New file written: {sdsfile}")
+                        else:
+                            print(f"- ✘ Failed to write {sdsfile} even in overwrite mode")                   
+
+                else: # output file already exists
                     try:
                         existing = read(sdsfile)
                     except Exception as e:
-                        print(f"⚠ Error reading existing file {sdsfile}: {e}")
+                        print(f"- Error reading existing file {sdsfile}: {e}")
                         existing = Stream()
 
                     shutil.copy2(sdsfile, tempfile)
 
-                    can_merge = True
-                    for existing_tr in existing.select(id=tr.id):
-                        has_overlap, matches = traces_overlap_and_match(existing_tr, tr)
-                        if has_overlap and not matches:
-                            can_merge = False
-                            safe_remove(tempfile)
-                            write_safely(tr, unmergedfile)
-                            if debug:
-                                print(f"✘ Cannot merge {tr.id} — conflict found.")
-                            success = False
-                            break
+                    merged, merge_info = smart_merge(Stream([tr]) + existing)
 
-                    if can_merge:
-                        combined = existing.copy().append(tr)
-                        combined = Stream([ensure_float32(t) for t in combined])
-                        combined.merge(method=0, fill_value=None)
-
-                        if len(combined) == 1:
-                            success = write_safely(combined[0], sdsfile, overwrite_ok=True)
-                            shutil.move(tempfile, obsoletefile)
-                            if debug:
-                                print(f"✔ Merged and wrote: {sdsfile}")
-
-                        else:
-                            safe_remove(tempfile)
-                            write_safely(combined, multitracefile)
-                            print(f"✘ Merge produced multiple traces: {tr.id}. Written to {multitracefile}")
-                            success = False
-                    else:
-                        write_safely(tr, unmergedfile)
+                    if merge_info["status"] == "identical":
+                        if debug:
+                            print("- Duplicate of existing SDS file — skipping")
                         safe_remove(tempfile)
-                        print(f"✘ Could not merge {tr} with {sdsfile}: Saved to {unmergedfile} instead")
+                        write_status[trace_id] = True
+                        continue
 
-                else:
-                    success = write_safely(tr, sdsfile, overwrite_ok=True)
-                    if debug:
-                        print(f"✔ New file written: {sdsfile}")
+                    elif merge_info["status"] == "conflict":
+                        if debug:
+                            print(f"- ✘ Cannot merge {trace_id} — conflict found. Writing to {unmergedfile}")
+                        write_mseed(tr, unmergedfile)
+                        safe_remove(tempfile)
+                        write_status[trace_id] = False
+                        continue
+
+                    elif merge_info["status"] == "ok":
+                        if len(merged) == 1:
+                            ok = write_mseed(merged[0], sdsfile, overwrite_ok=True)
+                            write_status[trace_id] = ok
+                            if ok:
+                                shutil.move(tempfile, obsoletefile)
+                                if debug:
+                                    print(f"- ✔ Merged and wrote: {sdsfile}")
+                            else:
+                                print(f"- ✘ Failed to write merged trace to {sdsfile}")
+                        else:
+                            print(f"- ✘ Merge produced multiple traces for {trace_id}, saving to {multitracefile}")
+                            write_mseed(merged, multitracefile)
+                            safe_remove(tempfile)
+                            write_status[trace_id] = False
+                    else:
+                        print(f"- ✘ Unexpected merge status: {merge_info['status']}")
+                        write_status[trace_id] = False
 
 
-        return success
+        if debug:
+            print('< SDSobj.write()>')
+
+        return all(write_status.values())
 
 
     def _get_nonempty_traceids(self, startday, endday=None, skip_low_rate_channels=True, speed=1):
@@ -424,7 +293,7 @@ class SDSobj:
             jday = f"{dayt.julday:03d}"
             station_glob = sta or '*'
             pattern = os.path.join(
-                self.topdir, year, net, station_glob, '*.D',
+                self.basedir, year, net, station_glob, '*.D',
                 f"{net}*.{year}.{jday}"
             )
             existingfiles = glob.glob(pattern)
@@ -475,16 +344,14 @@ class SDSobj:
                         if os.path.isfile(sdsfile):
                             st = read(sdsfile)
                             if len(st) > 0:
-                                # Ensure all Traces are in float32 dtype to avoid merge errors
-                                for tr in st:
-                                    if not np.issubdtype(tr.data.dtype, np.floating) or tr.data.dtype != np.float32:
-                                        tr.data = tr.data.astype(np.float32)
-
-                                st.merge(method=0)
-                                tr = st[0]
-                                expected = tr.stats.sampling_rate * 86400
-                                npts = np.count_nonzero(~np.isnan(tr.data)) if speed == 1 else tr.stats.npts
-                                percent = min(100.0, 100 * npts / expected) if expected > 0 else 0
+                                st = smart_merge(st)
+                                if len(st)==1:
+                                    tr = st[0]
+                                    expected = tr.stats.sampling_rate * 86400
+                                    npts = np.count_nonzero(~np.isnan(tr.data)) if speed == 1 else tr.stats.npts
+                                    percent = min(100.0, 100 * npts / expected) if expected > 0 else 0
+                                else:
+                                    percent = np.nan
                     else:
                         percent = self.client.get_availability_percentage(net, sta, loc, chan,
                                                                         thisday, thisday + 86400)[0]
@@ -566,7 +433,7 @@ class SDSobj:
         day_of_year = str(trace.stats.starttime.julday).zfill(3)
         filename = f"{net}.{sta}.{loc}.{chan}.D.{year}.{day_of_year}"
         sds_subdir = os.path.join(year, net, sta, f"{chan}.D")
-        return os.path.join(self.topdir, sds_subdir, filename)
+        return os.path.join(self.basedir, sds_subdir, filename)
     
     def load_metadata_from_excel(self, excel_path, sheet_name=0):
         """
@@ -659,19 +526,290 @@ class SDSobj:
             return True
         else:
             return False
+        
+    def build_file_list(self, return_failed_list_too=False, parameters=None, starttime=None, endtime=None):
+        """
+        Construct a list of file paths to process.
+        Optionally filters by network/station/channel/location and time window.
 
+        Parameters
+        ----------
+        return_failed_list_too : bool
+            Whether to return a list of files that failed validation.
+        parameters : dict, optional
+            Dictionary of filtering parameters, e.g.:
+            {
+                'network': ['XA', '1R', 'AM', 'FL'],
+                'station': ['SHZ1', 'ABC2'],
+                'channel': ['EHZ'],
+                'location': ['00', '10', '--']
+            }
+        starttime : UTCDateTime, optional
+            Inclusive start of time window.
+        endtime : UTCDateTime, optional
+            Inclusive end of time window.
+
+        Returns
+        -------
+        list
+            Valid file paths (and optionally failed ones).
+        """
+        file_list = []
+        failed_list = []
+
+        for root, dirs, files in os.walk(self.basedir, topdown=True):
+            dirs.sort()
+            files.sort()
+
+            if not is_valid_sds_dir(root):
+                continue
+
+            for filename in files:
+                full_path = os.path.join(root, filename)
+
+                if not is_valid_sds_filename(filename):
+                    failed_list.append(full_path)
+                    continue
+
+                parsed = parse_sds_filename(filename)
+                if not parsed:
+                    failed_list.append(full_path)
+                    continue
+
+                network, station, location, channel, dtype, year, jday = parsed
+
+                # Apply filtering by parameters
+                if parameters:
+                    if 'network' in parameters and network not in parameters['network']:
+                        continue
+                    if 'station' in parameters and station not in parameters['station']:
+                        continue
+                    if 'channel' in parameters and channel not in parameters['channel']:
+                        continue
+                    if 'location' in parameters and location not in parameters['location']:
+                        continue
+
+                # Apply filtering by time
+                if starttime or endtime:
+                    try:
+                        file_date = UTCDateTime(year=int(year), julday=int(jday))
+                        if (starttime and file_date < starttime) or (endtime and file_date > endtime):
+                            continue
+                    except Exception:
+                        failed_list.append(full_path)
+                        continue
+
+                file_list.append(full_path)
+
+        if return_failed_list_too:
+            return file_list, failed_list
+        else:
+            return file_list
+
+
+
+
+
+def parse_sds_dirname(dir_path):
+    """
+    Parse and extract components from an SDS directory path.
+    Expected format: .../YEAR/NET/STA/CHAN.D
+
+    Returns
+    -------
+    tuple or None
+        (year, network, station, channel) if valid format, else None
+    """
+    parts = os.path.normpath(dir_path).split(os.sep)[-4:]
+    if len(parts) != 4:
+        return None
+
+    year, net, sta, chanD = parts
+
+    # Validate each component
+    if not (year.isdigit() and len(year) == 4):
+        return None
+    if not re.match(r"^[A-Z0-9]{1,8}$", net):
+        return None
+    if not re.match(r"^[A-Z0-9]{1,8}$", sta):
+        return None
+    chan_match = re.match(r"^([A-Z0-9]{3})\.D$", chanD)
+    if not chan_match:
+        return None
+
+    chan = chan_match.group(1)
+    return year, net, sta, chan
+
+def is_valid_sds_dir(dir_path):
+    """
+    Validate that a directory follows the SDS structure: YEAR/NET/STA/CHAN.D
+
+    Returns
+    -------
+    bool
+        True if valid SDS directory format, else False.
+    """
+    return parse_sds_dirname(dir_path) is not None
 
 def parse_sds_filename(filename):
     """
     Parses an SDS-style MiniSEED filename and extracts its components.
     Assumes filenames follow: NET.STA.LOC.CHAN.TYPE.YEAR.DAY
     """
-    pattern = r"^(\w*)\.(\w*)\.(\w*)\.(\w*)\.(\w*)\.(\d{4})\.(\d{3})$"
+    if '/' in filename:
+        filename = os.path.basename(filename)
+    pattern = r"^(\w*)\.(\w*)\.(\w*)\.(\w*)\.(\w*)\.(\d{4})\.(\d{3})"
     match = re.match(pattern, filename)
     if match:
         network, station, location, channel, dtype, year, jday = match.groups()
         location = location if location else "--"
-        if len(location) == 1:
-            location = '0' + location
         return network, station, location, channel, dtype, year, jday
     return None
+
+def is_valid_sds_filename(filename):
+    """
+    Validate SDS MiniSEED filename using parsing logic.
+    Accepts only files matching NET.STA.LOC.CHAN.D.YEAR.DAY format
+    with dtype == 'D' (daily MiniSEED).
+    """
+    parsed = parse_sds_filename(filename)
+    if parsed is None:
+        return False
+
+    _, _, _, _, dtype, _, _ = parsed
+    return dtype == 'D'
+
+
+def merge_two_sds_archives(source1_sds_dir, source2_sds_dir, dest_sds_dir):
+    """
+    Merge two SDS archives into a destination SDS archive.
+
+    - If overlapping files are found, waveform data are merged using `smart_merge()`.
+    - Merged files are written only if the result differs from what's already in `dest_sds_dir`.
+    - Unresolved conflicts are logged using pandas to a CSV file.
+
+    Parameters
+    ----------
+    source1_sds_dir : str
+        Path to the first SDS archive.
+    source2_sds_dir : str
+        Path to the second SDS archive.
+    dest_sds_dir : str
+        Path to the destination SDS archive (created if it doesn't exist).
+    """
+    final_sds = SDSobj(dest_sds_dir)
+    conflicts_resolved = 0
+    conflicts_remaining = 0
+    unresolved_conflicts = []
+
+    for source in [source1_sds_dir, source2_sds_dir]:
+        for root, _, files in os.walk(source):
+            if not is_valid_sds_dir(root):
+                continue
+
+            for file in files:
+                if not is_valid_sds_filename(file):
+                    continue
+
+                source_file = os.path.join(root, file)
+                rel_path = os.path.relpath(source_file, source)
+                dest_file = os.path.join(dest_sds_dir, rel_path)
+
+                if os.path.exists(dest_file):
+                    try:
+                        st1 = read_mseed(dest_file)
+                        st2 = read_mseed(source_file)
+                        merged, report = smart_merge(st1 + st2)
+
+                        if report["status"] == "ok":
+                            # Only write if merged result differs from original
+                            if not _streams_equal(merged, st1):
+                                final_sds.write(merged)
+                                conflicts_resolved += 1
+                        else:
+                            conflicts_remaining += 1
+                            unresolved_conflicts.append({
+                                "relative_path": rel_path,
+                                "source_file": source_file,
+                                "dest_file": dest_file,
+                                "reason": report.get("reason", "merge failed")
+                            })
+                    except Exception as e:
+                        conflicts_remaining += 1
+                        unresolved_conflicts.append({
+                            "relative_path": rel_path,
+                            "source_file": source_file,
+                            "dest_file": dest_file,
+                            "reason": str(e)
+                        })
+                else:
+                    os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+                    shutil.copy2(source_file, dest_file)
+
+    # Save unresolved conflicts to CSV using pandas
+    if unresolved_conflicts:
+        log_path = os.path.join(dest_sds_dir, "conflicts_unresolved.csv")
+        df_conflicts = pd.DataFrame(unresolved_conflicts)
+        df_conflicts.to_csv(log_path, index=False)
+        print(f"⚠️ Logged {len(unresolved_conflicts)} unresolved conflicts to {log_path}")
+
+    print("✅ SDS merge complete.")
+    print(f"✔️ Conflicts resolved and merged: {conflicts_resolved}")
+    print(f"⚠️ Conflicts remaining:           {conflicts_remaining}")
+
+
+def _streams_equal(st1: Stream, st2: Stream) -> bool:
+    """
+    Determine whether two ObsPy Streams are effectively equal.
+
+    Uses:
+    - Number of traces
+    - Trace IDs
+    - Start/end times
+    - Number of samples
+    """
+    if len(st1) != len(st2):
+        return False
+
+    for tr1, tr2 in zip(st1, st2):
+        if tr1.id != tr2.id:
+            return False
+        if tr1.stats.starttime != tr2.stats.starttime:
+            return False
+        if tr1.stats.endtime != tr2.stats.endtime:
+            return False
+        if len(tr1.data) != len(tr2.data):
+            return False
+
+    return True
+
+def merge_multiple_sds_archives(source_sds_dirs, dest_sds_dir):
+    """
+    Merge multiple SDS archives into a single destination SDS archive.
+
+    This function uses `merge_two_sds_archives()` repeatedly to combine each source
+    archive into the growing destination archive.
+
+    Parameters
+    ----------
+    source_sds_dirs : list of str
+        List of SDS archive directories to merge.
+    dest_sds_dir : str
+        Path to destination SDS archive. Created if it doesn't exist.
+    """
+    if not source_sds_dirs:
+        print("❌ No source directories provided.")
+        return
+
+    # Step 1: Copy the first archive directly into the destination (if different)
+    first = source_sds_dirs[0]
+    if os.path.abspath(first) != os.path.abspath(dest_sds_dir):
+        print(f"📂 Copying initial archive from {first} to {dest_sds_dir}...")
+        shutil.copytree(first, dest_sds_dir, dirs_exist_ok=True)
+
+    # Step 2: Merge the rest
+    for src in source_sds_dirs[1:]:
+        print(f"\n🔄 Merging {src} into {dest_sds_dir}...")
+        merge_two_sds_archives(src, dest_sds_dir, dest_sds_dir)
+
+    print("\n✅ All SDS archives merged successfully.")
