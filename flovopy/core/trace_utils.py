@@ -17,7 +17,7 @@ Author: [Your Name or FLOVOpy Development Team]
 import numpy as np
 from obspy import Trace
 
-from .masking import sanitize_trace  # Assumes sanitize_trace is implemented in masking.py
+#from flovopy.core.miniseed_io import sanitize_trace  # Assumes sanitize_trace is implemented in masking.py
 
 
 def ensure_float32(tr: Trace) -> None:
@@ -89,4 +89,3 @@ def trace_equals(trace1: Trace, trace2: Trace, rtol=1e-5, atol=1e-8) -> bool:
         atol=atol,
         equal_nan=True
     )
-)

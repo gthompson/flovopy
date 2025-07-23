@@ -24,70 +24,104 @@ from obspy import read, Stream, Trace, UTCDateTime
 from collections import defaultdict
 from math import ceil
 
-def sanitize_trace(tr, unmask_short_zeros=False, zero_gap_threshold=100):
+
+def sanitize_trace(tr, unmask_short_zeros=True, min_gap_duration_s=1.0, inplace=False):
+    """
+    Cleans up a trace by trimming, masking zeros/NaNs, and optionally unmasking short internal gaps.
+
+    Parameters
+    ----------
+    tr : obspy.Trace
+        Input trace.
+    unmask_short_zeros : bool, optional
+        If True, unmasks internal zero gaps shorter than `min_gap_duration_s`.
+    min_gap_duration_s : float, optional
+        Gaps shorter than this (in seconds) will be unmasked if `unmask_short_zeros=True`. Default is 1.0 s.
+    inplace : bool, optional
+        If True, modify trace in place. Default is False (returns a new trace).
+
+    Returns
+    -------
+    obspy.Trace or None
+        Cleaned trace (if inplace=False) or None.
+    """
+    if not inplace:
+        tr = tr.copy()
+
     data = np.asarray(tr.data, dtype=np.float32)
 
-    # --- Trim leading/trailing zeros ---
+    # Trim leading/trailing zeros
     nonzero = np.flatnonzero(data != 0.0)
     if nonzero.size == 0:
         tr.data = np.ma.masked_array([], mask=[])
-        return tr
+        return tr if not inplace else None
 
     start, end = nonzero[0], nonzero[-1] + 1
     data = data[start:end]
     tr.stats.starttime += start / tr.stats.sampling_rate
 
-    # --- Mask all NaNs and zeros ---
+    # Mask all NaNs and zeros
     data = np.ma.masked_invalid(data)
     data = np.ma.masked_where(data == 0.0, data, copy=False)
 
-    # --- Optionally unmask short zero spans ---
+    # Optionally unmask short internal zero gaps
     if unmask_short_zeros:
+        sr = tr.stats.sampling_rate
+        min_gap_samples = int(sr * min_gap_duration_s)
         masked = np.where(data.mask)[0]
+
         if masked.size:
             d = np.diff(masked)
             gap_starts = np.where(np.insert(d, 0, 2) > 1)[0]
             gap_ends = np.where(np.append(d, 2) > 1)[0] - 1
+
             for i in range(len(gap_starts)):
                 s, e = masked[gap_starts[i]], masked[gap_ends[i]] + 1
-                if (e - s) < zero_gap_threshold:
-                    data.mask[s:e] = False  # Unmask short gap
+                if (e - s) < min_gap_samples:
+                    data.mask[s:e] = False  # Unmask short zero span
 
     tr.data = data
-    return tr
+    return tr if not inplace else None
 
-def sanitize_stream(stream):
-    return Stream([sanitize_trace(tr.copy()) for tr in stream])
+def sanitize_stream(stream, inplace=False, **kwargs):
+    """
+    Parameters
+    ----------
+    stream : obspy.Stream
+        Stream to sanitize.
+    inplace : bool
+        If True, modifies the traces in-place. Otherwise returns a new Stream.
+    kwargs : passed to sanitize_trace()
+    """
+    if inplace:
+        for tr in stream:
+            sanitize_trace(tr, inplace=True, **kwargs)
+        return stream
+    else:
+        return Stream([sanitize_trace(tr, inplace=False, **kwargs) for tr in stream])
 
 
 def smart_merge(traces, debug=False, strategy='obspy'):
     """
-    Merge a list of ObsPy Trace objects using a specified strategy, while detecting merge instabilities.
+    Merge a list of ObsPy Trace objects in-place using a specified strategy.
 
     Parameters
     ----------
-    traces : Stream
-        Stream of ObsPy Trace objects to merge.
+    traces : list of obspy.Trace
+        The traces to merge. Will be modified in-place.
     debug : bool, optional
-        If True, print detailed debug information.
-    strategy : {'obspy', 'max'}
-        Merge strategy:
-        - 'obspy': Use ObsPy's merge method and mask unstable regions.
-        - 'max': Use maximum absolute value per sample, ignoring conflicts.
+        If True, print diagnostic info during merging.
+    strategy : {'obspy', 'max'}, optional
+        Strategy to resolve overlaps:
+        - 'obspy': standard ObsPy merge + forward/reverse consistency check
+        - 'max': retain maximum absolute value at overlapping points
 
     Returns
     -------
-    merged : Stream
-        Merged stream of traces (one Trace per unique trace.id).
-    report : dict
-        Dictionary containing:
-            - 'merged': The merged Stream.
-            - 'instabilities': List of trace IDs with merge conflicts.
-            - 'collision_samples': Dict of {trace_id: number of unstable samples}.
-            - 'status_by_id': Dict of {trace_id: 'ok' or 'conflict'}.
-            - 'status': 'ok' or 'conflict' (if any conflicts).
-            - 'message': Optional status message.
+    dict
+        Report containing merge status and any detected instabilities.
     """
+
     report = {
         'instabilities': [],
         'collision_samples': {},
@@ -95,17 +129,18 @@ def smart_merge(traces, debug=False, strategy='obspy'):
         'status': 'ok',
         'message': ''
     }
-    merged = Stream()
 
-    traces_by_id = defaultdict(list)
+    traces_by_id = defaultdict(Stream)
     for tr in traces:
-        traces_by_id[tr.id].append(tr.copy())
+        traces_by_id[tr.id] += tr
 
-    for trace_id, trace_list in traces_by_id.items():
+    merged_traces = []
+
+    for trace_id, substream in traces_by_id.items():
         if debug:
-            print(f"- Merging {trace_id} with {len(trace_list)} traces")
+            print(f"- Merging {trace_id} with {len(substream)} traces")
 
-        sanitized = sanitize_stream(Stream(trace_list))
+        sanitized = sanitize_stream(substream)
         sr = sanitized[0].stats.sampling_rate
         t0 = min(tr.stats.starttime for tr in sanitized)
         t1 = max(tr.stats.endtime for tr in sanitized)
@@ -115,24 +150,25 @@ def smart_merge(traces, debug=False, strategy='obspy'):
         n_diff = 0
 
         if strategy == 'obspy':
-            merged_forward = sanitize_stream(Stream(trace_list)).merge(method=1, fill_value=np.nan)[0]
-            merged_reverse = sanitize_stream(Stream(trace_list[::-1])).merge(method=1, fill_value=np.nan)[0]
+            fwd = sanitized.merge(method=1, fill_value=np.nan)[0]
+            rev = Stream(sanitized[::-1]).merge(method=1, fill_value=np.nan)[0]
 
-            data_fwd = np.ma.masked_invalid(merged_forward.data)
-            data_rev = np.ma.masked_invalid(merged_reverse.data)
+            data_fwd = np.ma.masked_invalid(fwd.data)
+            data_rev = np.ma.masked_invalid(rev.data)
+
             unequal = (~np.isclose(data_fwd, data_rev, rtol=1e-5, atol=1e-8)) & ~data_fwd.mask & ~data_rev.mask
-
             n_diff = np.count_nonzero(unequal)
+
             if n_diff > 0:
                 status = 'conflict'
                 report['instabilities'].append(trace_id)
                 report['collision_samples'][trace_id] = n_diff
                 if debug:
-                    print(f"- {n_diff} merge-instability samples in {trace_id}")
-                # Mask out these positions
-                merged_forward.data.mask[unequal] = True
+                    print(f"⚠️  {n_diff} instability samples in {trace_id}")
+                data_fwd.mask[unequal] = True
 
-            merged_trace = merged_forward
+            merged_trace = fwd
+            merged_trace.data = data_fwd
 
         elif strategy == 'max':
             merged_data = np.ma.masked_all(npts, dtype=np.float32)
@@ -161,118 +197,177 @@ def smart_merge(traces, debug=False, strategy='obspy'):
 
         report['status_by_id'][trace_id] = status
         if status == 'conflict':
-            report['status'] = 'conflict'  # Set global status
+            report['status'] = 'conflict'
 
-        merged += merged_trace
+        merged_traces.append(merged_trace)
 
-    return merged, report
+    # Replace original content with merged results
+    traces[:] = merged_traces
 
+    return report
 
-def mask_gaps(trace, fill_value=0.0):
+def mask_gaps(trace, fill_value=0.0, inplace=True, validate_fill_value=False):
     """
-    Masks regions of the trace previously filled with `fill_value`, based on
-    metadata in trace.stats.processing.
+    Re-applies a mask to gap regions recorded in trace.stats.processing.
+
+    Parameters
+    ----------
+    trace : obspy.Trace
+        The trace with previously unmasked gaps.
+    fill_value : float, optional
+        Expected value used to fill gaps. Only used if `validate_fill_value=True`.
+    inplace : bool, optional
+        If True, modify in-place. If False, return a copy.
+    validate_fill_value : bool, optional
+        If True, only mask gaps where values match `fill_value`. Slower but safer.
     """
-    trace = trace.copy()
+    if not inplace:
+        trace = trace.copy()
+
     if not hasattr(trace.stats, "processing"):
-        return trace
+        return trace if not inplace else None
 
     processing_lines = [p for p in trace.stats.processing if p.startswith("GAP")]
     if not processing_lines:
-        return trace
+        return trace if not inplace else None
 
-    data = np.ma.masked_array(trace.data, mask=False)
+    sr = trace.stats.sampling_rate
+    start = trace.stats.starttime
+    npts = trace.stats.npts
+
+    mask = np.zeros(npts, dtype=bool)
 
     for line in processing_lines:
         try:
             parts = line.split()
             t1 = UTCDateTime(parts[3])
             t2 = UTCDateTime(parts[5])
-            idx1 = int((t1 - trace.stats.starttime) * trace.stats.sampling_rate)
-            idx2 = int((t2 - trace.stats.starttime) * trace.stats.sampling_rate)
-            data.mask[idx1:idx2] = True
+            idx1 = max(0, int((t1 - start) * sr))
+            idx2 = min(npts, int((t2 - start) * sr))
+            if idx2 > idx1:
+                if validate_fill_value:
+                    segment = trace.data[idx1:idx2]
+                    if np.allclose(segment, fill_value, equal_nan=True):
+                        mask[idx1:idx2] = True
+                else:
+                    mask[idx1:idx2] = True
         except Exception as e:
             print(f"✘ Could not parse gap line '{line}': {e}")
 
-    trace.data = data
-    return trace
+    trace.data = np.ma.masked_array(trace.data, mask=mask)
+    return trace if not inplace else None
 
+def unmask_gaps(trace, fill_value=0.0, inplace=True, verbose=False, log_gaps=False):
+    if not inplace:
+        trace = trace.copy()
 
-def unmask_gaps(trace, fill_value=0.0):
-    """
-    Fills masked gaps in the trace with `fill_value`, and appends GAP metadata.
-    We use this before writing MiniSEED files.
-    """
-    trace = trace.copy()
+    if not isinstance(trace.data, np.ma.MaskedArray) or trace.data.mask is np.ma.nomask:
+        return trace if not inplace else None
 
-    if not isinstance(trace.data, np.ma.MaskedArray):
-        return trace  # nothing to do
-
-    gaps = []
+    sr = trace.stats.sampling_rate
+    start = trace.stats.starttime
     mask = trace.data.mask
-    if mask is not np.ma.nomask:
-        idx = np.where(mask)[0]
-        if len(idx):
-            gap_bounds = np.split(idx, np.where(np.diff(idx) != 1)[0]+1)
-            for group in gap_bounds:
-                t1 = trace.stats.starttime + group[0] / trace.stats.sampling_rate
-                t2 = trace.stats.starttime + (group[-1]+1) / trace.stats.sampling_rate
-                gaps.append((t1, t2))
+
+    if isinstance(mask, np.ndarray):
+        gap_idxs = np.where(mask)[0]
+    else:
+        gap_idxs = np.arange(trace.stats.npts) if mask else []
+
+    n_gaps = 0
+    if gap_idxs.size:
+        if log_gaps:
+            split_idx = np.where(np.diff(gap_idxs) != 1)[0] + 1
+            gap_groups = np.split(gap_idxs, split_idx)
+            n_gaps = len(gap_groups)
+
+            if not hasattr(trace.stats, "processing"):
+                trace.stats.processing = []
+            trace.stats.processing.append(f"Filled {n_gaps} gaps with {fill_value}")
+
+            for group in gap_groups:
+                t1 = start + group[0] / sr
+                t2 = start + (group[-1] + 1) / sr
+                trace.stats.processing.append(f"GAP {t2 - t1:.2f}s from {t1} to {t2}")
 
     trace.data = trace.data.filled(fill_value)
 
-    if gaps:
-        if not hasattr(trace.stats, "processing"):
-            trace.stats.processing = []
-        trace.stats.processing.append(f"Filled {len(gaps)} gaps with {fill_value}")
-        for t1, t2 in gaps:
-            trace.stats.processing.append(f"GAP {t2 - t1:.2f}s from {t1} to {t2}")
+    if verbose and n_gaps > 500:
+        print(f"⚠️ Large number of GAP lines added to trace.stats.processing: {n_gaps}")
 
-    return trace
+    return trace if not inplace else None
 
 
-def write_mseed(tr, mseedfile, fill_value=0.0, overwrite_ok=False):
+
+def write_mseed(tr, mseedfile, fill_value=0.0, overwrite_ok=False, pickle_fallback=False):
     """
-    Writes a Trace or Stream to MiniSEED, filling masked gaps and recording metadata.
-    Avoids overwriting by default, writing indexed files instead.
+    Writes a Trace or Stream to MiniSEED, filling masked gaps with a constant value.
+
+    Parameters
+    ----------
+    tr : obspy.Trace or obspy.Stream
+        The trace(s) to write.
+    mseedfile : str
+        Destination MiniSEED filename.
+    fill_value : float, optional
+        Value used to fill masked (gap) regions. Default is 0.0.
+    overwrite_ok : bool, optional
+        If True, overwrites the specified file. If False, writes to an indexed filename.
+    pickle_fallback : bool, optional
+        If True, writes a .pkl backup if MiniSEED fails.
+
+    Returns
+    -------
+    bool
+        True if written to `mseedfile`, False if written to an indexed file, None if fallback was used.
     """
+   
 
-    try:
-        if isinstance(tr, Stream):
-            marked = Stream()
-            for real_tr in tr:
-                marked.append(unmask_gaps(real_tr, fill_value=fill_value))
-        elif isinstance(tr, Trace):
-            marked = unmask_gaps(tr, fill_value=fill_value)
+    # 1. Unmask gaps
+    if isinstance(tr, Stream):
+        marked = Stream([unmask_gaps(t, fill_value=fill_value, inplace=False) for t in tr])
+    elif isinstance(tr, Trace):
+        marked = unmask_gaps(tr, fill_value=fill_value, inplace=False)
+    else:
+        raise TypeError("Input must be an ObsPy Trace or Stream")
 
-        if overwrite_ok:
-            marked.write(mseedfile, format='MSEED')
+    # 2. Try to write
+    if overwrite_ok:
+        try:
+            marked.write(mseedfile, format="MSEED")
             return True
-        else:
-            index = 1
-            while True:
-                indexed = f"{mseedfile}.{index:02d}"
-                if not os.path.isfile(indexed):
-                    marked.write(indexed, format='MSEED')
-                    print(f"✔ Indexed file written due to merge conflict: {indexed}")
+        except Exception as e:
+            print(f"✘ Failed to write MSEED: {e}")
+    else:
+        base, ext = os.path.splitext(mseedfile)
+        for index in range(1, 100):  # Limit to 99 indexed retries
+            indexed = f"{base}.{index:02d}{ext}"
+            if not os.path.exists(indexed):
+                try:
+                    marked.write(indexed, format="MSEED")
+                    print(f"✔ Indexed file written due to conflict: {indexed}")
+                    return False
+                except Exception as e:
+                    print(f"✘ Failed to write indexed MSEED: {e}")
                     break
-                index += 1
-            return False
-    except Exception as e:
-        print(e)
-        pklfile = mseedfile + '.pkl'
-        if not os.path.isfile(pklfile):
+
+    # 3. Optional fallback to pickle
+    if pickle_fallback:
+        pklfile = mseedfile + ".pkl"
+        if not os.path.exists(pklfile):
             try:
-                tr.write(pklfile, format='PICKLE')
-            except:
-                print(f'✘ Could not write {pklfile}')
-        return False
+                marked.write(pklfile, format="PICKLE")
+                print(f"✔ Fallback written to pickle: {pklfile}")
+                return None
+            except Exception as e2:
+                print(f"✘ Failed to write fallback pickle: {e2}")
+
+    return False
 
 
 def read_mseed(
     mseedfile,
     fill_value=0.0,
-    zero_gap_threshold=100,
+    min_gap_duration_s=1.0,
     split_on_mask=False,
     merge=True,
     starttime=None,
@@ -289,8 +384,10 @@ def read_mseed(
         Path to the MiniSEED file to read.
     fill_value : float, optional
         Value used to fill gaps in unmasked data. Default is 0.0.
-    zero_gap_threshold : int, optional
-        Minimum number of consecutive 0.0 samples to treat as a gap. Default is 100.
+    unmask_short_zeros : bool, optional
+        If True, unmasks internal zero gaps shorter than `min_gap_duration_s`.
+    min_gap_duration_s : float, optional
+        Gaps shorter than this (in seconds) will be unmasked if `unmask_short_zeros=True`. Default is 1.0 s.
     split_on_mask : bool, optional
         If True, splits the stream at masked gaps using `Stream.split()`. Overrides merge.
     merge : bool, optional
@@ -300,45 +397,40 @@ def read_mseed(
     endtime : UTCDateTime, optional
         Trim end time.
     max_sampling_rate : float, optional
-        decimate() higher sampling rates than this by an integer. Default is 250.0 Hz.
-    unmask_short_zeros : bool, optional
-        If True, unmask short internal zero spans (< `zero_gap_threshold` samples).
+        Decimate traces with higher sampling rates. Default is 250.0 Hz.
+
 
     Returns
     -------
     Stream
         Cleaned, optionally merged/split ObsPy Stream.
     """
-    stream_in = read(mseedfile)
+    stream = read(mseedfile)
+
+    # Optional trim
     if starttime or endtime:
-        stream_in.trim(starttime=starttime, endtime=endtime)
-    stream_in = downsample_stream_to_min_rate(stream_in)
+        stream.trim(starttime=starttime, endtime=endtime)
 
-    stream_out = Stream()
-    for tr in stream_in:
+    # Downsample to consistent rate, capped by max_sampling_rate
+    downsample_stream_to_common_rate(stream, inplace=True, max_sampling_rate=max_sampling_rate)
 
-        decimate(tr, max_sampling_rate=max_sampling_rate)
-
-        # Apply sanitization: trim zeros, mask zeros/NaNs, unmask short gaps if requested
-        tr = sanitize_trace(tr, unmask_short_zeros=unmask_short_zeros, zero_gap_threshold=zero_gap_threshold)
-        tr = mask_gaps(tr)
-        if len(tr.data) == 0:
-            continue
-        stream_out.append(tr)
-
-    # Final optional cleanup
+    # Final optional stream-level sanitization
     try:
-        stream_out = sanitize_stream(stream_out)
+        sanitize_stream(stream, inplace=True, unmask_short_zeros=unmask_short_zeros, min_gap_duration_s=min_gap_duration_s)
     except ImportError:
         pass
 
-    # Split or merge
+    # Split or merge if requested
     if split_on_mask:
-        stream_out = stream_out.split()
+        stream = stream.split()
     elif merge:
-        stream_out, _ = smart_merge(stream_out)
+        try:
+            report = smart_merge(stream)
+        except Exception as e:
+            print(f"⚠️ smart_merge failed: {e}, falling back to stream.merge()")
+            stream.merge(method=1, fill_value=fill_value)
 
-    return stream_out
+    return stream
 
 def decimate(tr, max_sampling_rate=250.0):
     if tr.stats.sampling_rate > max_sampling_rate:
@@ -353,55 +445,97 @@ def decimate(tr, max_sampling_rate=250.0):
             tr.stats.processing.append(f"Decimation failed: {e}")
 
 def get_min_sampling_rate(st):
-    if len(st) == 0:
-        raise ValueError("Stream is empty")
-    return min(tr.stats.sampling_rate for tr in st)
+    """
+    Return the minimum sampling rate in a Stream, excluding traces
+    whose channel code starts with 'L' (typically long-period).
 
-def downsample_trace(tr, target_rate):
+    Parameters
+    ----------
+    st : obspy.Stream
+        The input stream.
+
+    Returns
+    -------
+    float
+        The minimum sampling rate among the remaining traces.
+
+    Raises
+    ------
+    ValueError
+        If the stream is empty or all traces are excluded.
+    """
+    filtered = [tr.stats.sampling_rate for tr in st if not tr.stats.channel.startswith('L')]
+
+    if not filtered:
+        raise ValueError("No valid traces found (all filtered out)")
+
+    return min(filtered)
+
+
+
+def downsample_trace(tr, target_rate, inplace=True):
     sr = tr.stats.sampling_rate
     if sr == target_rate:
         return tr
-    elif sr > target_rate:
+
+    target = tr if inplace else tr.copy()
+
+    if sr > target_rate:
         factor = int(sr // target_rate)
+        print(f'trying to downsample by factor {factor} for {tr} where target_rate={target_rate}')
         if sr / factor == target_rate:
-            tr = tr.copy()
-            tr.decimate(factor=factor, no_filter=False)
+            
+            target.decimate(factor=factor, no_filter=False)
         else:
-            tr = tr.copy()
-            tr.resample(sampling_rate=target_rate)
-        return tr
+            target.resample(sampling_rate=target_rate)
+        return target
     else:
         raise ValueError(f"Upsampling not supported: {sr} Hz → {target_rate} Hz")
-
-def downsample_stream_to_min_rate(st):
+    
+def downsample_stream_to_common_rate(st, inplace=True, max_sampling_rate=None):
     """
-    Downsamples all traces in a Stream to the lowest sampling rate among them.
-    Traces with lower-than-minimum sampling rate are excluded.
+    Downsamples all traces in a Stream to a uniform target sampling rate.
+
+    If max_sampling_rate is provided, the target rate is the minimum of the 
+    lowest sampling rate in the stream and max_sampling_rate.
+
+    Traces with lower-than-target sampling rate are excluded.
 
     Parameters
     ----------
     st : obspy.Stream
         Stream with potentially mixed sampling rates.
+    inplace : bool
+        If True, modifies the stream in place and returns it.
+    max_sampling_rate : float or None
+        Optional ceiling on target sampling rate.
 
     Returns
     -------
-    st_out : obspy.Stream
-        Stream with all traces downsampled to the minimum sampling rate.
+    obspy.Stream
+        Stream with all traces downsampled to a uniform sampling rate.
     """
     if len(st) == 0:
         return st
 
+    # Compute target sampling rate
     min_rate = get_min_sampling_rate(st)
-    st_out = Stream()
+    target_rate = min(min_rate, max_sampling_rate) if max_sampling_rate else min_rate
 
+    traces_out = []
     for tr in st:
         try:
-            if tr.stats.sampling_rate >= min_rate:
-                tr_ds = downsample_trace(tr, min_rate)
-                st_out += tr_ds
+            if tr.stats.sampling_rate >= target_rate:
+                tr_ds = downsample_trace(tr, target_rate, inplace=inplace)
+                traces_out.append(tr_ds)
             else:
                 print(f"⚠️ Skipping {tr.id} — sampling rate too low ({tr.stats.sampling_rate} Hz)")
         except Exception as e:
             print(f"⚠️ Failed to downsample {tr.id}: {e}")
 
-    return st_out
+    if inplace:
+        st._traces = traces_out
+        return st
+    else:
+        return Stream(traces_out)
+

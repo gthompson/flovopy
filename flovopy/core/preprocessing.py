@@ -1735,53 +1735,30 @@ def _detect_and_handle_gaps(tr, gap_threshold=10, null_values=[0, np.nan], verbo
 ##                Stream tools                                       ##
 #######################################################################
 
-def remove_empty_traces(stream):
+def remove_empty_traces(stream, inplace=False):
     """
     Removes empty traces, traces full of zeros, and traces full of NaNs from an ObsPy Stream.
 
-    This function filters out traces that contain **no valid seismic data**, including:
-    - **Completely empty traces** (no data points).
-    - **Traces filled entirely with zeros**.
-    - **Traces containing only NaN (Not-a-Number) values**.
-
-    Parameters:
+    Parameters
     ----------
     stream : obspy.Stream
         The input Stream object containing multiple seismic traces.
+    inplace : bool, optional
+        If True, modifies the original Stream in-place. If False (default), returns a cleaned copy.
 
-    Returns:
+    Returns
     -------
-    obspy.Stream
-        A new Stream object with only valid traces.
-
-    Notes:
-    ------
-    - This function uses `_is_empty_trace(trace)` to check if a trace is empty or invalid.
-    - The function does **not modify the original Stream**, but returns a cleaned copy.
-
-    Example:
-    --------
-    ```python
-    from obspy import read
-
-    # Load waveform data
-    st = read("example.mseed")
-
-    # Remove empty or invalid traces
-    cleaned_st = remove_empty_traces(st)
-
-    print(f"Original stream had {len(st)} traces, cleaned stream has {len(cleaned_st)} traces.")
-    ```
+    obspy.Stream or None
+        If inplace=False, returns a new Stream with only valid traces.
+        If inplace=True, modifies the stream in-place and returns None.
     """
-    '''
-    cleaned_stream = Stream()  # Create a new empty Stream
-
-    for trace in stream:
-        if not _is_empty_trace(trace):
-            cleaned_stream += trace'
-    '''
-
-    return Stream(tr for tr in stream if not _is_empty_trace(tr))   
+    if inplace:
+        to_remove = [tr for tr in stream if _is_empty_trace(tr)]
+        for tr in to_remove:
+            stream.remove(tr)
+        return None
+    else:
+        return Stream(tr for tr in stream if not _is_empty_trace(tr))  
 
 
 '''

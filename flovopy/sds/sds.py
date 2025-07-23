@@ -12,10 +12,12 @@ import numpy as np
 import shutil
 from itertools import groupby
 from operator import itemgetter
-from flovopy.core.miniseed_io import smart_merge, read_mseed, write_mseed, decimate
+from flovopy.core.miniseed_io import smart_merge, read_mseed, write_mseed, downsample_stream_to_common_rate, unmask_gaps
 from math import ceil
+from tqdm import tqdm
 #from flovopy.core.trace_utils import ensure_float32
 import re
+import gc
 
 def safe_remove(filepath):
     """Remove file if it exists."""
@@ -63,182 +65,159 @@ class SDSobj:
         self.basedir = basedir
         self.metadata = metadata # for supporting a dataframe of allowable SEED ids (from same Excel spreadsheet used to generate StationXML)
 
-
     def read(self, startt, endt, skip_low_rate_channels=True, trace_ids=None,
-                speed=2, verbose=True, progress=False, max_sampling_rate=250.0):
-            """
-            Read data from the SDS archive into the internal stream.
-            """
-            if not trace_ids:
-                trace_ids = self._get_nonempty_traceids(startt, endt, skip_low_rate_channels, speed=speed)
+            speed=2, verbose=True, progress=False, max_sampling_rate=250.0):
+        """
+        Read data from the SDS archive into the internal stream.
+        """
+        if trace_ids is None:
+            trace_ids = self._get_nonempty_traceids(
+                startt, endt, skip_low_rate_channels, speed=speed
+            )
 
-            st = Stream()
-            #trace_iter = tqdm(trace_ids, desc="Reading traces") if progress else trace_ids
+        st = Stream()
+        trace_iter = tqdm(trace_ids, desc="Reading traces") if progress else trace_ids
 
-            #for trace_id in trace_iter:
-            
-            for trace_id in trace_ids:
-                net, sta, loc, chan = trace_id.split('.')
-                if chan.startswith('L') and skip_low_rate_channels:
-                    continue
+        for trace_id in trace_iter:
+            net, sta, loc, chan = trace_id.split('.')
+            if skip_low_rate_channels and chan.startswith('L'):
+                continue
 
-                print(f'\n**************\nReading SDS for {trace_id}: {startt}-{endt}')
-                try:
-                    if speed == 1:
-                        sdsfiles = self.client._get_filenames(net, sta, loc, chan, startt, endt)
-                        if verbose:
-                            print(f'Found {len(sdsfiles)} matching SDS files')
-                        for sdsfile in sdsfiles:
-                            if os.path.isfile(sdsfile):
-                                try:
-                                    if verbose:
-                                        print(f'Reading {sdsfile}')
-                                    traces = read_mseed(sdsfile, starttime=startt, endtime=endt)
-                                    if verbose:
-                                        print(traces)
-                                    for tr in traces:
-                                        st += tr
-                                except Exception as e:
-                                    if verbose:
-                                        print(f"Failed to read (v1) {sdsfile}: {e}")
-                    elif speed == 2:
-                        traces = self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
-                        for tr in traces:
-                            decimate(tr, max_sampling_rate=max_sampling_rate)
-                        traces, report = smart_merge(traces)
-                        if verbose:
-                            print(traces)
-                        for tr in traces:
-                            st += tr
+            if verbose:
+                print(f"\n**************\nReading SDS for {trace_id}: {startt} – {endt}")
 
-                except Exception as e:
+            try:
+                if speed == 1:
+                    sdsfiles = self.client._get_filenames(net, sta, loc, chan, startt, endt)
                     if verbose:
-                        print(f"Failed to read (v2) {trace_id}: {e}")
+                        print(f"Found {len(sdsfiles)} matching SDS files")
 
-            st = remove_empty_traces(st)
-            print(f'\nAfter remove blank traces:\n{st}')
+                    for sdsfile in sdsfiles:
+                        if os.path.isfile(sdsfile):
+                            try:
+                                if verbose:
+                                    print(f"Reading {sdsfile}")
+                                traces = read_mseed(sdsfile, starttime=startt, endtime=endt)
+                                st += traces
+                            except Exception as e:
+                                if verbose:
+                                    print(f"✘ Failed to read (v1) {sdsfile}: {e}")
 
-            if len(st):
-                st.trim(startt, endt)
-                st, report = smart_merge(st)
-                print(f'\nAfter final smart_merge:\n{st}')
+                elif speed == 2:
+                    traces = self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
 
-            self.stream = st
-            return 0 if len(st) else 1
+                    ds_stream = downsample_stream_to_common_rate(traces, max_sampling_rate=max_sampling_rate)
+                    smart_merge(ds_stream)
+                    st += ds_stream
 
-    def write(self, force_overwrite=False, fallback_to_indexed=True, debug=False):
+            except Exception as e:
+                if verbose:
+                    print(f"✘ Failed to read (v2) {trace_id}: {e}")
+
+        remove_empty_traces(st, inplace=True)
+        if verbose:
+            print(f"\nAfter removing empty traces:\n{st}")
+
+        if len(st):
+            st.trim(startt, endt)
+            smart_merge(st)
+            if verbose:
+                print(f"\nAfter final smart_merge:\n{st}")
+
+        self.stream = st
+        gc.collect()
+        return 0 if len(st) else 1
+
+    def write(self, overwrite=False, fill_value=0.0, debug=False):
         """
-        Write internal stream to SDS archive, marking gaps with 0.0 and preserving metadata.
+        Writes a Stream or Trace to the SDS archive.
 
-        Parameters:
-        - force_overwrite (bool): Overwrite existing files if True.
-        - fallback_to_indexed (bool): If True, write .01, .02 files on merge conflict. If False, raise error.
-        - debug (bool): Print debug messages if True.
+        Parameters
+        ----------
 
-        Returns:
-        - bool: True if all writes succeed, False otherwise.
+        overwrite : bool, optional
+            If True, overwrite existing files. If False, attempt merge and write.
+        fill_value : float, optional
+            Value to fill masked gap regions before writing.
+        debug : bool, optional
+            Print detailed debug output.
+
+        Returns
+        -------
+        dict
+            Results dictionary keyed by Trace ID with status, reason, and path.
         """
-        if isinstance(self.stream, Trace):
-            self.stream = Stream(traces=[self.stream])
 
-        write_status = {}  # Per-trace success flag
+        results = {}
+        all_ok = True
+        stream = Stream([self.stream]) if isinstance(self.stream, Trace) else self.stream
 
-        # Setup subdirectories
-        tempdir = os.path.join(self.basedir, 'temporarily_move_while_merging')
-        unmergeddir = os.path.join(self.basedir, 'unable_to_merge')
-        obsoletedir = os.path.join(self.basedir, 'obsolete')
-        unwrittendir = os.path.join(self.basedir, 'failed_to_write_to_sds')
-        multitracedir = os.path.join(self.basedir, 'multitrace')
+        for tr in stream:
+            trace_id = tr.id
+            sdsfile = self.client._get_filename(
+                tr.stats.network,
+                tr.stats.station,
+                tr.stats.location,
+                tr.stats.channel,
+                tr.stats.starttime,
+                'D'
+            )
 
-        for d in [tempdir, unmergeddir, obsoletedir, unwrittendir, multitracedir]:
-            os.makedirs(d, exist_ok=True)
+            os.makedirs(os.path.dirname(sdsfile), exist_ok=True)
 
-        if debug:
-            print('> SDSobj.write()')
+            if debug:
+                print(f"→ Attempting to write: {trace_id} → {sdsfile}")
 
-        for tr_unsplit in self.stream:
-            split_traces = split_trace_at_midnight(tr_unsplit)
+            try:
+                if os.path.exists(sdsfile) and not overwrite:
+                    # Try merging with existing file
+                    existing = read_mseed(sdsfile)
+                    merged = existing + Stream([tr])
+                    report = smart_merge(merged, debug=debug)
+                    unmask_gaps(merged)
 
-            for tr in split_traces:
-                trace_id = tr.id
-
-                sdsfile = self.client._get_filename(
-                    tr.stats.network, tr.stats.station,
-                    tr.stats.location, tr.stats.channel,
-                    tr.stats.starttime, 'D'
-                )
-
-                basename = os.path.basename(sdsfile)
-                tempfile = os.path.join(tempdir, basename)
-                unmergedfile = os.path.join(unmergeddir, basename)
-                obsoletefile = os.path.join(obsoletedir, basename)
-                unwrittenfile = os.path.join(unwrittendir, basename)
-                multitracefile = os.path.join(multitracedir, basename)
-
-                os.makedirs(os.path.dirname(sdsfile), exist_ok=True)
-
-                if debug:
-                    print(f'- Attempting to write {trace_id} to {sdsfile}')
-
-                if force_overwrite or not os.path.isfile(sdsfile):
-                    ok = write_mseed(tr, sdsfile, overwrite_ok=True)
-                    write_status[trace_id] = ok
-                    if debug:
-                        if ok:
-                            print(f"- ✔ New file written: {sdsfile}")
-                        else:
-                            print(f"- ✘ Failed to write {sdsfile} even in overwrite mode")                   
-
-                else: # output file already exists
-                    try:
-                        existing = read(sdsfile)
-                    except Exception as e:
-                        print(f"- Error reading existing file {sdsfile}: {e}")
-                        existing = Stream()
-
-                    shutil.copy2(sdsfile, tempfile)
-
-                    merged, merge_info = smart_merge(Stream([tr]) + existing)
-
-                    if merge_info["status"] == "identical":
-                        if debug:
-                            print("- Duplicate of existing SDS file — skipping")
-                        safe_remove(tempfile)
-                        write_status[trace_id] = True
-                        continue
-
-                    elif merge_info["status"] == "conflict":
-                        if debug:
-                            print(f"- ✘ Cannot merge {trace_id} — conflict found. Writing to {unmergedfile}")
-                        write_mseed(tr, unmergedfile)
-                        safe_remove(tempfile)
-                        write_status[trace_id] = False
-                        continue
-
-                    elif merge_info["status"] == "ok":
-                        if len(merged) == 1:
-                            ok = write_mseed(merged[0], sdsfile, overwrite_ok=True)
-                            write_status[trace_id] = ok
-                            if ok:
-                                shutil.move(tempfile, obsoletefile)
-                                if debug:
-                                    print(f"- ✔ Merged and wrote: {sdsfile}")
-                            else:
-                                print(f"- ✘ Failed to write merged trace to {sdsfile}")
-                        else:
-                            print(f"- ✘ Merge produced multiple traces for {trace_id}, saving to {multitracefile}")
-                            write_mseed(merged, multitracefile)
-                            safe_remove(tempfile)
-                            write_status[trace_id] = False
+                    if report['status'] == 'ok' and len(merged) == 1:
+                        success = write_mseed(merged, sdsfile, fill_value=fill_value, overwrite_ok=True)
+                        results[trace_id] = {
+                            "status": "ok" if success else "exception",
+                            "reason": "Merged and written" if success else "Failed to write merged stream",
+                            "path": sdsfile,
+                        }
                     else:
-                        print(f"- ✘ Unexpected merge status: {merge_info['status']}")
-                        write_status[trace_id] = False
+                        msg = "Merge conflict"
+                        if report['status'] != 'ok':
+                            msg += f" ({report['status']})"
+                        if len(merged) != 1:
+                            msg += f"; result has {len(merged)} traces (expected 1)"
+                        results[trace_id] = {
+                            "status": "conflict",
+                            "reason": msg,
+                            "path": sdsfile,
+                        }
+                        all_ok = False
+                        if debug:
+                            print(f"⚠️ Merge failed for {trace_id}: {msg}")
+                else:
+                    # Either overwrite is allowed, or file does not exist
+                    success = write_mseed(tr, sdsfile, fill_value=fill_value, overwrite_ok=True)
+                    results[trace_id] = {
+                        "status": "ok" if success else "exception",
+                        "reason": "Written (no existing file)" if success else "Failed to write",
+                        "path": sdsfile,
+                    }
 
+            except Exception as e:
+                results[trace_id] = {
+                    "status": "exception",
+                    "reason": str(e),
+                    "path": sdsfile,
+                }
+                all_ok = False
+                if debug:
+                    print(f"✘ Exception while writing {trace_id} → {e}")
 
-        if debug:
-            print('< SDSobj.write()>')
-
-        return all(write_status.values())
+        results["all_ok"] = all_ok
+        return results
 
 
     def _get_nonempty_traceids(self, startday, endday=None, skip_low_rate_channels=True, speed=1):
@@ -344,7 +323,7 @@ class SDSobj:
                         if os.path.isfile(sdsfile):
                             st = read(sdsfile)
                             if len(st) > 0:
-                                st = smart_merge(st)
+                                report = smart_merge(st)
                                 if len(st)==1:
                                     tr = st[0]
                                     expected = tr.stats.sampling_rate * 86400
@@ -697,7 +676,7 @@ def merge_two_sds_archives(source1_sds_dir, source2_sds_dir, dest_sds_dir):
     dest_sds_dir : str
         Path to the destination SDS archive (created if it doesn't exist).
     """
-    final_sds = SDSobj(dest_sds_dir)
+    #final_sds = SDSobj(dest_sds_dir)
     conflicts_resolved = 0
     conflicts_remaining = 0
     unresolved_conflicts = []
@@ -719,12 +698,13 @@ def merge_two_sds_archives(source1_sds_dir, source2_sds_dir, dest_sds_dir):
                     try:
                         st1 = read_mseed(dest_file)
                         st2 = read_mseed(source_file)
-                        merged, report = smart_merge(st1 + st2)
+                        merged = st1 + st2
+                        report = smart_merge(merged)
 
                         if report["status"] == "ok":
                             # Only write if merged result differs from original
                             if not _streams_equal(merged, st1):
-                                final_sds.write(merged)
+                                write_mseed(merged, dest_file, overwrite_ok=True)
                                 conflicts_resolved += 1
                         else:
                             conflicts_remaining += 1
