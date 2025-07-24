@@ -5,14 +5,14 @@ import numpy as np
 from obspy import read, Stream, Trace
 from obspy.core.utcdatetime import UTCDateTime
 import obspy.clients.filesystem.sds
-from flovopy.core.preprocessing import remove_empty_traces #, fix_trace_id, _can_write_to_miniseed_and_read_back
+from flovopy.core.trace_utils import remove_empty_traces #, fix_trace_id, _can_write_to_miniseed_and_read_back
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
 import shutil
 from itertools import groupby
 from operator import itemgetter
-from flovopy.core.miniseed_io import smart_merge, read_mseed, write_mseed, downsample_stream_to_common_rate, unmask_gaps
+from flovopy.core.miniseed_io import smart_merge, read_mseed, write_mseed, downsample_stream_to_common_rate #, unmask_gaps
 from math import ceil
 from tqdm import tqdm
 #from flovopy.core.trace_utils import ensure_float32
@@ -128,15 +128,13 @@ class SDSobj:
         gc.collect()
         return 0 if len(st) else 1
 
-    def write(self, overwrite=False, fill_value=0.0, debug=False):
+    def write(self, fill_value=0.0, debug=False):
         """
         Writes a Stream or Trace to the SDS archive.
 
         Parameters
         ----------
 
-        overwrite : bool, optional
-            If True, overwrite existing files. If False, attempt merge and write.
         fill_value : float, optional
             Value to fill masked gap regions before writing.
         debug : bool, optional
@@ -169,15 +167,14 @@ class SDSobj:
                 print(f"→ Attempting to write: {trace_id} → {sdsfile}")
 
             try:
-                if os.path.exists(sdsfile) and not overwrite:
+                if os.path.exists(sdsfile):
                     # Try merging with existing file
                     existing = read_mseed(sdsfile)
                     merged = existing + Stream([tr])
                     report = smart_merge(merged, debug=debug)
-                    unmask_gaps(merged)
 
                     if report['status'] == 'ok' and len(merged) == 1:
-                        success = write_mseed(merged, sdsfile, fill_value=fill_value, overwrite_ok=True)
+                        success = write_mseed(merged[0], sdsfile, fill_value=fill_value)
                         results[trace_id] = {
                             "status": "ok" if success else "exception",
                             "reason": "Merged and written" if success else "Failed to write merged stream",
@@ -198,8 +195,8 @@ class SDSobj:
                         if debug:
                             print(f"⚠️ Merge failed for {trace_id}: {msg}")
                 else:
-                    # Either overwrite is allowed, or file does not exist
-                    success = write_mseed(tr, sdsfile, fill_value=fill_value, overwrite_ok=True)
+                    # file does not exist
+                    success = write_mseed(tr, sdsfile, fill_value=fill_value)
                     results[trace_id] = {
                         "status": "ok" if success else "exception",
                         "reason": "Written (no existing file)" if success else "Failed to write",

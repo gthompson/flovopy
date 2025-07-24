@@ -23,92 +23,16 @@ import numpy as np
 from obspy import read, Stream, Trace, UTCDateTime
 from collections import defaultdict
 from math import ceil
+from flovopy.core.trace_utils import sanitize_stream
 
-
-def sanitize_trace(tr, unmask_short_zeros=True, min_gap_duration_s=1.0, inplace=False):
+def smart_merge(stream_in, debug=False, strategy='obspy'):
     """
-    Cleans up a trace by trimming, masking zeros/NaNs, and optionally unmasking short internal gaps.
+    Merge an ObsPy Stream in-place using a specified strategy.
 
     Parameters
     ----------
-    tr : obspy.Trace
-        Input trace.
-    unmask_short_zeros : bool, optional
-        If True, unmasks internal zero gaps shorter than `min_gap_duration_s`.
-    min_gap_duration_s : float, optional
-        Gaps shorter than this (in seconds) will be unmasked if `unmask_short_zeros=True`. Default is 1.0 s.
-    inplace : bool, optional
-        If True, modify trace in place. Default is False (returns a new trace).
-
-    Returns
-    -------
-    obspy.Trace or None
-        Cleaned trace (if inplace=False) or None.
-    """
-    if not inplace:
-        tr = tr.copy()
-
-    data = np.asarray(tr.data, dtype=np.float32)
-
-    # Trim leading/trailing zeros
-    nonzero = np.flatnonzero(data != 0.0)
-    if nonzero.size == 0:
-        tr.data = np.ma.masked_array([], mask=[])
-        return tr if not inplace else None
-
-    start, end = nonzero[0], nonzero[-1] + 1
-    data = data[start:end]
-    tr.stats.starttime += start / tr.stats.sampling_rate
-
-    # Mask all NaNs and zeros
-    data = np.ma.masked_invalid(data)
-    data = np.ma.masked_where(data == 0.0, data, copy=False)
-
-    # Optionally unmask short internal zero gaps
-    if unmask_short_zeros:
-        sr = tr.stats.sampling_rate
-        min_gap_samples = int(sr * min_gap_duration_s)
-        masked = np.where(data.mask)[0]
-
-        if masked.size:
-            d = np.diff(masked)
-            gap_starts = np.where(np.insert(d, 0, 2) > 1)[0]
-            gap_ends = np.where(np.append(d, 2) > 1)[0] - 1
-
-            for i in range(len(gap_starts)):
-                s, e = masked[gap_starts[i]], masked[gap_ends[i]] + 1
-                if (e - s) < min_gap_samples:
-                    data.mask[s:e] = False  # Unmask short zero span
-
-    tr.data = data
-    return tr if not inplace else None
-
-def sanitize_stream(stream, inplace=False, **kwargs):
-    """
-    Parameters
-    ----------
-    stream : obspy.Stream
-        Stream to sanitize.
-    inplace : bool
-        If True, modifies the traces in-place. Otherwise returns a new Stream.
-    kwargs : passed to sanitize_trace()
-    """
-    if inplace:
-        for tr in stream:
-            sanitize_trace(tr, inplace=True, **kwargs)
-        return stream
-    else:
-        return Stream([sanitize_trace(tr, inplace=False, **kwargs) for tr in stream])
-
-
-def smart_merge(traces, debug=False, strategy='obspy'):
-    """
-    Merge a list of ObsPy Trace objects in-place using a specified strategy.
-
-    Parameters
-    ----------
-    traces : list of obspy.Trace
-        The traces to merge. Will be modified in-place.
+    stream_in : obspy.Stream
+        The input stream to merge. Will be modified in-place.
     debug : bool, optional
         If True, print diagnostic info during merging.
     strategy : {'obspy', 'max'}, optional
@@ -120,62 +44,91 @@ def smart_merge(traces, debug=False, strategy='obspy'):
     -------
     dict
         Report containing merge status and any detected instabilities.
+        report['status_by_id'][trace_id] ∈ {'ok', 'conflict'}
     """
-
     report = {
         'instabilities': [],
         'collision_samples': {},
         'status_by_id': {},
         'status': 'ok',
-        'message': ''
+        'message': '',
+        'summary': {
+            'total_ids': 0,
+            'merged': 0,
+            'ok': 0,
+            'conflict': 0,
+            'duplicate': 0,  # retained for future expandability
+            'empty': 0       # retained for future expandability
+        }
     }
 
-    traces_by_id = defaultdict(Stream)
-    for tr in traces:
-        traces_by_id[tr.id] += tr
+    # Group traces by unique ID
+    stream_by_id = defaultdict(Stream)
+    for tr in stream_in:
+        stream_by_id[tr.id].append(tr)
+    report['summary']['total_ids'] = len(stream_by_id)
 
-    merged_traces = []
+    merged_stream = []
 
-    for trace_id, substream in traces_by_id.items():
+    for trace_id, substream in stream_by_id.items():
         if debug:
-            print(f"- Merging {trace_id} with {len(substream)} traces")
+            print(f"- Merging {trace_id} ({len(substream)} traces)")
 
-        sanitized = sanitize_stream(substream)
-        sr = sanitized[0].stats.sampling_rate
-        t0 = min(tr.stats.starttime for tr in sanitized)
-        t1 = max(tr.stats.endtime for tr in sanitized)
+        # Sanitize in-place: removes empty + duplicate traces
+        sanitize_stream(substream)
+
+        if len(substream) == 0:
+            report['status_by_id'][trace_id] = 'empty'
+            report['summary']['empty'] += 1
+            if debug:
+                print(f"⚠️  {trace_id}: all traces empty after sanitization")
+            continue
+
+        if len(substream) == 1:
+            # Only one trace remains after sanitization
+            merged_trace = substream[0].copy()
+            merged_stream.append(merged_trace)
+            report['status_by_id'][trace_id] = 'ok'
+            report['summary']['ok'] += 1
+            continue
+
+        # Estimate time range and number of samples
+        sr = substream[0].stats.sampling_rate
+        t0 = min(tr.stats.starttime for tr in substream)
+        t1 = max(tr.stats.endtime for tr in substream)
         npts = int((t1 - t0) * sr) + 1
 
         status = 'ok'
-        n_diff = 0
 
         if strategy == 'obspy':
-            fwd = sanitized.merge(method=1, fill_value=np.nan)[0]
-            rev = Stream(sanitized[::-1]).merge(method=1, fill_value=np.nan)[0]
+            fwd = substream.merge(method=1, fill_value=np.nan)[0]
+            rev = Stream(substream[::-1]).merge(method=1, fill_value=np.nan)[0]
 
             data_fwd = np.ma.masked_invalid(fwd.data)
             data_rev = np.ma.masked_invalid(rev.data)
 
-            unequal = (~np.isclose(data_fwd, data_rev, rtol=1e-5, atol=1e-8)) & ~data_fwd.mask & ~data_rev.mask
+            unequal = (~np.isclose(data_fwd, data_rev, rtol=1e-5, atol=1e-8)) & \
+                      ~data_fwd.mask & ~data_rev.mask
+
             n_diff = np.count_nonzero(unequal)
 
             if n_diff > 0:
                 status = 'conflict'
                 report['instabilities'].append(trace_id)
                 report['collision_samples'][trace_id] = n_diff
-                if debug:
-                    print(f"⚠️  {n_diff} instability samples in {trace_id}")
                 data_fwd.mask[unequal] = True
+                if debug:
+                    print(f"⚠️  {trace_id}: {n_diff} conflict samples")
 
             merged_trace = fwd
             merged_trace.data = data_fwd
 
         elif strategy == 'max':
             merged_data = np.ma.masked_all(npts, dtype=np.float32)
-            for tr in sanitized:
+            for tr in substream:
                 offset = int((tr.stats.starttime - t0) * sr)
                 end = offset + tr.stats.npts
-                incoming = tr.data
+                incoming = np.ma.masked_invalid(tr.data)
                 existing = merged_data[offset:end]
 
                 use_new = existing.mask
@@ -187,7 +140,7 @@ def smart_merge(traces, debug=False, strategy='obspy'):
                     incoming[both], existing[both]
                 )
 
-            stats = sanitized[0].stats.copy()
+            stats = substream[0].stats.copy()
             stats.starttime = t0
             stats.npts = npts
             merged_trace = Trace(data=merged_data, header=stats)
@@ -195,14 +148,14 @@ def smart_merge(traces, debug=False, strategy='obspy'):
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 
+        merged_stream.append(merged_trace)
         report['status_by_id'][trace_id] = status
-        if status == 'conflict':
-            report['status'] = 'conflict'
+        report['summary'][status] += 1
 
-        merged_traces.append(merged_trace)
-
-    # Replace original content with merged results
-    traces[:] = merged_traces
+    # Replace original stream content in-place
+    stream_in.clear()
+    stream_in.extend(merged_stream)
+    report['summary']['merged'] = len(merged_stream)
 
     return report
 
@@ -298,7 +251,7 @@ def unmask_gaps(trace, fill_value=0.0, inplace=True, verbose=False, log_gaps=Fal
 
 
 
-def write_mseed(tr, mseedfile, fill_value=0.0, overwrite_ok=False, pickle_fallback=False):
+def write_mseed(tr, mseedfile, fill_value=0.0, overwrite_ok=True, pickle_fallback=False):
     """
     Writes a Trace or Stream to MiniSEED, filling masked gaps with a constant value.
 
@@ -311,7 +264,7 @@ def write_mseed(tr, mseedfile, fill_value=0.0, overwrite_ok=False, pickle_fallba
     fill_value : float, optional
         Value used to fill masked (gap) regions. Default is 0.0.
     overwrite_ok : bool, optional
-        If True, overwrites the specified file. If False, writes to an indexed filename.
+        If True (default), overwrites the specified file. If False, writes to an indexed filename. Ignored if file does not already exist.
     pickle_fallback : bool, optional
         If True, writes a .pkl backup if MiniSEED fails.
 
@@ -416,7 +369,7 @@ def read_mseed(
 
     # Final optional stream-level sanitization
     try:
-        sanitize_stream(stream, inplace=True, unmask_short_zeros=unmask_short_zeros, min_gap_duration_s=min_gap_duration_s)
+        sanitize_stream(stream, unmask_short_zeros=unmask_short_zeros, min_gap_duration_s=min_gap_duration_s)
     except ImportError:
         pass
 

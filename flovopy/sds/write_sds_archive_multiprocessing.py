@@ -868,24 +868,12 @@ def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, 
                     fixed_id = tr.id
                     metadata_matched = sdsout.match_metadata(tr) if sdsout.metadata is not None else True
 
+                    unmatched = False
+                    whichsdsobj = sdsout
                     if not metadata_matched:
-                        try:
-                            sdsunmatched.stream.traces = [tr]
-                            results = sdsunmatched.write(debug=debug)
-                            res = results.get(tr.id, {})
-                            status = res.get('status', 'failed')
-                            reason = res.get('reason', 'Unknown write issue to unmatched')
-                            outputfile = res.get('path', None) if status == 'ok' else None
-                            if status == 'ok':
-                                ntraces_out += 1
-                        except Exception as e:
-                            status = 'failed'
-                            reason = f'Unmatched write exception: {str(e)}'
-                            outputfile = None
-                        sdsunmatched.stream.clear()
-                    else:
-                        full_dest_path = sdsout.get_fullpath(tr)
-                        
+                        unmatched = True
+                        whichsdsobj = sdsunmatched
+                    full_dest_path = whichsdsobj.get_fullpath(tr)
                     output_locked = False
                     try:
                         output_locked = try_lock_output_file(conn, full_dest_path, cpu_id)
@@ -893,9 +881,9 @@ def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, 
                         print(f"{UTCDateTime()}: ⚠️ Output lock attempt failed for {full_dest_path}: {e}", flush=True)
 
                     if output_locked:
-                        sdsout.stream.traces = [tr]
+                        whichsdsobj.stream.traces = [tr]
                         try:
-                            results = sdsout.write(debug=debug)
+                            results = whichsdsobj.write(debug=debug)
                             res = results.get(tr.id, {})
                             status = res.get('status', 'failed')
                             reason = res.get('reason', 'Unknown write error')
@@ -909,13 +897,15 @@ def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, 
                             reason = f"Write exception: {str(e)}"
                             outputfile = None
                         finally:
-                            sdsout.stream.clear()
+                            whichsdsobj.stream.clear()
                             release_output_file_lock_safe(conn, full_dest_path)
                     else:
                         status = 'skipped'
                         reason = 'SDS output file locked by another worker'
                         outputfile = None
 
+                    if unmatched:
+                        status = 'unmatched ' + status
                     cursor.execute("""
                         INSERT OR REPLACE INTO trace_log
                         (source_id, fixed_id, trace_id, filepath, station, sampling_rate, starttime, endtime, reason, outputfile, status, cpu_id, timestamp)

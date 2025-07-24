@@ -495,62 +495,6 @@ def _compute_trace_metrics(trace):
     trace.stats.metrics["num_overlaps"] = num_overlaps
     trace.stats.metrics["percent_availability"] = percent_availability  
 
-def _is_empty_trace(trace):
-    """
-    Determines whether a seismic trace is effectively empty.
-
-    A trace is considered empty if:
-    - It has zero data points (`npts == 0`).
-    - All samples are identical (e.g., all zeros, all -1s).
-    - All values are NaN.
-
-    Parameters:
-    ----------
-    trace : obspy.Trace
-        The seismic trace to check.
-
-    Returns:
-    -------
-    bool
-        `True` if the trace is empty or contains only redundant values, otherwise `False`.
-
-    Notes:
-    ------
-    - The function first checks if the trace has no data (`npts == 0`).
-    - Then it checks if all values are identical (suggesting a completely flat signal).
-    - Finally, it verifies if all values are NaN.
-
-    Example:
-    --------
-    ```python
-    from obspy import Trace
-    import numpy as np
-
-    # Create an empty trace
-    empty_trace = Trace(data=np.array([]))
-    print(_is_empty_trace(empty_trace))  # True
-
-    # Create a flat-line trace
-    flat_trace = Trace(data=np.zeros(1000))
-    print(_is_empty_trace(flat_trace))  # True
-
-    # Create a normal trace with random data
-    normal_trace = Trace(data=np.random.randn(1000))
-    print(_is_empty_trace(normal_trace))  # False
-    ```
-    """
-    if trace.stats.npts == 0:
-        return True
-    
-    # Check for flat trace (e.g. all zero, or all -1)
-    if np.all(trace.data == np.nanmean(trace.data)):
-        return True
-
-    # Check if all values are NaN
-    if np.all(np.isnan(trace.data)):
-        return True 
-
-    return False
 
 
     
@@ -1735,30 +1679,7 @@ def _detect_and_handle_gaps(tr, gap_threshold=10, null_values=[0, np.nan], verbo
 ##                Stream tools                                       ##
 #######################################################################
 
-def remove_empty_traces(stream, inplace=False):
-    """
-    Removes empty traces, traces full of zeros, and traces full of NaNs from an ObsPy Stream.
-
-    Parameters
-    ----------
-    stream : obspy.Stream
-        The input Stream object containing multiple seismic traces.
-    inplace : bool, optional
-        If True, modifies the original Stream in-place. If False (default), returns a cleaned copy.
-
-    Returns
-    -------
-    obspy.Stream or None
-        If inplace=False, returns a new Stream with only valid traces.
-        If inplace=True, modifies the stream in-place and returns None.
-    """
-    if inplace:
-        to_remove = [tr for tr in stream if _is_empty_trace(tr)]
-        for tr in to_remove:
-            stream.remove(tr)
-        return None
-    else:
-        return Stream(tr for tr in stream if not _is_empty_trace(tr))  
+ 
 
 
 '''
