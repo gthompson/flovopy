@@ -467,7 +467,7 @@ class SDSobj:
             df = pd.concat([df, expanded_df], ignore_index=True)
 
         self.metadata = df
-
+    '''
     def match_metadata(self, trace):
         """
         Match trace metadata and update trace.stats.location if needed.
@@ -502,7 +502,65 @@ class SDSobj:
             return True
         else:
             return False
-        
+    '''
+    def match_metadata(self, trace):
+        """
+        Match trace metadata and update trace.stats.location if needed.
+
+        Matching strategy:
+        ------------------
+        1. Try to match on (network, station, channel) and on/off date overlap.
+        2. If no match found, try to match on (das_serial) and on/off date overlap.
+
+        Returns
+        -------
+        bool : True if metadata was matched and updated, False otherwise.
+        """
+        if self.metadata is None or self.metadata.empty:
+            return False
+
+        net = trace.stats.network
+        sta = trace.stats.station
+        cha = trace.stats.channel
+        start = trace.stats.starttime
+        end = trace.stats.endtime
+
+        df = self.metadata
+
+        # -- First attempt: match by network/station/channel/date overlap
+        match = df[
+            (df["network"] == net) &
+            (df["station"] == sta) &
+            (df["channel"] == cha) &
+            (df["ondate"] <= start) &
+            (df["offdate"] >= end - 86400)
+        ]
+
+        if not match.empty:
+            loc = match.iloc[0]["location"]
+            trace.stats.location = str(loc).zfill(2)
+            return True
+
+        # -- Second attempt: match by das_serial/date overlap (fallback)
+        das_serial = trace.stats.station
+        if das_serial is not None and "das_serial" in df.columns:
+            match = df[
+                (df["das_serial"] == das_serial) &
+                (df["ondate"] <= start) &
+                (df["offdate"] >= end - 86400)
+            ]
+            if not match.empty:
+                row = match.iloc[0]
+                trace.stats.network = row["network"]
+                trace.stats.station = row["station"]
+                trace.stats.channel = row["channel"]
+                trace.stats.location = str(row["location"]).zfill(2)
+                return True
+
+        return False
+
+
+
     def build_file_list(self, return_failed_list_too=False, parameters=None, starttime=None, endtime=None):
         """
         Construct a list of file paths to process.
@@ -655,138 +713,3 @@ def is_valid_sds_filename(filename):
     _, _, _, _, dtype, _, _ = parsed
     return dtype == 'D'
 
-
-def merge_two_sds_archives(source1_sds_dir, source2_sds_dir, dest_sds_dir):
-    """
-    Merge two SDS archives into a destination SDS archive.
-
-    - If overlapping files are found, waveform data are merged using `smart_merge()`.
-    - Merged files are written only if the result differs from what's already in `dest_sds_dir`.
-    - Unresolved conflicts are logged using pandas to a CSV file.
-
-    Parameters
-    ----------
-    source1_sds_dir : str
-        Path to the first SDS archive.
-    source2_sds_dir : str
-        Path to the second SDS archive.
-    dest_sds_dir : str
-        Path to the destination SDS archive (created if it doesn't exist).
-    """
-    #final_sds = SDSobj(dest_sds_dir)
-    conflicts_resolved = 0
-    conflicts_remaining = 0
-    unresolved_conflicts = []
-
-    for source in [source1_sds_dir, source2_sds_dir]:
-        for root, _, files in os.walk(source):
-            if not is_valid_sds_dir(root):
-                continue
-
-            for file in files:
-                if not is_valid_sds_filename(file):
-                    continue
-
-                source_file = os.path.join(root, file)
-                rel_path = os.path.relpath(source_file, source)
-                dest_file = os.path.join(dest_sds_dir, rel_path)
-
-                if os.path.exists(dest_file):
-                    try:
-                        st1 = read_mseed(dest_file)
-                        st2 = read_mseed(source_file)
-                        merged = st1 + st2
-                        report = smart_merge(merged)
-
-                        if report["status"] == "ok":
-                            # Only write if merged result differs from original
-                            if not _streams_equal(merged, st1):
-                                write_mseed(merged, dest_file, overwrite_ok=True)
-                                conflicts_resolved += 1
-                        else:
-                            conflicts_remaining += 1
-                            unresolved_conflicts.append({
-                                "relative_path": rel_path,
-                                "source_file": source_file,
-                                "dest_file": dest_file,
-                                "reason": report.get("reason", "merge failed")
-                            })
-                    except Exception as e:
-                        conflicts_remaining += 1
-                        unresolved_conflicts.append({
-                            "relative_path": rel_path,
-                            "source_file": source_file,
-                            "dest_file": dest_file,
-                            "reason": str(e)
-                        })
-                else:
-                    os.makedirs(os.path.dirname(dest_file), exist_ok=True)
-                    shutil.copy2(source_file, dest_file)
-
-    # Save unresolved conflicts to CSV using pandas
-    if unresolved_conflicts:
-        log_path = os.path.join(dest_sds_dir, "conflicts_unresolved.csv")
-        df_conflicts = pd.DataFrame(unresolved_conflicts)
-        df_conflicts.to_csv(log_path, index=False)
-        print(f"⚠️ Logged {len(unresolved_conflicts)} unresolved conflicts to {log_path}")
-
-    print("✅ SDS merge complete.")
-    print(f"✔️ Conflicts resolved and merged: {conflicts_resolved}")
-    print(f"⚠️ Conflicts remaining:           {conflicts_remaining}")
-
-
-def _streams_equal(st1: Stream, st2: Stream) -> bool:
-    """
-    Determine whether two ObsPy Streams are effectively equal.
-
-    Uses:
-    - Number of traces
-    - Trace IDs
-    - Start/end times
-    - Number of samples
-    """
-    if len(st1) != len(st2):
-        return False
-
-    for tr1, tr2 in zip(st1, st2):
-        if tr1.id != tr2.id:
-            return False
-        if tr1.stats.starttime != tr2.stats.starttime:
-            return False
-        if tr1.stats.endtime != tr2.stats.endtime:
-            return False
-        if len(tr1.data) != len(tr2.data):
-            return False
-
-    return True
-
-def merge_multiple_sds_archives(source_sds_dirs, dest_sds_dir):
-    """
-    Merge multiple SDS archives into a single destination SDS archive.
-
-    This function uses `merge_two_sds_archives()` repeatedly to combine each source
-    archive into the growing destination archive.
-
-    Parameters
-    ----------
-    source_sds_dirs : list of str
-        List of SDS archive directories to merge.
-    dest_sds_dir : str
-        Path to destination SDS archive. Created if it doesn't exist.
-    """
-    if not source_sds_dirs:
-        print("❌ No source directories provided.")
-        return
-
-    # Step 1: Copy the first archive directly into the destination (if different)
-    first = source_sds_dirs[0]
-    if os.path.abspath(first) != os.path.abspath(dest_sds_dir):
-        print(f"📂 Copying initial archive from {first} to {dest_sds_dir}...")
-        shutil.copytree(first, dest_sds_dir, dirs_exist_ok=True)
-
-    # Step 2: Merge the rest
-    for src in source_sds_dirs[1:]:
-        print(f"\n🔄 Merging {src} into {dest_sds_dir}...")
-        merge_two_sds_archives(src, dest_sds_dir, dest_sds_dir)
-
-    print("\n✅ All SDS archives merged successfully.")

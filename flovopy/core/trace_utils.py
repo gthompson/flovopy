@@ -91,6 +91,50 @@ def trace_equals(trace1: Trace, trace2: Trace, rtol=1e-5, atol=1e-8, sanitize=Tr
         equal_nan=True
     )
 
+#from obspy import Stream, Trace
+#from typing import Union
+
+def streams_equal(stream1: Stream, stream2: Stream, rtol=1e-5, atol=1e-8, sanitize=True, sort=True) -> bool:
+    """
+    Compare two ObsPy Stream objects for equality.
+
+    Parameters
+    ----------
+    stream1 : Stream
+        First stream to compare.
+    stream2 : Stream
+        Second stream to compare.
+    rtol : float
+        Relative tolerance for floating-point comparison.
+    atol : float
+        Absolute tolerance for floating-point comparison.
+    sanitize : bool
+        Whether to sanitize each trace before comparison.
+    sort : bool
+        Whether to sort streams by trace.id before comparison.
+
+    Returns
+    -------
+    bool
+        True if all traces in both streams are equal, False otherwise.
+    """
+    if len(stream1) != len(stream2):
+        return False
+
+    s1 = stream1.copy()
+    s2 = stream2.copy()
+
+    if sort:
+        s1.sort(keys=['id', 'starttime'])
+        s2.sort(keys=['id', 'starttime'])
+
+    for tr1, tr2 in zip(s1, s2):
+        if not trace_equals(tr1, tr2, rtol=rtol, atol=atol, sanitize=sanitize):
+            return False
+
+    return True
+
+
 def remove_empty_traces(stream, inplace=False):
     """
     Removes empty traces, traces full of zeros, and traces full of NaNs from an ObsPy Stream.

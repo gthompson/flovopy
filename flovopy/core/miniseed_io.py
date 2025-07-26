@@ -25,6 +25,7 @@ from collections import defaultdict
 from math import ceil
 from flovopy.core.trace_utils import sanitize_stream
 
+'''
 def smart_merge(stream_in, debug=False, strategy='obspy'):
     """
     Merge an ObsPy Stream in-place using a specified strategy.
@@ -111,14 +112,12 @@ def smart_merge(stream_in, debug=False, strategy='obspy'):
                       ~data_fwd.mask & ~data_rev.mask
 
             n_diff = np.count_nonzero(unequal)
-
             if n_diff > 0:
                 status = 'conflict'
                 report['instabilities'].append(trace_id)
                 report['collision_samples'][trace_id] = n_diff
-                data_fwd.mask[unequal] = True
-                if debug:
-                    print(f"⚠️  {trace_id}: {n_diff} conflict samples")
+                report['reason'] = f'{n_diff} mismatched samples in {trace_id}'
+
 
             merged_trace = fwd
             merged_trace.data = data_fwd
@@ -158,6 +157,171 @@ def smart_merge(stream_in, debug=False, strategy='obspy'):
     report['summary']['merged'] = len(merged_stream)
 
     return report
+'''
+def smart_merge(stream_in, debug=False, strategy='obspy', allow_timeshift=False, max_shift_seconds=2):
+    """
+    Merge an ObsPy Stream in-place using a specified strategy.
+
+    Parameters
+    ----------
+    stream_in : obspy.Stream
+        The input stream to merge. Will be modified in-place.
+    debug : bool, optional
+        If True, print diagnostic info during merging.
+    strategy : {'obspy', 'max'}, optional
+        Strategy to resolve overlaps:
+        - 'obspy': standard ObsPy merge + forward/reverse consistency check
+        - 'max': retain maximum absolute value at overlapping points
+    allow_timeshift : bool, optional
+        If True, attempts 0 or ±1 second shifts when conflicts occur.
+    max_shift_seconds : int, optional
+        Maximum number of integer seconds to try shifting if conflict.
+
+    Returns
+    -------
+    dict
+        Report containing merge status and any detected instabilities.
+        report['status_by_id'][trace_id] ∈ {'ok', 'conflict', 'timeshifted', 'max'}
+    """
+    if len(stream_in)>0 and stream_in[0].stats.network == 'MV':
+        allow_timeshift=True
+
+    def merge_max(substream, sr, t0, npts):
+        merged_data = np.ma.masked_all(npts, dtype=np.float32)
+        for tr in substream:
+            offset = int((tr.stats.starttime - t0) * sr)
+            end = offset + tr.stats.npts
+            incoming = np.ma.masked_invalid(tr.data)
+            existing = merged_data[offset:end]
+
+            use_new = existing.mask
+            both = ~existing.mask & ~incoming.mask
+
+            merged_data[offset:end][use_new] = incoming[use_new]
+            merged_data[offset:end][both] = np.where(
+                np.abs(incoming[both]) > np.abs(existing[both]),
+                incoming[both], existing[both]
+            )
+
+        stats = substream[0].stats.copy()
+        stats.starttime = t0
+        stats.npts = npts
+        return Trace(data=merged_data, header=stats)
+
+    report = {
+        'instabilities': [],
+        'collision_samples': {},
+        'status_by_id': {},
+        'status': 'ok',
+        'message': '',
+        'summary': {
+            'total_ids': 0,
+            'merged': 0,
+            'ok': 0,
+            'conflict': 0,
+            'duplicate': 0,
+            'empty': 0,
+            'timeshifted': 0,
+            'max': 0
+        },
+        'time_shifts': {},
+        'fallback_to_max': []
+    }
+
+    stream_by_id = defaultdict(Stream)
+    for tr in stream_in:
+        stream_by_id[tr.id].append(tr)
+    report['summary']['total_ids'] = len(stream_by_id)
+
+    merged_stream = []
+
+    for trace_id, substream in stream_by_id.items():
+        if debug:
+            print(f"- Merging {trace_id} ({len(substream)} traces)")
+
+        sanitize_stream(substream)
+
+        if len(substream) == 0:
+            report['status_by_id'][trace_id] = 'empty'
+            report['summary']['empty'] += 1
+            continue
+
+        if len(substream) == 1:
+            merged_stream.append(substream[0].copy())
+            report['status_by_id'][trace_id] = 'ok'
+            report['summary']['ok'] += 1
+            continue
+
+        sr = substream[0].stats.sampling_rate
+        t0 = min(tr.stats.starttime for tr in substream)
+        t1 = max(tr.stats.endtime for tr in substream)
+        npts = int((t1 - t0) * sr) + 1
+        status = 'ok'
+        merged_trace = None
+
+        if strategy == 'obspy':
+            def try_merge(trs):
+                return trs.merge(method=1, fill_value=np.nan)[0]
+
+            fwd = try_merge(substream)
+            rev = try_merge(Stream(substream[::-1]))
+            data_fwd = np.ma.masked_invalid(fwd.data)
+            data_rev = np.ma.masked_invalid(rev.data)
+
+            unequal = (~np.isclose(data_fwd, data_rev, rtol=1e-5, atol=1e-8)) & \
+                      ~data_fwd.mask & ~data_rev.mask
+            n_diff = np.count_nonzero(unequal)
+
+            if n_diff > 0 and allow_timeshift:
+                for shift in range(1, max_shift_seconds + 1):
+                    for sign in [-1, 1]:
+                        shifted = substream.copy()
+                        for tr in shifted:
+                            tr.stats.starttime += sign * shift
+                        fwd = try_merge(shifted)
+                        rev = try_merge(Stream(shifted[::-1]))
+                        df, dr = np.ma.masked_invalid(fwd.data), np.ma.masked_invalid(rev.data)
+                        unequal = (~np.isclose(df, dr, rtol=1e-5, atol=1e-8)) & ~df.mask & ~dr.mask
+                        n_diff = np.count_nonzero(unequal)
+                        if n_diff == 0:
+                            merged_trace = fwd
+                            merged_trace.data = df
+                            report['status_by_id'][trace_id] = 'timeshifted'
+                            report['summary']['timeshifted'] += 1
+                            report['time_shifts'][trace_id] = sign * shift
+                            break
+                    if trace_id in report['status_by_id']:
+                        break
+
+            if merged_trace is None:
+                if n_diff > 0:
+                    merged_trace = merge_max(substream, sr, t0, npts)
+                    report['status_by_id'][trace_id] = 'max'
+                    report['summary']['max'] += 1
+                    report['fallback_to_max'].append(trace_id)
+                else:
+                    merged_trace = fwd
+                    merged_trace.data = data_fwd
+                    report['status_by_id'][trace_id] = status
+                    report['summary'][status] += 1
+            else:
+                status = 'timeshifted'
+
+        elif strategy == 'max':
+            merged_trace = merge_max(substream, sr, t0, npts)
+            report['status_by_id'][trace_id] = 'ok'
+            report['summary']['ok'] += 1
+
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+
+        merged_stream.append(merged_trace)
+
+    stream_in.clear()
+    stream_in.extend(merged_stream)
+    report['summary']['merged'] = len(merged_stream)
+    return report
+
 
 def mask_gaps(trace, fill_value=0.0, inplace=True, validate_fill_value=False):
     """
@@ -325,6 +489,7 @@ def read_mseed(
     merge=True,
     starttime=None,
     endtime=None,
+    min_sampling_rate=50.0,
     max_sampling_rate=250.0,
     unmask_short_zeros=True
 ):
@@ -358,11 +523,25 @@ def read_mseed(
     Stream
         Cleaned, optionally merged/split ObsPy Stream.
     """
-    stream = read(mseedfile)
+    try:
+        stream = read(mseedfile, format='MSEED')
+    except:
+        try:
+            stream = read(mseedfile) # format unknown
+        except:
+            return Stream()
+    if len(stream)==0:
+        return Stream()
 
     # Optional trim
     if starttime or endtime:
         stream.trim(starttime=starttime, endtime=endtime)
+
+    
+    for tr in stream:
+        if tr.stats.sampling_rate < min_sampling_rate:
+            st.remove(tr)
+
 
     # Downsample to consistent rate, capped by max_sampling_rate
     downsample_stream_to_common_rate(stream, inplace=True, max_sampling_rate=max_sampling_rate)

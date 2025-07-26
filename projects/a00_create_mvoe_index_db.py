@@ -175,7 +175,7 @@ if __name__ == "__main__":
     from flovopy.config_projects import get_config
     if len(sys.argv) > 1:
         # Use argparse if there are any command-line arguments
-        parser = argparse.ArgumentParser(description="Index and convert SEISAN WAV files to MiniSEED.")
+        parser = argparse.ArgumentParser(description="Create database to index Seisan data.")
         parser.add_argument("--dbfile", required=True, help="SQLite database path")
         args = parser.parse_args()
         main(args.dbfile)

@@ -1246,6 +1246,7 @@ def fix_trace_id(trace, legacy=False, netcode=None, verbose=False):
 
     if legacy: # indicates an old VDAP/analog telemetry network where 4-character station code includes orientation
         _fix_legacy_id(trace)
+    print('initial ID', trace.id)
 
     if not trace.stats.network and netcode:
         trace.stats.network = netcode
@@ -1254,9 +1255,21 @@ def fix_trace_id(trace, legacy=False, netcode=None, verbose=False):
     current_id = trace.id
     net, sta, loc, chan = current_id.split('.')
     sampling_rate = trace.stats.sampling_rate
+    if sta[0:3]=='BHP' or sta=='TANKP' or sta=='FIREP':
+        if chan == '2000':
+            chan = 'EHZ'
+        elif chan == '2001':
+            chan = 'EH1'       
+        elif chan == '2002':
+            chan = 'EH2'   
+        net = '1R' 
+        trace.id = '.'.join([net, sta, loc, chan])
+    print('after corrections ID', trace.id)
     current_band_code = chan[0]
 
+
     # KSC network fixes
+                  
     if net=='FL' or net=='1R': # KSC
         if sta=='CARL1':
             sta = 'TANK'
