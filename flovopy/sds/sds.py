@@ -66,7 +66,7 @@ class SDSobj:
         self.metadata = metadata # for supporting a dataframe of allowable SEED ids (from same Excel spreadsheet used to generate StationXML)
 
     def read(self, startt, endt, skip_low_rate_channels=True, trace_ids=None,
-            speed=2, verbose=True, progress=False, max_sampling_rate=250.0):
+            speed=2, verbose=True, progress=False, max_sampling_rate=250.0, merge_strategy='obspy'):
         """
         Read data from the SDS archive into the internal stream.
         """
@@ -107,7 +107,7 @@ class SDSobj:
                     traces = self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
 
                     ds_stream = downsample_stream_to_common_rate(traces, max_sampling_rate=max_sampling_rate)
-                    smart_merge(ds_stream)
+                    smart_merge(ds_stream, strategy=merge_strategy)
                     st += ds_stream
 
             except Exception as e:
@@ -120,7 +120,7 @@ class SDSobj:
 
         if len(st):
             st.trim(startt, endt)
-            smart_merge(st)
+            smart_merge(st, strategy=merge_strategy)
             if verbose:
                 print(f"\nAfter final smart_merge:\n{st}")
 
@@ -128,7 +128,7 @@ class SDSobj:
         gc.collect()
         return 0 if len(st) else 1
 
-    def write(self, fill_value=0.0, debug=False):
+    def write(self, fill_value=0.0, debug=False, merge_strategy='obspy'):
         """
         Writes a Stream or Trace to the SDS archive.
 
@@ -171,7 +171,7 @@ class SDSobj:
                     # Try merging with existing file
                     existing = read_mseed(sdsfile)
                     merged = existing + Stream([tr])
-                    report = smart_merge(merged, debug=debug)
+                    report = smart_merge(merged, debug=debug, strategy=merge_strategy)
 
                     if report['status'] == 'ok' and len(merged) == 1:
                         success = write_mseed(merged[0], sdsfile, fill_value=fill_value)
@@ -280,7 +280,7 @@ class SDSobj:
         return missing_days
 
     def get_percent_availability(self, startday, endday, skip_low_rate_channels=True,
-                                trace_ids=None, speed=3, verbose=False, progress=True):
+                                trace_ids=None, speed=3, verbose=False, progress=True, merge_strategy='obspy'):
         """
         Compute data availability percentage for each trace ID per day.
 
@@ -320,7 +320,7 @@ class SDSobj:
                         if os.path.isfile(sdsfile):
                             st = read(sdsfile)
                             if len(st) > 0:
-                                report = smart_merge(st)
+                                report = smart_merge(st, strategy=merge_strategy)
                                 if len(st)==1:
                                     tr = st[0]
                                     expected = tr.stats.sampling_rate * 86400

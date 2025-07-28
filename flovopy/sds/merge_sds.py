@@ -56,7 +56,8 @@ def convert_numpy_types(obj):
         return obj
 
 
-def merge_two_sds_archives(source1_sds_dir, source2_sds_dir, dest_sds_dir, db_path="merge_tracking.sqlite", interactive=True):
+def merge_two_sds_archives(source1_sds_dir, source2_sds_dir, dest_sds_dir, 
+                           db_path="merge_tracking.sqlite", interactive=True, merge_strategy='obspy'):
     """
     Merge SDS files from source1_sds_dir into dest_sds_dir.
 
@@ -150,7 +151,7 @@ def merge_two_sds_archives(source1_sds_dir, source2_sds_dir, dest_sds_dir, db_pa
                     st1 = read_mseed(dest_file)
                     st2 = read_mseed(source_file)
                     merged = st1 + st2
-                    report = smart_merge(merged)
+                    report = smart_merge(merged, strategy=merge_strategy)
 
                     st1_summary = json.dumps(convert_numpy_types(summarize_stream(st1)))
                     st2_summary = json.dumps(convert_numpy_types(summarize_stream(st2)))
@@ -273,6 +274,7 @@ def merge_sds_archives(
     source2_sds_dir=None,
     db_path="merge_tracking.sqlite",
     interactive=True,
+    merge_strategy='obspy'
 ):
     """
     Merge one or two SDS archives into a destination directory.
@@ -317,6 +319,7 @@ def merge_sds_archives(
             dest_sds_dir=abs_dest,
             db_path=db_path,
             interactive=interactive,
+            merge_strategy=merge_strategy
         )
 
     else:
@@ -331,10 +334,11 @@ def merge_sds_archives(
             dest_sds_dir=abs_dest,
             db_path=db_path,
             interactive=interactive,
+            merge_strategy=merge_strategy
         )
 
 
-def merge_multiple_sds_archives(source_sds_dirs, dest_sds_dir, db_path="merge_tracking.sqlite"):
+def merge_multiple_sds_archives(source_sds_dirs, dest_sds_dir, db_path="merge_tracking.sqlite", merge_strategy='obspy'):
     """
     Merge multiple SDS archives into a single destination SDS directory.
 
@@ -373,6 +377,7 @@ def merge_multiple_sds_archives(source_sds_dirs, dest_sds_dir, db_path="merge_tr
                 source2_sds_dir=None,
                 db_path=db_path,
                 interactive=False,
+                merge_strategy=merge_strategy
             )
             abs_sources = []
         else:
@@ -384,6 +389,7 @@ def merge_multiple_sds_archives(source_sds_dirs, dest_sds_dir, db_path="merge_tr
                 dest_sds_dir=abs_dest,
                 db_path=db_path,
                 interactive=False,
+                merge_strategy=merge_strategy
             )
             abs_sources = abs_sources[2:]
     else:
@@ -399,6 +405,7 @@ def merge_multiple_sds_archives(source_sds_dirs, dest_sds_dir, db_path="merge_tr
             source2_sds_dir=None,
             db_path=db_path,
             interactive=False,
+            merge_strategy=merge_strategy
         )
 
     print("\n✅ All SDS archives merged successfully.")

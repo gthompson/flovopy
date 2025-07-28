@@ -2,12 +2,12 @@ import os
 import glob
 import shutil
 import multiprocessing as mp
-from flovopy.core.miniseed_io import smart_merge
+#from flovopy.core.miniseed_io import smart_merge
 import pandas as pd
 from obspy import Stream, UTCDateTime
 from flovopy.sds.sds import SDSobj #, parse_sds_filename, merge_multiple_sds_archives #is_valid_sds_dir, is_valid_sds_filename
 from flovopy.core.preprocessing import fix_trace_id
-from flovopy.core.miniseed_io import read_mseed, write_mseed
+from flovopy.core.miniseed_io import read_mseed #, write_mseed
 import traceback
 import sqlite3
 #from datetime import datetime
@@ -106,7 +106,8 @@ def write_sds_archive(
     recursive=True,
     file_glob="*.mseed",
     n_processes=1,
-    debug=False
+    debug=False,
+    merge_strategy='obspy'
 ):
     """
     Processes and reorganizes seismic waveform data from an SDS (SeisComP Data Structure) or arbitrary file list,
@@ -169,7 +170,7 @@ def write_sds_archive(
         file_chunks = [file_list[i:i + chunk_size] for i in range(0, len(file_list), chunk_size)]
 
         args = [
-            (chunk, dest_dir, networks, stations, start_date, end_date, db_path, str(i), metadata_excel_path, debug)
+            (chunk, dest_dir, networks, stations, start_date, end_date, db_path, str(i), metadata_excel_path, debug, merge_strategy)
             for i, chunk in enumerate(file_chunks)
         ]
 
@@ -279,7 +280,9 @@ def release_input_file_lock(cursor, conn, file_path):
         print(f"⚠️ Failed to release input file lock for {file_path}: {e}", flush=True)
 
 
-def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, start_date, end_date, db_path, cpu_id, metadata_excel_path=None, debug=False):
+def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, start_date, 
+                                 end_date, db_path, cpu_id, metadata_excel_path, 
+                                 debug, merge_strategy):
     print(f"{UTCDateTime()}: ✅ Started {cpu_id} with {len(file_list)} files")
     os.makedirs(sds_output_dir, exist_ok=True)
     sdsout = SDSobj(sds_output_dir)
@@ -357,7 +360,7 @@ def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, 
                     if output_locked:
                         whichsdsobj.stream.traces = [tr]
                         try:
-                            results = whichsdsobj.write(debug=debug)
+                            results = whichsdsobj.write(debug=debug, merge_strategy=merge_strategy)
                             res = results.get(tr.id, {})
                             status = res.get('status', 'failed')
                             reason = res.get('reason', 'Unknown write error')

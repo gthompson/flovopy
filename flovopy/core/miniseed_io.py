@@ -172,6 +172,7 @@ def smart_merge(stream_in, debug=False, strategy='obspy', allow_timeshift=False,
         Strategy to resolve overlaps:
         - 'obspy': standard ObsPy merge + forward/reverse consistency check
         - 'max': retain maximum absolute value at overlapping points
+        - 'both': try 'obspy' first, and if merge errors result, try 'max'
     allow_timeshift : bool, optional
         If True, attempts 0 or ±1 second shifts when conflicts occur.
     max_shift_seconds : int, optional
@@ -259,7 +260,7 @@ def smart_merge(stream_in, debug=False, strategy='obspy', allow_timeshift=False,
         status = 'ok'
         merged_trace = None
 
-        if strategy == 'obspy':
+        if strategy == 'obspy' or strategy=='both':
             def try_merge(trs):
                 return trs.merge(method=1, fill_value=np.nan)[0]
 
@@ -294,7 +295,7 @@ def smart_merge(stream_in, debug=False, strategy='obspy', allow_timeshift=False,
                         break
 
             if merged_trace is None:
-                if n_diff > 0:
+                if n_diff > 0 and strategy=='both':
                     merged_trace = merge_max(substream, sr, t0, npts)
                     report['status_by_id'][trace_id] = 'max'
                     report['summary']['max'] += 1
@@ -487,6 +488,7 @@ def read_mseed(
     min_gap_duration_s=1.0,
     split_on_mask=False,
     merge=True,
+    merge_strategy='obspy',
     starttime=None,
     endtime=None,
     min_sampling_rate=50.0,
@@ -510,6 +512,7 @@ def read_mseed(
         If True, splits the stream at masked gaps using `Stream.split()`. Overrides merge.
     merge : bool, optional
         If True, merges using `smart_merge()`. Ignored if `split_on_mask` is True.
+    merge_strategy : either 'obspy', 'max', or 'both'
     starttime : UTCDateTime, optional
         Trim start time.
     endtime : UTCDateTime, optional
@@ -540,7 +543,7 @@ def read_mseed(
     
     for tr in stream:
         if tr.stats.sampling_rate < min_sampling_rate:
-            st.remove(tr)
+            stream.remove(tr)
 
 
     # Downsample to consistent rate, capped by max_sampling_rate
@@ -557,7 +560,7 @@ def read_mseed(
         stream = stream.split()
     elif merge:
         try:
-            report = smart_merge(stream)
+            report = smart_merge(stream, strategy=merge_strategy)
         except Exception as e:
             print(f"⚠️ smart_merge failed: {e}, falling back to stream.merge()")
             stream.merge(method=1, fill_value=fill_value)
