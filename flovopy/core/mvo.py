@@ -11,6 +11,12 @@ dome_location = {'lat':16.71111, 'lon':-62.17722}
 ##########################################################################
 ####                    Montserrat Trace tools                        ####
 ##########################################################################
+def fix_trace_mvo_wrapper(trace):
+    legacy = True
+    sta = trace.stats.station
+    if (sta[0:2] == 'MB' and sta!='MBET') or sta[0:3]=='MTB' or sta[0:3]=='BLV':
+        legacy = False
+    fix_trace_mvo(trace, legacy=legacy, netcode='MV')
 
 def fix_trace_mvo(trace, legacy=False, netcode='MV'):
     fix_y2k_times_mvo(trace)

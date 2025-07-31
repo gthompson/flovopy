@@ -9,15 +9,17 @@ from flovopy.core.trace_utils import remove_empty_traces #, fix_trace_id, _can_w
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
-import shutil
-from itertools import groupby
-from operator import itemgetter
+#import shutil
+#from itertools import groupby
+#from operator import itemgetter
 from flovopy.core.miniseed_io import smart_merge, read_mseed, write_mseed, downsample_stream_to_common_rate #, unmask_gaps
 from math import ceil
 from tqdm import tqdm
 #from flovopy.core.trace_utils import ensure_float32
 import re
 import gc
+from obspy.core.inventory import Inventory
+
 
 def safe_remove(filepath):
     """Remove file if it exists."""
@@ -560,6 +562,38 @@ class SDSobj:
         return False
 
 
+
+    def load_metadata_from_stationxml(self, xml_path):
+        """
+        Populate SDSobj.metadata from a StationXML file.
+
+        Parameters
+        ----------
+        xml_path : str
+            Path to StationXML file.
+        """
+        inv = Inventory.read(xml_path, format="stationxml")
+        rows = []
+
+        for net in inv:
+            for sta in net:
+                for chan in sta:
+                    row = {
+                        "network": net.code,
+                        "station": sta.code,
+                        "location": chan.location_code,
+                        "channel": chan.code,
+                        "latitude": sta.latitude,
+                        "longitude": sta.longitude,
+                        "elevation_m": sta.elevation,
+                        "depth_m": chan.depth,
+                        "starttime": chan.start_date.isoformat() if chan.start_date else None,
+                        "endtime": chan.end_date.isoformat() if chan.end_date else None,
+                        "samplerate": chan.sample_rate
+                    }
+                    rows.append(row)
+
+        self.metadata = pd.DataFrame(rows)
 
     def build_file_list(self, return_failed_list_too=False, parameters=None, starttime=None, endtime=None):
         """

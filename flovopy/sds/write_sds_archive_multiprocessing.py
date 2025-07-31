@@ -16,7 +16,7 @@ import time
 #import threading
 import gc
 from flovopy.core.computer_health import get_cpu_temperature, pause_if_too_hot, log_cpu_temperature_to_csv, start_cpu_logger, log_memory_usage
-
+from flovopy.core.mvo import fix_trace_mvo_wrapper
 def setup_database(db_path):
     with sqlite3.connect(db_path) as conn:
         c = conn.cursor()
@@ -289,8 +289,15 @@ def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, 
     unmatcheddir = os.path.join(sds_output_dir, 'unmatched')
     sdsunmatched = SDSobj(unmatcheddir)
 
+
     if metadata_excel_path:
-        sdsout.load_metadata_from_excel(metadata_excel_path)
+        ext = os.path.splitext(metadata_excel_path)[1].lower()
+        if ext in ['.xls', '.xlsx', '.csv']:
+            sdsout.load_metadata_from_excel(metadata_excel_path)
+        elif ext in ['.xml']:
+            sdsout.load_metadata_from_stationxml(metadata_excel_path)
+        else:
+            raise ValueError(f"Unsupported metadata file extension: {ext}")
 
     conn = sqlite3.connect(db_path, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -341,7 +348,10 @@ def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, 
                     outputfile = None
                 else:
                     source_id = tr.id
-                    fix_trace_id(tr)
+                    if tr.stats.network == 'MV':
+                        fix_trace_mvo_wrapper(tr)
+                    else:
+                        fix_trace_id(tr)
                     fixed_id = tr.id
                     metadata_matched = sdsout.match_metadata(tr) if sdsout.metadata is not None else True
 
