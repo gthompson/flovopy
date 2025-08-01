@@ -1,94 +1,33 @@
 import os
 import glob
-import shutil
 import multiprocessing as mp
 import pandas as pd
-from obspy import Stream, UTCDateTime
-from flovopy.sds.sds import SDSobj #, parse_sds_filename, merge_multiple_sds_archives #is_valid_sds_dir, is_valid_sds_filename
-from flovopy.core.trace_utils import fix_trace_id
-from flovopy.core.miniseed_io import read_mseed #, write_mseed
+from obspy import UTCDateTime
+from flovopy.sds.sds import SDSobj
+from flovopy.core.trace_utils import fix_id_wrapper
+from flovopy.core.miniseed_io import read_mseed
 import traceback
 import sqlite3
 import time
 import gc
-from flovopy.core.computer_health import get_cpu_temperature, pause_if_too_hot, log_cpu_temperature_to_csv, start_cpu_logger, log_memory_usage
-from flovopy.core.mvo import fix_trace_mvo_wrapper
-
-def setup_database(db_path):
-    with sqlite3.connect(db_path) as conn:
-        c = conn.cursor()
-
-        # Log of all input files processed
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS file_log (
-            filepath TEXT PRIMARY KEY,
-            status TEXT,
-            reason TEXT,
-            ntraces_in INTEGER,
-            ntraces_out INTEGER,
-            cpu_id TEXT,
-            timestamp TEXT
-        )
-        """)
-
-        # Log of all individual traces processed
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS trace_log (
-            source_id TEXT,
-            fixed_id TEXT,      
-            trace_id TEXT,
-            filepath TEXT,
-            station TEXT,
-            sampling_rate REAL,
-            starttime TEXT,
-            endtime TEXT,
-            reason TEXT,
-            outputfile TEXT,
-            status TEXT,
-            cpu_id TEXT,
-            timestamp TEXT,
-            PRIMARY KEY (trace_id, filepath)
-        )
-        """)
-
-        # Lock table for input files (MiniSEED)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS locks (
-            filepath TEXT PRIMARY KEY,
-            locked_by TEXT,
-            locked_at TEXT
-        )
-        """)
-
-        # NEW: Lock table for SDS output file paths
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS output_locks (
-            filepath TEXT PRIMARY KEY,
-            locked_by TEXT,
-            locked_at TEXT
-        )
-        """)
-
-        conn.commit()
-
-
-def try_lock_output_file(conn, filepath, cpu_id):
-    try:
-        conn.execute("""
-            INSERT INTO output_locks (filepath, locked_by, locked_at)
-            VALUES (?, ?, datetime('now'))
-        """, (filepath, cpu_id))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-
-def release_output_file_lock_safe(conn, filepath):
-    try:
-        conn.execute("DELETE FROM output_locks WHERE filepath = ?", (filepath,))
-        conn.commit()
-    except Exception as e:
-        print(f"{UTCDateTime()}: ⚠️ Failed to release output lock for {filepath}: {e}", flush=True)
+from flovopy.core.computer_health import (
+    get_cpu_temperature,
+    pause_if_too_hot,
+    log_cpu_temperature_to_csv,
+    start_cpu_logger,
+    log_memory_usage
+)
+from flovopy.sds.sds_utils import (
+    try_lock_output_file,
+    release_output_file_lock_safe,
+    release_input_file_lock,
+    remove_stale_locks,
+    remove_empty_dirs,
+    sqlite_to_excel,
+    setup_database, 
+    populate_file_log, 
+    get_pending_file_list
+)
 
 def write_sds_archive(
     src_dir,
@@ -106,10 +45,6 @@ def write_sds_archive(
     debug=False,
     merge_strategy='obspy'
 ):
-    """
-    Processes and reorganizes seismic waveform data from an SDS (SeisComP Data Structure) or arbitrary file list,
-    writing to a shared SDS archive and logging all activity to a SQLite database.
-    """
     try:
         if os.path.abspath(src_dir) == os.path.abspath(dest_dir):
             raise ValueError("Source and destination directories must be different.")
@@ -121,6 +56,7 @@ def write_sds_archive(
 
         os.makedirs(dest_dir, exist_ok=True)
         db_path = os.path.join(dest_dir, "processing_log.sqlite")
+
         if os.path.exists(db_path):
             print(f"{UTCDateTime()}: 📂 Resuming from existing database: {db_path}")
             file_list = get_pending_file_list(db_path)
@@ -128,10 +64,7 @@ def write_sds_archive(
                 print(f"{UTCDateTime()}: ✅ No pending files left to process.")
                 return
         else:
-            # Build original file list from SDS or glob
-            setup_database(db_path)
-
-            # Build file list
+            setup_database(db_path, mode="write")
             if use_sds_structure:
                 sdsin = SDSobj(src_dir)
                 filterdict = {}
@@ -159,10 +92,8 @@ def write_sds_archive(
             populate_file_log(file_list, db_path)
             pd.DataFrame(file_list, columns=['file']).to_csv(os.path.join(dest_dir, 'original_file_list.csv'), index=False)
 
-        # Turn on a thread for periodic temperature logging
         start_cpu_logger(interval_sec=60, log_path=os.path.join(dest_dir, "cpu_temperature_log.csv"))
 
-        # Split file list for multiprocessing
         chunk_size = len(file_list) // n_processes + (len(file_list) % n_processes > 0)
         file_chunks = [file_list[i:i + chunk_size] for i in range(0, len(file_list), chunk_size)]
 
@@ -173,21 +104,19 @@ def write_sds_archive(
 
         with mp.Pool(processes=n_processes) as pool:
             pool.starmap(process_partial_file_list_db, args)
-    
+
     except Exception as e:
         traceback.print_exc()
-
     finally:
         remove_empty_dirs(dest_dir)
         sqlite_to_excel(db_path, db_path.replace('.sqlite', '.xlsx'))
 
-        # Check if all files were processed
         try:
             with sqlite3.connect(db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT COUNT(*) FROM file_log WHERE status = 'pending'")
                 pending_count = cursor.fetchone()[0]
-            
+
             if pending_count == 0:
                 print(f"{UTCDateTime()}: ✅ All files processed and logged in SQLite database: {db_path}", flush=True)
                 print("OK", flush=True)
@@ -196,63 +125,8 @@ def write_sds_archive(
 
         except Exception as e:
             print(f"{UTCDateTime()}: ❌ Could not verify processing completion: {e}", flush=True)
+
         gc.collect()
-
-def populate_file_log(file_list, db_path):
-    with sqlite3.connect(db_path) as conn:
-        c = conn.cursor()
-        now = UTCDateTime().isoformat()
-        entries = [(f, 'pending', None, None, None, None, now) for f in file_list]
-        c.executemany("""
-            INSERT OR IGNORE INTO file_log
-            (filepath, status, reason, ntraces_in, ntraces_out, cpu_id, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, entries)
-        conn.commit()
-
-def remove_empty_dirs(root_dir):
-    for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
-        # Skip the root directory itself
-        if dirpath == root_dir:
-            continue
-        if not dirnames and not filenames:
-            try:
-                os.rmdir(dirpath)
-                print(f"🧹 Removed empty directory: {dirpath}")
-            except OSError as e:
-                print(f"⚠️ Failed to remove {dirpath}: {e}")
-
-
-def get_pending_file_list(db_path):
-    import sqlite3
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute("SELECT filepath FROM file_log WHERE status IN ('pending', 'incomplete', 'failed')")
-    file_list = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return file_list
-
-
-def remove_stale_locks(cursor, conn, max_age_minutes=2):
-    """
-    Remove file locks older than `max_age_minutes` to avoid blocking on crashed workers.
-    """
-    try:
-        cutoff = UTCDateTime() - max_age_minutes * 60
-        safe_sqlite_exec(cursor, """
-            DELETE FROM locks WHERE locked_at < ?
-        """, (cutoff.strftime('%Y-%m-%d %H:%M:%S'),))
-        safe_commit(conn)
-    except Exception as e:
-        print(f"{UTCDateTime()}: ⚠️ Failed to remove stale locks: {e}", flush=True)
-
-
-def release_input_file_lock(cursor, conn, file_path):
-    try:
-        safe_sqlite_exec(cursor, "DELETE FROM locks WHERE filepath = ?", (file_path,))
-        safe_commit(conn)
-    except Exception as e:
-        print(f"⚠️ Failed to release input file lock for {file_path}: {e}", flush=True)
 
 
 def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, start_date, 
@@ -322,12 +196,7 @@ def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, 
                     reason = 'Low sample rate'
                     outputfile = None
                 else:
-                    source_id = tr.id
-                    if tr.stats.network == 'MV':
-                        fix_trace_mvo_wrapper(tr)
-                    else:
-                        fix_trace_id(tr)
-                    fixed_id = tr.id
+                    source_id, fixed_id = fix_id_wrapper(tr)
                     metadata_matched = sdsout.match_metadata(tr) if sdsout.metadata is not None else True
 
                     unmatched = False
@@ -429,4 +298,3 @@ def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, 
     gc.collect()
     log_memory_usage(f"{UTCDateTime()}: [{cpu_id}] Finished all files")
     print(f"{UTCDateTime()}: ✅ Finished {cpu_id}", flush=True)
-

@@ -9,18 +9,15 @@ from flovopy.core.trace_utils import remove_empty_traces #, fix_trace_id, _can_w
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
-#import shutil
-#from itertools import groupby
-#from operator import itemgetter
 from flovopy.core.miniseed_io import smart_merge, read_mseed, write_mseed, downsample_stream_to_common_rate #, unmask_gaps
 from math import ceil
 from tqdm import tqdm
-#from flovopy.core.trace_utils import ensure_float32
+
+from flovopy.sds.sds_utils import is_valid_sds_filename, parse_sds_filename, is_valid_sds_dir
 import re
 import gc
 import traceback
 from pathlib import Path
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from obspy.core.inventory import Inventory
 
@@ -50,31 +47,6 @@ def _compute_percent(args):
 
     return (day.date, trace_id, percent)
 
-
-
-def safe_remove(filepath):
-    """Remove file if it exists."""
-    try:
-        if os.path.isfile(filepath):
-            os.remove(filepath)
-    except Exception as e:
-        print(f"Warning: Failed to remove file {filepath}: {e}")
-
-def split_trace_at_midnight(tr):
-    """
-    Split a Trace at UTC midnight boundaries. Return list of Trace objects.
-    """
-    out = []
-    t1 = tr.stats.starttime
-    t2 = tr.stats.endtime
-
-    while t1 < t2:
-        next_midnight = UTCDateTime(t1.date) + 86400
-        trim_end = min(t2, next_midnight)
-        tr_piece = tr.copy().trim(starttime=t1, endtime=trim_end, nearest_sample=True)
-        out.append(tr_piece)
-        t1 = trim_end
-    return out
 
 class SDSobj:
     """
@@ -723,75 +695,3 @@ class SDSobj:
         else:
             return file_list
 
-
-
-
-
-def parse_sds_dirname(dir_path):
-    """
-    Parse and extract components from an SDS directory path.
-    Expected format: .../YEAR/NET/STA/CHAN.D
-
-    Returns
-    -------
-    tuple or None
-        (year, network, station, channel) if valid format, else None
-    """
-    parts = os.path.normpath(dir_path).split(os.sep)[-4:]
-    if len(parts) != 4:
-        return None
-
-    year, net, sta, chanD = parts
-
-    # Validate each component
-    if not (year.isdigit() and len(year) == 4):
-        return None
-    if not re.match(r"^[A-Z0-9]{1,8}$", net):
-        return None
-    if not re.match(r"^[A-Z0-9]{1,8}$", sta):
-        return None
-    chan_match = re.match(r"^([A-Z0-9]{3})\.D$", chanD)
-    if not chan_match:
-        return None
-
-    chan = chan_match.group(1)
-    return year, net, sta, chan
-
-def is_valid_sds_dir(dir_path):
-    """
-    Validate that a directory follows the SDS structure: YEAR/NET/STA/CHAN.D
-
-    Returns
-    -------
-    bool
-        True if valid SDS directory format, else False.
-    """
-    return parse_sds_dirname(dir_path) is not None
-
-
-def parse_sds_filename(filename):
-    """
-    Parses an SDS-style MiniSEED filename and extracts its components.
-    Assumes filenames follow: NET.STA.LOC.CHAN.TYPE.YEAR.DAY
-    Handles location code '--' properly.
-    """
-    if '/' in filename:
-        filename = os.path.basename(filename)
-    pattern = r"^([A-Z0-9]+)\.([A-Z0-9]+)\.([A-Z0-9\-]{2})\.([A-Z0-9]+)\.([A-Z])\.(\d{4})\.(\d{3})$"
-    match = re.match(pattern, filename, re.IGNORECASE)
-    if match:
-        return match.groups()
-    return None
-
-def is_valid_sds_filename(filename):
-    """
-    Validate SDS MiniSEED filename using parsing logic.
-    Accepts only files matching NET.STA.LOC.CHAN.D.YEAR.DAY format
-    with dtype == 'D' (daily MiniSEED).
-    """
-    parsed = parse_sds_filename(filename)
-    if parsed is None:
-        return False
-
-    _, _, _, _, dtype, _, _ = parsed
-    return dtype.upper() == 'D'

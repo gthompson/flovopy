@@ -3,57 +3,18 @@ import shutil
 import sqlite3
 import pandas as pd
 from obspy import UTCDateTime
-from flovopy.sds.sds import is_valid_sds_dir, is_valid_sds_filename
 from flovopy.core.miniseed_io import read_mseed, write_mseed, smart_merge
-from flovopy.core.trace_utils import streams_equal
+from flovopy.core.trace_utils import streams_equal, summarize_stream
 import json
 import numpy as np
 
-def init_merge_tracking_db(db_path):
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS merge_sessions (
-            id INTEGER PRIMARY KEY,
-            started_at TEXT,
-            ended_at TEXT,
-            source1 TEXT,
-            source2 TEXT,
-            destination TEXT,
-            resolved INTEGER,
-            unresolved INTEGER
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS merge_files (
-            id INTEGER PRIMARY KEY,
-            session_id INTEGER,
-            rel_path TEXT,
-            source_file TEXT,
-            dest_file TEXT,
-            action TEXT,
-            reason TEXT,
-            st1_metadata TEXT,
-            st2_metadata TEXT,
-            FOREIGN KEY(session_id) REFERENCES merge_sessions(id)
-        )
-    """)
-    conn.commit()
-    return conn
-
-def convert_numpy_types(obj):
-    if isinstance(obj, dict):
-        return {k: convert_numpy_types(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_numpy_types(v) for v in obj]
-    elif isinstance(obj, (np.integer, np.int64)):
-        return int(obj)
-    elif isinstance(obj, (np.floating, np.float64)):
-        return float(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    else:
-        return obj
+from sds_utils import (
+    convert_numpy_types,
+    setup_merge_tracking_db,
+    restore_backup_file,
+    is_valid_sds_dir, 
+    is_valid_sds_filename
+)
 
 
 def merge_two_sds_archives(source1_sds_dir, source2_sds_dir, dest_sds_dir, 
@@ -104,7 +65,7 @@ def merge_two_sds_archives(source1_sds_dir, source2_sds_dir, dest_sds_dir,
             print("❌ Merge cancelled by user.")
             return
 
-    conn = init_merge_tracking_db(db_path)
+    conn = setup_merge_tracking_db(db_path)
     c = conn.cursor()
     session_start = UTCDateTime().isoformat()
 
@@ -248,26 +209,6 @@ def rollback_merge_session(session_id, db_path="merge_tracking.sqlite"):
     print(f"✅ Rollback complete. Restored {rollback_count} files.")
 
 
-def summarize_stream(st):
-    summary = []
-    for tr in st:
-        stats = tr.stats
-        data = tr.data
-        summary.append({
-            "id": tr.id,
-            "starttime": str(stats.starttime),
-            "endtime": str(stats.endtime),
-            "sampling_rate": stats.sampling_rate,
-            "npts": stats.npts,
-            "min": float(np.min(data)) if len(data) else None,
-            "max": float(np.max(data)) if len(data) else None,
-            "mean": float(np.mean(data)) if len(data) else None,
-            "masked": hasattr(data, 'mask'),
-            "zero_count": int(np.sum(data == 0)) if len(data) else None,
-            "masked_count": np.ma.count_masked(data),         
-        })
-    return summary
-
 def merge_sds_archives(
     source1_sds_dir,
     dest_sds_dir,
@@ -410,12 +351,11 @@ def merge_multiple_sds_archives(source_sds_dirs, dest_sds_dir, db_path="merge_tr
 
     print("\n✅ All SDS archives merged successfully.")
 
-
-
-
-
+'''
 def copytree_without_overwrite(src, dst):
     if not os.path.exists(dst):
         shutil.copy2(src, dst)
+
+'''
 
 
