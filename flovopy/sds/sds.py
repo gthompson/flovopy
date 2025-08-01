@@ -9,9 +9,9 @@ from flovopy.core.trace_utils import remove_empty_traces #, fix_trace_id, _can_w
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
-import shutil
-from itertools import groupby
-from operator import itemgetter
+#import shutil
+#from itertools import groupby
+#from operator import itemgetter
 from flovopy.core.miniseed_io import smart_merge, read_mseed, write_mseed, downsample_stream_to_common_rate #, unmask_gaps
 from math import ceil
 from tqdm import tqdm
@@ -22,7 +22,7 @@ import traceback
 from pathlib import Path
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from obspy.core.inventory import Inventory
 
 def _compute_percent(args):
     self, trace_id, day, speed, merge_strategy, verbose = args
@@ -49,6 +49,7 @@ def _compute_percent(args):
         percent = 0
 
     return (day.date, trace_id, percent)
+
 
 
 def safe_remove(filepath):
@@ -611,6 +612,38 @@ class SDSobj:
 
 
 
+    def load_metadata_from_stationxml(self, xml_path):
+        """
+        Populate SDSobj.metadata from a StationXML file.
+
+        Parameters
+        ----------
+        xml_path : str
+            Path to StationXML file.
+        """
+        inv = Inventory.read(xml_path, format="stationxml")
+        rows = []
+
+        for net in inv:
+            for sta in net:
+                for chan in sta:
+                    row = {
+                        "network": net.code,
+                        "station": sta.code,
+                        "location": chan.location_code,
+                        "channel": chan.code,
+                        "latitude": sta.latitude,
+                        "longitude": sta.longitude,
+                        "elevation_m": sta.elevation,
+                        "depth_m": chan.depth,
+                        "starttime": chan.start_date.isoformat() if chan.start_date else None,
+                        "endtime": chan.end_date.isoformat() if chan.end_date else None,
+                        "samplerate": chan.sample_rate
+                    }
+                    rows.append(row)
+
+        self.metadata = pd.DataFrame(rows)
+
     def build_file_list(self, return_failed_list_too=False, parameters=None, starttime=None, endtime=None):
         """
         Construct a list of file paths to process.
@@ -735,19 +768,19 @@ def is_valid_sds_dir(dir_path):
     """
     return parse_sds_dirname(dir_path) is not None
 
+
 def parse_sds_filename(filename):
     """
     Parses an SDS-style MiniSEED filename and extracts its components.
     Assumes filenames follow: NET.STA.LOC.CHAN.TYPE.YEAR.DAY
+    Handles location code '--' properly.
     """
     if '/' in filename:
         filename = os.path.basename(filename)
-    pattern = r"^(\w*)\.(\w*)\.(\w*)\.(\w*)\.(\w*)\.(\d{4})\.(\d{3})"
-    match = re.match(pattern, filename)
+    pattern = r"^([A-Z0-9]+)\.([A-Z0-9]+)\.([A-Z0-9\-]{2})\.([A-Z0-9]+)\.([A-Z])\.(\d{4})\.(\d{3})$"
+    match = re.match(pattern, filename, re.IGNORECASE)
     if match:
-        network, station, location, channel, dtype, year, jday = match.groups()
-        location = location if location else "--"
-        return network, station, location, channel, dtype, year, jday
+        return match.groups()
     return None
 
 def is_valid_sds_filename(filename):
@@ -761,5 +794,4 @@ def is_valid_sds_filename(filename):
         return False
 
     _, _, _, _, dtype, _, _ = parsed
-    return dtype == 'D'
-
+    return dtype.upper() == 'D'

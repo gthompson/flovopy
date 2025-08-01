@@ -4,13 +4,20 @@ import struct
 from obspy import read, Stream, Trace
 from obspy.core.inventory import read_inventory
 
-from flovopy.core.preprocessing import fix_trace_id, remove_empty_traces, _get_band_code, _adjust_band_code_for_sensor_type, remove_empty_traces
+from flovopy.core.preprocessing import fix_trace_id,  _get_band_code, _adjust_band_code_for_sensor_type
+from flovopy.core.trace_utils import remove_empty_traces
 
 dome_location = {'lat':16.71111, 'lon':-62.17722}
 
 ##########################################################################
 ####                    Montserrat Trace tools                        ####
 ##########################################################################
+def fix_trace_mvo_wrapper(trace):
+    legacy = True
+    sta = trace.stats.station
+    if (sta[0:2] == 'MB' and sta!='MBET') or sta[0:3]=='MTB' or sta[0:3]=='BLV':
+        legacy = False
+    fix_trace_mvo(trace, legacy=legacy, netcode='MV')
 
 def fix_trace_mvo(trace, legacy=False, netcode='MV'):
     fix_y2k_times_mvo(trace)
