@@ -18,6 +18,38 @@ from tqdm import tqdm
 #from flovopy.core.trace_utils import ensure_float32
 import re
 import gc
+import traceback
+from pathlib import Path
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def _compute_percent(args):
+    self, trace_id, day, speed, merge_strategy, verbose = args
+    net, sta, loc, chan = trace_id.split('.')
+    percent = 0
+
+    try:
+        if speed < 3:
+            sdsfile = self.client._get_filename(net, sta, loc, chan, day)
+            if sdsfile and os.path.exists(sdsfile) and os.path.getsize(sdsfile) > 0:
+                st = read(sdsfile)
+                if len(st) > 0:
+                    st = smart_merge(st, strategy=merge_strategy)
+                    tr = st[0]
+                    expected = tr.stats.sampling_rate * 86400
+                    npts = np.count_nonzero(~np.isnan(tr.data)) if speed == 1 else tr.stats.npts
+                    percent = min(100.0, 100 * npts / expected) if expected > 0 else 0
+        else:
+            percent = self.client.get_availability_percentage(
+                net, sta, loc, chan, day, day + 86400)[0]
+    except Exception as e:
+        if verbose:
+            print(f"Error for {trace_id} on {day.date()}: {e}")
+        percent = 0
+
+    return (day.date, trace_id, percent)
+
 
 def safe_remove(filepath):
     """Remove file if it exists."""
@@ -216,47 +248,88 @@ class SDSobj:
         results["all_ok"] = all_ok
         return results
 
-
     def _get_nonempty_traceids(self, startday, endday=None, skip_low_rate_channels=True, speed=1):
-        """
-        Get a list of trace IDs that have data between two dates.
-
-        Parameters:
-        - startday (UTCDateTime)
-        - endday (UTCDateTime): Optional. Defaults to startday + 1 day.
-        - skip_low_rate_channels (bool)
-        - speed (int): If 1, confirm using has_data(); if >1, trust get_all_nslc().
-
-        Returns:
-        - list: Sorted list of trace IDs.
-        """
+        import datetime
         endday = endday or startday + 86400
         trace_ids = set()
         thisday = startday
 
         while thisday < endday:
+            print(thisday)
             try:
-                for net, sta, loc, chan in self.client.get_all_nslc(sds_type='D', datetime=thisday):
-                    if chan.startswith('L') and skip_low_rate_channels:
-                        continue
-                    if speed == 1:
+                # Try to get the NSLC list from the client
+                nslc_list = self.client.get_all_nslc(sds_type='D', datetime=thisday)
+            except Exception as e:
+                #print(f"Warning: get_all_nslc() failed for {thisday} with error: {e}")
+                # Fall back to manual walk if get_all_nslc() fails
+                nslc_list = self._walk_sds_for_day(thisday)
+
+            # If still no data found, just continue to next day
+            if not nslc_list:
+                print(f"No NSLC data found for {thisday}")
+                thisday += 86400
+                continue
+
+            # Process the NSLC list to filter channels and check data presence
+            for net, sta, loc, chan in nslc_list:
+                if chan.startswith('L') and skip_low_rate_channels:
+                    continue
+                if speed == 1:
+                    try:
                         if not self.client.has_data(net, sta, loc, chan):
                             continue
-                    trace_ids.add(f"{net}.{sta}.{loc}.{chan}")
-            except Exception as e:
-                print(f"Error on {thisday.date()}: {e}")
+                    except Exception as e:
+                        print(f"has_data() error for {net}.{sta}.{loc}.{chan}: {e}")
+                        continue
+                trace_ids.add(f"{net}.{sta}.{loc}.{chan}")
+
             thisday += 86400
 
         return sorted(trace_ids)
+
+
+    def _walk_sds_for_day(self, day):
+        """
+        Scan SDS directory structure manually for the given day to build NSLC list.
+        """
+        base_path = Path(self.client.sds_root)
+        year = day.strftime("%Y")
+        jday = day.strftime("%j")  # Julian day, zero-padded 3 digits
+        nslc_set = set()
+
+        year_path = base_path / year
+        if not year_path.exists():
+            print(f"Missing SDS year directory: {year_path}")
+            return []
+
+        for net_dir in year_path.iterdir():
+            if not net_dir.is_dir():
+                continue
+            for sta_dir in net_dir.iterdir():
+                if not sta_dir.is_dir():
+                    continue
+                for chan_dir in sta_dir.iterdir():
+                    if not chan_dir.is_dir() or not chan_dir.name.endswith(".D"):
+                        continue
+                    chan = chan_dir.name[:-2]  # Remove trailing '.D'
+                    # Look for files matching pattern *.D.YEAR.JDAY
+                    for file in chan_dir.glob(f"*.D.{year}.{jday}"):
+                        parts = file.name.split(".")
+                        if len(parts) >= 4:
+                            n, s, l, c = parts[:4]
+                            nslc_set.add((n, s, l, c))
+
+        return sorted(nslc_set)
+
 
     def find_missing_days(self, stime, etime, net, sta=None):
         """
         Return list of days with no data for a given network (or station).
 
         Parameters:
-        - stime, etime (UTCDateTime): Start and end time range.
+        - stime, etime (UTCDateTime): Time range.
         - net (str): Network code.
-        - sta (str): Optional station code. If None, checks any station in net.
+        - sta (str): Optional station code. If None, checks all stations.
 
         Returns:
         - list of UTCDateTime: Days with no matching files.
@@ -270,7 +343,7 @@ class SDSobj:
             station_glob = sta or '*'
             pattern = os.path.join(
                 self.basedir, year, net, station_glob, '*.D',
-                f"{net}*.{year}.{jday}"
+                f"{net}.{station_glob}.*.*.{year}.{jday}"
             )
             existingfiles = glob.glob(pattern)
             if not existingfiles:
@@ -279,68 +352,45 @@ class SDSobj:
 
         return missing_days
 
+
     def get_percent_availability(self, startday, endday, skip_low_rate_channels=True,
-                                trace_ids=None, speed=3, verbose=False, progress=True, merge_strategy='obspy'):
+                                trace_ids=None, speed=3, verbose=False,
+                                progress=True, merge_strategy='obspy', max_workers=8):
         """
-        Compute data availability percentage for each trace ID per day.
-
-        Parameters:
-        - startday, endday (UTCDateTime): Date range.
-        - skip_low_rate_channels (bool): Skip L-prefixed channels.
-        - trace_ids (list): Optional list of SEED IDs.
-        - speed (int): Mode (1 = count non-NaN, 2 = use .npts, 3 = SDS client).
-        - verbose (bool): Print errors.
-        - progress (bool): Show progress bar.
-
-        Returns:
-        - (DataFrame, list): Availability DataFrame and SEED IDs.
+        Compute data availability percentage for each trace ID per day using parallel processing.
         """
-        from tqdm import tqdm
-        import pandas as pd
 
-        trace_ids = trace_ids or self._get_nonempty_traceids(startday, endday, skip_low_rate_channels, speed=speed)
-        lod = []
 
-        day_list = []
+        trace_ids = trace_ids or self._get_nonempty_traceids(startday, endday,
+                                                            skip_low_rate_channels,
+                                                            speed=speed)
+
+        # Create list of (day, trace_id) tasks
+        days = []
         t = startday
         while t < endday:
-            day_list.append(t)
+            days.append(t)
             t += 86400
 
-        day_iter = tqdm(day_list, desc="Computing availability") if progress else day_list
+        tasks = [(self, tid, day, speed, merge_strategy, verbose)
+                for day in days for tid in trace_ids]
 
-        for thisday in day_iter:
-            row = {'date': thisday.date()}
-            for trace_id in trace_ids:
-                net, sta, loc, chan = trace_id.split('.')
-                percent = 0
-                try:
-                    if speed < 3:
-                        sdsfile = self.client._get_filename(net, sta, loc, chan, thisday)
-                        if os.path.isfile(sdsfile):
-                            st = read(sdsfile)
-                            if len(st) > 0:
-                                report = smart_merge(st, strategy=merge_strategy)
-                                if len(st)==1:
-                                    tr = st[0]
-                                    expected = tr.stats.sampling_rate * 86400
-                                    npts = np.count_nonzero(~np.isnan(tr.data)) if speed == 1 else tr.stats.npts
-                                    percent = min(100.0, 100 * npts / expected) if expected > 0 else 0
-                                else:
-                                    percent = np.nan
-                    else:
-                        percent = self.client.get_availability_percentage(net, sta, loc, chan,
-                                                                        thisday, thisday + 86400)[0]
-                except Exception as e:
-                    if verbose:
-                        print(f"Error for {trace_id} on {thisday.date()}: {e}")
-                    percent = 0
-                row[trace_id] = percent
-            lod.append(row)
+        results = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = list(executor.map(_compute_percent, tasks))
+            if progress:
+                futures = tqdm(futures, total=len(tasks), desc="Availability")
 
-        df = pd.DataFrame(lod)
-        df['date'] = pd.to_datetime(df['date'])
+            for result in futures:
+                results.append(result)
+
+        # Convert to DataFrame
+        df = pd.DataFrame(results, columns=["date", "trace_id", "percent"])
+        df = df.pivot(index="date", columns="trace_id", values="percent").reset_index()
+        df["date"] = pd.to_datetime(df["date"])
+
         return df, trace_ids
+
 
     def plot_availability(self, availabilityDF, outfile=None, figsize=(12, 8), fontsize=10, labels=None, cmap='viridis'):
         """

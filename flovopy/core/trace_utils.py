@@ -47,7 +47,7 @@ def ensure_masked(trace: Trace) -> None:
         trace.data = np.ma.masked_array(trace.data, mask=False)
 
 
-def trace_equals(trace1: Trace, trace2: Trace, rtol=1e-5, atol=1e-8, sanitize=True) -> bool:
+def trace_equals(trace1: Trace, trace2: Trace, rtol=1e-5, atol=1e-8, sanitize=True, verbose=False) -> bool:
     """
     Compare two ObsPy Trace objects for equality, ignoring gaps and zeros.
 
@@ -81,6 +81,8 @@ def trace_equals(trace1: Trace, trace2: Trace, rtol=1e-5, atol=1e-8, sanitize=Tr
         sanitize_trace(t2)
 
     if len(t1.data) != len(t2.data):
+        if verbose:
+            print(f'different lengths {len(tr.data)}, {len(tr.data)}')
         return False
 
     return np.allclose(
@@ -94,7 +96,7 @@ def trace_equals(trace1: Trace, trace2: Trace, rtol=1e-5, atol=1e-8, sanitize=Tr
 #from obspy import Stream, Trace
 #from typing import Union
 
-def streams_equal(stream1: Stream, stream2: Stream, rtol=1e-5, atol=1e-8, sanitize=True, sort=True) -> bool:
+def streams_equal(stream1: Stream, stream2: Stream, rtol=1e-5, atol=1e-8, sanitize=True, sort=True, verbose=False) -> bool:
     """
     Compare two ObsPy Stream objects for equality.
 
@@ -119,18 +121,23 @@ def streams_equal(stream1: Stream, stream2: Stream, rtol=1e-5, atol=1e-8, saniti
         True if all traces in both streams are equal, False otherwise.
     """
     if len(stream1) != len(stream2):
+        if verbose:
+            print(f'Different number of traces {len(stream1)}, {len(stream2)}')
         return False
 
     s1 = stream1.copy()
     s2 = stream2.copy()
 
     if sort:
-        s1.sort(keys=['id', 'starttime'])
-        s2.sort(keys=['id', 'starttime'])
+        s1.sort()
+        s2.sort()
 
     for tr1, tr2 in zip(s1, s2):
-        if not trace_equals(tr1, tr2, rtol=rtol, atol=atol, sanitize=sanitize):
-            return False
+        if not trace_equals(tr1, tr2, rtol=rtol, atol=atol, sanitize=sanitize, verbose=verbose):
+            if verbose:
+                trace_diff(tr1, tr2)
+            else:
+                return False
 
     return True
 
@@ -318,3 +325,182 @@ def sanitize_stream(stream, drop_empty=True, drop_duplicates=True, **kwargs):
                 deduped.append(tr)
         stream.clear()
         stream.extend(deduped)
+
+
+def trace_diff(tr1, tr2):
+
+    a = tr1.data
+    b = tr2.data
+
+    if len(a) != len(b):
+        if abs(len(a)-len(b))==1:
+            if len(a)>len(b):
+                if a[0]==b[0]:
+                    a = a[:len(b)]
+                else:
+                    a = a[1:]
+                print('trace1 has 1 extra sample') 
+            else:
+                if a[0]==b[0]:
+                    b = b[:len(a)]
+                else:
+                    b = b[1:]  
+                print('trace2 has 1 extra sample')              
+
+    # Create a mask of differences
+    #diff_mask = a != b
+    diff_mask = ~(np.isclose(a, b, equal_nan=True))
+
+
+    # Show indices where they differ
+    diff_indices = np.where(diff_mask)[0]
+    L = len(diff_indices)
+    if L>0:
+        if L<100:
+            print(f"{L} different indices: {diff_indices}")
+
+
+            # Show values that differ
+            print("a:", a[diff_mask])
+            print("b:", b[diff_mask])
+        else:
+            print(f"{L} different indices")
+
+
+def trace_equals(trace1: Trace, trace2: Trace, rtol=1e-5, atol=1e-8,
+                 sanitize=True, verbose=False) -> bool:
+    """
+    Compare two ObsPy Trace objects for equality, with extra handling for small mismatches.
+
+    Parameters
+    ----------
+    trace1 : Trace
+    trace2 : Trace
+    rtol : float : Relative tolerance for np.isclose
+    atol : float : Absolute tolerance for np.isclose
+    sanitize : bool : Whether to apply sanitize_trace() to both traces
+    verbose : bool : Print detailed differences if found
+
+    Returns
+    -------
+    bool : True if equal (including 1-sample tolerance), False otherwise
+    """
+    if trace1.id != trace2.id:
+        if verbose:
+            print(f"ID mismatch: {trace1.id} != {trace2.id}")
+            print(trace1, trace2)
+        return False
+
+
+
+    t1 = trace1.copy()
+    t2 = trace2.copy()
+    if sanitize:
+        sanitize_trace(t1)
+        sanitize_trace(t2)
+
+    if abs(t1.stats.starttime - t2.stats.starttime) > t1.stats.delta / 4:
+        if verbose:
+            print("Start time mismatch.")
+            print(t1, t2)
+        return False
+
+    if t1.stats.sampling_rate != t2.stats.sampling_rate:
+        if verbose:
+            print("Sampling rate mismatch.")
+            print(t1, t2)
+        return False
+
+    a = t1.data.filled(np.nan) if hasattr(t1.data, 'filled') else t1.data
+    b = t2.data.filled(np.nan) if hasattr(t2.data, 'filled') else t2.data
+
+    len_diff = len(a) - len(b)
+    if len_diff == 0:
+        if np.allclose(a, b, rtol=rtol, atol=atol, equal_nan=True):
+            return True
+    elif abs(len_diff) == 1:
+        # Attempt to align and compare if only one sample is different
+        if len_diff == 1:
+            a_trim = a[:len(b)]
+            if np.allclose(a_trim, b, rtol=rtol, atol=atol, equal_nan=True):
+                if verbose:
+                    print("Trace1 has 1 extra sample (tail trimmed).")
+                return True
+            a_trim = a[1:]
+            if np.allclose(a_trim, b, rtol=rtol, atol=atol, equal_nan=True):
+                if verbose:
+                    print("Trace1 has 1 extra sample (head trimmed).")
+                return True
+        else:
+            b_trim = b[:len(a)]
+            if np.allclose(a, b_trim, rtol=rtol, atol=atol, equal_nan=True):
+                if verbose:
+                    print("Trace2 has 1 extra sample (tail trimmed).")
+                return True
+            b_trim = b[1:]
+            if np.allclose(a, b_trim, rtol=rtol, atol=atol, equal_nan=True):
+                if verbose:
+                    print("Trace2 has 1 extra sample (head trimmed).")
+                return True
+
+    if verbose:
+        print(f"Length mismatch or content differs: {len(a)} vs {len(b)}")
+        # Compute differences
+        min_len = min(len(a), len(b))
+        diff_mask = ~np.isclose(a[:min_len], b[:min_len], rtol=rtol, atol=atol, equal_nan=True)
+        diff_indices = np.where(diff_mask)[0]
+        L = len(diff_indices)
+        print(f"{L} differing sample(s).")
+        if L > 0:
+            if L < 100:
+                print(f"Different indices: {diff_indices}")
+                print("a:", a[diff_mask])
+                print("b:", b[diff_mask])
+            else:
+                print(f"Too many differing samples to display ({L})")
+
+    return False
+
+
+
+def streams_equal(stream1: Stream, stream2: Stream, rtol=1e-5, atol=1e-8,
+                  sanitize=True, sort=True, verbose=False) -> bool:
+    """
+    Compare two ObsPy Stream objects for equality.
+
+    Parameters
+    ----------
+    stream1 : Stream
+    stream2 : Stream
+    rtol : float : Relative tolerance for floating-point comparison
+    atol : float : Absolute tolerance for floating-point comparison
+    sanitize : bool : Sanitize traces before comparison
+    sort : bool : Sort streams by trace ID before comparing
+    verbose : bool : Print differences if found
+
+    Returns
+    -------
+    bool : True if all traces match, False otherwise
+    """
+    if len(stream1) != len(stream2):
+        if verbose:
+            print(f"Stream length mismatch: {len(stream1)} != {len(stream2)}")
+        return False
+
+    s1 = stream1.copy()
+    s2 = stream2.copy()
+
+    if sort:
+        s1.sort()
+        s2.sort()
+
+    all_equal = True
+
+    for tr1, tr2 in zip(s1, s2):
+        if not trace_equals(tr1, tr2, rtol=rtol, atol=atol, sanitize=sanitize, verbose=verbose):
+            all_equal = False
+            if not verbose:
+                break  # stop early only if not in verbose mode
+
+    return all_equal
+
