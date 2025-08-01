@@ -719,19 +719,19 @@ def is_valid_sds_dir(dir_path):
     """
     return parse_sds_dirname(dir_path) is not None
 
+
 def parse_sds_filename(filename):
     """
     Parses an SDS-style MiniSEED filename and extracts its components.
     Assumes filenames follow: NET.STA.LOC.CHAN.TYPE.YEAR.DAY
+    Handles location code '--' properly.
     """
     if '/' in filename:
         filename = os.path.basename(filename)
-    pattern = r"^(\w*)\.(\w*)\.(\w*)\.(\w*)\.(\w*)\.(\d{4})\.(\d{3})"
-    match = re.match(pattern, filename)
+    pattern = r"^([A-Z0-9]+)\.([A-Z0-9]+)\.([A-Z0-9\-]{2})\.([A-Z0-9]+)\.([A-Z])\.(\d{4})\.(\d{3})$"
+    match = re.match(pattern, filename, re.IGNORECASE)
     if match:
-        network, station, location, channel, dtype, year, jday = match.groups()
-        location = location if location else "--"
-        return network, station, location, channel, dtype, year, jday
+        return match.groups()
     return None
 
 def is_valid_sds_filename(filename):
@@ -745,5 +745,4 @@ def is_valid_sds_filename(filename):
         return False
 
     _, _, _, _, dtype, _, _ = parsed
-    return dtype == 'D'
-
+    return dtype.upper() == 'D'

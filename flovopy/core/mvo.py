@@ -4,7 +4,8 @@ import struct
 from obspy import read, Stream, Trace
 from obspy.core.inventory import read_inventory
 
-from flovopy.core.preprocessing import fix_trace_id, remove_empty_traces, _get_band_code, _adjust_band_code_for_sensor_type, remove_empty_traces
+from flovopy.core.preprocessing import fix_trace_id,  _get_band_code, _adjust_band_code_for_sensor_type
+from flovopy.core.trace_utils import remove_empty_traces
 
 dome_location = {'lat':16.71111, 'lon':-62.17722}
 

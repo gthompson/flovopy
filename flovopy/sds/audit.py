@@ -23,18 +23,22 @@ def audit_trace_ids_in_sds(sds_root, output_csv="trace_id_audit.csv", verbose=Tr
         DataFrame of audit results.
     """
     audit_records = []
-
+    print(f'Auditing {sds_root}')
     for root, dirs, files in os.walk(sds_root):
+        if len(files)>0:
+            print(f'{root}: files={len(files)}')
         for fname in files:
-            if not fname.endswith(".D"):
-                continue
+
 
             full_path = os.path.join(root, fname)
-            if not is_valid_sds_filename(full_path):
+            if not is_valid_sds_filename(os.path.basename(full_path)):
+                print(f'{full_path} not a valid sds filename')
                 continue
 
             try:
-                st = read(full_path, headonly=True)
+                print(f'Reading {full_path}')
+                st = read(full_path, headonly=True, format='MSEED')
+                print(st)
             except Exception as e:
                 if verbose:
                     print(f"⚠️ Failed to read {full_path}: {e}")
