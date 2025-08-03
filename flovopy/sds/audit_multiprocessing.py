@@ -256,7 +256,7 @@ def cli():
     export_grouped_summary(df, output_csv=args.excel.replace('.xlsx', '_summary.csv'))
     compute_contiguous_ranges(
         df,
-        output_csv=args.excel.replace('.xlsx', '_ranges.csv')
+        output_csv=args.excel.replace('.xlsx', '_ranges.csv'),
         gap_threshold=1.0,
         rate_tolerance=1.0
     )
