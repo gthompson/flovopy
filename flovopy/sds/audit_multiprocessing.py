@@ -41,6 +41,7 @@ def process_files(file_chunk, db_path, cpu_id, speed):
     start_time = UTCDateTime()
     commit_interval = 10  # or 100
     commit_counter = 0
+    print(f'Processing {total} files')
     for i, filepath in enumerate(file_chunk):
         try:
             safe_sqlite_exec(cursor, "SELECT status FROM file_log WHERE filepath = ?", (filepath,))
@@ -67,7 +68,7 @@ def process_files(file_chunk, db_path, cpu_id, speed):
                     orig_id = f"{net}.{sta}.{loc}.{chan}"
                     orig_start = UTCDateTime(f"{yyyy}-01-01T00:00:00")+ (int(jjj) - 1) * 86400
                     orig_end = orig_start + 86400 - 1/2000
-                    write_trace_metadata(cursor, filepath, orig_id, orig_start, orig_end, 0, 0, orig_id)
+                    write_trace_metadata(cursor, filepath, orig_id, orig_start.isoformat(), orig_end.isoformat(), 0, 0.0, "")
                 except Exception as e:
                     print(f"⚠️ Failed to parse SDS filename {filepath}: {e}")
                     continue
@@ -106,6 +107,7 @@ def process_files(file_chunk, db_path, cpu_id, speed):
 def run_audit(sds_root, db_path, n_processes=6, use_sds=True, filterdict=None, starttime=None, endtime=None, speed=1):
     setup_database(db_path, mode="audit")
     file_list = discover_files(sds_root, use_sds=use_sds, filterdict=filterdict, starttime=starttime, endtime=endtime)
+    print(f'Found {len(file_list)} files at {sds_root}')
     populate_file_log(file_list, db_path, mode="audit")
 
     start_cpu_logger(interval_sec=60, log_path="cpu_temperature_log.csv")
