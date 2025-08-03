@@ -106,15 +106,24 @@ def setup_database(db_path, mode="write"):
 
         conn.commit()
 
-def populate_file_log(file_list, db_path):
+def populate_file_log(file_list, db_path, mode="write"):
     with sqlite3.connect(db_path) as conn:
         c = conn.cursor()
         now = UTCDateTime().isoformat()
-        entries = [(f, 'pending', None, None, None, None, now) for f in file_list]
-        c.executemany("""
-            INSERT OR IGNORE INTO file_log
-            (filepath, status, reason, ntraces_in, ntraces_out, cpu_id, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""", entries)
+
+        if mode == "audit":
+            entries = [(f, 'pending', None, now) for f in file_list]
+            c.executemany("""
+                INSERT OR IGNORE INTO file_log
+                (filepath, status, reason, timestamp)
+                VALUES (?, ?, ?, ?)""", entries)
+        else:
+            entries = [(f, 'pending', None, None, None, None, now) for f in file_list]
+            c.executemany("""
+                INSERT OR IGNORE INTO file_log
+                (filepath, status, reason, ntraces_in, ntraces_out, cpu_id, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""", entries)
+
         conn.commit()
 
 
