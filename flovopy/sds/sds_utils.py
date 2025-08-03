@@ -15,6 +15,7 @@ import os
 import sqlite3
 import pandas as pd
 from obspy import UTCDateTime
+import re
 
 def setup_database(db_path, mode="write"):
     """
