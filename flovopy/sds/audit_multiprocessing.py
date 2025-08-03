@@ -23,6 +23,7 @@ from sds_utils import (
     safe_commit,
     safe_sqlite_exec
 )
+import atexit
 
 def write_trace_metadata(cursor, filepath, orig_id, orig_start, orig_end, npts, orig_sr, fixed_id):
     """
@@ -45,8 +46,10 @@ def process_files(file_chunk, db_path, cpu_id, speed):
     for i, filepath in enumerate(file_chunk):
         try:
             safe_sqlite_exec(cursor, "SELECT status FROM file_log WHERE filepath = ?", (filepath,))
-            if cursor.fetchone()[0] != 'pending':
+            row = cursor.fetchone()
+            if not row or row[0] != 'pending':
                 continue
+
 
             orig_id = orig_start = orig_end = fixed_id = orig_sr = npts = None
 
@@ -96,7 +99,7 @@ def process_files(file_chunk, db_path, cpu_id, speed):
             print_progress(cpu_id, i + 1, total, start_time)
             log_memory_usage(f"[{cpu_id}] Memory after {i+1} files")
             temp = get_cpu_temperature()
-            if temp:
+            if temp is not None:
                 print(f"[{cpu_id}] CPU Temperature: {temp:.1f}°C")
 
     # Final commit
@@ -131,6 +134,104 @@ def summarize_audit(db_path):
         print(f"  ✅ Completed: {done}")
         print(f"  ❌ Failed:    {failed}")
 
+def load_trace_metadata(db_path):
+    with sqlite3.connect(db_path) as conn:
+        return pd.read_sql("SELECT * FROM trace_metadata", conn, parse_dates=["starttime", "endtime"])
+
+
+
+def export_grouped_summary(df, output_csv="trace_id_mapping_summary.csv"):
+    """
+    Export a grouped summary showing how each original_id maps to one or more fixed_id values.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        The audit DataFrame with columns: original_id, fixed_id, sampling_rate
+    output_csv : str
+        Path to the CSV file to write.
+    """
+    summary = (
+        df.groupby("original_id")
+        .agg(
+            fixed_ids=("fixed_id", lambda x: sorted(set(x))),
+            num_fixed_ids=("fixed_id", lambda x: len(set(x))),
+            sampling_rates=("sampling_rate", lambda x: sorted(set(x)))
+        )
+        .reset_index()
+    )
+
+    # Convert list columns to strings
+    summary["fixed_ids"] = summary["fixed_ids"].apply(lambda x: ", ".join(x))
+    summary["sampling_rates"] = summary["sampling_rates"].apply(lambda x: ", ".join(str(s) for s in x))
+
+    summary.to_csv(output_csv, index=False)
+    print(f"📄 Grouped summary saved to {output_csv}. Total unique original_ids: {len(summary)}")
+
+
+def compute_contiguous_ranges(df, output_csv="trace_segment_ranges.csv", gap_threshold=1.0, rate_tolerance=1.0):
+    """
+    Compute contiguous time ranges for each trace ID, with autosave protection.
+    """
+    from datetime import datetime
+    records = []
+    partial_csv = output_csv + ".partial"
+
+    def autosave():
+        if records:
+            pd.DataFrame(records).to_csv(partial_csv, index=False)
+            print(f"🛟 Autosaved contiguous ranges to {partial_csv} (may be partial)")
+    atexit.register(autosave)
+
+    for i, (trace_id, group) in enumerate(df.groupby("fixed_id")):
+        group = group.sort_values(by="starttime")
+        segment_start = group.iloc[0]["starttime"]
+        segment_end = group.iloc[0]["endtime"]
+        segment_sr = group.iloc[0]["sampling_rate"]
+        total_npts = group.iloc[0]["npts"]
+
+        for j in range(1, len(group)):
+            row = group.iloc[j]
+            gap = (pd.to_datetime(row["starttime"]) - pd.to_datetime(segment_end)).total_seconds()
+            sr_diff = abs(row["sampling_rate"] - segment_sr)
+
+            if gap > gap_threshold or sr_diff > rate_tolerance:
+                records.append({
+                    "fixed_id": trace_id,
+                    "segment_start": segment_start,
+                    "segment_end": segment_end,
+                    "total_npts": total_npts,
+                    "sampling_rate": segment_sr
+                })
+                segment_start = row["starttime"]
+                total_npts = 0
+                if row['sampling_rate'] is not None:
+                    segment_sr = row["sampling_rate"]
+                else:
+                    segment_sr = 0
+
+            segment_end = max(segment_end, row["endtime"])
+            total_npts += row["npts"]
+
+        records.append({
+            "fixed_id": trace_id,
+            "segment_start": segment_start,
+            "segment_end": segment_end,
+            "total_npts": total_npts,
+            "sampling_rate": segment_sr
+        })
+
+        if i % 100 == 0 and records:
+            pd.DataFrame(records).to_csv(partial_csv, index=False)
+            print(f"💾 Wrote partial ranges after {i} trace IDs")
+
+    out_df = pd.DataFrame(records)
+    out_df.to_csv(output_csv, index=False)
+    print(f"📄 Contiguous ranges saved to {output_csv}. Total rows: {len(out_df)}")
+
+    if os.path.exists(partial_csv):
+        os.remove(partial_csv)
+
 def cli():
     import argparse
     parser = argparse.ArgumentParser(description="Audit SDS trace IDs using SQLite + multiprocessing")
@@ -146,14 +247,24 @@ def cli():
 
     start = UTCDateTime(args.start) if args.start else None
     end = UTCDateTime(args.end) if args.end else None
-
+    print(f"📁 Auditing SDS at: {args.sds_root}")
+    print(f"🧠 Using {args.nproc} processes | Speed mode: {args.speed}")
     run_audit(args.sds_root, args.db, n_processes=args.nproc, use_sds=not args.nosds, starttime=start, endtime=end, speed=args.speed)
     summarize_audit(args.db)
     sqlite_to_excel(args.db, args.excel)
+    df = load_trace_metadata(args.db)
+    export_grouped_summary(df, output_csv=args.excel.replace('.xlsx', '_summary.csv'))
+    compute_contiguous_ranges(
+        df,
+        output_csv=args.excel.replace('.xlsx', '_ranges.csv')
+        gap_threshold=1.0,
+        rate_tolerance=1.0
+    )
     print(f"✅ Done. Results in {args.db} and {args.excel}")
 
 if __name__ == '__main__':
     cli()
 
-
+# python Developer/flovopy_test/flovopy/sds/audit_multiprocessing.py /raid/newhome/thompsong/work/PROJECTS/MASTERING/seed/DSNC_SDS_from_Silvio_wrong_sampling_rate --db audit2.sqlite --excel audit2.xlsx --nproc 6 --speed 2 --start 1900-01-01 --end 2024-12-31 --nosds
 # python audit_mulitprocessing.py /data/SDS_Montserrat --db audit.sqlite --excel audit.xlsx --nproc 6 --start 2020-01-01 --end 2020-12-31
+# python audit_multiprocessing.py /data/SDS --db audit.sqlite --excel audit.xlsx --nproc 6 --start 2020-01-01 --end 2020-12-31 --speed 1
