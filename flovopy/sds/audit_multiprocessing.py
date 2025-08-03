@@ -106,7 +106,7 @@ def process_files(file_chunk, db_path, cpu_id, speed):
 def run_audit(sds_root, db_path, n_processes=6, use_sds=True, filterdict=None, starttime=None, endtime=None, speed=1):
     setup_database(db_path, mode="audit")
     file_list = discover_files(sds_root, use_sds=use_sds, filterdict=filterdict, starttime=starttime, endtime=endtime)
-    populate_file_log(file_list, db_path)
+    populate_file_log(file_list, db_path, mode="audit")
 
     start_cpu_logger(interval_sec=60, log_path="cpu_temperature_log.csv")
 
