@@ -15,6 +15,8 @@ import os
 import sqlite3
 import pandas as pd
 from obspy import UTCDateTime
+import re
+
 
 def setup_database(db_path, mode="write"):
     """
@@ -105,15 +107,24 @@ def setup_database(db_path, mode="write"):
 
         conn.commit()
 
-def populate_file_log(file_list, db_path):
+def populate_file_log(file_list, db_path, mode="write"):
     with sqlite3.connect(db_path) as conn:
         c = conn.cursor()
         now = UTCDateTime().isoformat()
-        entries = [(f, 'pending', None, None, None, None, now) for f in file_list]
-        c.executemany("""
-            INSERT OR IGNORE INTO file_log
-            (filepath, status, reason, ntraces_in, ntraces_out, cpu_id, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""", entries)
+
+        if mode == "audit":
+            entries = [(f, 'pending', None, now) for f in file_list]
+            c.executemany("""
+                INSERT OR IGNORE INTO file_log
+                (filepath, status, reason, timestamp)
+                VALUES (?, ?, ?, ?)""", entries)
+        else:
+            entries = [(f, 'pending', None, None, None, None, now) for f in file_list]
+            c.executemany("""
+                INSERT OR IGNORE INTO file_log
+                (filepath, status, reason, ntraces_in, ntraces_out, cpu_id, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""", entries)
+
         conn.commit()
 
 
@@ -186,9 +197,11 @@ def release_input_file_lock(cursor, conn, file_path):
 
 
 def discover_files(sds_root, use_sds=True, filterdict=None, starttime=None, endtime=None):
-    from flovopy.sds.sds import SDSobj, is_valid_sds_filename
+
 
     if use_sds:
+        print('using SDSobj to find files')
+        from flovopy.sds.sds import SDSobj
         sdsin = SDSobj(sds_root)
         file_list, failed_list = sdsin.build_file_list(
             return_failed_list_too=True,
@@ -200,11 +213,13 @@ def discover_files(sds_root, use_sds=True, filterdict=None, starttime=None, endt
             pd.DataFrame(failed_list, columns=['filepath']).to_csv("invalid_sds_files.csv", index=False)
         return file_list
     else:
+        print('not using SDSobj to find files')
         file_list = []
         for root, dirs, files in os.walk(sds_root):
             dirs.sort()
             files.sort()
             for fname in files:
+                print(fname)
                 full_path = os.path.join(root, fname)
                 if is_valid_sds_filename(fname):
                     file_list.append(full_path)
@@ -296,18 +311,34 @@ def is_valid_sds_dir(dir_path):
     return parse_sds_dirname(dir_path) is not None
 
 
-def parse_sds_filename(filename):
+def parse_sds_filename(filename, normalize_empty_loc=True):
     """
     Parses an SDS-style MiniSEED filename and extracts its components.
-    Assumes filenames follow: NET.STA.LOC.CHAN.TYPE.YEAR.DAY
-    Handles location code '--' properly.
+    Supports location codes of 0–2 characters.
+    Normalizes empty location codes ('') to '--' if normalize_empty_loc is True.
+    
+    Parameters
+    ----------
+    filename : str
+        Filename to parse (can be a full path).
+    normalize_empty_loc : bool
+        If True, replaces empty location codes ('') with '--'.
+        
+    Returns
+    -------
+    tuple or None
+        (network, station, location, channel, type, year, day), or None if no match.
     """
     if '/' in filename:
         filename = os.path.basename(filename)
-    pattern = r"^([A-Z0-9]+)\.([A-Z0-9]+)\.([A-Z0-9\-]{2})\.([A-Z0-9]+)\.([A-Z])\.(\d{4})\.(\d{3})$"
+
+    pattern = r"^([A-Z0-9]+)\.([A-Z0-9]+)\.([A-Z0-9\-]{0,2})\.([A-Z0-9]+)\.([A-Z])\.(\d{4})\.(\d{3})$"
     match = re.match(pattern, filename, re.IGNORECASE)
     if match:
-        return match.groups()
+        groups = list(match.groups())
+        if normalize_empty_loc and groups[2] == '':
+            groups[2] = '--'
+        return tuple(groups)
     return None
 
 def is_valid_sds_filename(filename):
