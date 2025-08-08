@@ -818,20 +818,23 @@ def fix_trace_id(trace, legacy=False, netcode=None, verbose=False):
     sampling_rate = trace.stats.sampling_rate
 
     # Route to specialized network fixers
+
+        
     if not net or net in ['FL', '1R']:
         fix_KSC_id(trace)
     elif net == 'MV':
+        print(f'Fixing MV trace ID: {trace.id}')
         fix_trace_mvo(trace)
+        print(f'Fixed MV trace ID: {trace.id}')
+        
     else:
         # Apply band code fix unless this is an analog QC channel (e.g., starts with 'A')
         chan = trace.stats.channel or ''
         if chan and not chan.startswith('A'):
             trace.stats.channel = fix_channel_code(chan, sampling_rate)
 
-    # Ensure location code is 0 or 2 characters
-    loc = trace.stats.location or ''
-    if len(loc) == 1:
-        trace.stats.location = loc.zfill(2)
+        # Ensure location code is 0 or 2 characters
+        trace.stats.location = fix_location_code(trace.stats.location)
 
     # Final ID check
     if trace.id != current_id:
@@ -841,8 +844,25 @@ def fix_trace_id(trace, legacy=False, netcode=None, verbose=False):
 
     return changed
 
-def fix_channel_code(chan, sampling_rate, short_period=False):
+def fix_location_code(loc):
+    """
+    Normalizes location code to two characters:
+    - None or '' becomes ''
+    - '-' becomes '--'
+    - Digits like '0' become '00'
+    - Truncates anything longer than 2 characters
+    """
+    print(f'Fixing location code: {loc}')
+    if not loc:
+        return ''
+    if loc == '-':
+        return '--'
+    if loc.isdigit():
+        return loc.zfill(2)
+    return loc[:2].zfill(2) if len(loc) < 2 else loc[:2]
 
+def fix_channel_code(chan, sampling_rate, short_period=False):
+    print(f'Fixing channel code: {chan} with fs={sampling_rate}, short_period={short_period}')
     current_band_code = chan[0].upper() if chan else ''
 
     # Determine the correct band code
@@ -853,7 +873,36 @@ def fix_channel_code(chan, sampling_rate, short_period=False):
     chan = expected_band_code + chan[1:]
     return chan 
 
-def _fix_legacy_id(trace, network=None):
+
+def decompose_channel_code(chan):
+    """
+    Decomposes a SEED channel code into band, instrument, and orientation components.
+
+    Parameters:
+        chan (str): SEED channel code (e.g., 'BHZ', 'BZ', 'BH', 'B').
+
+    Returns:
+        tuple: (bandcode, instrumentcode, orientationcode), using 'x' for unknowns.
+    """
+    print(f'Decomposing channel code: {chan}')
+    chan = (chan or "").upper()
+    band = chan[0] if len(chan) > 0 else 'x'
+
+    if len(chan) == 3:
+        return band, chan[1], chan[2]
+    elif len(chan) == 2:
+        if chan[1] in 'ZNE':
+            return band, 'H', chan[1]
+        elif chan[1] in 'HDL':
+            return band, chan[1], 'Z'
+        else:
+            return band, 'x', 'x'
+    elif len(chan) == 1:
+        return band, 'x', 'x'
+    else:
+        return 'x', 'x', 'x'
+
+def _fix_legacy_id(trace, network=None, add_T=True):
     """
     Fixes legacy trace IDs for old VDAP/analog telemetry networks.
 
@@ -942,21 +991,7 @@ def _fix_legacy_id(trace, network=None):
     
 
     net, sta, loc, chan = trace.id.split('.')
-    #bandcode = instrumentcode = orientationcode = None
-    if len(chan) == 3:
-        bandcode = chan[0].upper()  # First character is band code
-        instrumentcode = chan[1].upper()  # Second character is instrument code
-        orientationcode = chan[2].upper()  # Third character is orientation code
-    elif len(chan) == 2:
-        bandcode = chan[0].upper()
-        instrumentcode = chan[1].upper()
-        orientationcode = 'Z'  # Default to vertical if no orientation code provided
-    elif len(chan) == 1:
-        bandcode = chan[0].upper()
-        instrumentcode = 'H'  # Default to high-frequency broadband if no instrument code provided
-        orientationcode = 'Z'  # Default to vertical if no orientation code provided
-    else:
-        chan = 'SHZ'  # Default to short-period high-frequency vertical if no channel code provided
+    bandcode, instrumentcode, orientationcode = decompose_channel_code(chan)
 
     # Process the channel code
     if len(chan) > 0:
@@ -975,16 +1010,13 @@ def _fix_legacy_id(trace, network=None):
         # this might be a legacy station code that includes an orientation, or sensor type
         if sta != 'MNEV':
             sta = sta[:-1]
-        if last_sta_char in 'ZV':
-            orientationcode = 'Z'  # Vertical
-        elif last_sta_char in 'EX':
-            orientationcode = 'E'
-        elif last_sta_char in 'NY':     
-            orientationcode = 'N'       
-        elif last_sta_char == 'L':
-            instrumentcode = 'L'
-        elif last_sta_char == 'H':
-            instrumentcode = 'H'    
+        if last_sta_char in 'ZVEXNY':
+            orientationcode = last_sta_char      
+        elif last_sta_char in 'LH':
+            instrumentcode = last_sta_char
+    
+    if add_T and len(sta) < 4: # end station in T?
+        sta = sta + 'T'
 
     if not bandcode:
         bandcode = 'S'
@@ -1004,7 +1036,7 @@ def fix_trace_mvo(trace):
     legacy = True
     sta = trace.stats.station
     shortperiod = True
-    if (sta[0:2] == 'MB' and sta!='MBET') or sta[0:3]=='MTB' or sta[0:3]=='BLV':
+    if (sta[0:2] == 'MB' and sta!='MBET') or sta[0:3]=='MTB' or sta[0:3]=='BLV' or sta=='GHWS':
         legacy = False    
         shortperiod = False #shortperiod may be true or false now
 
@@ -1012,8 +1044,9 @@ def fix_trace_mvo(trace):
         fix_y2k_times_mvo(trace)
         fix_sample_rate(trace)
 
-    if len(trace.stats.channel)==3 and trace.stats.channel[1:] == 'HA':
-        trace.stats.channel = trace.stats.channel[0] + 'DO'  # Convert 'HA' to 'DO' for outdoor microbarometer
+    #if len(trace.stats.channel)==3 and trace.stats.channel[1:] == 'HA':
+    #    trace.stats.channel = trace.stats.channel[0] + 'DO'  # Convert 'HA' to 'DO' for outdoor microbarometer
+    print('Fixing MVO trace ID:', trace.id, 'legacy:', legacy, 'shortperiod:', shortperiod)
     if legacy:
         _fix_legacy_id(trace, network='MV')        
     else:
@@ -1051,126 +1084,139 @@ def correct_nslc_mvo(traceID, Fs, shortperiod=None, net='MV'):
     """
     Standardizes Montserrat trace IDs, handling legacy and special cases.
     """
-    def handle_microbarometer(chan, loc):
-        # Old DSN
-        if chan == 'A N' and loc == 'J':
-            return 'SDO', ''
+    def handle_microbarometer(chan, loc, sta, Fs):
+        print(f"Handling microbarometer channel: {chan} at {sta} with Fs={Fs}")
+
+        if chan=='PR' or chan=='PRS':
+            chan='BDO'
+
+        if chan[0]=='E':
+            chan = 'H' + chan[1:]  # Convert 'E' to 'H' for high-frequency broadband
+        elif chan[0]=='S':
+            chan = 'B' + chan[1:]
+       
+        bandcode, instrumentcode, orientationcode = decompose_channel_code(chan)
+        print(f"Decomposed channel: {bandcode}, {instrumentcode}, {orientationcode}")
+        expected_band_code = fix_channel_code(chan, Fs)[0]
+        if orientationcode.isdigit():
+            chan = expected_band_code + 'D' + orientationcode
+        elif orientationcode == 'F':
+            chan = expected_band_code + 'DF'
+        else:
+            chan = expected_band_code + 'DO'
+
+        print(f"Converted channel: {loc}.{chan}")
+        return chan, loc
+
+
+        '''
+        # --- MVO legacy Seisan (1990s-2000s) ---
         if chan == 'PRS':
-            if loc:
-                return 'SD' + loc[0], loc[1:]
-            else:
-                return 'SDO', ''
-        # New DSN
-        if loc == 'S' and chan == 'AP':
-            return 'EDO', ''
-        if loc in '0123456789' and chan == 'PR':
-            return 'EDO', loc.zfill(2)
-        # Final catch for infrasound
+            return 'BDO', loc.zfill(2) if loc.isdigit() else '00'
+
+        if chan.startswith('PR') and len(chan) == 3 and chan[2].isdigit():
+            # PR1, PR2 (component in channel)
+            return 'BDO', f'{chan[2]}0'
+
+        # --- Old DSN format ---
+        if chan == 'A N' and loc == 'J':
+            return 'BDO', ''
+        
+        # --- New DSN format ---
+        if chan == 'AP' and loc == 'S':
+            return 'HDO', ''
+        if chan == 'PR' and loc.isdigit():
+            return 'HDO', loc.zfill(2)
+
+        # --- Generic acoustic sensor catch-all ---
         if any(x in chan for x in ['AP', 'PR', 'PH']) or chan == 'S A':
-            # Instrument D = infrasound, O = omnidirectional
-            return 'DO', loc.zfill(2) if loc.isnumeric() else ''
-        return None
+            if Fs<80.0:
+                return 'BDO', loc.zfill(2) if loc.isdigit() else ''
+            else:
+                return 'HDO', loc.zfill(2) if loc.isdigit() else ''        
+
+        return chan, loc # if no match, return original
+        '''
 
     def handle_seismic(chan, loc, sta, Fs, shortperiod):
         # Extract instrument and orientation codes from channel if present
-        if len(chan) == 3:
-            instrumentcode = chan[1]
-            orientationcode = chan[2]
-        else:
-            instrumentcode = 'H'
-            orientationcode = 'x'
+        print(f"Handling seismic channel: {chan} at {sta} with Fs={Fs}")
 
-        # Seisan S-file picks
-        if len(chan) == 2:
-            if chan[1] in 'ZNE':
-                orientationcode = chan[1]
-            elif chan[1] == 'H' and loc in 'ZNE':
-                chan = chan + loc
-                loc = ''
-
-        if loc in ['--', 'J', 'I']:
-            loc = ''
-
+        # Process channel code
         # Shortperiod logic
-        if shortperiod is None:
-            if 'SB' in chan or (chan and chan[0] in 'BH'):
-                shortperiod = False
-                if len(chan) > 2:
-                    chan = 'BH' + chan[2:]
-                else:
-                    chan = 'BH'
-            else:
-                shortperiod = True
+        if chan.startswith("SB") and len(chan) == 3 and chan[2] in "ZNE":
+            chan = "BH" + chan[2]
+            shortperiod = False
 
-        # Determine the correct band code
-        expected_band_code = fix_channel_code(chan, Fs, short_period=shortperiod)[0]
+        bandcode, instrumentcode, orientationcode = decompose_channel_code(chan)
+        if orientationcode == 'x':
+            if len(loc) == 1 and loc in 'ZNE':
+                orientationcode = loc
+                loc = ''
+        chan = bandcode + instrumentcode + orientationcode
 
         # Low gain warning
         if sta[:2] != 'MB' and (shortperiod and 'L' in chan or sta[-1] == 'L'):
             print(f'Warning: {traceID} might be a legacy ID for a low gain sensor from an old analog network')
 
-        # Orientation code logic
-        if 'Z' in loc or 'Z' in chan:
-            orientationcode = 'Z'
-        elif 'N' in loc or 'N' in chan:
-            orientationcode = 'N'
-        elif 'E' in loc or 'E' in chan:
-            orientationcode = 'E'
-        elif len(chan) > 1:
-            if chan[1].strip():
-                instrumentcode = chan[1]
-            if len(chan) > 2:
-                orientationcode = chan[2]
-                if orientationcode == 'H':
-                    orientationcode = 'x'
+        # Determine the correct band code
+        expected_band_code = fix_channel_code(chan, Fs, short_period=shortperiod)[0]
 
-        # Handle 2-char channels with orientation in loc
-        if len(chan) == 2:
-            if len(loc) == 1 and loc in 'ZNE':
-                orientationcode = loc
-                loc = ''
-            elif len(loc) == 0 and chan[1] in 'ZNE':
-                orientationcode = chan[1]
-
-        # Special handling for SBx channels
-        if len(chan) == 3 and chan[0:2] == 'SB':
-            instrumentcode = 'H'
 
         # Compose new channel code
         chan = expected_band_code + instrumentcode + orientationcode
         return chan, loc
 
+
+    
     # --- Main logic ---
+
+    # where is this from? commenting out, and adding logic for channel DUM later
+    '''
     if traceID == '.MBLG.M.DUM':
         traceID = f'{net}.MBLG.10.SHZ'
+    '''
     traceID = traceID.replace("?", "x")
     oldnet, oldsta, oldloc, oldcha = traceID.split('.')
-    sta = oldsta.strip()
-    loc = oldloc.strip()
-    chan = oldcha.strip() or 'SHZ'
+    if oldsta == 'GHWS':
+        return traceID  # GHWS is a special case, a weather station, no changes needed
+    sta = oldsta.strip().upper() if oldsta else ''
+    loc = oldloc.strip().upper() if oldloc else ''
+    chan = oldcha.strip().upper() if oldcha else '' # or 'SHZ' # commented out SHZ default - do not force anything
 
-    # Fix sample rate for 'J'
-    if 'J' in loc or 'J' in chan:
+    # Normalize '--' and similar
+    #if not loc or loc.strip('-') == '':
+    #    loc = ''
+    if 'J' in loc or 'I' in loc:
         Fs = 75.0
+        loc = loc.replace('J', '')  # Remove 'J' from location code
 
-    # AEF file channel fixes
-    if chan.startswith('S J'):
-        chan = 'SH' + chan[3:]
-    elif chan.startswith('SBJ'):
-        chan = 'BH' + chan[3:]
+    # Ensure location code is 0 or 2 characters
+    loc = fix_location_code(loc)
 
-    # Microbarometer/infrasound handling
-    micro_result = handle_microbarometer(chan, loc)
-    if micro_result:
-        chan, loc = micro_result
-        if chan == 'DO':
-            # Use correct band code for infrasound
-            instrumentcode = 'D'
-            orientationcode = 'O'
-            chan = fix_channel_code(chan, Fs, short_period=False)[0] + instrumentcode + orientationcode
-    else:
-        # Seismic channel handling
-        chan, loc = handle_seismic(chan, loc, sta, Fs, shortperiod)
+
+    if net=='MV': # we can call this function for non-MVO data if we add this
+        # Fix sample rate for 'J'
+        if 'J' in loc or 'J' in chan:
+            Fs = 75.0
+
+        if chan!='DUM':
+        
+            # AEF file channel fixes
+            if chan.startswith('S J'):
+                chan = 'SH' + chan[3:]
+            elif chan.startswith('SBJ'):
+                chan = 'BH' + chan[3:]
+            
+            
+            # Microbarometer/infrasound handling
+            if len(chan)>1 and chan[:2] in ['AP', 'PR']:
+                chan, loc = handle_microbarometer(chan, loc, sta, Fs)            
+            elif len(chan)>1 and (chan[:2] in ['AH', 'PH'] or (chan[0]=='S' and chan[-1] == 'A')):
+                pass
+            else:
+                # Seismic channel handling
+                chan, loc = handle_seismic(chan, loc, sta, Fs, shortperiod)
 
     newID = f"{net}.{sta}.{loc}.{chan}"
     return newID
@@ -1188,21 +1234,23 @@ def fix_KSC_id(trace):
             trace.stats.channel = chan
         trace.stats.network = net = '1R' 
 
-    if net=='FL' or net=='1R': # KSC
-        if trace.stats.station=='CARL1':
-            trace.stats.station = 'TANK'
-        elif trace.stats.station == 'CARL0':
-            trace.stats.station = 'BCHH'
-        elif trace.stats.station == '378':
-            trace.stats.station = 'DVEL1'
-        elif trace.stats.station == 'FIRE' and trace.stats.starttime.year == 2018:
-            trace.stats.station = 'DVEL2'
 
-        if trace.stats.network == 'FL':
-            trace.stats.network = '1R'
+    if trace.stats.station=='CARL1':
+        trace.stats.station = 'TANK'
+    elif trace.stats.station == 'CARL0':
+        trace.stats.station = 'BCHH'
+    elif trace.stats.station == '378':
+        trace.stats.station = 'DVEL1'
+    elif trace.stats.station == 'FIRE' and trace.stats.starttime.year == 2018:
+        trace.stats.station = 'DVEL2'
 
-        if trace.stats.location in ['00', '0', '--', '', '10']:
-            trace.stats.location = '00'
+    if trace.stats.network == 'FL':
+        trace.stats.network = '1R'
+
+    # Ensure location code is 0 or 2 characters
+    trace.stats.location = fix_location_code(loc)
+    #if trace.stats.location in ['00', '0', '--', '', '10']: # special case to work with Excel metadata
+    #    trace.stats.location = '00'
 
     trace.stats.channel = fix_channel_code(trace.stats.channel, trace.stats.sampling_rate)
 

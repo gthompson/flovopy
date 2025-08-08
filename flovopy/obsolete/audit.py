@@ -228,7 +228,14 @@ def compute_contiguous_ranges(df, output_csv="trace_segment_ranges.csv", gap_thr
     if os.path.exists(partial_csv):
         os.remove(partial_csv)
 
-
+def autosave():
+    try:
+        if records:
+            pd.DataFrame(records).to_csv(partial_csv, index=False)
+            print(f"🛟 Autosaved contiguous ranges to {partial_csv} (may be partial)")
+    except Exception as e:
+        print(f"⚠️ Autosave failed: {e}")
+        
 if __name__ == '__main__':
     import argparse
 
