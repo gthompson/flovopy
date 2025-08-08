@@ -1,5 +1,5 @@
 import os
-from flovopy.core.mvo import correct_nslc_mvo
+from flovopy.core.trace_utils import correct_nslc_mvo
 
 
 class AEFfile:

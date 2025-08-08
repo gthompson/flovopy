@@ -1242,3 +1242,51 @@ def fake_trace(id, sampling_rate=100.0, npts=1000, starttime=UTCDateTime(), data
     tr.data = np.array(data, dtype=np.float32)
 
     return tr
+
+
+def print_nslc_tree(nslc_or_seed_list):
+    """
+    Print a directory-like structure of NSLC codes in a hierarchical tree format.
+
+    Accepts either:
+    - A list of 4-tuples: (network, station, location, channel), OR
+    - A list of SEED IDs like "NET.STA.LOC.CHA" or "NET.STA.CHA"
+
+    Parameters:
+    -----------
+    nslc_or_seed_list : list of tuple or str
+        The NSLC or SEED-style identifiers to display.
+    """
+    tree = {}
+
+    for item in nslc_or_seed_list:
+        # Convert SEED ID strings to 4-tuples
+        if isinstance(item, str):
+            parts = item.strip().split(".")
+            if len(parts) == 3:
+                net, sta, cha = parts
+                loc = ""
+            elif len(parts) == 4:
+                net, sta, loc, cha = parts
+            else:
+                print(f"[WARN] Skipping invalid SEED ID: {item}")
+                continue
+        elif isinstance(item, (list, tuple)) and len(item) == 4:
+            net, sta, loc, cha = item
+        else:
+            print(f"[WARN] Skipping invalid item: {item}")
+            continue
+
+        # Build the nested tree
+        tree.setdefault(net, {}).setdefault(sta, {}).setdefault(loc, []).append(cha)
+
+    def _print_branch(branch, indent=""):
+        for key, value in sorted(branch.items()):
+            if isinstance(value, dict):
+                print(f"{indent}{key}/")
+                _print_branch(value, indent + "    ")
+            else:
+                for cha in sorted(value):
+                    print(f"{indent}{key}/{cha}")
+
+    _print_branch(tree)

@@ -1,6 +1,7 @@
 # Standard Library
 import os
 import math
+import glob
 import pickle
 from pprint import pprint
 
@@ -14,16 +15,15 @@ import pygmt
 
 # ObsPy core and event tools
 import obspy
-from obspy import Stream, Trace, UTCDateTime, read_events, Inventory
+from obspy import UTCDateTime, read_events, Inventory
 from obspy.core.event import Event, Catalog, ResourceIdentifier, Origin, Amplitude, QuantityError, OriginQuality, Comment
 from obspy.geodetics import locations2degrees, degrees2kilometers, gps2dist_azimuth
 # Your internal or local modules (assumed to exist)
 # For example:
-from flovopy.core.inventory import inventory2traceid
+from flovopy.stationmetadata.utils import inventory2traceid
 from flovopy.processing.sam import VSAM  # VSAM class for corrections and simulation
 from flovopy.core.mvo import dome_location
-import os
-import glob
+
 
 
 def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, centerlon=-62.177, centerlat=16.711, contour_interval=100, \

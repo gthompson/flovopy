@@ -6,6 +6,46 @@ from obspy import UTCDateTime
 import psutil
 
 
+def log_system_status_csv(logfile, rownum=None, cooldown=True):
+    """Log system CPU, memory, and temperature metrics to a CSV file."""
+
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    mem = psutil.virtual_memory()
+    cpu = psutil.cpu_percent(interval=0.1)
+    cpu_perc = psutil.cpu_percent(percpu=True)
+    mem_perc = [p.memory_percent() for p in psutil.process_iter(attrs=['memory_percent'])]
+
+    temp = get_cpu_temperature()
+    cpu_core = psutil.Process(os.getpid()).cpu_num()
+
+    warnings = []
+    if cpu > 90:
+        warnings.append("HIGH_CPU")
+    if mem.percent > 90:
+        warnings.append("HIGH_RAM")
+    if temp is not None:
+        if temp > 85:
+            warnings.append("CRITICAL_TEMP")
+            if cooldown:
+                pause_if_too_hot(threshold=85.0, max_cooldown_seconds=120)  # forced 2 min cooldown
+        elif temp > 75:
+            warnings.append("HIGH_TEMP")
+
+    row = pd.DataFrame([{
+        "timestamp": now,
+        "rownum": rownum if rownum is not None else -1,
+        "cpu_percent": round(cpu, 1),
+        "ram_percent": round(mem.percent, 1),
+        "ram_mb_used": mem.used // (1024**2),
+        "temp_c": round(temp, 1) if temp is not None else None,
+        "cpu_core": cpu_core,
+        "warnings": ",".join(warnings),
+        "cpu_per_core": ",".join([f"{c:.1f}" for c in cpu_perc]),
+        "proc_mem_perc": ",".join([f"{m:.2f}" for m in mem_perc[:10]])
+    }])
+
+    row.to_csv(logfile, mode='a', index=False, header=not os.path.exists(logfile))
+
 def get_cpu_temperature():
     try:
         with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:

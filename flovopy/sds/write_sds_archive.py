@@ -8,12 +8,9 @@ from flovopy.core.trace_utils import fix_id_wrapper
 from flovopy.core.miniseed_io import read_mseed
 import traceback
 import sqlite3
-import time
 import gc
 from flovopy.core.computer_health import (
-    get_cpu_temperature,
     pause_if_too_hot,
-    log_cpu_temperature_to_csv,
     start_cpu_logger,
     log_memory_usage
 )

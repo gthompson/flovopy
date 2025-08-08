@@ -14,12 +14,13 @@ from math import ceil
 from tqdm import tqdm
 
 from flovopy.sds.sds_utils import is_valid_sds_filename, parse_sds_filename, is_valid_sds_dir
-import re
+#import re
 import gc
-import traceback
+#import traceback
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor #, as_completed
 from obspy.core.inventory import Inventory
+from flovopy.stationmetadata.utils import build_dataframe_from_table
 
 def _compute_percent(args):
     self, trace_id, day, speed, merge_strategy, verbose = args
@@ -434,6 +435,61 @@ class SDSobj:
         sds_subdir = os.path.join(year, net, sta, f"{chan}.D")
         return os.path.join(self.basedir, sds_subdir, filename)
     
+
+    def sds2eventStream(self, eventtime,
+                        pretrig=3600, posttrig=3600,
+                        networks=['*'], bandcodes=['GHDCESB'],
+                        show_available=True):
+        """
+        Load waveform data from an SDS archive around a trigger time.
+
+        Parameters:
+        -----------
+        eventtime : UTCDateTime or ISO time string
+            Center time of the event window.
+
+        pretrig : float
+            Seconds before the trigger to include.
+
+        posttrig : float
+            Seconds after the trigger to include.
+
+        networks : list of str
+            Network codes to include (use ['*'] for wildcard).
+
+        bandcodes : list of str
+            Channel bandcodes or wildcards (e.g., ['HH', 'GH', 'BH']).
+
+        show_available : bool
+            If True, print available NSLC structure at midpoint of the window.
+
+        Returns:
+        --------
+        obspy.Stream
+            Combined waveform stream for requested time window and filters.
+        """
+
+        from flovopy.core.trace_utils import print_nslc_tree
+        startt = UTCDateTime(eventtime) - pretrig
+        endt = UTCDateTime(eventtime) + posttrig
+
+        if show_available:
+            mid = UTCDateTime((startt.timestamp + endt.timestamp) / 2)
+            nslc_list = self.sdsclient.get_all_nslc(datetime=mid)
+            print_nslc_tree(nslc_list)
+
+        st = Stream()
+        for network in networks:
+            bc_filter = f"[{''.join(bandcodes)}]*" if bandcodes else "*"
+            try:
+                this_st = self.sdsclient.get_waveforms(network, "*", "*", bc_filter, startt, endt)
+                st += this_st
+            except Exception as e:
+                print(f"[WARN] Failed to load waveforms for network {network}: {e}")
+
+        return st
+    
+    '''
     def load_metadata_from_excel(self, excel_path, sheet_name=0):
         """
         Load metadata from an Excel file into the SDSobj, including
@@ -488,6 +544,40 @@ class SDSobj:
             expanded_df = pd.DataFrame(expanded_rows)
             df = df[df["channel"].apply(lambda x: isinstance(x, str) and len(x) == 3)]
             df = pd.concat([df, expanded_df], ignore_index=True)
+
+        self.metadata = df
+    '''
+      # or your actual import path
+
+    def load_metadata_from_excel(self, excel_path, sheet_name='ksc_stations_master'):
+        """
+        Load metadata from an Excel file into the SDSobj, including
+        on/off dates and multi-channel expansion.
+
+        Parameters
+        ----------
+        excel_path : str
+            Path to the Excel file.
+        sheet_name : str or int, optional
+            Sheet name or index to load (default is 'ksc_stations_master').
+        """
+        df = build_dataframe_from_table(excel_path, sheet_name=sheet_name)
+
+        required_cols = {'network', 'station', 'location', 'channel'}
+        id_cols = {'id', 'seedid', 'traceid'}
+
+        if not required_cols.issubset(df.columns) and not id_cols.intersection(df.columns):
+            raise ValueError("Excel file must contain either full IDs ('id', 'seedid') or network/station/location/channel columns")
+
+        if 'id' not in df.columns:
+            if id_cols.intersection(df.columns):
+                # Rename one of the ID columns to 'id'
+                df = df.rename(columns={list(id_cols.intersection(df.columns))[0]: 'id'})
+            else:
+                df['id'] = df.apply(
+                    lambda row: f"{row['network']}.{row['station']}.{str(row['location']).zfill(2)}.{row['channel']}",
+                    axis=1
+                )
 
         self.metadata = df
     '''

@@ -2,7 +2,7 @@ from flovopy.processing.sam import RSAM
 import obspy
 import os
 from glob import glob
-from flovopy.core.legacy import _fix_legacy_id
+from flovopy.core.trace_utils import _fix_legacy_id
 starttime = obspy.UTCDateTime(1991,1,1)
 endtime = obspy.UTCDateTime(1991,12,31,23,59,59)
 RSAM_DIR = '/Users/thompsong/Dropbox/Pinatubo/from_tom/RSAM/RSAM'

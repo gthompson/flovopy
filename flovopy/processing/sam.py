@@ -781,7 +781,7 @@ class RSAM(SAM):
             tr.data[tr.data == -998.0] = np.nan
             tr.trim(stime, etime)
             if convert_legacy_ids_using_this_network and not tr.stats.network:
-                from flovopy.core.legacy import _fix_legacy_id
+                from flovopy.core.trace_utils import _fix_legacy_id
                 fix_trace_id(tr, legacy=True, netcode=convert_legacy_ids_using_this_network)
 
             return tr
@@ -811,7 +811,7 @@ class RSAM(SAM):
             tr.data[tr.data == -998.0] = np.nan
             tr.trim(stime, etime)
             if convert_legacy_ids_using_this_network and not tr.stats.network:
-                from flovopy.core.legacy import _fix_legacy_id
+                from flovopy.core.trace_utils import _fix_legacy_id
                 fix_trace_id(tr, legacy=True, netcode=convert_legacy_ids_using_this_network)
             return tr
 

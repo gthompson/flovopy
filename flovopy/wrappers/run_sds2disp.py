@@ -2,7 +2,7 @@ import os
 import numpy as np
 from obspy import read_inventory, Stream
 from flovopy.sds.sds import SDSobj
-from flovopy.core.inventory import inventory2traceid
+from flovopy.stationmetadata.utils import inventory2traceid
 from flovopy.core.preprocessing import preprocess_trace
 
 SECONDS_PER_DAY = 86400

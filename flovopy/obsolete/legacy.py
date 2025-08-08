@@ -1,9 +1,6 @@
 import numpy as np
-from obspy import read, Stream,  UTCDateTime #, Catalog, Event,
-#from obspy.core.event import Origin, Magnitude, Comment
-
-
-
+from obspy import read, Stream,  UTCDateTime
+from obspy.core.event import Catalog, Event, Origin, Magnitude, Comment
 
 #######################################################################
 ##               Read event metadata                                 ##

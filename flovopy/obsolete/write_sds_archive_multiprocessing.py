@@ -1,18 +1,15 @@
 import os
 import glob
-import shutil
 import multiprocessing as mp
 import pandas as pd
-from obspy import Stream, UTCDateTime
+from obspy import UTCDateTime
 from flovopy.sds.sds import SDSobj #, parse_sds_filename, merge_multiple_sds_archives #is_valid_sds_dir, is_valid_sds_filename
 from flovopy.core.trace_utils import fix_trace_id
 from flovopy.core.miniseed_io import read_mseed #, write_mseed
 import traceback
 import sqlite3
-import time
 import gc
-from flovopy.core.computer_health import get_cpu_temperature, pause_if_too_hot, log_cpu_temperature_to_csv, start_cpu_logger, log_memory_usage
-from flovopy.core.mvo import fix_trace_mvo_wrapper
+from flovopy.core.computer_health import pause_if_too_hot, start_cpu_logger, log_memory_usage
 
 def setup_database(db_path):
     with sqlite3.connect(db_path) as conn:
@@ -323,10 +320,7 @@ def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, 
                     outputfile = None
                 else:
                     source_id = tr.id
-                    if tr.stats.network == 'MV':
-                        fix_trace_mvo_wrapper(tr)
-                    else:
-                        fix_trace_id(tr)
+                    fix_trace_id(tr)
                     fixed_id = tr.id
                     metadata_matched = sdsout.match_metadata(tr) if sdsout.metadata is not None else True
 
