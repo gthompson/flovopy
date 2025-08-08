@@ -9,6 +9,7 @@ from flovopy.stationmetadata.utils import (
     expand_channel_code,
     build_dataframe_from_table
 )
+from flovopy.stationmetadata.sensors import build_combined_infrabsu_centaur_stationxml, get_rsb, get_rboom, get_rs1d_v4, get_rs3d_v5
 from collections import defaultdict
 
 
@@ -60,8 +61,13 @@ def NRL2inventory(
     inventory : obspy.core.inventory.Inventory
         Inventory containing one station with the specified response.
     """
-    if os.path.isdir(nrl_path):
-        nrl = NRL(nrl_path)
+    print(f"[INFO] NRL2inventory: Building inventory for {net}.{sta}.{loc} with channels: {chans}")
+    if nrl_path and os.path.isdir(nrl_path):
+        try:
+            nrl = NRL(nrl_path)
+        except Exception as e:
+            print(f"[ERROR] Failed to load local NRL from {nrl_path}: {e}")
+            nrl = NRL("http://ds.iris.edu/NRL/")
     else:
         nrl = NRL("http://ds.iris.edu/NRL/")
 
@@ -214,7 +220,7 @@ def sensor_type_dispatch(
     inv = Inventory(networks=[], source="sensor_type_dispatch")
 
     # --- Special handling ---
-    if datalogger.upper().startswith("RS"):
+    if datalogger.upper() in ['RSB', 'RBOOM', 'RS1D', 'RS3D']:
         if datalogger.upper() == "RSB":
             inv = get_rsb(sta, loc)
         elif datalogger.upper() == "RBOOM":
@@ -323,9 +329,12 @@ def build_inventory_from_dataframe(df, nrl_path=None, infrabsu_xml=None, verbose
     obspy.core.inventory.Inventory
         Combined ObsPy Inventory object for all valid rows.
     """
+    import traceback
     inventory = Inventory(networks=[], source="build_inventory_from_dataframe")
 
     for _, row in df.iterrows():
+        if verbose:
+            print('\n' + f'[INFO] build_inventory_from_dataframe: Processing {row.get("network", "?")}.{row.get("station", "?")}.{row.get("location", "")}.{row.get("channel", "")}')
         try:
             inv_piece = sensor_type_dispatch(
                 row,
@@ -341,6 +350,7 @@ def build_inventory_from_dataframe(df, nrl_path=None, infrabsu_xml=None, verbose
                 loc = row.get("location", "")
                 chan = row.get("channel", "")
                 print(f"[WARN] Failed to parse {net}.{sta}.{loc}.{chan}: {e}")
+                traceback.print_exc()
 
     return inventory
 

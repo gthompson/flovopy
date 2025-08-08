@@ -3,6 +3,7 @@ from obspy import UTCDateTime
 from obspy.core.inventory import Inventory, Network, Station, Channel, Site, read_inventory
 from flovopy.stationmetadata.build import build_inventory_from_table, merge_inventories
 from flovopy.stationmetadata.utils import apply_coordinates_from_csv
+import traceback
 
 def get_stationXML_inventory(
     xmlfile: str,
@@ -49,18 +50,32 @@ def get_stationXML_inventory(
         if verbose:
             print("[INFO] Creating new inventory from Excel metadata...")
 
+        try:
+            inv = build_inventory_from_table(
+                path=excel_file,
+                sheet_name=sheet_name,
+                nrl_path=nrl_path,
+                verbose=verbose,
+                infrabsu_xml=infrabsu_xml
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to build inventory from {excel_file}: {e}")
+            traceback.print_exc()
+            raise e
 
-        inv = build_inventory_from_table(
-            path=excel_file,
-            sheet_name=sheet_name,
-            nrl_path=nrl_path,
-            verbose=verbose,
-            infrabsu_xml=infrabsu_xml
-        )
-
-
-        inv = merge_inventories(inv)
-        inv.write(xmlfile, format='STATIONXML', validate=True)
+        try:
+            inv = merge_inventories(inv)
+        except Exception as e:
+            print(f"[ERROR] Failed to merge inventories: {e}")
+            traceback.print_exc()
+            raise e 
+        
+        try:
+            inv.write(xmlfile, format='STATIONXML', validate=True)
+        except Exception as e:
+            print(f"[ERROR] Failed to write StationXML to {xmlfile}: {e}")
+            traceback.print_exc()
+            raise e 
 
         if verbose:
             print(f"[OK] Wrote StationXML to {xmlfile}")

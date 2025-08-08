@@ -131,7 +131,9 @@ def build_dataframe_from_table(path, sheet_name='ksc_stations_master'):
 
     # Clean and normalize
     df.columns = df.columns.str.strip().str.lower()
-    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+   
+    #df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    df = df.apply(lambda col: col.map(lambda x: x.strip() if isinstance(x, str) else x))
 
     for col in ['network', 'station', 'location', 'channel']:
         if col in df.columns:

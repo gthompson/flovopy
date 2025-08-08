@@ -66,45 +66,115 @@ def ChaparralM25() -> float:
     return voltsPerPaLowGain
 
 
+def get_rboom(sta, loc, fsamp=100.0, lat=0.0, lon=0.0, elev=0.0, depth=0.0,
+              start_date=UTCDateTime(1900, 1, 1), end_date=UTCDateTime(2100, 1, 1)):
+    """
+    Build an ObsPy Inventory for a Raspberry Boom (HDF only) by reusing get_rsb() 
+    and removing the EHZ seismic channel.
 
-# Inventory constructors for Raspberry Shake models
+    Parameters
+    ----------
+    sta : str
+        Station code to assign.
+    loc : str
+        Location code to assign.
+    fsamp : float, optional
+        Default sample rate for HDF channel (Hz).
+    lat, lon, elev, depth : float, optional
+        Station coordinates and depth (meters).
+    start_date, end_date : obspy.UTCDateTime, optional
+        Start and end of channel validity.
 
-def get_rboom(sta, loc):
-    return get_rsb(sta, loc)
+    Returns
+    -------
+    obspy.core.inventory.Inventory
+        Inventory containing only the HDF channel.
+    """
+    # First, build the full RSB inventory (HDF + EHZ)
+    inv = get_rsb(
+        sta=sta, loc=loc, fsamp=fsamp,
+        lat=lat, lon=lon, elev=elev, depth=depth,
+        start_date=start_date, end_date=end_date
+    )
 
-def get_rsb(sta, loc, fsamp=100.0, lat=0.0, lon=0.0, elev=0.0, depth=0.0,
-            start_date=UTCDateTime(1900, 1, 1), end_date=UTCDateTime(2100, 1, 1)):
-    net = 'AM'
-    url = 'https://manual.raspberryshake.org/_downloads/57ab6152abedf7bb15f86fdefa71978c/RSnBV3-20s.dataless.xml-reformatted.xml'
-    xmlfile = 'rsb_v3.xml'
-    if not os.path.isfile(xmlfile):
-        response = requests.get(url)
-        if response.status_code == 200:
-            with open(xmlfile, "wb") as f:
-                f.write(response.content)
-            print("[OK] File downloaded: rsb_v3.xml")
-        else:
-            print(f"[ERROR] Failed to download file. HTTP {response.status_code}")
-            return None
+    if inv is None:
+        return None
 
-    responses = {}
-    responses['HDF'] = Response.from_paz(
-        zeros=[0.0 + 0j, 0.0 + 0j],
-        poles=[-0.312 + 0.0j, -0.312 + 0.0j],
-        gain=56000,
-        input_units='m/s',
-        output_units='Counts')
+    try:
+        station = inv[0][0]
+        # Keep only channels with code 'HDF'
+        station.channels = [ch for ch in station.channels if ch.code == "HDF"]
+        if not station.channels:
+            print(f"[WARN] No HDF channel found for {sta} — inventory will be empty.")
+    except Exception as e:
+        print(f"[ERROR] Failed to strip EHZ channel: {e}")
+        return None
 
-    responses['EHZ'] = Response.from_paz(
-        zeros=[0.0 + 0j] * 3,
-        poles=[-1.0, -3.03, -3.03],
-        gain=399650000,
-        input_units='m/s',
-        output_units='Counts')
+    return inv
 
-    inventory = responses2inventory(net, sta, loc, fsamp, responses, lat, lon, elev, depth, start_date, end_date)
-    return inventory
 
+def get_rsb(sta, loc, fsamp=100.0,
+            lat=0.0, lon=0.0, elev=0.0, depth=0.0,
+            start_date=UTCDateTime(1900, 1, 1),
+            end_date=UTCDateTime(2100, 1, 1)):
+    """
+    Raspberry Shake & Boom (EHZ seismic + HDF infrasound).
+
+    Tries to fetch a published RSB dataless file. 
+    If unavailable, falls back to hardcoded PAZ definitions.
+    """
+    net = "AM"
+
+    # 1. Try matching pattern from other get_rs* functions
+    rsb_url = 'https://manual.raspberryshake.org/_downloads/57ab6152abedf7bb15f86fdefa71978c/RSnBV3-20s.dataless.xml-reformatted.xml'  
+    rsb_dataless = "rsb_v3.dataless"
+    rsb_xml = "rsb_v3.xml"
+
+    try:
+        inv = _fetch_and_parse_response(sta, loc, rsb_url, rsb_dataless, rsb_xml)
+        if inv:
+            # Optionally adjust sample rates - but would they have to be propagated through stages?
+            '''
+            for chan in inv[0][0].channels:
+                if chan.code.startswith("EHZ"):
+                    chan.sample_rate = fsamp
+                elif chan.code.startswith("HDF"):
+                    chan.sample_rate = fsamp
+            '''
+            return inv
+    except Exception as e:
+        print(f"[WARN] Could not fetch RSB dataless, falling back to PAZ: {e}")
+
+    # 2. Fallback — hardcoded PAZ definitions
+    hdf_resp = Response.from_paz(
+        zeros=[0j, 0j],
+        poles=[-0.312 + 0j, -0.312 + 0j],
+        stage_gain=56000,   # TODO: verify
+        input_units="Pa",   # infrasound pressure
+        output_units="Counts",
+    )
+
+    ehz_resp = Response.from_paz(
+        zeros=[0j, 0j, 0j],
+        poles=[-1.0 + 0j, -3.03 + 0j, -3.03 + 0j],
+        stage_gain=399650000,  # TODO: verify
+        input_units="m/s",     # ground velocity
+        output_units="Counts",
+    )
+
+    responses = {
+        "HDF": (hdf_resp, fsamp_hdf),
+        "EHZ": (ehz_resp, fsamp_ehz),
+    }
+
+    return responses2inventory(
+        net=net, sta=sta, loc=loc,
+        fsamp=None,  # let responses dict define per-channel fsamp
+        responses=responses,
+        lat=lat, lon=lon, elev=elev, depth=depth,
+        start_date=start_date, end_date=end_date,
+    )
+'''
 def get_rs1d_v4(sta, loc, fsamp=100.0):
     url = 'https://manual.raspberryshake.org/_downloads/e324d5afda5534b3266cd8abdd349199/out4.response.restored-plus-decimation.dataless'
     responsefile = 'rs1d_v4.dataless'
@@ -135,6 +205,74 @@ def get_rs1d_v4(sta, loc, fsamp=100.0):
 
     replace_sta_loc(inventory, sta, loc)
     return inventory
+'''
+
+def get_rs1d_v4(sta, loc, fsamp=100.0):
+    """
+    Return Inventory for Raspberry Shake 1D (v4 response). Most devices are 100 Hz,
+    but early units were 50 Hz; pass fsamp=50.0 to adjust metadata coherently.
+
+    Parameters
+    ----------
+    sta : str
+        Station code to assign.
+    loc : str
+        Location code to assign.
+    fsamp : float, default 100.0
+        Desired native sample rate for the channel(s).
+
+    Returns
+    -------
+    obspy.core.inventory.Inventory or None
+    """
+    inv = _fetch_and_parse_response(
+        sta, loc,
+        url='https://manual.raspberryshake.org/_downloads/e324d5afda5534b3266cd8abdd349199/out4.response.restored-plus-decimation.dataless',
+        responsefile='rs1d_v4.dataless',
+        xmlfile='rs1d_v4.xml'
+    )
+    if inv is None:
+        return None
+
+    # If caller asked for 50 Hz (or any non-default), adjust channels & response stages
+    if fsamp and isinstance(fsamp, (int, float)):
+        for net in inv:
+            for sta_obj in net:
+                for ch in sta_obj.channels:
+                    # Set top-level channel sample rate
+                    ch.sample_rate = float(fsamp)
+
+                    # Propagate through response stages if present
+                    stages = getattr(ch.response, "response_stages", None)
+                    if not stages:
+                        continue
+
+                    current_rate = float(fsamp)
+                    for stage in stages:
+                        # Set input rate into this stage
+                        if hasattr(stage, "decimation_input_sample_rate"):
+                            stage.decimation_input_sample_rate = current_rate
+
+                        # If stage has decimation, compute output rate and carry forward
+                        if hasattr(stage, "decimation_factor") and stage.decimation_factor:
+                            factor = float(stage.decimation_factor)
+                            if factor != 1.0:
+                                print(f"[WARN] Stage {stage.stage_sequence_number} uses decimation factor {factor}")
+                            out_rate = current_rate / factor
+                            # If stage exposes output rate, set it too
+                            if hasattr(stage, "decimation_output_sample_rate"):
+                                stage.decimation_output_sample_rate = out_rate
+                            current_rate = out_rate
+                        else:
+                            # No decimation at this stage; carry rate forward unchanged
+                            pass
+                    # Optionally: you could verify `current_rate` == ch.sample_rate or leave as-is.
+                    # Here we’re modeling the *input chain* starting at ch.sample_rate; some files
+                    # model the chain the other way around. We leave instrument sensitivity frequency unchanged.
+
+    # Overwrite station & location codes for consistency (same as other helpers)
+    replace_sta_loc(inv, sta, loc)
+    return inv
 
 def get_rs3d_v5(sta, loc):
     return _fetch_and_parse_response(
