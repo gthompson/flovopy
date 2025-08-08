@@ -475,14 +475,14 @@ class SDSobj:
 
         if show_available:
             mid = UTCDateTime((startt.timestamp + endt.timestamp) / 2)
-            nslc_list = self.sdsclient.get_all_nslc(datetime=mid)
+            nslc_list = self.client.get_all_nslc(datetime=mid)
             print_nslc_tree(nslc_list)
 
         st = Stream()
         for network in networks:
             bc_filter = f"[{''.join(bandcodes)}]*" if bandcodes else "*"
             try:
-                this_st = self.sdsclient.get_waveforms(network, "*", "*", bc_filter, startt, endt)
+                this_st = self.client.get_waveforms(network, "*", "*", bc_filter, startt, endt)
                 st += this_st
             except Exception as e:
                 print(f"[WARN] Failed to load waveforms for network {network}: {e}")
