@@ -6,7 +6,14 @@ from obspy.geodetics import locations2degrees, degrees2kilometers
 from obspy.core.util import AttribDict
 import pandas as pd
 from collections import defaultdict
+from pathlib import Path
 
+def get_templates_dir() -> Path:
+    """
+    Return the absolute path to the stationxml_templates directory.
+    Works regardless of OS, working directory, or installation type.
+    """
+    return Path(__file__).resolve().parent / "stationxml_templates"
 
 def inventory2traceid(inv):
     """

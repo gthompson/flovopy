@@ -2,7 +2,7 @@ import os
 from obspy import UTCDateTime
 from obspy.core.inventory import Inventory, Network, Station, Channel, Site, read_inventory
 from flovopy.stationmetadata.build import build_inventory_from_table, merge_inventories
-from flovopy.stationmetadata.utils import apply_coordinates_from_csv
+#from flovopy.stationmetadata.utils import apply_coordinates_from_csv
 import traceback
 
 def get_stationXML_inventory(
@@ -199,3 +199,70 @@ def responses2inventory(
     inventory = Inventory(networks=[network], source="USF_instrument_responses.py")
 
     return inventory
+
+if __name__ == "__main__":
+    import os
+    from pathlib import Path
+    import tempfile
+    import pandas as pd
+
+    print("[TEST] get_stationXML_inventory — end-to-end smoke test")
+
+    # Temp working dir
+    workdir = Path(tempfile.gettempdir()) / "flovopy_stationxml_test"
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    # Where to write the StationXML result
+    out_xml = workdir / "test_inventory.stationxml"
+
+    # Build a tiny metadata table as CSV (so we don't need a real Excel file)
+    # Columns expected by build_inventory_from_table -> build_inventory_from_dataframe -> sensor_type_dispatch
+    rows = [
+        # RBOOM (local template path; no NRL)
+        dict(network="AM", station="RBTEST",  location="00", channel="HDF",
+             sensor="RBOOM", datalogger="RBOOM", lat=28.5, lon=-80.6, elev=3.0, depth=0.0,
+             fsamp=100.0, vpp=40, ondate="2024-01-01", offdate="2100-01-01"),
+        # RS1D v6 (local template path; no NRL)
+        dict(network="AM", station="RS1D6T", location="00", channel="EHZ",
+             sensor="RS1D", datalogger="RS1D", lat=28.5, lon=-80.6, elev=3.0, depth=0.0,
+             fsamp=100.0, vpp=40, ondate="2024-01-01", offdate="2100-01-01"),
+    ]
+
+    # Optionally include an infraBSU+Centaur example (hits remote NRL unless you’ve cached)
+    if os.environ.get("INCLUDE_INFRA", "0") == "1":
+        rows.append(
+            dict(network="1R", station="INFRA1", location="10", channel="HDF",
+                 sensor="infraBSU", datalogger="Centaur", lat=28.5721, lon=-80.6480, elev=3.0, depth=0.0,
+                 fsamp=100.0, vpp=40, ondate="2024-01-01", offdate="2100-01-01")
+        )
+
+    df = pd.DataFrame(rows)
+    csv_path = workdir / "test_metadata.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"[INFO] Wrote test CSV: {csv_path}")
+
+    # Run once (should build fresh file)
+    print("\n[STEP 1] Build new inventory (overwrite=True)")
+    inv = get_stationXML_inventory(
+        xmlfile=str(out_xml),
+        excel_file=str(csv_path),          # build_* functions accept CSV path as well
+        sheet_name="ksc_stations_master",  # ignored for CSV
+        infrabsu_xml=None,                 # provide a path to prebuilt infraBSU template if you want
+        nrl_path=None,                     # set if you have a compatible local NRLv1 (rare now)
+        overwrite=True,
+        verbose=True,
+    )
+    print(inv)
+
+    # Run again without overwrite (should load from disk, not rebuild)
+    print("\n[STEP 2] Load existing inventory (overwrite=False)")
+    inv2 = get_stationXML_inventory(
+        xmlfile=str(out_xml),
+        excel_file=str(csv_path),
+        overwrite=False,
+        verbose=True,
+    )
+    print(inv2)
+
+    print(f"\n[OK] StationXML is at: {out_xml}")
+    print("[NOTE] To include an infraBSU+Centaur test row (will query the remote NRL), set INCLUDE_INFRA=1.")

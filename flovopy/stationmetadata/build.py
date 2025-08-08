@@ -9,7 +9,14 @@ from flovopy.stationmetadata.utils import (
     expand_channel_code,
     build_dataframe_from_table
 )
-from flovopy.stationmetadata.sensors import build_combined_infrabsu_centaur_stationxml, get_rsb, get_rboom, get_rs1d_v4, get_rs3d_v5
+from flovopy.stationmetadata.raspberryshake import (
+    _rs_kind,
+    build_inv_from_template
+)
+from flovopy.stationmetadata.infrabsu import (
+    get_infrabsu_sensor_template,
+    get_infrabsu_centaur,
+)
 from collections import defaultdict
 
 
@@ -118,9 +125,9 @@ def NRL2inventory(
 
         try:
             thisresponse = Response.from_paz(
-                zeros=zeros, poles=poles, sensitivity=sensitivity,
+                zeros=zeros, poles=poles, stage_gain=sensitivity,
                 input_units=input_units, output_units=output_units
-            )
+            )            
         except Exception as err:
             print(f"[ERROR] Failed to build fallback PAZ response: {err}")
             thisresponse = Response(instrument_sensitivity=InstrumentSensitivity(
@@ -220,36 +227,36 @@ def sensor_type_dispatch(
     inv = Inventory(networks=[], source="sensor_type_dispatch")
 
     # --- Special handling ---
+    # inside sensor_type_dispatch(...)
     if datalogger.upper() in ['RSB', 'RBOOM', 'RS1D', 'RS3D']:
-        if datalogger.upper() == "RSB":
-            inv = get_rsb(sta, loc)
-        elif datalogger.upper() == "RBOOM":
-            inv = get_rboom(sta, loc)
-        elif datalogger.upper() == "RS1D":
-            inv = get_rs1d_v4(sta, loc, fsamp=fsamp)
-        elif datalogger.upper() == "RS3D":
-            inv = get_rs3d_v5(sta, loc)
-        else:
-            raise ValueError(f"Unknown Raspberry Shake model: {datalogger}")
-        for netobj in inv:
-            for staobj in netobj:
-                staobj.latitude = lat
-                staobj.longitude = lon
-                staobj.elevation = elev
-                staobj.depth = depth
-                for ch in staobj:
-                    ch.latitude = lat
-                    ch.longitude = lon
-                    ch.elevation = elev
-                    ch.depth = depth
-        return inv
+        kind = _rs_kind(datalogger, fsamp)
+        try:
+            inv = build_inv_from_template(
+                kind=kind,
+                net=net, sta=sta, loc=loc,
+                keep_channels=None,                   # keep whatever’s in the template
+                coords=(lat, lon, elev, depth),
+                validity=(ondate, offdate),
+                sr_overrides=None,                    # usually not needed
+                propagate_response=True,
+            )
+            return inv
+        except FileNotFoundError as e:
+            print(f"[ERROR] {e}")
+            print("Run `download_rshake_seiscompxml_convert_stationxml_wrapper.sh` on newton "
+                "to create missing template StationXML files for Raspberry Shakes.")
+            raise e
 
-    elif sensor.lower().startswith("infrabsu") and infrabsu_xml:
+    elif sensor.lower().startswith("infrabsu"):
+        # ensure we have a cached template
+        if not infrabsu_xml:
+            infrabsu_xml = str(get_infrabsu_sensor_template())
+
         for ch in chans:
-            inv += build_combined_infrabsu_centaur_stationxml(
+            inv += get_infrabsu_centaur(
+                template_path=infrabsu_xml,
                 fsamp=fsamp,
-                vpp=vpp,
-                stationxml_path=infrabsu_xml,
+                vpp=int(vpp),
                 network=net,
                 station=sta,
                 location=loc,
@@ -259,9 +266,12 @@ def sensor_type_dispatch(
                 elevation=elev,
                 depth=depth,
                 start_date=ondate,
-                end_date=offdate
+                end_date=offdate,
+                # nrl_path=nrl_path,  # optional: pass a local NRL if you have it
+                verbose=verbose,
             )
-        return inv
+        return inv    
+
 
     elif sensor.upper().startswith("CHAP"):
         inv = NRL2inventory(
@@ -696,3 +706,80 @@ def merge_inventories(*inventories):
         merged_inv.networks.append(merged_net)
 
     return merged_inv
+
+if __name__ == "__main__":
+    import traceback
+    import pandas as pd
+
+    print("[TEST] build/sensor_type_dispatch glue – quick integration test")
+
+    # 1) Make a few representative “rows” like what your DataFrame would contain
+    # NOTE: Times are strings to mimic CSV/Excel; build_dataframe_from_table normally parses, so we do it manually here
+    rows = [
+        # Raspberry Boom (will load local template if present, else print hint)
+        {
+            "network": "AM", "station": "RBTEST", "location": "00", "channel": "HDF",
+            "sensor": "RBOOM", "datalogger": "RBOOM",
+            "lat": 28.6, "lon": -80.65, "elev": 5.0, "depth": 0.0,
+            "fsamp": 100.0, "vpp": 40,
+            "ondate": UTCDateTime("2024-01-01"), "offdate": UTCDateTime("2100-01-01"),
+        },
+        # Raspberry Shake 1D v6 @100 Hz (HHZ->EHZ patch happens inside build_inv_from_template)
+        {
+            "network": "AM", "station": "RS1D6T", "location": "00", "channel": "EHZ",
+            "sensor": "RS1D", "datalogger": "RS1D",
+            "lat": 28.6, "lon": -80.65, "elev": 5.0, "depth": 0.0,
+            "fsamp": 100.0, "vpp": 40,
+            "ondate": UTCDateTime("2024-01-01"), "offdate": UTCDateTime("2100-01-01"),
+        },
+        # infraBSU + Centaur path (auto-downloads template if missing)
+        {
+            "network": "1R", "station": "INFRA1", "location": "10", "channel": "HDF",
+            "sensor": "infraBSU", "datalogger": "Centaur",
+            "lat": 28.5721, "lon": -80.6480, "elev": 3.0, "depth": 0.0,
+            "fsamp": 100.0, "vpp": 40,
+            "ondate": UTCDateTime("2024-01-01"), "offdate": UTCDateTime("2100-01-01"),
+        },
+        # Chaparral via NRL (falls back to PAZ if lookup fails)
+        {
+            "network": "XX", "station": "CHAP1", "location": "00", "channel": "HDF",
+            "sensor": "CHAP-25", "datalogger": "Centaur",
+            "lat": 0.0, "lon": 0.0, "elev": 0.0, "depth": 0.0,
+            "fsamp": 100.0, "vpp": 40,
+            "ondate": UTCDateTime("2020-01-01"), "offdate": UTCDateTime("2025-12-31"),
+        },
+        # Default NRL (TCP + Centaur)
+        {
+            "network": "XX", "station": "TCPT1", "location": "00", "channel": "HHZ",
+            "sensor": "TCP", "datalogger": "Centaur",
+            "lat": 0.0, "lon": 0.0, "elev": 0.0, "depth": 0.0,
+            "fsamp": 200.0, "vpp": 40,
+            "ondate": UTCDateTime("2019-01-01"), "offdate": UTCDateTime("2021-01-01"),
+        },
+    ]
+
+    # 2) Wrap each row through sensor_type_dispatch directly
+    for r in rows:
+        tag = f"{r['network']}.{r['station']}.{r['location']}.{r['channel']} [{r['datalogger']}/{r['sensor']}]"
+        print("\n--- Testing row:", tag)
+        try:
+            inv_piece = sensor_type_dispatch(r, nrl_path=None, infrabsu_xml=None, verbose=True)
+            print(inv_piece)
+        except FileNotFoundError as e:
+            # This is expected when a Raspberry Shake template is missing
+            print(f"[MISSING] {e}")
+            print("[HINT] run download_rshake_seiscompxml_convert_stationxml_wrapper.sh on newton "
+                  "to create missing template StationXML files for Raspberry Shakes.")
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            traceback.print_exc()
+
+    # 3) Also test the full DataFrame -> Inventory pipeline in one go
+    print("\n[TEST] DataFrame → build_inventory_from_dataframe")
+    df = pd.DataFrame(rows)
+    try:
+        inv_all = build_inventory_from_dataframe(df, nrl_path=None, infrabsu_xml=None, verbose=True)
+        print(inv_all)
+    except Exception as e:
+        print(f"[ERROR] building inventory from dataframe: {e}")
+        traceback.print_exc()
