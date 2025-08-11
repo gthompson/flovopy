@@ -1093,7 +1093,7 @@ def _longest_common_prefix(strings: list[str]) -> str:
         i += 1
     return s1[:i]
 
-def _group_map_for_columns(cols, mode="component", station_prefix_len=4, station_prefix_min=3):
+def _group_map_for_columns(cols, mode="component", station_prefix_len=4, station_prefix_min=2):
     """
     Build a mapping {original_col -> group_key} and, for component mode,
     a pretty renamer {group_key -> label_with_suffixes}.
