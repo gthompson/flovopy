@@ -111,9 +111,12 @@ def process_files(file_chunk, db_path, cpu_id, speed):
         safe_commit(conn)
     conn.close()
 
-def run_audit(sds_root, db_path, n_processes=6, use_sds=True, filterdict=None, starttime=None, endtime=None, speed=1):
+def run_audit(sds_root, db_path, n_processes=6, use_sds=True, filterdict=None, starttime=None, endtime=None, speed=1, skip_unmatched=True):
     setup_database(db_path, mode="audit")
     file_list = discover_files(sds_root, use_sds=use_sds, filterdict=filterdict, starttime=starttime, endtime=endtime)
+    if not use_sds and skip_unmatched:
+        # remove any files in the file_list that have the "unmatched" directory in their path
+        file_list = [f for f in file_list if 'unmatched' not in f.lower()]
     print(f'Found {len(file_list)} files at {sds_root}')
     populate_file_log(file_list, db_path, mode="audit")
 
