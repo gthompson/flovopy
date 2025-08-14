@@ -920,3 +920,371 @@ def plot_picks_on_stream(stream: Stream, picks: dict, title="Waveform with Picks
     plt.suptitle(title, fontsize=14)
     plt.tight_layout()
     plt.show()
+
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+def plot_stalta_triggers_on_stream(
+    st,
+    normalize=False,
+    equal_scale=False,
+    shade=True,
+    span_alpha=0.18,
+    on_color="tab:red",
+    off_color="tab:blue",
+    line_style="--",
+    line_width=1.5,
+    title="STA/LTA Triggers",
+    outfile=None,
+    show=True,
+):
+    """
+    Overlay STA/LTA trigger-on/off times stored in `tr.stats.triggers` on a Stream plot.
+
+    Assumes each Trace may have:
+        tr.stats.triggers = [[on_UTCDateTime, off_UTCDateTime], ...]
+    created e.g. by your `add_channel_detections()` function.
+
+    Parameters
+    ----------
+    st : obspy.Stream
+        Stream to plot.
+    normalize : bool
+        If True, normalize each trace by its max abs amplitude before plotting.
+    equal_scale : bool
+        Pass through to `Stream.plot(equal_scale=...)`.
+    shade : bool
+        If True, shade trigger intervals in addition to vertical lines.
+    span_alpha : float
+        Alpha (opacity) for shaded intervals.
+    on_color, off_color : str
+        Colors for trigger-on and trigger-off vertical lines.
+    line_style : str
+        Matplotlib linestyle for trigger lines (e.g., "--").
+    line_width : float
+        Width of the trigger lines.
+    title : str
+        Suptitle for the figure.
+    outfile : str or None
+        If provided, save the figure to this path.
+    show : bool
+        If True, call plt.show().
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The figure with overlays.
+    """
+    # Work on a copy if normalizing
+    st_to_plot = st.copy()
+    if normalize:
+        for tr in st_to_plot:
+            d = tr.data
+            # Avoid division by zero
+            peak = float(np.max(np.abs(d))) if len(d) else 0.0
+            if peak > 0.0:
+                tr.data = d / peak
+
+    # Let ObsPy do the per-trace layout with time axis
+    fig = st_to_plot.plot(show=False, equal_scale=equal_scale)
+    fig.suptitle(title)
+
+    # We trust ObsPy keeps axes order aligned with traces in the stream
+    axes = fig.axes
+    # Some backends return extra colorbar axes; keep only time axes
+    axes = [ax for ax in axes if ax.has_data()]
+
+    # Overlay triggers per trace
+    for tr, ax in zip(st, axes):
+        triggers = getattr(tr.stats, "triggers", []) or []
+        if not triggers:
+            continue
+
+        # Draw each (on, off) pair
+        for pair in triggers:
+            if len(pair) != 2 or pair[0] is None or pair[1] is None:
+                continue
+            on_t, off_t = pair
+            on_num = on_t.matplotlib_date
+            off_num = off_t.matplotlib_date
+
+            # Vertical lines
+            ax.axvline(on_num, color=on_color, linestyle=line_style, linewidth=line_width, label="Trigger On")
+            ax.axvline(off_num, color=off_color, linestyle=line_style, linewidth=line_width, label="Trigger Off")
+
+            # Shaded span
+            if shade:
+                ax.axvspan(on_num, off_num, color=on_color, alpha=span_alpha)
+
+        # Make sure time formatting is readable
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M:%S"))
+        # Avoid duplicate legend entries
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            # Deduplicate while preserving order
+            seen = set()
+            uniq = [(h, l) for h, l in zip(handles, labels) if not (l in seen or seen.add(l))]
+            ax.legend(*zip(*uniq), loc="upper right", fontsize=8)
+
+    fig.autofmt_xdate()
+
+    if outfile:
+        fig.savefig(outfile, dpi=200, bbox_inches="tight")
+
+    if show:
+        plt.show()
+
+    return fig
+
+from typing import Optional, List, Dict
+import numpy as np
+from obspy.core.trace import Trace
+from obspy.core import UTCDateTime
+from obspy.signal.trigger import classic_sta_lta, trigger_onset
+
+def run_sta_lta_on_trace(
+    tr: Trace,
+    sta_s: float,
+    lta_s: float,
+    on: float,
+    off: float,
+    max_trigs: int = 2,
+    t0_hint: Optional[UTCDateTime] = None,
+    min_sep_s: float = 30.0,
+    min_dur_s: float = 0.0,
+    max_dur_s: Optional[float] = None,
+    preprocess: bool = True,
+    save_to_stats: bool = True,
+) -> List[Dict]:
+    """
+    Run classic STA/LTA on a single Trace and persist triggers to `tr.stats.triggers`.
+
+    Returns a list of dicts (ranked) with indices/times and peak CFT near onset.
+    Also writes:
+      - tr.stats.triggers = [[UTC_on, UTC_off], ...]
+      - tr.stats.trigger_meta = {'algo':'classic_sta_lta', ...}
+
+    Notes
+    -----
+    - `preprocess=True` does a light detrend/taper and replaces NaNs/Infs with 0.
+    - `min_dur_s`/`max_dur_s` clip or discard windows too short/long.
+    - Overlapping/nearby windows (< 1 sample apart) are merged before ranking.
+    """
+    sr = float(tr.stats.sampling_rate or 0.0)
+    if sr <= 0:
+        if save_to_stats:
+            tr.stats.triggers = []
+        return []
+
+    data = tr.data.astype(float, copy=False)
+    if preprocess:
+        # Replace non-finite with zero to keep CFT stable
+        bad = ~np.isfinite(data)
+        if bad.any():
+            data = data.copy()
+            data[bad] = 0.0
+        # Light detrend + taper (very fast & robust)
+        try:
+            tr_tmp = tr.copy()
+            tr_tmp.detrend("linear")
+            tr_tmp.taper(0.01, type="cosine")
+            data = tr_tmp.data.astype(float, copy=False)
+        except Exception:
+            pass
+
+    nsta = max(1, int(round(sta_s * sr)))
+    nlta = max(nsta + 1, int(round(lta_s * sr)))
+
+    # Guard: LTA must be longer than STA and smaller than length
+    if nlta >= tr.stats.npts:
+        if save_to_stats:
+            tr.stats.triggers = []
+        return []
+
+    cft = classic_sta_lta(data, nsta, nlta)
+
+    # Raw on/off (sample indices)
+    on_off = trigger_onset(cft, on, off)
+    if not on_off:
+        if save_to_stats:
+            tr.stats.triggers = []
+        return []
+
+    # Merge adjacent/overlapping windows that touch (index-wise)
+    merged = []
+    for i_on, i_off in on_off:
+        if not merged:
+            merged.append([i_on, i_off])
+            continue
+        j_on, j_off = merged[-1]
+        if i_on <= j_off + 1:  # overlap or abut
+            merged[-1][1] = max(j_off, i_off)
+        else:
+            merged.append([i_on, i_off])
+
+    # Convert to UTC times and enforce duration limits
+    windows = []
+    for i_on, i_off in merged:
+        # Clip to data bounds
+        i_on = int(max(0, min(i_on, tr.stats.npts - 1)))
+        i_off = int(max(0, min(i_off, tr.stats.npts - 1)))
+        if i_off <= i_on:
+            continue
+
+        dur_s = (i_off - i_on) / sr
+        if dur_s < min_dur_s:
+            continue
+        if max_dur_s is not None and dur_s > max_dur_s:
+            # Clip long windows rather than dropping completely
+            i_off = i_on + int(round(max_dur_s * sr))
+            i_off = min(i_off, tr.stats.npts - 1)
+            dur_s = (i_off - i_on) / sr
+            if dur_s <= 0:
+                continue
+
+        t_on = tr.stats.starttime + (i_on / sr)
+        t_off = tr.stats.starttime + (i_off / sr)
+
+        # Peak CFT in a small window around onset for ranking
+        w0 = max(0, i_on - int(1 * sr))
+        w1 = min(len(cft), i_on + int(5 * sr))
+        peak_val = float(np.nanmax(cft[w0:w1])) if w1 > w0 else float(np.nanmax(cft))
+
+        dt_hint = abs((t_on - t0_hint)) if t0_hint else None
+        windows.append({
+            "i_on": int(i_on),
+            "i_off": int(i_off),
+            "t_on": t_on,
+            "t_off": t_off,
+            "peak_cft": peak_val,
+            "dt_from_hint": float(dt_hint) if dt_hint is not None else None,
+            "dur_s": dur_s,
+        })
+
+    if not windows:
+        if save_to_stats:
+            tr.stats.triggers = []
+        return []
+
+    # Rank: prefer closest to hint, then strongest
+    if t0_hint is not None:
+        windows.sort(key=lambda d: (d["dt_from_hint"], -d["peak_cft"]))
+    else:
+        windows.sort(key=lambda d: -d["peak_cft"])
+
+    # Enforce minimum separation between accepted picks
+    picks = []
+    for cand in windows:
+        if not picks:
+            picks.append(cand)
+            continue
+        if all(abs((cand["t_on"] - p["t_on"])) >= min_sep_s for p in picks):
+            picks.append(cand)
+        if len(picks) >= max_trigs:
+            break
+
+    # Persist to stats
+    if save_to_stats:
+        tr.stats.triggers = [[p["t_on"], p["t_off"]] for p in picks]
+        tr.stats.trigger_meta = {
+            "algo": "classic_sta_lta",
+            "sta_s": float(sta_s),
+            "lta_s": float(lta_s),
+            "on": float(on),
+            "off": float(off),
+            "min_sep_s": float(min_sep_s),
+            "min_dur_s": float(min_dur_s),
+            "max_dur_s": float(max_dur_s) if max_dur_s is not None else None,
+            "sampling_rate": sr,
+            "nsta": nsta,
+            "nlta": nlta,
+        }
+
+    return picks
+
+from typing import Optional, Dict, List, Tuple
+import pandas as pd
+from obspy.core.stream import Stream
+from obspy.core import UTCDateTime
+
+def add_sta_lta_triggers_to_stream(
+    st: Stream,
+    sta_s: float,
+    lta_s: float,
+    on: float,
+    off: float,
+    max_trigs: int = 2,
+    t0_hint: Optional[UTCDateTime] = None,
+    min_sep_s: float = 30.0,
+    min_dur_s: float = 0.0,
+    max_dur_s: Optional[float] = None,
+    preprocess: bool = True,
+    save_to_stats: bool = True,
+) -> Tuple[Dict[str, List[dict]], pd.DataFrame]:
+    """
+    Run classic STA/LTA on each trace in a Stream and persist triggers to `tr.stats.triggers`.
+
+    Parameters
+    ----------
+    st : obspy.Stream
+        Input stream.
+    sta_s, lta_s, on, off :
+        Classic STA/LTA parameters (seconds and thresholds).
+    max_trigs : int
+        Max triggers to keep per trace.
+    t0_hint : UTCDateTime or None
+        If provided, picks nearer to this time are ranked higher.
+    min_sep_s : float
+        Minimum separation between accepted onsets for a given trace.
+    min_dur_s : float
+        Discard windows shorter than this.
+    max_dur_s : float or None
+        Clip windows longer than this (if None, no max).
+    preprocess : bool
+        Light detrend/taper and NaN cleanup before STA/LTA.
+    save_to_stats : bool
+        If True, save to `tr.stats.triggers` and `tr.stats.trigger_meta`.
+
+    Returns
+    -------
+    picks_by_trace : dict
+        { trace.id: [ {i_on, i_off, t_on, t_off, peak_cft, dt_from_hint, dur_s}, ... ] }
+    summary_df : pandas.DataFrame
+        One row per accepted trigger with columns:
+        ['trace_id','t_on','t_off','dur_s','peak_cft','dt_from_hint']
+    """
+    picks_by_trace: Dict[str, List[dict]] = {}
+    rows = []
+
+    for tr in st:
+        try:
+            picks = run_sta_lta_on_trace(
+                tr, sta_s, lta_s, on, off,
+                max_trigs=max_trigs,
+                t0_hint=t0_hint,
+                min_sep_s=min_sep_s,
+                min_dur_s=min_dur_s,
+                max_dur_s=max_dur_s,
+                preprocess=preprocess,
+                save_to_stats=save_to_stats,
+            )
+        except Exception as e:
+            # If anything goes wrong on a single trace, keep going
+            if save_to_stats:
+                tr.stats.triggers = []
+            picks = []
+
+        picks_by_trace[tr.id] = picks
+
+        for p in picks:
+            rows.append({
+                "trace_id": tr.id,
+                "t_on": p["t_on"],
+                "t_off": p["t_off"],
+                "dur_s": p["dur_s"],
+                "peak_cft": p["peak_cft"],
+                "dt_from_hint": p["dt_from_hint"],
+            })
+
+    summary_df = pd.DataFrame(rows, columns=["trace_id","t_on","t_off","dur_s","peak_cft","dt_from_hint"])
+    return picks_by_trace, summary_df

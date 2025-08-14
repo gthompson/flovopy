@@ -244,7 +244,7 @@ class SDSobj:
                         if report['status'] != 'ok':
                             msg += f" ({report['status']})"
                         if len(merged) != 1:
-                            msg += f"; result has {len(merged)} traces (expected 1)"
+                            msg += f"; result has {len(merged)} trfrom obspy import UTCDateTimeaces (expected 1)"
                         results[trace_id] = {
                             "status": "conflict",
                             "reason": msg,
@@ -275,32 +275,53 @@ class SDSobj:
         results["all_ok"] = all_ok
         return results
 
-    def _get_nonempty_traceids(self, startday, endday=None, skip_low_rate_channels=True, speed=1):
-        import datetime
-        endday = endday or startday + 86400
+    
+
+    def _get_nonempty_traceids(self, startday: UTCDateTime, endday: UTCDateTime = None,
+                            skip_low_rate_channels: bool = True, speed: int = 1):
+        """
+        Collect unique net.station.loc.chan IDs that have data between startday (inclusive)
+        and endday (exclusive), stepping by whole days. Uses ObsPy UTCDateTime throughout.
+
+        Parameters
+        ----------
+        startday : UTCDateTime
+            Start of first day (00:00:00 preferred).
+        endday : UTCDateTime or None
+            Exclusive end. If None, defaults to startday + 86400 s (one day).
+        skip_low_rate_channels : bool
+            Skip channels whose code starts with 'L' (e.g., LH?).
+        speed : int
+            If 1, call client.has_data() per NSLC to confirm presence; otherwise skip that check.
+        """
+        if endday is None:
+            endday = startday + 86400  # one day
+
         trace_ids = set()
         thisday = startday
 
         while thisday < endday:
-            print(thisday)
+            print(thisday.isoformat())
+
+            # Try to get NSLC list via client; fall back to walking the SDS
             try:
-                # Try to get the NSLC list from the client
-                nslc_list = self.client.get_all_nslc(sds_type='D', datetime=thisday)
-            except Exception as e:
-                #print(f"Warning: get_all_nslc() failed for {thisday} with error: {e}")
-                # Fall back to manual walk if get_all_nslc() fails
+                try:
+                    nslc_list = self.client.get_all_nslc(sds_type='D', datetime=thisday)
+                except TypeError:
+                    # Some clients want a datetime.datetime
+                    nslc_list = self.client.get_all_nslc(sds_type='D', datetime=thisday.datetime)
+            except Exception:
                 nslc_list = self._walk_sds_for_day(thisday)
 
-            # If still no data found, just continue to next day
             if not nslc_list:
-                print(f"No NSLC data found for {thisday}")
+                print(f"No NSLC data found for {thisday.isoformat()}")
                 thisday += 86400
                 continue
 
-            # Process the NSLC list to filter channels and check data presence
             for net, sta, loc, chan in nslc_list:
-                if chan.startswith('L') and skip_low_rate_channels:
+                if skip_low_rate_channels and isinstance(chan, str) and chan.startswith('L'):
                     continue
+
                 if speed == 1:
                     try:
                         if not self.client.has_data(net, sta, loc, chan):
@@ -308,11 +329,13 @@ class SDSobj:
                     except Exception as e:
                         print(f"has_data() error for {net}.{sta}.{loc}.{chan}: {e}")
                         continue
+
                 trace_ids.add(f"{net}.{sta}.{loc}.{chan}")
 
-            thisday += 86400
+            thisday += 86400  # next day
 
         return sorted(trace_ids)
+
 
 
     def _walk_sds_for_day(self, day):
@@ -1123,7 +1146,7 @@ def _component_sort_key(c):
     # canonical order: Z,N,E then 1,2,3 then letters then digits
     order = {c:i for i,c in enumerate(list("ZNE123"))}
     return order.get(c, 100 + ord(str(c)[0]))
-
+'''
 def _longest_common_prefix(strings: list[str]) -> str:
     """Return the full longest common prefix across all strings."""
     if not strings:
@@ -1133,6 +1156,19 @@ def _longest_common_prefix(strings: list[str]) -> str:
     while i < len(s1) and i < len(s2) and s1[i] == s2[i]:
         i += 1
     return s1[:i]
+'''
+from typing import Sequence
+
+def _longest_common_prefix(strings: Sequence[str]) -> str:
+    """Return the full longest common prefix across all strings."""
+    if not strings:
+        return ""
+    s1, s2 = min(strings), max(strings)  # lexicographic bound trick
+    i = 0
+    while i < len(s1) and i < len(s2) and s1[i] == s2[i]:
+        i += 1
+    return s1[:i]
+
 
 def _group_map_for_columns(cols, mode="component", station_prefix_len=4, station_prefix_min=2):
     """
