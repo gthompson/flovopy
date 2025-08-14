@@ -7,7 +7,7 @@ from obspy.core.event import Event, Origin, Magnitude, WaveformStreamID #, Catal
 from flovopy.seisanio.core.wavfile import Wavfile
 from flovopy.seisanio.core.aeffile import AEFfile
 from flovopy.seisanio.utils.helpers import filetime2wavpath, spath2datetime
-from flovopy.core.mvo import correct_nslc_mvo
+from flovopy.core.trace_utils import correct_nslc_mvo
 from flovopy.core.enhanced import EnhancedEvent
 import json
 

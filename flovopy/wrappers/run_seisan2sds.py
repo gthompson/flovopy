@@ -2,7 +2,7 @@ import os
 import glob
 from obspy import UTCDateTime, read
 from flovopy.sds.sds import SDSobj
-from flovopy.core.mvo import fix_trace_mvo
+from flovopy.core.trace_utils import fix_trace_mvo
 
 SECONDS_PER_DAY = 86400
 

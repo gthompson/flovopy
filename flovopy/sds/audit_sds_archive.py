@@ -29,6 +29,9 @@ def write_trace_metadata(cursor, filepath, orig_id, orig_start, orig_end, npts, 
     """
     Write trace metadata to the SQLite database.
     """
+    # Fallback: if fixed_id is None/"" use orig_id
+    fixed_id = fixed_id or orig_id
+
     safe_sqlite_exec(cursor, """
         INSERT OR REPLACE INTO trace_metadata
         (filepath, original_id, starttime, endtime, npts, sampling_rate, fixed_id)
@@ -69,9 +72,10 @@ def process_files(file_chunk, db_path, cpu_id, speed):
                 try:
                     net, sta, loc, chan, typecode, yyyy, jjj = parse_sds_filename(filepath)
                     orig_id = f"{net}.{sta}.{loc}.{chan}"
-                    orig_start = UTCDateTime(f"{yyyy}-01-01T00:00:00")+ (int(jjj) - 1) * 86400
+                    orig_start = UTCDateTime(f"{yyyy}-01-01T00:00:00") + (int(jjj) - 1) * 86400
                     orig_end = orig_start + 86400 - 1/2000
-                    write_trace_metadata(cursor, filepath, orig_id, orig_start.isoformat(), orig_end.isoformat(), 0, 0.0, "")
+                    # use orig_id as fixed_id to avoid blanks
+                    write_trace_metadata(cursor, filepath, orig_id, orig_start.isoformat(), orig_end.isoformat(), 0, 0.0, orig_id)
                 except Exception as e:
                     print(f"⚠️ Failed to parse SDS filename {filepath}: {e}")
                     continue
@@ -107,9 +111,12 @@ def process_files(file_chunk, db_path, cpu_id, speed):
         safe_commit(conn)
     conn.close()
 
-def run_audit(sds_root, db_path, n_processes=6, use_sds=True, filterdict=None, starttime=None, endtime=None, speed=1):
+def run_audit(sds_root, db_path, n_processes=6, use_sds=True, filterdict=None, starttime=None, endtime=None, speed=1, skip_unmatched=True):
     setup_database(db_path, mode="audit")
     file_list = discover_files(sds_root, use_sds=use_sds, filterdict=filterdict, starttime=starttime, endtime=endtime)
+    if not use_sds and skip_unmatched:
+        # remove any files in the file_list that have the "unmatched" directory in their path
+        file_list = [f for f in file_list if 'unmatched' not in f.lower()]
     print(f'Found {len(file_list)} files at {sds_root}')
     populate_file_log(file_list, db_path, mode="audit")
 
@@ -172,8 +179,16 @@ def export_grouped_summary(df, output_csv="trace_id_mapping_summary.csv"):
 def compute_contiguous_ranges(df, output_csv="trace_segment_ranges.csv", gap_threshold=1.0, rate_tolerance=1.0):
     """
     Compute contiguous time ranges for each trace ID, with autosave protection.
+    If fixed_id is blank/NaN, fall back to original_id.
     """
     from datetime import datetime
+    import numpy as np
+
+    # Create an effective ID for grouping
+    eff = df["fixed_id"].replace("", pd.NA)
+    df = df.copy()
+    df["effective_id"] = eff.fillna(df["original_id"])
+
     records = []
     partial_csv = output_csv + ".partial"
 
@@ -183,7 +198,8 @@ def compute_contiguous_ranges(df, output_csv="trace_segment_ranges.csv", gap_thr
             print(f"🛟 Autosaved contiguous ranges to {partial_csv} (may be partial)")
     atexit.register(autosave)
 
-    for i, (trace_id, group) in enumerate(df.groupby("fixed_id")):
+    # Group by effective_id instead of fixed_id
+    for i, (trace_id, group) in enumerate(df.groupby("effective_id")):
         group = group.sort_values(by="starttime")
         segment_start = group.iloc[0]["starttime"]
         segment_end = group.iloc[0]["endtime"]
@@ -197,6 +213,7 @@ def compute_contiguous_ranges(df, output_csv="trace_segment_ranges.csv", gap_thr
 
             if gap > gap_threshold or sr_diff > rate_tolerance:
                 records.append({
+                    # write out under 'fixed_id' to keep your existing column name
                     "fixed_id": trace_id,
                     "segment_start": segment_start,
                     "segment_end": segment_end,
@@ -205,10 +222,7 @@ def compute_contiguous_ranges(df, output_csv="trace_segment_ranges.csv", gap_thr
                 })
                 segment_start = row["starttime"]
                 total_npts = 0
-                if row['sampling_rate'] is not None:
-                    segment_sr = row["sampling_rate"]
-                else:
-                    segment_sr = 0
+                segment_sr = row["sampling_rate"] if row["sampling_rate"] is not None else 0
 
             segment_end = max(segment_end, row["endtime"])
             total_npts += row["npts"]

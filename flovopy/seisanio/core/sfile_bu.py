@@ -8,7 +8,7 @@ from obspy import read
 from flovopy.seisanio.core.wavfile import Wavfile
 from flovopy.seisanio.core.aeffile import AEFfile
 from flovopy.seisanio.utils.helpers import spath2datetime
-from flovopy.core.mvo import correct_nslc_mvo
+from flovopy.core.trace_utils import correct_nslc_mvo
 
 class Sfile:
     def __init__(self, path, use_mvo_parser=False, fast_mode=False):

@@ -10,7 +10,7 @@ from obspy import UTCDateTime, Stream
 from flovopy.core.sam import RSAM, DRS
 from flovopy.core.spectrograms import icewebSpectrogram
 from flovopy.sds.sds import SDSobj
-from flovopy.core.inventory import attach_station_coordinates_from_inventory, attach_distance_to_stream
+from flovopy.stationmetadata.utils import attach_station_coordinates_from_inventory, attach_distance_to_stream
 
 logger = logging.getLogger(__name__)
 

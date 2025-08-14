@@ -1,5 +1,5 @@
-from flovopy.core.sds.sds import SDSobj
-from flovopy.core.inventory import inventory2traceid
+from flovopy.sds.sds import SDSobj
+from flovopy.stationmetadata.utils import inventory2traceid
 from flovopy.core.fdsn import get_inventory, get_stream
 
 def FDSN_to_SDS_daily_wrapper(startt, endt, SDS_TOP, centerlat=None, centerlon=None, searchRadiusDeg=None, trace_ids=None, \

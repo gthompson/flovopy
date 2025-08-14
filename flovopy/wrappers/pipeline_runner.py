@@ -54,8 +54,9 @@ def big_sausage(seisandbdir, paths, startt, endt, sampling_interval=60, source=N
 
 
 if __name__ == "__main__":
+    import os
     import setup_paths
-    from flovopy.core.asl import dome_location
+    from flovopy.core.mvo import dome_location
 
     paths = setup_paths.paths
     seisandbdir =  '/data/SEISAN_DB/WAV/DSNC_'

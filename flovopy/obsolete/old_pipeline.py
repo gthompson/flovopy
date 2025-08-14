@@ -3,11 +3,10 @@ import glob
 from obspy import UTCDateTime, read, read_inventory, Stream
 from flovopy.sds.sds import SDSObj
 from flovopy.core.mvo import fix_trace_mvo
-from flovopy.core.sam import RSAM
-from flovopy.core.inventory import inventory2traceid
+from flovopy.stationmetadata.utils import inventory2traceid
 from flovopy.core.preprocessing import preprocess_trace
 from flovopy.core.sam import RSAM, VSAM, VSEM, DSAM
-from flovopy.core.asl import dome_location
+from flovopy.analysis.asl import dome_location
 secondsPerDay = 60 * 60 * 24
 
 # SEISAN to SDS or Antelope

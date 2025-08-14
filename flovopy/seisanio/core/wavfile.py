@@ -2,7 +2,7 @@ import os
 #import datetime as dt
 from obspy import read, UTCDateTime
 from flovopy.seisanio.utils.helpers import filetime2spath, legacy_or_not
-from flovopy.core.mvo import correct_nslc_mvo, fix_trace_mvo
+from flovopy.core.trace_utils import correct_nslc_mvo, fix_trace_mvo
 
 class Wavfile:
     def __init__(self, path=''):

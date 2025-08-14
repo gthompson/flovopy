@@ -222,56 +222,160 @@ def preprocess_trace(tr, bool_despike=True, bool_clean=True, inv=None, quality_t
 
 # ---- Helper Functions ----
 
+
+def clean_stream(stream_in, taperFraction=0.05,
+                 filterType='bandpass', freq=(1.0, 10.0), corners=4,
+                 zerophase=True, inv=None, outputType='VEL', verbose=False):
+    """
+    Apply padding, tapering, filtering, and instrument response correction
+    to each trace in a Stream using `_clean_trace`.
+
+    Parameters:
+    -----------
+    stream_in : obspy.Stream
+        Input stream to clean.
+
+    taperFraction : float
+        Fraction of trace length to taper on both ends (e.g., 0.05 = 5%).
+
+    filterType : str
+        Type of filter to apply (e.g., 'bandpass', 'highpass').
+
+    freq : float or tuple
+        Frequency or frequency range (tuple for bandpass).
+
+    corners : int
+        Number of filter corners.
+
+    zerophase : bool
+        Whether to use zero-phase filtering.
+
+    inv : obspy.Inventory or None
+        Inventory for instrument correction.
+
+    outputType : str
+        One of 'DISP', 'VEL', 'ACC', or 'DEF'.
+
+    verbose : bool
+        Print detailed processing messages.
+
+    Returns:
+    --------
+    cleaned_stream : obspy.Stream
+        New stream with cleaned traces (failed traces are skipped).
+    """
+    cleaned = Stream()
+
+    for tr in stream_in.copy():
+        if _clean_trace(tr, taperFraction, filterType, freq, corners, zerophase,
+                        inv, outputType, verbose):
+            cleaned.append(tr)
+        elif verbose:
+            print(f"[SKIP] Trace {tr.id} was not added to cleaned stream.")
+
+    if verbose:
+        print(f"[DONE] Cleaned stream contains {len(cleaned)} traces.")
+
+    return cleaned
+
 def _clean_trace(tr, taperFraction, filterType, freq, corners, zerophase, inv, outputType, verbose):
     """
-    Applies padding, tapering, filtering, and instrument response correction.
+    Clean a trace by padding, tapering, filtering, and optionally removing the instrument response.
+
+    Parameters:
+    -----------
+    tr : obspy.Trace
+        The input trace to process.
+
+    taperFraction : float
+        Fraction of the trace to taper on each end.
+
+    filterType : str
+        ObsPy filter type (e.g., 'bandpass', 'highpass').
+
+    freq : float or tuple of float
+        Corner frequencies. Tuple for bandpass, float for others.
+
+    corners : int
+        Number of filter corners.
+
+    zerophase : bool
+        Whether to apply zero-phase filtering.
+
+    inv : obspy.Inventory or None
+        Inventory used for instrument correction (if available).
+
+    outputType : str
+        One of 'DISP', 'VEL', 'ACC', or 'DEF'.
+
+    verbose : bool
+        Whether to print debug messages.
+
+    Returns:
+    --------
+    success : bool
+        True if cleaning succeeded; False if skipped or failed.
     """
-    if verbose:
-        print('- cleaning trace')
-
-    # Padding
-    npts_pad = int(taperFraction * tr.stats.npts)
-    npts_pad_seconds = max(npts_pad * tr.stats.delta, 1/freq[0])  # Ensure minimum pad length
-    _pad_trace(tr, npts_pad_seconds)
-    max_fraction = npts_pad / tr.stats.npts
-
-    # Taper
-    if verbose:
-        print('- tapering')
-    tr.taper(max_percentage=max_fraction, type="hann")
-    add_to_trace_history(tr, 'tapered')
-
-    # Filtering
-    if inv:
-        # Estimate pre_filt based on bandpass
-        nyquist = 0.5 / tr.stats.delta
-        if filterType == "bandpass":
-            fmin, fmax = freq
-        else:
-            fmin = freq
-            fmax = 999999 # unrealistically high
-        pre_filt = (
-            max(0.01, fmin * 0.5),
-            fmin,
-            min(fmax, nyquist * 0.95),
-            min(fmax * 1.5, nyquist * 0.99)
-        )
-
-        # Instrument Response Removal
-        _handle_instrument_response(tr, inv, pre_filt, outputType, verbose)    
-
-    else: # Filter only, do not remove response
+    if tr.stats.npts == 0:
         if verbose:
-            print('- filtering')
-        if filterType == "bandpass":
-            tr.filter(filterType, freqmin=freq[0], freqmax=freq[1], corners=corners, zerophase=zerophase)
-        else:
-            tr.filter(filterType, freq=freq[0], corners=corners, zerophase=zerophase)
-        _update_trace_filter(tr, filterType, freq, zerophase)
-        add_to_trace_history(tr, filterType)
+            print(f"[SKIP] Trace {tr.id} has zero length.")
+        return False
 
-    # Remove Padding
-    _unpad_trace(tr)
+    if verbose:
+        print(f'- cleaning trace {tr.id}')
+
+    try:
+        # Padding
+        npts_pad = int(taperFraction * tr.stats.npts)
+        npts_pad_seconds = max(npts_pad * tr.stats.delta, 1 / (freq[0] if isinstance(freq, (list, tuple)) else freq))
+        _pad_trace(tr, npts_pad_seconds)
+        max_fraction = npts_pad / tr.stats.npts
+
+        # Taper
+        if verbose:
+            print('- tapering')
+        tr.taper(max_percentage=max_fraction, type="hann")
+        add_to_trace_history(tr, 'tapered')
+
+        # Filtering and/or Response Removal
+        if inv:
+            # Estimate pre_filt based on desired band
+            nyquist = 0.5 / tr.stats.delta
+            if filterType == "bandpass":
+                fmin, fmax = freq
+            else:
+                fmin = freq
+                fmax = nyquist * 0.95
+
+            pre_filt = (
+                max(0.01, fmin * 0.5),
+                fmin,
+                min(fmax, nyquist * 0.95),
+                min(fmax * 1.5, nyquist * 0.99)
+            )
+
+            # Instrument response correction
+            success = _handle_instrument_response(tr, inv, pre_filt, outputType, verbose)
+            if not success:
+                return False
+        else:
+            # Only apply filter
+            if verbose:
+                print('- filtering (no instrument response)')
+            if filterType == "bandpass":
+                tr.filter(filterType, freqmin=freq[0], freqmax=freq[1], corners=corners, zerophase=zerophase)
+            else:
+                tr.filter(filterType, freq=freq[0], corners=corners, zerophase=zerophase)
+            _update_trace_filter(tr, filterType, freq, zerophase)
+            add_to_trace_history(tr, filterType)
+
+        # Remove Padding
+        _unpad_trace(tr)
+        return True
+
+    except Exception as e:
+        print(f"[ERROR] Failed to clean trace {tr.id}: {e}")
+        return False
 
 def _handle_instrument_response(tr, inv, pre_filt, outputType, verbose):
     """

@@ -6,7 +6,8 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import argparse
 import subprocess
-
+# NOTE: This is currently unused. Full system monitoring tool with CSV logging,
+# plotting, and optional SMS alerts. Not used in current pipelines.
 SMS_ALERT_ENABLED = False  # Set to False by default
 SMS_ALERT_THRESH = 85  # temperature threshold (°C)
 SMS_GATEWAY = os.environ.get("SYSMON_SMS_GATEWAY")  # e.g., 5551234567@tmomail.net

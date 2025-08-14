@@ -1,25 +1,38 @@
-# flovopy/core/sds.py
-import os
+# --- Standard library ---
+import gc
 import glob
+import os
+import re
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from math import ceil
+from pathlib import Path
+
+# --- Third-party ---
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+from matplotlib.ticker import PercentFormatter
 from obspy import read, Stream, Trace
+from obspy.core.inventory import Inventory
 from obspy.core.utcdatetime import UTCDateTime
 import obspy.clients.filesystem.sds
-from flovopy.core.trace_utils import remove_empty_traces #, fix_trace_id, _can_write_to_miniseed_and_read_back
-from tqdm import tqdm
-import pandas as pd
-import numpy as np
-from flovopy.core.miniseed_io import smart_merge, read_mseed, write_mseed, downsample_stream_to_common_rate #, unmask_gaps
-from math import ceil
 from tqdm import tqdm
 
-from flovopy.sds.sds_utils import is_valid_sds_filename, parse_sds_filename, is_valid_sds_dir
-import re
-import gc
-import traceback
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from obspy.core.inventory import Inventory
+# --- Local imports ---
+from flovopy.core.miniseed_io import (
+    smart_merge,
+    read_mseed,
+    write_mseed,
+    downsample_stream_to_common_rate,
+)
+from flovopy.core.trace_utils import remove_empty_traces
+from flovopy.sds.sds_utils import (
+    is_valid_sds_dir,
+    is_valid_sds_filename,
+    parse_sds_filename,
+)
+from flovopy.stationmetadata.utils import build_dataframe_from_table
 
 def _compute_percent(args):
     self, trace_id, day, speed, merge_strategy, verbose = args
@@ -366,92 +379,357 @@ class SDSobj:
 
         return missing_days
 
-
-    def get_percent_availability(self, startday, endday, skip_low_rate_channels=True,
+    def get_availability(self, startday, endday, skip_low_rate_channels=True,
                                 trace_ids=None, speed=3, verbose=False,
                                 progress=True, merge_strategy='obspy', max_workers=8):
         """
-        Compute data availability percentage for each trace ID per day using parallel processing.
+        Return (DataFrame, ordered_trace_ids) with one row per date and one column per SEED id.
+        Values are FRACTIONS in [0, 1] representing availability.
+
+        Usage:
+            df, ids = sds.get_availability(startday, endday)
+            sds.plot_availability(df, outfile="avail.png")
         """
+        trace_ids = trace_ids or self._get_nonempty_traceids(startday, endday, skip_low_rate_channels, speed=speed)
 
-
-        trace_ids = trace_ids or self._get_nonempty_traceids(startday, endday,
-                                                            skip_low_rate_channels,
-                                                            speed=speed)
-
-        # Create list of (day, trace_id) tasks
-        days = []
-        t = startday
+        days, t = [], startday
         while t < endday:
             days.append(t)
             t += 86400
 
-        tasks = [(self, tid, day, speed, merge_strategy, verbose)
-                for day in days for tid in trace_ids]
+        tasks = [(self, tid, day, speed, merge_strategy, verbose) for day in days for tid in trace_ids]
 
         results = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = list(executor.map(_compute_percent, tasks))
-            if progress:
-                futures = tqdm(futures, total=len(tasks), desc="Availability")
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_compute_percent, task) for task in tasks]
+            iterator = tqdm(as_completed(futures), total=len(futures), desc="Availability") if progress else as_completed(futures)
+            for fut in iterator:
+                results.append(fut.result())  # expecting (date_epoch_or_dt, trace_id, value)
 
-            for result in futures:
-                results.append(result)
+        if not results:
+            df = pd.DataFrame({"date": pd.to_datetime([int(d) for d in days], unit='s')})
+            for tid in trace_ids:
+                df[tid] = np.nan
+            return df, trace_ids
 
-        # Convert to DataFrame
-        df = pd.DataFrame(results, columns=["date", "trace_id", "percent"])
-        df = df.pivot(index="date", columns="trace_id", values="percent").reset_index()
-        df["date"] = pd.to_datetime(df["date"])
+        df = pd.DataFrame(results, columns=["date", "trace_id", "value"])
 
-        return df, trace_ids
+        # Dates -> naive datetime (localize/strip tz for plotting)
+        try:
+            df["date"] = pd.to_datetime(df["date"], unit='s', utc=True).dt.tz_convert(None)
+        except (ValueError, TypeError):
+            df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_convert(None)
+
+        # Coerce to float and normalize to fraction if needed (robust to 0–100 or 0–1 inputs)
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        if df["value"].max(skipna=True) > 1.5:
+            df["value"] = df["value"] / 100.0  # convert percent -> fraction
+
+        wide = (df.pivot_table(index="date", columns="trace_id", values="value", aggfunc="mean")
+                .sort_index())
+
+        all_dates = pd.to_datetime([int(d) for d in days], unit='s', utc=True).tz_convert(None)
+        wide = wide.reindex(index=all_dates, columns=trace_ids)
+
+        wide = wide.reset_index().rename(columns={"index": "date"})
+        return wide, trace_ids
 
 
-    def plot_availability(self, availabilityDF, outfile=None, figsize=(12, 8), fontsize=10, labels=None, cmap='viridis'):
+    # --- helper: build daily availability (fractions) from audit ranges csv ---
+
+    def _availability_from_audit_csv(self, csv_path, start=None, end=None, ids=None):
         """
-        Plot availability heatmap for SEED IDs across time.
-
-        Parameters:
-        - availabilityDF (DataFrame): output from get_percent_availability
-        - outfile (str): optional path to save the figure
-        - figsize (tuple): figure size in inches
-        - fontsize (int): font size for labels
-        - labels (list): optional list of trace IDs
-        - cmap (str): matplotlib colormap (default 'viridis')
+        Convert audit_sds_archive() CSV into a wide daily availability DataFrame:
+        one row per date, one column per SEED id (fixed_id), values in [0..1].
         """
-        import matplotlib.pyplot as plt
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            return pd.DataFrame(columns=["date"])
 
-        if availabilityDF.empty:
+        # Parse times to UTC
+        df["segment_start"] = pd.to_datetime(df["segment_start"], utc=True, errors="coerce")
+        df["segment_end"]   = pd.to_datetime(df["segment_end"],   utc=True, errors="coerce")
+
+        # Discover IDs if none provided
+        if ids is None:
+            ids = sorted(df["fixed_id"].dropna().unique().tolist())
+
+        # Filter to requested IDs if given
+        df = df[df["fixed_id"].isin(ids)].copy()
+        if df.empty:
+            return pd.DataFrame(columns=["date"] + list(ids))
+
+        # Establish overall date span
+        seg_min = df["segment_start"].min()
+        seg_max = df["segment_end"].max()
+
+        # Optional external bounds
+        if start is not None:
+            start = pd.to_datetime(start, utc=True, errors="coerce")
+            seg_min = max(seg_min, start) if seg_min is not None else start
+        if end is not None:
+            end = pd.to_datetime(end, utc=True, errors="coerce")
+            seg_max = min(seg_max, end) if seg_max is not None else end
+
+        if (seg_min is pd.NaT) or (seg_max is pd.NaT) or (seg_min >= seg_max):
+            return pd.DataFrame(columns=["date"] + list(ids))
+
+        # Build midnight-aligned day bins
+        days_utc = pd.date_range(seg_min.normalize(), seg_max.normalize(), freq="D", tz="UTC")
+        day_starts = days_utc
+        day_ends   = day_starts + pd.Timedelta(days=1)
+
+        # Accumulate overlap seconds
+        day_id_seconds = {}
+        use_sr = (df.get("sampling_rate", 0) > 0) & (df.get("total_npts", 0) > 0)
+        npts_seconds = pd.Series(np.nan, index=df.index, dtype="float64")
+        npts_seconds.loc[use_sr] = df.loc[use_sr, "total_npts"] / df.loc[use_sr, "sampling_rate"]
+
+        for idx, row in df.iterrows():
+            fid = row["fixed_id"]
+            t0  = row["segment_start"]
+            t1  = row["segment_end"]
+            if pd.isna(t0) or pd.isna(t1) or t1 <= t0:
+                continue
+
+            target_total = npts_seconds.iloc[idx] if not np.isnan(npts_seconds.iloc[idx]) else None
+            remaining = target_total
+
+            first_day_idx = max(0, day_starts.searchsorted(t0, side="right") - 1)
+            last_day_idx  = min(len(day_starts)-1, day_starts.searchsorted(t1, side="left"))
+
+            for di in range(first_day_idx, last_day_idx + 1):
+                d0 = day_starts[di]
+                d1 = day_ends[di]
+                ov_start = max(t0, d0)
+                ov_end   = min(t1, d1)
+                overlap  = (ov_end - ov_start).total_seconds()
+                if overlap <= 0:
+                    continue
+
+                if remaining is not None:
+                    if overlap > remaining:
+                        overlap = remaining
+                    remaining -= overlap
+
+                key = (d0.tz_convert(None).to_pydatetime().date(), fid)
+                day_id_seconds[key] = day_id_seconds.get(key, 0.0) + float(overlap)
+
+        if not day_id_seconds:
+            return pd.DataFrame(columns=["date"] + list(ids))
+
+        recs = [{"date": k[0], "fixed_id": k[1], "seconds": v} for k, v in day_id_seconds.items()]
+        tall = pd.DataFrame(recs)
+
+        secs_per_day = 86400.0
+        tall["value"] = np.clip(tall["seconds"] / secs_per_day, 0.0, 1.0)
+
+        wide = tall.pivot_table(index="date", columns="fixed_id", values="value", aggfunc="sum").sort_index()
+        wide = wide.clip(upper=1.0)
+
+        # Reindex to full date span and discovered/requested IDs
+        all_dates = pd.date_range(days_utc.min(), days_utc.max(), freq="D", tz="UTC").tz_convert(None).date
+        wide = wide.reindex(index=all_dates, columns=ids)
+
+        return wide.reset_index().rename(columns={"index": "date"})
+
+
+    # --- plotting: now accepts either availabilityDF or audit CSV ---
+    '''
+    def plot_availability(
+        self,
+        availabilityDF=None,
+        outfile=None,
+        figsize=(12, 9),                 # a bit taller to fit the counts plot
+        fontsize=10,
+        labels=None,
+        cmap='gray_r',
+        audit_ranges_csvfile=None,
+        start=None,
+        end=None,
+        ids=None,
+        grouping=None,                   # None | 'component' | 'location' | 'station' | 'similarity'
+        station_prefix_len=4,
+        group_agg="mean",                # 'mean' (default) or 'max'
+        show_counts=True,                # NEW: show counts axis above heatmap
+        count_min_fraction=0.0           # NEW: threshold for counting a row as reporting
+    ):
+        """
+        Plot availability heatmap from FRACTIONS (0..1). Darker = more available.
+        If show_counts=True, adds a panel above showing number of reporting rows per day.
+        """
+
+
+        # Build availabilityDF if only CSV is provided
+        if availabilityDF is None and audit_ranges_csvfile:
+            availabilityDF = self._availability_from_audit_csv(audit_ranges_csvfile, start=start, end=end, ids=ids)
+
+        if availabilityDF is None or availabilityDF.empty:
             print("No availability data to plot.")
             return
 
-        Adf = availabilityDF.set_index('date').T / 100.0
-        Adata = Adf.to_numpy()
-        xticklabels = availabilityDF['date'].dt.strftime('%Y-%m-%d').tolist()
-        yticklabels = labels or Adf.index.tolist()
+        # Optional grouping (now with mean-aggregation by default)
+        if grouping:
+            availabilityDF = _apply_grouping(availabilityDF, mode=grouping, station_prefix_len=station_prefix_len, agg=group_agg)
 
-        fig, ax = plt.subplots(figsize=figsize)
-        im = ax.imshow(Adata, aspect='auto', cmap=cmap, interpolation='nearest', vmin=0, vmax=1)
+        # Arrange: rows = ids, cols = dates; values in 0..1
+        A_df = availabilityDF.set_index('date').T
+        # Keep date index as datetime index for nicer formatting
+        A_df.columns = pd.to_datetime(A_df.columns)
 
-        ax.set_xticks(np.arange(len(xticklabels))[::max(1, len(xticklabels) // 25)])
-        ax.set_xticklabels(xticklabels[::max(1, len(xticklabels) // 25)], rotation=90, fontsize=fontsize)
+        yticklabels = labels or list(A_df.index)
+        xdates = A_df.columns
+
+        if show_counts:
+            fig = plt.figure(figsize=figsize)
+            gs = fig.add_gridspec(nrows=2, ncols=1, height_ratios=[1, 4], hspace=0.15, left=0.08, right=0.98, top=0.95, bottom=0.08)
+            ax_top = fig.add_subplot(gs[0, 0])
+            ax = fig.add_subplot(gs[1, 0], sharex=ax_top)
+        else:
+            fig, ax = plt.subplots(figsize=figsize)
+
+        # --- Top counts plot (optional) ---
+        if show_counts:
+            # Count how many rows have fraction > threshold each day (ignoring NaNs)
+            counts = (A_df > count_min_fraction).sum(axis=0)
+            ax_top.plot(xdates, counts)                 # default style; no explicit color/style
+            ax_top.set_ylabel("# reporting", fontsize=fontsize)
+            ax_top.grid(True, axis='y', alpha=0.3)
+            # Keep x tick labels only on bottom axis
+            plt.setp(ax_top.get_xticklabels(), visible=False)
+
+        # --- Heatmap ---
+        im = ax.imshow(A_df.to_numpy(), aspect='auto', interpolation='nearest',
+                    cmap=cmap, vmin=0, vmax=1)
+
+        # X ticks: subsample for readability
+        if len(xdates) > 0:
+            step = max(1, len(xdates) // 25)
+            xlab = pd.to_datetime(pd.Series(xdates)).dt.strftime('%Y-%m-%d').tolist()
+            ax.set_xticks(np.arange(len(xdates))[::step])
+            ax.set_xticklabels(xlab[::step], rotation=90, fontsize=fontsize)
 
         ax.set_yticks(np.arange(len(yticklabels)))
         ax.set_yticklabels(yticklabels, fontsize=fontsize)
 
         ax.set_xlabel("Date", fontsize=fontsize)
-        ax.set_ylabel("SEED ID", fontsize=fontsize)
+        ax.set_ylabel("SEED ID" if not grouping else f"Group ({grouping})", fontsize=fontsize)
         ax.set_title("SDS Data Availability (%)", fontsize=fontsize + 2)
 
         cbar = plt.colorbar(im, ax=ax)
+        cbar.ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
         cbar.set_label("Availability", fontsize=fontsize)
 
         plt.tight_layout()
         if outfile:
             plt.savefig(outfile, dpi=300)
             print(f"Saved availability plot to: {outfile}")
+        return fig  
+    # --- plotting: now accepts either availabilityDF or audit CSV ---
+    '''  
+    
+    def plot_availability(
+        self,
+        availabilityDF=None,
+        outfile=None,
+        figsize=(12, 9),
+        fontsize=10,
+        labels=None,
+        cmap='gray_r',
+        audit_ranges_csvfile=None,
+        start=None,
+        end=None,
+        ids=None,
+        grouping=None,
+        station_prefix_len=4,
+        group_agg="mean",
+        show_counts=True,
+        count_min_fraction=0.0
+    ):
 
-    def __str__(self):
-        return f"client={self.client}, stream={self.stream}"
+
+        # Build availabilityDF if only CSV is provided
+        if availabilityDF is None and audit_ranges_csvfile:
+            availabilityDF = self._availability_from_audit_csv(audit_ranges_csvfile, start=start, end=end, ids=ids)
+
+        if availabilityDF is None or availabilityDF.empty:
+            print("No availability data to plot.")
+            return
+
+        # Optional grouping
+        if grouping:
+            availabilityDF = _apply_grouping(
+                availabilityDF, mode=grouping, station_prefix_len=station_prefix_len, agg=group_agg
+            )
+
+        # rows = ids, cols = dates; values in 0..1
+        A_df = availabilityDF.set_index('date').T
+        # normalize/ensure datetime for labels (not used for x coords)
+        xdates = pd.to_datetime(A_df.columns)
+        yticklabels = labels or list(A_df.index)
+
+        # numeric x coordinates so both axes align
+        n_cols = len(xdates)
+        n_rows = len(yticklabels)
+        idx = np.arange(n_cols)
+
+        if show_counts:
+            fig = plt.figure(figsize=figsize, constrained_layout=True)
+            gs = fig.add_gridspec(nrows=2, ncols=1, height_ratios=[1, 4])
+            ax_top = fig.add_subplot(gs[0, 0])
+            ax = fig.add_subplot(gs[1, 0])
+        else:
+            fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+            ax_top = None
+
+        # --- Heatmap (use extent to align with idx coordinates) ---
+        A = A_df.to_numpy()
+        im = ax.imshow(
+            A,
+            aspect='auto',
+            interpolation='nearest',
+            cmap=cmap,
+            vmin=0,
+            vmax=1,
+            extent=[-0.5, n_cols - 0.5, n_rows - 0.5, -0.5]  # x: columns, y: rows; top-left origin
+        )
+
+        # X ticks: indices with date labels
+        if n_cols > 0:
+            step = max(1, n_cols // 25)
+            ax.set_xticks(idx[::step])
+            ax.set_xticklabels(xdates.strftime('%Y-%m-%d')[::step], rotation=90, fontsize=fontsize)
+
+        # Y ticks: rows
+        ax.set_yticks(np.arange(n_rows))
+        ax.set_yticklabels(yticklabels, fontsize=fontsize)
+
+        ax.set_xlabel("Date", fontsize=fontsize)
+        ax.set_ylabel("SEED ID" if not grouping else f"Group ({grouping})", fontsize=fontsize)
+        ax.set_title("SDS Data Availability (%)", fontsize=fontsize + 2)
+
+        cbar = fig.colorbar(im, ax=ax)
+        cbar.ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
+        cbar.set_label("Availability", fontsize=fontsize)
+
+        # --- Counts on top (share the same idx coordinates) ---
+        if show_counts:
+            # Count “reporting” rows per day (post-grouping); treat NaN as False
+            counts = (A_df.fillna(0.0) > count_min_fraction).sum(axis=0)
+            ax_top.plot(idx, counts.values)
+            ax_top.set_xlim(-0.5, n_cols - 0.5)  # match heatmap
+            ax.set_xlim(-0.5, n_cols - 0.5)      # explicit, too
+            ax_top.set_ylabel("# reporting", fontsize=fontsize)
+            ax_top.grid(True, axis='y', alpha=0.3)
+            # Hide top x tick labels; bottom handles them
+            ax_top.tick_params(labelbottom=False)
+
+        # Do NOT call plt.tight_layout(); constrained_layout handles this
+        if outfile:
+            fig.savefig(outfile, dpi=300)
+            print(f"Saved availability plot to: {outfile}")
+        return fig
+
 
     def get_fullpath(self, trace):
         """
@@ -475,6 +753,61 @@ class SDSobj:
         sds_subdir = os.path.join(year, net, sta, f"{chan}.D")
         return os.path.join(self.basedir, sds_subdir, filename)
     
+
+    def sds2eventStream(self, eventtime,
+                        pretrig=3600, posttrig=3600,
+                        networks=['*'], bandcodes=['GHDCESB'],
+                        show_available=True):
+        """
+        Load waveform data from an SDS archive around a trigger time.
+
+        Parameters:
+        -----------
+        eventtime : UTCDateTime or ISO time string
+            Center time of the event window.
+
+        pretrig : float
+            Seconds before the trigger to include.
+
+        posttrig : float
+            Seconds after the trigger to include.
+
+        networks : list of str
+            Network codes to include (use ['*'] for wildcard).
+
+        bandcodes : list of str
+            Channel bandcodes or wildcards (e.g., ['HH', 'GH', 'BH']).
+
+        show_available : bool
+            If True, print available NSLC structure at midpoint of the window.
+
+        Returns:
+        --------
+        obspy.Stream
+            Combined waveform stream for requested time window and filters.
+        """
+
+        from flovopy.core.trace_utils import print_nslc_tree
+        startt = UTCDateTime(eventtime) - pretrig
+        endt = UTCDateTime(eventtime) + posttrig
+
+        if show_available:
+            mid = UTCDateTime((startt.timestamp + endt.timestamp) / 2)
+            nslc_list = self.client.get_all_nslc(datetime=mid)
+            print_nslc_tree(nslc_list)
+
+        st = Stream()
+        for network in networks:
+            bc_filter = f"[{''.join(bandcodes)}]*" if bandcodes else "*"
+            try:
+                this_st = self.client.get_waveforms(network, "*", "*", bc_filter, startt, endt)
+                st += this_st
+            except Exception as e:
+                print(f"[WARN] Failed to load waveforms for network {network}: {e}")
+
+        return st
+    
+    '''
     def load_metadata_from_excel(self, excel_path, sheet_name=0):
         """
         Load metadata from an Excel file into the SDSobj, including
@@ -529,6 +862,40 @@ class SDSobj:
             expanded_df = pd.DataFrame(expanded_rows)
             df = df[df["channel"].apply(lambda x: isinstance(x, str) and len(x) == 3)]
             df = pd.concat([df, expanded_df], ignore_index=True)
+
+        self.metadata = df
+    '''
+      # or your actual import path
+
+    def load_metadata_from_excel(self, excel_path, sheet_name='ksc_stations_master'):
+        """
+        Load metadata from an Excel file into the SDSobj, including
+        on/off dates and multi-channel expansion.
+
+        Parameters
+        ----------
+        excel_path : str
+            Path to the Excel file.
+        sheet_name : str or int, optional
+            Sheet name or index to load (default is 'ksc_stations_master').
+        """
+        df = build_dataframe_from_table(excel_path, sheet_name=sheet_name)
+
+        required_cols = {'network', 'station', 'location', 'channel'}
+        id_cols = {'id', 'seedid', 'traceid'}
+
+        if not required_cols.issubset(df.columns) and not id_cols.intersection(df.columns):
+            raise ValueError("Excel file must contain either full IDs ('id', 'seedid') or network/station/location/channel columns")
+
+        if 'id' not in df.columns:
+            if id_cols.intersection(df.columns):
+                # Rename one of the ID columns to 'id'
+                df = df.rename(columns={list(id_cols.intersection(df.columns))[0]: 'id'})
+            else:
+                df['id'] = df.apply(
+                    lambda row: f"{row['network']}.{row['station']}.{str(row['location']).zfill(2)}.{row['channel']}",
+                    axis=1
+                )
 
         self.metadata = df
     '''
@@ -736,3 +1103,232 @@ class SDSobj:
         else:
             return file_list
 
+
+
+
+_SEED_RE = re.compile(r"^(?P<net>[^.]+)\.(?P<sta>[^.]+)\.(?P<loc>[^.]+)\.(?P<cha>[^.]+)$")
+
+def _parse_seed_id(fid: str):
+    m = _SEED_RE.match(fid)
+    if not m:
+        # Fallback: treat everything as station-level bucket
+        return None, fid, None, None
+    return m.group("net"), m.group("sta"), m.group("loc"), m.group("cha")
+
+def _component_suffix(ch: str):
+    """Return the component discriminator (last char), e.g. Z/N/E or 1/2/3; None if unknown."""
+    return ch[-1] if ch else None
+
+def _component_sort_key(c):
+    # canonical order: Z,N,E then 1,2,3 then letters then digits
+    order = {c:i for i,c in enumerate(list("ZNE123"))}
+    return order.get(c, 100 + ord(str(c)[0]))
+
+def _longest_common_prefix(strings: list[str]) -> str:
+    """Return the full longest common prefix across all strings."""
+    if not strings:
+        return ""
+    s1, s2 = min(strings), max(strings)  # lexicographic bound trick
+    i = 0
+    while i < len(s1) and i < len(s2) and s1[i] == s2[i]:
+        i += 1
+    return s1[:i]
+
+def _group_map_for_columns(cols, mode="component", station_prefix_len=4, station_prefix_min=2):
+    """
+    Build a mapping {original_col -> group_key} and, for component mode,
+    a pretty renamer {group_key -> label_with_suffixes}.
+    """
+    mapping = {}
+    renamer = {}
+
+    if mode == "location":
+        for c in cols:
+            net, sta, loc, cha = _parse_seed_id(c)
+            if sta is None:
+                mapping[c] = c  # fallback
+            else:
+                mapping[c] = f"{net}.{sta}.{loc}"
+        return mapping, renamer
+
+    if mode == "station":
+        for c in cols:
+            net, sta, loc, cha = _parse_seed_id(c)
+            if sta is None:
+                mapping[c] = c
+            else:
+                mapping[c] = f"{net}.{sta}"
+        return mapping, renamer
+
+    if mode == "similarity":
+        # 1) coarse bucket by (net, first station_prefix_min chars) to keep it efficient
+        buckets = defaultdict(list)  # (net, base_min) -> [full id cols]
+        parsed = {}
+        for c in cols:
+            net, sta, loc, cha = _parse_seed_id(c)
+            parsed[c] = (net, sta, loc, cha)
+            if not sta:
+                mapping[c] = c  # fallback
+                continue
+            base_min = sta[:max(1, station_prefix_min)]
+            buckets[(net, base_min)].append(c)
+
+        # 2) for each bucket, compute full LCP of station codes and use that as the final label
+        #    (this allows 5+ characters when truly shared; singletons use their full station code)
+        for (net, _), members in buckets.items():
+            stas = [parsed[m][1] for m in members if parsed[m][1]]
+            lcp = _longest_common_prefix(stas) or stas[0]  # fallback to first if no common prefix
+            gkey = f"{net}.{lcp}"
+            for m in members:
+                mapping[m] = gkey
+
+        # no pretty renamer needed; gkey is already the desired label
+        return mapping, renamer
+
+
+    # component mode (default)
+    buckets = defaultdict(list)  # key -> list of original cols
+    key2parts = {}               # key -> (net,sta,loc,prefix)
+    for c in cols:
+        net, sta, loc, cha = _parse_seed_id(c)
+        if sta is None or not cha:
+            mapping[c] = c
+            continue
+        prefix = cha[:2]  # e.g., 'BH','EH','DH','DD'
+        key = (net, sta, loc, prefix)
+        buckets[key].append(c)
+        key2parts[key] = (net, sta, loc, prefix)
+
+    for key, members in buckets.items():
+        net, sta, loc, prefix = key2parts[key]
+        gkey = f"{net}.{sta}.{loc}.{prefix}"  # internal group key
+        for m in members:
+            mapping[m] = gkey
+
+        # build pretty label with concatenated, ordered suffixes present
+        suffixes = []
+        for m in members:
+            _, _, _, mcha = _parse_seed_id(m)
+            s = _component_suffix(mcha)
+            if s:
+                suffixes.append(s)
+        # de-dup & order
+        seen = []
+        for s in sorted(set(suffixes), key=_component_sort_key):
+            seen.append(s)
+        suffix_concat = "".join(seen) if seen else ""
+        renamer[gkey] = f"{net}.{sta}.{loc}.{prefix}{suffix_concat}"
+
+    return mapping, renamer
+
+'''
+def _apply_grouping(wide_df: pd.DataFrame, mode="component", station_prefix_len=4):
+    """
+    wide_df: 'date' column + one column per id (values are fractions 0..1).
+    Returns grouped wide_df with columns grouped and aggregated by max.
+    """
+    if wide_df is None or wide_df.empty:
+        return wide_df
+
+    id_cols = [c for c in wide_df.columns if c != "date"]
+    if not id_cols:
+        return wide_df
+
+    mapping, renamer = _group_map_for_columns(id_cols, mode=mode, station_prefix_len=station_prefix_len)
+
+    # group by mapping (aggregate with max: “available if any component is available”)
+    M = pd.Series(mapping)
+    grouped_vals = (
+        wide_df[id_cols]
+        .T.groupby(M)  # group columns by target key
+        .max()         # or .mean() if you prefer average across components
+        .T
+    )
+
+    out = pd.concat([wide_df[["date"]], grouped_vals], axis=1)
+
+    # pretty names for component mode
+    if renamer:
+        out = out.rename(columns=renamer)
+
+    return out
+'''
+
+def _apply_grouping(wide_df: pd.DataFrame, mode="component", station_prefix_len=4, agg="mean"):
+    """
+    wide_df: 'date' + id columns (fractions 0..1).
+    mode: 'component' | 'location' | 'station' | 'similarity' | None
+    agg: 'mean' or 'max'
+    """
+    if wide_df is None or wide_df.empty:
+        return wide_df
+
+    id_cols = [c for c in wide_df.columns if c != "date"]
+    if not id_cols or not mode:
+        return wide_df
+
+    mapping, renamer = _group_map_for_columns(id_cols, mode=mode, station_prefix_len=station_prefix_len)
+
+    grouped_vals = (
+        wide_df[id_cols]
+        .T.groupby(pd.Series(mapping))   # map original ids -> group key
+        .mean() if agg == "mean" else
+        wide_df[id_cols].T.groupby(pd.Series(mapping)).max()
+    ).T
+
+    out = pd.concat([wide_df[["date"]], grouped_vals], axis=1)
+    if renamer:
+        out = out.rename(columns=renamer)
+    return out
+
+if __name__ == "__main__":
+    #sdsobj = SDSobj(basedir="/data/remastered/SDS_KSC")
+    sdsobj = SDSobj(basedir="SDS_KSC")
+    sdsobj.plot_availability(
+        availabilityDF=None,
+        audit_ranges_csvfile="/Users/glennthompson/Dropbox/audit_ksc_ranges.csv",
+        start="2016-02-20",
+        end="2022-12-03",
+        ids=None, #["1R.BCHH.00.DD1","1R.BCHH.00.DD2","1R.BCHH.00.DD3"],
+        group_agg="mean",
+        show_counts=True,
+        count_min_fraction=0.0,        
+        outfile="avail_from_audit.png"
+    )
+    
+    sdsobj.plot_availability(
+        audit_ranges_csvfile="/Users/glennthompson/Dropbox/audit_ksc_ranges.csv",
+        grouping="component",
+        group_agg="mean",
+        show_counts=True,
+        count_min_fraction=0.0,  
+        outfile="avail_component.png"
+    )
+
+    sdsobj.plot_availability(
+        audit_ranges_csvfile="/Users/glennthompson/Dropbox/audit_ksc_ranges.csv",
+        grouping="location",
+        group_agg="mean",
+        show_counts=True,
+        count_min_fraction=0.0,         
+        outfile="avail_location.png"
+    )
+    
+    sdsobj.plot_availability(
+        audit_ranges_csvfile="/Users/glennthompson/Dropbox/audit_ksc_ranges.csv",
+        grouping="station",
+        group_agg="mean",
+        show_counts=True,
+        count_min_fraction=0.0,  
+        outfile="avail_station.png"
+    )
+    
+    sdsobj.plot_availability(
+        audit_ranges_csvfile="/Users/glennthompson/Dropbox/audit_ksc_ranges.csv",
+        grouping="similarity",
+        station_prefix_len=3,
+        group_agg="mean",
+        show_counts=True,
+        count_min_fraction=0.0,          
+        outfile="avail_similarity.png"
+    )
