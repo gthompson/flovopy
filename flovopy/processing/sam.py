@@ -12,9 +12,9 @@ from obspy import Trace, Stream, UTCDateTime
 
 
 class SAM:
-
+    '''
     def __init__(self, dataframes=None, stream=None, sampling_interval=60.0, filter=[0.5, 18.0], bands = {'VLP': [0.02, 0.2], 'LP':[0.5, 4.0], 'VT':[4.0, 18.0]}, corners=4, clip=None, verbose=False, squash_nans=False):
-        ''' Create an SAM object 
+        """ Create an SAM object 
         
             Optional name-value pairs:
                 dataframes: Create an SAM object using these dataframes. Used by downsample() method, for example. Default: None.
@@ -32,7 +32,7 @@ class SAM:
                 verbose: default False
                 squash_nans: new behaviour is that if any time window contains a NaN, the whole time window for all metrics will be NaN.
                              if squash_nans=True, then old behaviour restored, where NaNs stripped before computing each metric by using nan-aware averaging functions
-        '''
+        """
         self.dataframes = {} 
 
         if isinstance(dataframes, dict):
@@ -142,7 +142,257 @@ class SAM:
 
             df.replace(0.0, np.nan, inplace=True)
             self.dataframes[tr.id] = df
+    '''
 
+
+    def __init__(self,
+                 dataframes=None,
+                 stream=None,
+                 sampling_interval: float = 60.0,
+                 filter=[0.5, 18.0],
+                 bands={'VLP': [0.02, 0.2], 'LP': [0.5, 4.0], 'VT': [4.0, 18.0]},
+                 corners: int = 4,
+                 clip=None,
+                 verbose: bool = False,
+                 squash_nans: bool = False):
+        """
+        Initialize a Seismic Amplitude Measurement (SAM) object.
+
+        The SAM object stores per-trace, windowed metrics (e.g., min, mean, max, median, RMS)
+        and optionally filtered-band means, computed from an ObsPy Stream or precomputed
+        pandas DataFrames.
+
+        Parameters
+        ----------
+        dataframes : dict of {str: pandas.DataFrame}, optional
+            Precomputed metrics to use directly. Keys are trace IDs
+            (e.g., "NET.STA.LOC.CHAN"), and values are DataFrames containing
+            at least a 'time' column (epoch seconds) and one or more metric
+            columns. If provided, `stream` is ignored.
+        stream : obspy.Stream, optional
+            ObsPy Stream of waveform data from which to compute metrics.
+            If given and `dataframes` is None, metrics will be computed.
+        sampling_interval : float, default=60.0
+            Output sampling interval in seconds for the computed metrics.
+            This is the window length over which min/mean/max/etc. are computed.
+        filter : list [fmin, fmax] or None, default=[0.5, 18.0]
+            Primary bandpass filter to apply before computing the core metrics.
+            If None, no primary bandpass is applied.
+        bands : dict {name: [fmin, fmax]}, default={'VLP': [0.02, 0.2], 'LP': [0.5, 4.0], 'VT': [4.0, 18.0]}
+            Additional named frequency bands. For each band, the mean absolute
+            amplitude per window is computed and stored under the given name.
+            Set to None or empty dict to skip band-specific metrics.
+        corners : int, default=4
+            Number of corners for all bandpass filters (Butterworth design).
+        clip : float or None, optional
+            If given, clip all trace data to ±`clip` before filtering/metrics.
+        verbose : bool, default=False
+            If True, print progress messages and diagnostic information.
+        squash_nans : bool, optional (deprecated)
+            Ignored; retained for backward compatibility. All metrics are always
+            computed using NaN-aware reducers (`np.nanmin`, `np.nanmean`, etc.).
+
+        Notes
+        -----
+        - If `dataframes` is supplied and valid, no computation is performed.
+        - If `stream` traces appear to have been merged by `SDSobj.read()` with
+          the `flovopy:smart_merge_v1` tag, no further sanitization is done.
+          Otherwise, a light `sanitize_stream()` pass removes empties/duplicates.
+        - If `stream`'s sampling rate matches exactly 1 / `sampling_interval`,
+          the method will skip filtering and directly store time/mean pairs.
+        - If the trace sampling rate is insufficient for a given band
+          (less than 2.2 × fmax), that band is skipped for that trace.
+        - All metrics are computed on the absolute value of the waveform.
+          Zero values are replaced with NaN before computation.
+        - Computed metric columns:
+            'time'   – epoch seconds (window start/left edge)
+            'min'    – minimum absolute amplitude in the window
+            'mean'   – mean absolute amplitude
+            'max'    – maximum absolute amplitude
+            'median' – median absolute amplitude
+            'rms'    – standard deviation (as RMS) of absolute amplitude
+          plus one column per band in `bands`, and optionally 'fratio'
+          if both 'LP' and 'VT' bands are present.
+
+        Raises
+        ------
+        ValueError
+            If `stream`'s sampling rate is less than the Nyquist requirement for
+            the primary filter or any requested band.
+        Exception
+            If filtering or detrending fails for a given trace, that trace is skipped.
+
+        Examples
+        --------
+        >>> from obspy import read
+        >>> from flovopy.sam import SAM
+        >>> st = read("IU_ANMO.mseed")
+        >>> sam = SAM(stream=st, sampling_interval=60.0)
+        >>> list(sam.dataframes.keys())
+        ['IU.ANMO..BHZ']
+        >>> sam.dataframes['IU.ANMO..BHZ'].head()
+               time       min      mean       max    median       rms   VLP    LP    VT
+        0  1.691040e+09  ...   ...   ...   ...   ...   ...   ...
+        """
+        self.dataframes = {}
+
+        # 0) Accept prebuilt dataframes (unchanged behavior)
+        if isinstance(dataframes, dict):
+            good = {k: v for k, v in dataframes.items() if isinstance(v, pd.DataFrame)}
+            if good:
+                self.dataframes = good
+                return
+
+        # 1) No stream → blank object
+        if not isinstance(stream, Stream):
+            print('creating blank SAM object')
+            return
+
+        # Deprecation notice (printed once per call)
+        if 'squash_nans' in SAM.__init__.__code__.co_varnames:
+            if squash_nans is not None:
+                print("NOTE: 'squash_nans' is deprecated; SAM now always uses NaN-aware reducers.")
+
+        # Defensive copy of mutable defaults
+        filt = None if filter is None else [float(filter[0]), float(filter[1])]
+        band_dict = None if bands is None else {str(k): [float(v[0]), float(v[1])] for k, v in bands.items()}
+
+        st = stream
+
+        # 2) Trust-but-verify: light sanitize if SDS merge tag missing
+        has_tag = False
+        for tr_chk in st:
+            proc = getattr(tr_chk.stats, "processing", []) or []
+            if any("flovopy:smart_merge_v1" in p for p in proc):
+                has_tag = True
+                break
+        if not has_tag:
+            try:
+                from flovopy.core.trace_utils import sanitize_stream
+                sanitize_stream(st, drop_empty=True, drop_duplicates=True,
+                                unmask_short_zeros=True, min_gap_duration_s=1.0)
+            except Exception as e:
+                if verbose:
+                    print(f"sanitize_stream skipped/failed: {e}")
+
+        if verbose:
+            print('good_stream:\n', st)
+
+        if len(st) == 0:
+            return
+
+        # 3) Fast path: if fs == 1/Δt, emit time+mean directly
+        ref_fs = st[0].stats.sampling_rate
+        if np.isclose(ref_fs, 1.0 / sampling_interval):
+            for tr in st:
+                df = pd.DataFrame({
+                    'time': pd.Series(tr.times('timestamp')),
+                    'mean': pd.Series(tr.data)
+                })
+                self.dataframes[tr.id] = df
+            return
+
+        # 4) Disallow undersampled streams for requested Δt
+        if ref_fs < 1.0 / sampling_interval:
+            print('error: cannot compute SAM for a Stream with a tr.stats.delta bigger than requested sampling interval')
+            return
+
+        # 5) Per-trace processing
+        for tr in st:
+            fs = tr.stats.sampling_rate
+            if tr.stats.npts < int(fs * sampling_interval):
+                if verbose:
+                    print(f'Not enough samples for {tr.id}. Skipping.')
+                continue
+
+            # Base copy once per trace: handle masking, detrend, optional clip
+            tr_base = tr.copy()
+            if isinstance(tr_base.data, np.ma.MaskedArray):
+                tr_base.data = tr_base.data.filled(fill_value=0)
+            try:
+                tr_base.detrend('demean')
+            except Exception as e:
+                if verbose:
+                    print(f"{tr.id}: detrend failed ({e})")
+                continue
+            if clip is not None:
+                try:
+                    tr_base.data = np.clip(tr_base.data, a_min=-clip, a_max=clip)
+                except Exception as e:
+                    if verbose:
+                        print(f"{tr.id}: clip failed ({e})")
+                    continue
+            tr_base.data = np.asarray(tr_base.data, dtype=float)
+
+            # Window timestamps (left edge = min timestamp per window)
+            t_epoch = tr.times('timestamp')
+            T = self.reshape_trace_data(t_epoch, fs, sampling_interval)
+            time_col = pd.Series(np.nanmin(T, axis=1))
+
+            # Primary filter (optional) with 2.2× Nyquist guard; cache filtered copies
+            filt_cache = {}
+            if filt:
+                fmin, fmax = float(filt[0]), float(filt[1])
+                if fs < 2.2 * fmax:
+                    if verbose:
+                        print(f"{tr.id}: bad sampling rate for primary band {fmin}-{fmax} Hz. Skipping trace.")
+                    continue
+                key = (round(fmin, 6), round(fmax, 6), int(corners))
+                tr_primary = tr_base.copy()
+                try:
+                    tr_primary.filter('bandpass', freqmin=fmin, freqmax=fmax, corners=corners)
+                except Exception as e:
+                    if verbose:
+                        print(f"{tr.id}: bandpass {fmin}-{fmax} Hz failed ({e})")
+                    continue
+                filt_cache[key] = tr_primary
+                y = tr_primary.data
+            else:
+                y = tr_base.data
+
+            # Windowed metrics on |y| with NaN-aware reducers
+            y = np.asarray(y, dtype=float)
+            y[y == 0.0] = np.nan
+            Y = self.reshape_trace_data(np.abs(y), fs, sampling_interval)
+
+            df = pd.DataFrame()
+            df['time']   = time_col
+            df['min']    = pd.Series(np.nanmin(Y, axis=1))
+            df['mean']   = pd.Series(np.nanmean(Y, axis=1))
+            df['max']    = pd.Series(np.nanmax(Y, axis=1))
+            df['median'] = pd.Series(np.nanmedian(Y, axis=1))
+            df['rms']    = pd.Series(np.nanstd(Y, axis=1))
+
+            # Extra bands: mean(|bandpass|) per window
+            if band_dict:
+                for key_name, (flow, fhigh) in band_dict.items():
+                    if fs < 2.2 * fhigh:
+                        if verbose:
+                            print(f"{tr.id}: bad sampling rate for band {key_name} {flow}-{fhigh} Hz. Skipping band.")
+                        continue
+                    bkey = (round(float(flow), 6), round(float(fhigh), 6), int(corners))
+                    if bkey in filt_cache:
+                        tr_band = filt_cache[bkey]
+                    else:
+                        tr_band = tr_base.copy()
+                        try:
+                            tr_band.filter('bandpass', freqmin=float(flow), freqmax=float(fhigh), corners=corners)
+                        except Exception as e:
+                            if verbose:
+                                print(f"{tr.id}: bandpass {flow}-{fhigh} Hz failed ({e})")
+                            continue
+                        filt_cache[bkey] = tr_band
+                    Yb = self.reshape_trace_data(np.abs(np.asarray(tr_band.data, dtype=float)), fs, sampling_interval)
+                    df[key_name] = pd.Series(np.nanmean(Yb, axis=1))
+
+                # frequency ratio when LP & VT available
+                if 'LP' in band_dict and 'VT' in band_dict and 'LP' in df and 'VT' in df:
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        df['fratio'] = np.log2(df['VT'] / df['LP'])
+
+            # Normalize zeros to NaN, store
+            df.replace(0.0, np.nan, inplace=True)
+            self.dataframes[tr.id] = df
     
     def copy(self):
         ''' make a full copy of an SAM object and return it '''
@@ -150,7 +400,7 @@ class SAM:
         selfcopy.dataframes = self.dataframes.copy()
         return selfcopy
     
-    def despike(self, metrics=['mean'], thresh=1.5, reps=1, verbose=False):
+    def despike_old(self, metrics=['mean'], thresh=1.5, reps=1, verbose=False):
         if not isinstance(metrics, list):
             metrics = [metrics]
         if metrics=='all':
@@ -174,9 +424,75 @@ class SAM:
                     print(f'{tr.id}: removed {count2} length-2 spikes and {count1} length-1 spikes')           
                 self.dataframes[tr.id][metric]=x
         if reps>1:
-            self.despike(metrics=metrics, thresh=thresh, reps=reps-1)        
+            self.despike(metrics=metrics, thresh=thresh, reps=reps-1)     
 
-    def downsample(self, new_sampling_interval=3600):
+    def despike(self, metrics=['mean'], z=6.0, window=9, inplace=True, verbose=False):
+        """
+        MAD-based despike on SAM time-series metrics.
+        - metrics: list or 'all' to target all numeric metric columns present in dataframes
+        - z: modified z-score threshold (typical: 5–8)
+        - window: odd integer rolling window length (samples)
+        - inplace: modify this SAM or return a new one
+        """
+        if not isinstance(metrics, list):
+            metrics = [metrics]
+
+        out = {} if not inplace else self.dataframes
+        for tid, df in self.dataframes.items():
+            d = df.copy() if not inplace else df
+
+            # figure out which columns to touch
+            if metrics == ['all']:
+                cols = [c for c in d.columns if c not in ('time', 'date')]
+            else:
+                cols = [c for c in metrics if c in d.columns]
+
+            if not cols:
+                if verbose:
+                    print(f"{tid}: no matching metric columns")
+                if not inplace:
+                    out[tid] = d
+                continue
+
+            # ensure datetime for resampling use elsewhere
+            if 'date' not in d.columns:
+                d['date'] = pd.to_datetime(d['time'], unit='s')
+
+            # rolling center median/MAD
+            for col in cols:
+                x = d[col].astype(float).values
+                if np.all(np.isnan(x)) or len(x) < max(5, window):
+                    continue
+
+                s = pd.Series(x)
+                med = s.rolling(window=window, center=True, min_periods=3).median()
+                # MAD with rolling window
+                abs_dev = (s - med).abs()
+                mad = abs_dev.rolling(window=window, center=True, min_periods=3).median()
+
+                # modified z-score (0.6745 * |x - med| / MAD)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    mz = 0.6745 * abs_dev / mad
+                spikes = mz > z
+
+                # replace spikes with rolling median
+                x_new = x.copy()
+                x_new[spikes.values] = med.values[spikes.values]
+                d[col] = x_new
+
+                if verbose:
+                    n_spikes = int(np.nansum(spikes.values))
+                    print(f"{tid}.{col}: replaced {n_spikes} spikes (z>{z})")
+
+            if not inplace:
+                out[tid] = d
+
+        if inplace:
+            return self
+        else:
+            return self.__class__(dataframes=out)   
+
+    def downsample_old(self, new_sampling_interval=3600):
         ''' downsample an SAM object to a larger sampling interval(e.g. from 1 minute to 1 hour). Returns a new SAM object.
          
             Optional name-value pair:
@@ -200,6 +516,57 @@ class SAM:
             else:
                 print('Cannot downsample to a smaller sampling interval')
         return self.__class__(dataframes=dataframes) 
+    
+    def downsample(self, new_sampling_interval=3600, inplace=False):
+        """
+        Downsample SAM metrics to a coarser interval (seconds).
+        Returns a new SAM unless inplace=True.
+        """
+        if new_sampling_interval <= 0:
+            raise ValueError("new_sampling_interval must be positive")
+
+        result = {} if not inplace else self.dataframes
+
+        for tid, df in self.dataframes.items():
+            d = df.copy() if not inplace else df
+
+            if 'date' not in d.columns:
+                d['date'] = pd.to_datetime(d['time'], unit='s')
+
+            # current cadence (best effort)
+            if len(d) < 2:
+                if not inplace:
+                    result[tid] = d
+                continue
+            # resample
+            freq = f"{int(new_sampling_interval)}S"  # seconds
+            # numeric aggregation only; leave non-numeric alone
+            numeric = d.select_dtypes(include='number').copy()
+            # Ensure 'time' isn't used as numeric input
+            numeric = numeric.drop(columns=[c for c in ['time'] if c in numeric.columns], errors='ignore')
+
+            agg = numeric.set_index(d['date']).resample(freq, origin='epoch', label='left').mean()
+
+            # rebuild 'time' and 'date'
+            agg['date'] = agg.index
+            agg['time'] = (agg['date'].view('int64') // 10**9).astype(float)
+
+            # Put 'time' first, then others (stable order)
+            ordered = ['time'] + [c for c in d.columns if c not in ('time', 'date')] + ['date']
+            # Some columns might be absent (e.g., non-numeric); filter existing
+            ordered = [c for c in ordered if c in agg.columns]
+
+            d2 = agg[ordered].reset_index(drop=True)
+
+            if inplace:
+                self.dataframes[tid] = d2
+            else:
+                result[tid] = d2
+
+        if inplace:
+            return self
+        else:
+            return self.__class__(dataframes=result)
         
     def drop(self, id):
         if id in self.__get_trace_ids():
@@ -228,9 +595,9 @@ class SAM:
 
     def __len__(self):
         return len(self.dataframes)
-
+    '''
     def plot(self, metrics=['mean'], kind='stream', logy=False, equal_scale=False, outfile=None, ylims=None):
-        ''' plot a SAM object 
+        """ plot a SAM object 
 
             Optional name-value pairs:
                 metrics: The columns of each SAM DataFrame to plot. Can be one (scalar), or many (a list)
@@ -243,7 +610,7 @@ class SAM:
                 logy:    In combination with kind='line', will make the y-axis logarithmic. No effect if kind='stream'.
                 equal_scale: If True, y-axes for each plot will have same limits. Default: False.
         
-        '''
+        """
         self.__remove_empty()
         if isinstance(metrics, str):
             metrics = [metrics]
@@ -300,10 +667,10 @@ class SAM:
                 else:
                     plt.show()
             plt.close('all')
-
+    
     @classmethod
     def read(classref, startt, endt, SAM_DIR, trace_ids=None, network='*', sampling_interval=60, ext='pickle', verbose=False):
-        ''' read one or many SAM files from folder specified by SAM_DIR for date/time range specified by startt, endt
+        """ read one or many SAM files from folder specified by SAM_DIR for date/time range specified by startt, endt
             return corresponding SAM object
 
             startt and endt must be ObsPy.UTCDateTime data types
@@ -314,7 +681,7 @@ class SAM:
                 sampling_interval (int): seconds of raw seismic data corresponding to each SAM sample. Default: 60
                 ext (str): should be 'csv' or 'pickle' (default). Indicates what type of file format to open.
 
-        '''
+        """
         #self = classref() # blank SAM object
         dataframes = {}
 
@@ -366,7 +733,357 @@ class SAM:
                 
         samObj = classref(dataframes=dataframes) # create SAM object         
         return samObj
+    '''
 
+    def plot(self, metrics=['mean'], kind='stream', logy=False, equal_scale=False, outfile=None, ylims=None):
+        """Plot a SAM object.
+
+        Parameters
+        ----------
+        metrics : str or list, default 'mean'
+            Columns to plot from each SAM DataFrame. Special value 'bands'
+            auto-detects a band set among:
+            - PRI, SEC, HI   (storm seismic)
+            - TC, MB, TH     (storm infrasound)
+            - VLP, LP, VT    (classic volcano)
+            If LP and VT are present anywhere, 'fratio' is appended too.
+        kind : {'stream','line','scatter'}, default 'stream'
+            'stream' → convert each metric to an ObsPy.Stream and call .plot()
+            'line'   → pandas line plot (metrics on one axes)
+            'scatter'→ two stacked scatter subplots (for 2 metrics)
+        logy : bool, default False
+            Log-scale y-axis (only for kind != 'stream').
+        equal_scale : bool, default False
+            If True, same y-limits for all Stream plots (kind='stream').
+        outfile : str or None
+            If provided, figures are written to disk. For kind='stream',
+            the metric name is appended before '.png' unless already present.
+        ylims : (low, high) or None
+            Optional clipping bounds applied before plotting (non-stream).
+        """
+        import matplotlib.pyplot as plt
+        self.__remove_empty()
+
+        # Normalize metrics input
+        if isinstance(metrics, str):
+            metrics = [metrics]
+
+        # -------- Auto-detect band set if requested --------
+        if metrics == ['bands']:
+            # Union of columns across all traces
+            all_cols = set()
+            for df in self.dataframes.values():
+                all_cols.update(df.columns)
+
+            # Preference order of band triads
+            candidates = [
+                ['PRI', 'SEC', 'HI'],   # storm seismic
+                ['TC', 'MB', 'TH'],     # storm infrasound
+                ['VLP', 'LP', 'VT'],    # classic volcano
+            ]
+            chosen = None
+            for triad in candidates:
+                if set(triad).issubset(all_cols):
+                    chosen = triad
+                    break
+
+            if not chosen:
+                print('no frequency bands data present')
+                return
+
+            # Add fratio if available (LP & VT)
+            if {'LP', 'VT'}.issubset(all_cols):
+                metrics = chosen + ['fratio']
+            else:
+                metrics = chosen
+
+        # -------- kind='stream' path --------
+        if kind == 'stream':
+            for m in metrics:
+                print('METRIC:', m)
+                st = self.to_stream(metric=m, ylims=ylims)
+                if outfile:
+                    if m not in outfile:
+                        this_outfile = outfile.replace('.png', f"_{m}.png")
+                        st.plot(equal_scale=equal_scale, outfile=this_outfile)
+                    else:
+                        st.plot(equal_scale=equal_scale, outfile=outfile)
+                else:
+                    st.plot(equal_scale=equal_scale)
+            return
+
+        # -------- kind='line' / 'scatter' path --------
+        for key, df in self.dataframes.items():
+            this_df = df.copy()
+            this_df['time'] = pd.to_datetime(df['time'], unit='s')
+
+            # Optional clipping
+            if isinstance(ylims, (list, tuple)) and len(ylims) == 2:
+                lo, hi = ylims
+                for m in metrics:
+                    if m in this_df.columns:
+                        this_df[m] = this_df[m].clip(lower=lo, upper=hi)
+
+            # Ensure requested metrics exist for this trace
+            missing = [m for m in metrics if m not in this_df.columns]
+            if missing:
+                print(f"{key}: missing columns: {', '.join(missing)}")
+                continue
+
+            if kind == 'line':
+                ax = this_df.plot(x='time', y=metrics, kind='line', title=key, logy=logy, rot=45)
+            elif kind == 'scatter':
+                if len(metrics) < 2:
+                    print(f"{key}: scatter requires at least 2 metrics")
+                    continue
+                fh, ax = plt.subplots(nrows=min(2, len(metrics)), ncols=1, sharex=True, sharey=False)
+                if not isinstance(ax, (list, tuple, np.ndarray)):
+                    ax = [ax]
+                for i, m in enumerate(metrics[:len(ax)]):
+                    this_df.plot(x='time', y=m, kind='scatter', ax=ax[i], title=key, logy=logy, rot=45)
+            else:
+                print(f"Unknown kind='{kind}'")
+                continue
+
+            if outfile:
+                suffix = "_bands.png" if set(['PRI','SEC','HI']).issubset(metrics) or set(['VLP','LP','VT']).issubset(metrics) or set(['TC','MB','TH']).issubset(metrics) else "_metrics.png"
+                this_outfile = outfile.replace('.png', suffix)
+                plt.savefig(this_outfile)
+            else:
+                plt.show()
+
+            plt.close('all')
+
+    @classmethod
+    def read(classref, startt, endt, SAM_DIR, trace_ids=None, network='*',
+            sampling_interval=60, ext='pickle', verbose=False):
+        """
+        Read one or many SAM files from SAM_DIR over [startt, endt) and return a SAM object.
+
+        Parameters
+        ----------
+        startt, endt : obspy.UTCDateTime
+            Start and end times (UTC). End is treated as **exclusive**.
+        SAM_DIR : str
+            Base output directory that contains RSAM/ or VSAM subfolders (class handles this).
+        trace_ids : list[str], optional
+            Explicit list of trace IDs to load (e.g., "IU.DWPF.10.BHZ"). If omitted, the
+            method discovers trace IDs from files matching the network pattern.
+        network : str, default '*'
+            Network filter when discovering trace IDs (ignored if trace_ids is provided).
+        sampling_interval : int, default 60
+            SAM sampling interval (seconds).
+        ext : {'pickle','csv'}, default 'pickle'
+            File format to read.
+        verbose : bool, default False
+            Print diagnostics.
+
+        Returns
+        -------
+        classref
+            A SAM/RSAM/VSAM instance with `dataframes` populated for the selected IDs/time span.
+        """
+        dataframes = {}
+
+        # Convert bounds to pandas Timestamps (naive UTC) for robust masking
+        start_ts = pd.to_datetime(startt.datetime)
+        end_ts   = pd.to_datetime(endt.datetime)
+
+        # -------- Discover trace_ids if not provided --------
+        # -------- Discover trace_ids if not provided --------
+        if not trace_ids:
+            found_ids = set()
+            subdir = classref.__name__.upper()  # 'RSAM' or 'VSAM'
+            for year in range(startt.year, endt.year + 1):
+                # Files live at: <SAM_DIR>/<RSAM|VSAM>/<NET>/<RSAM|VSAM>_<NET.STA.LOC.CHA>_<YEAR>_<Δs>.<ext>
+                pattern = os.path.join(
+                    SAM_DIR, subdir, network,
+                    f"{subdir}_*_{year}_{int(sampling_interval)}s.{ext}"
+                )
+                samfiles = glob.glob(pattern)
+                if not samfiles and verbose:
+                    print(f'No files found matching {pattern}')
+                for path in samfiles:
+                    base = os.path.basename(path)
+                    parts = base.split('_')
+                    # e.g., VSAM_IU.DWPF.10.BHZ_2011_60s.pickle  -> parts[-3] == 'IU.DWPF.10.BHZ'
+                    if len(parts) >= 3:
+                        found_ids.add(parts[-3])
+            trace_ids = sorted(found_ids)
+
+            if verbose and not trace_ids:
+                print("No trace IDs discovered for the given pattern/time range.")
+
+        # -------- Load frames per id across years, then slice by time --------
+        for tid in trace_ids:
+            yearly = []
+            for yyyy in range(startt.year, endt.year + 1):
+                samfile = classref.get_filename(SAM_DIR, tid, yyyy, sampling_interval, ext)
+                if os.path.isfile(samfile):
+                    if verbose:
+                        print('Reading', samfile)
+                    if ext == 'csv':
+                        df = pd.read_csv(samfile, index_col=False)
+                    elif ext == 'pickle':
+                        df = pd.read_pickle(samfile)
+                    else:
+                        raise ValueError(f"Unsupported ext '{ext}'. Use 'pickle' or 'csv'.")
+                    if df.empty:
+                        continue
+
+                    # Standardize column name
+                    if 'std' in df.columns:
+                        df.rename(columns={'std': 'rms'}, inplace=True)
+
+                    # Time mask: [start, end)
+                    df['pddatetime'] = pd.to_datetime(df['time'], unit='s', utc=False)
+                    mask = df['pddatetime'].between(start_ts, end_ts, inclusive='left')
+                    subset_df = df.loc[mask].drop(columns=['pddatetime'])
+                    if not subset_df.empty:
+                        yearly.append(subset_df)
+                else:
+                    if verbose:
+                        print(f"Cannot find {samfile}")
+
+            if len(yearly) == 1:
+                dataframes[tid] = yearly[0]
+            elif len(yearly) > 1:
+                dataframes[tid] = pd.concat(yearly, ignore_index=True)
+
+        # Return a SAM/RSAM/VSAM instance populated with the loaded frames
+        return classref(dataframes=dataframes)
+
+    @classmethod
+    def missing_days(
+        classref,
+        startt,
+        endt,
+        SAM_DIR,
+        trace_ids=None,
+        network="*",
+        sampling_interval=60,
+        ext="pickle",
+        require_full_day=False,
+        tol=0.05,
+        verbose=False,
+    ):
+        """
+        Return per-trace lists of *missing* UTC days in [startt, endt), based on FINAL
+        per-year RSAM/VSAM files. This **wraps `read()`** to avoid code duplication.
+
+        Coverage rule:
+          - require_full_day=False → a day is covered if it has ≥ 1 sample.
+          - require_full_day=True  → a day is covered if it has ≥ (1 - tol) * floor(86400/Δ) samples.
+
+        Parameters
+        ----------
+        startt, endt : obspy.UTCDateTime
+            Time window; end is **exclusive**. Days are midnight UTC boundaries.
+        SAM_DIR : str
+            Base output dir that contains RSAM/ or VSAM (chosen by subclass).
+        trace_ids : list[str], optional
+            Explicit SEED IDs to consider. If omitted, IDs are discovered by `read()`.
+            If provided and some IDs are missing from the loaded object, those IDs
+            are treated as **completely missing** in the interval.
+        network : str, default '*'
+            Network filter when discovering IDs (ignored if `trace_ids` provided).
+        sampling_interval : int, default 60
+            SAM Δ in seconds (used for expected-per-day).
+        ext : {'pickle','csv'}, default 'pickle'
+            File format of final files.
+        require_full_day : bool, default False
+            Enforce near-full-day coverage (see `tol`).
+        tol : float, default 0.05
+            Shortfall tolerance when `require_full_day=True`.
+        verbose : bool, default False
+            Print diagnostics.
+
+        Returns
+        -------
+        dict[str, list[UTCDateTime]]
+            Mapping: trace_id → list of missing-day UTC midnights in [startt, endt).
+        """
+        # Build the day list once
+        start_ts = pd.to_datetime(startt.datetime, utc=True)
+        end_ts   = pd.to_datetime(endt.datetime,   utc=True)
+        all_days = pd.date_range(
+            start=start_ts.floor("D"),
+            end=end_ts.floor("D"),
+            freq="D",
+            inclusive="left",
+        )
+        day_keys = [d.strftime("%Y-%m-%d") for d in all_days]
+
+        if not day_keys:
+            return {}
+
+        # Expected samples per full day for this Δ
+        exp_per_day = int(math.floor(86400.0 / float(sampling_interval)))
+        threshold   = (1.0 - float(tol)) * exp_per_day if require_full_day else 1
+
+        # Reuse the existing loader — no duplication
+        loaded = classref.read(
+            startt=startt, endt=endt, SAM_DIR=SAM_DIR,
+            trace_ids=trace_ids, network=network,
+            sampling_interval=int(sampling_interval),
+            ext=ext, verbose=verbose,
+        )
+
+        # Which IDs are we evaluating?
+        loaded_ids = set(loaded.dataframes.keys())
+        requested_ids = set(trace_ids) if trace_ids else loaded_ids
+        all_ids = sorted(requested_ids.union(loaded_ids))
+
+        missing_by_id = {}
+
+        for tid in all_ids:
+            # If an explicitly requested ID didn't load at all, everything is missing
+            if tid not in loaded_ids:
+                missing_by_id[tid] = [
+                    UTCDateTime(pd.Timestamp(k).to_pydatetime().replace(tzinfo=None))
+                    for k in day_keys
+                ]
+                if verbose:
+                    print(f"[missing_days] {tid}: no data loaded → {len(day_keys)} missing days")
+                continue
+
+            df = loaded.dataframes[tid]
+            if df.empty:
+                # No samples in the window ⇒ all days are missing
+                missing_by_id[tid] = [
+                    UTCDateTime(pd.Timestamp(k).to_pydatetime().replace(tzinfo=None))
+                    for k in day_keys
+                ]
+                if verbose:
+                    print(f"[missing_days] {tid}: empty frame → {len(day_keys)} missing days")
+                continue
+
+            # Count samples per UTC day
+            ts = pd.to_datetime(df["time"], unit="s", utc=True)
+            # ts is a Series of pandas Timestamps
+            # Use the datetime accessor; fall back to .dt.normalize() for older pandas.
+            try:
+                days = ts.dt.floor("D")
+            except AttributeError:  # very old pandas
+                days = ts.dt.normalize()
+            per_day_counts = days.value_counts()
+
+            # Covered if day in counts and meets threshold
+            covered = {
+                pd.Timestamp(d).strftime("%Y-%m-%d")
+                for d, n in per_day_counts.items() if n >= threshold
+            }
+            remaining = [k for k in day_keys if k not in covered]
+
+            missing_by_id[tid] = [
+                UTCDateTime(pd.Timestamp(k).to_pydatetime().replace(tzinfo=None))
+                for k in remaining
+            ]
+
+            if verbose:
+                print(f"[missing_days] {tid}: covered={len(covered)}  missing={len(remaining)}")
+
+        return missing_by_id
 
     def select(self, network=None, station=None, location=None, channel=None,
                sampling_interval=None, npts=None, component=None, id=None,
@@ -1510,7 +2227,141 @@ def energy2magnitude(E, a=-3.2, b=2/3):
     ME = b * np.log10(E) + a
     return ME
 
+import argparse
+from obspy.clients.fdsn import Client
+from obspy import Stream, UTCDateTime
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Download Z/N/E components from IRIS/EarthScope FDSN and compute RSAM.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # Data/service
+    parser.add_argument("--service", default="IRIS",
+                        help="FDSN service name or base URL.")
+    parser.add_argument("--network", default="IU",
+                        help="FDSN network code (e.g., IU, II, IC).")
+    parser.add_argument("--station", default="DWPF",
+                        help="Station code (e.g., ANMO).")
+    parser.add_argument("--location", default="*",
+                        help="Location code (use '*' for any).")
+
+    # Time range (defaults form a canned example)
+    parser.add_argument("--startdate", default="2011-03-10",
+                        help="Start ISO UTC: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS.")
+    parser.add_argument("--enddate", default="2011-03-15",
+                        help="End ISO UTC (not inclusive of the last day's end).")
+
+    # RSAM settings
+    parser.add_argument("--sampling_interval", type=float, default=60.0,
+                        help="RSAM sampling interval (s).")
+    parser.add_argument("--minfreq", type=float, default=0.5,
+                        help="Bandpass low-cut for RSAM (Hz).")
+    parser.add_argument("--maxfreq", type=float, default=18.0,
+                        help="Bandpass high-cut for RSAM (Hz).")
+    parser.add_argument("--corners", type=int, default=4,
+                        help="IIR filter corners for bandpass.")
+
+    # I/O
+    parser.add_argument("--sam_dir", default="SAM_OUT",
+                        help="Output directory root for SAM/RSAM archive.")
+    parser.add_argument("--ext", choices=["pickle", "csv"], default="pickle",
+                        help="Output format for RSAM files.")
+
+    # Misc
+    parser.add_argument("--verbose", action="store_true",
+                        help="Verbose logging.")
+    return parser.parse_args()
+
+
+def _build_channel_csv():
+    # Try these in priority order; request explicit Z/N/E
+    families = ["HH?", "BH?", "EH?", "LH?"]
+    chans = []
+    for fam in families:
+        chans += [fam.replace("?", c) for c in ("Z", "N", "E")]
+    return ",".join(chans)
+
+
+def _process_day(client, args, day_start, day_end):
+    channel_csv = _build_channel_csv()
+
+    if args.verbose:
+        print(f"\n=== {day_start.isoformat()} to {day_end.isoformat()} ===")
+
+    # Fetch waveforms
+    try:
+        st_all = client.get_waveforms(
+            network=args.network,
+            station=args.station,
+            location=args.location,
+            channel=channel_csv,
+            starttime=day_start,
+            endtime=day_end,
+            attach_response=False,
+        )
+    except Exception as e:
+        if args.verbose:
+            print(f"Waveform request failed for {day_start.date}: {e}")
+        return
+
+    if len(st_all) == 0:
+        if args.verbose:
+            print("No data returned for this day.")
+        return
+
+    # Merge segments; keep Z/N/E only
+    try:
+        st_all.merge(method=1, fill_value=None)
+    except Exception as e:
+        if args.verbose:
+            print(f"Merge warning: {e}")
+
+    st_clean = Stream([tr for tr in st_all if tr.stats.channel[-1] in ("Z", "N", "E")])
+    if len(st_clean) == 0:
+        if args.verbose:
+            print("No Z/N/E components found after filtering.")
+        return
+
+    # Compute and write RSAM
+    try:
+        rsamObject = RSAM(
+            stream=st_clean,
+            sampling_interval=args.sampling_interval,
+            filter=[args.minfreq, args.maxfreq],
+            corners=args.corners,
+            verbose=args.verbose,
+        )
+        if len(rsamObject) > 0:
+            rsamObject.write(SAM_DIR=args.sam_dir, ext=args.ext, overwrite=False, verbose=args.verbose)
+            if args.verbose:
+                print("RSAM written.")
+        else:
+            if args.verbose:
+                print("RSAM object is empty; nothing to write.")
+    except Exception as e:
+        print(f"RSAM/write failed for {day_start.date}: {e}")
+
+
+def main():
+    args = parse_args()
+    client = Client(args.service)
+
+    # Parse to UTCDateTime (accepts date-only or full ISO)
+    start_utc = UTCDateTime(args.startdate)
+    end_utc = UTCDateTime(args.enddate)
+
+    day = start_utc
+    one_day = 24 * 3600
+    while day < end_utc:
+        day_start = day
+        day_end = min(day_start + one_day, end_utc)
+        _process_day(client, args, day_start, day_end)
+        day += one_day
+
+    if args.verbose:
+        print("\nDone.")
 
 
 if __name__ == "__main__":
-    pass
+    main()

@@ -72,19 +72,45 @@ def extract_definitions(path: Path):
     except Exception as e:
         return "  # [error parsing]"
 
-def tree(dir_path: Path, prefix: str=''):
-    """Recursively print a visual tree of a directory with function/class info for .py files."""
-    space =  '    '
-    branch = '│   '
-    tee =    '├── '
-    last =   '└── '
-    
-    contents = sorted(list(dir_path.iterdir()), key=lambda p: (not p.is_dir(), p.name.lower()))
-    pointers = [tee] * (len(contents) - 1) + [last]
+from pathlib import Path
+
+def tree(dir_path, prefix: str = ""):
+    """
+    Recursively yield a visual tree of a directory. Accepts str or Path.
+    """
+    # Coerce to Path and normalize
+    dir_path = Path(dir_path).expanduser()
+
+    if not dir_path.exists():
+        yield prefix + f"(missing) {dir_path}"
+        return
+    if not dir_path.is_dir():
+        # If it's a file, just return the file name (plus definitions for .py)
+        line = prefix + dir_path.name
+        if dir_path.suffix == ".py":
+            line += extract_definitions(dir_path)  # your helper
+        yield line
+        return
+
+    space  = "    "
+    branch = "│   "
+    tee    = "├── "
+    last   = "└── "
+
+    try:
+        contents = sorted(
+            dir_path.iterdir(),
+            key=lambda p: (not p.is_dir(), p.name.lower())
+        )
+    except PermissionError:
+        yield prefix + f"{dir_path.name}/ (permission denied)"
+        return
+
+    pointers = [tee] * (len(contents) - 1) + [last] if contents else []
     for pointer, path in zip(pointers, contents):
         line = prefix + pointer + path.name
-        if path.is_file() and path.suffix == '.py':
-            line += extract_definitions(path)
+        if path.is_file() and path.suffix == ".py":
+            line += extract_definitions(path)  # your helper
         yield line
         if path.is_dir():
             extension = branch if pointer == tee else space

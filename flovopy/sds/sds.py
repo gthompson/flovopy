@@ -70,10 +70,24 @@ class SDSobj:
         self.basedir = basedir
         self.metadata = metadata # for supporting a dataframe of allowable SEED ids (from same Excel spreadsheet used to generate StationXML)
 
-    def read(self, startt, endt, skip_low_rate_channels=True, trace_ids=None,
-            speed=2, verbose=True, progress=False, max_sampling_rate=250.0, merge_strategy='obspy'):
+    def read(self, startt, endt,
+            skip_low_rate_channels=True,
+            trace_ids=None,
+            speed=2,
+            verbose=True,
+            progress=False,
+            min_sampling_rate=50.0,
+            max_sampling_rate=250.0,
+            merge_strategy='obspy'):
         """
         Read data from the SDS archive into the internal stream.
+
+        Guarantees (on success):
+        - traces culled below `min_sampling_rate` (if not None),
+        - downsampled to a common rate (<= `max_sampling_rate`),
+        - merged per-id with `smart_merge` when needed,
+        - trimmed to [startt, endt],
+        - tagged in stats.processing: "flovopy:smart_merge_v1".
         """
         if trace_ids is None:
             trace_ids = self._get_nonempty_traceids(
@@ -93,6 +107,7 @@ class SDSobj:
 
             try:
                 if speed == 1:
+                    # Read per-file using read_mseed() (which already sanitizes/merges per-file)
                     sdsfiles = self.client._get_filenames(net, sta, loc, chan, startt, endt)
                     if verbose:
                         print(f"Found {len(sdsfiles)} matching SDS files")
@@ -102,18 +117,36 @@ class SDSobj:
                             try:
                                 if verbose:
                                     print(f"Reading {sdsfile}")
-                                traces = read_mseed(sdsfile, starttime=startt, endtime=endt)
+                                traces = read_mseed(
+                                    sdsfile,
+                                    starttime=startt, endtime=endt,
+                                    min_sampling_rate=min_sampling_rate,
+                                    max_sampling_rate=max_sampling_rate,
+                                    merge=True, merge_strategy=merge_strategy
+                                )
                                 st += traces
                             except Exception as e:
                                 if verbose:
                                     print(f"✘ Failed to read (v1) {sdsfile}: {e}")
 
                 elif speed == 2:
+                    # Read a whole window from the SDS client, then normalize like read_mseed()
                     traces = self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
 
+                    # Cull below min_sampling_rate (match read_mseed policy)
+                    if min_sampling_rate is not None:
+                        for tr in list(traces):
+                            if tr.stats.sampling_rate < float(min_sampling_rate):
+                                traces.remove(tr)
+
+                    # Downsample to common rate (cap by max_sampling_rate), then merge
                     ds_stream = downsample_stream_to_common_rate(traces, max_sampling_rate=max_sampling_rate)
                     smart_merge(ds_stream, strategy=merge_strategy)
                     st += ds_stream
+                    del ds_stream
+
+                else:
+                    raise ValueError(f"Unknown speed value: {speed}")
 
             except Exception as e:
                 if verbose:
@@ -125,9 +158,17 @@ class SDSobj:
 
         if len(st):
             st.trim(startt, endt)
-            smart_merge(st, strategy=merge_strategy)
-            if verbose:
-                print(f"\nAfter final smart_merge:\n{st}")
+
+            # Merge only if needed: gaps exist or duplicate IDs present
+            needs_merge = bool(st.get_gaps()) or (len({tr.id for tr in st}) != len(st))
+            if needs_merge:
+                smart_merge(st, strategy=merge_strategy)
+                if verbose:
+                    print(f"\nAfter final smart_merge:\n{st}")
+
+            # Tag traces so downstream can trust the merge contract
+            for tr in st:
+                tr.stats.processing = (tr.stats.processing or []) + ["flovopy:smart_merge_v1"]
 
         self.stream = st
         gc.collect()
