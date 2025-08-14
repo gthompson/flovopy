@@ -68,8 +68,8 @@ stationxml_dir = os.path.join(sds_path, "stationxml")
 if __name__ == "__main__":
     args = [
         # Time window (end exclusive)
-        "--start", "2011-03-10",
-        "--end",   "2011-03-27",
+        "--start", "2011-01-01",
+        "--end",   "2012-01-01",
 
         # Locations
         "--sds_root", sds_path,
@@ -78,9 +78,9 @@ if __name__ == "__main__":
         # ---- FDSN selection + circular domain around KSC ----
         "--service", "IRIS",
         "--network", "IU",
-        "--station", "*",           # wildcard stations within the domain
-        "--location", "*",
-        "--channels", "BH?",
+        "--station", "DWPF",           # wildcard stations within the domain
+        "--location", "10",
+        "--channels", "BHZ",
 
         "--domain", "circle",
         "--lat", "28.573",          # Kennedy Space Center ~28.573 N
