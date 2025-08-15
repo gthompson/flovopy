@@ -20,7 +20,6 @@ from obspy.core.event import (
 from obspy.core.util.attribdict import AttribDict
 from obspy.geodetics.base import gps2dist_azimuth
 
-from flovopy.core.preprocessing import add_to_trace_history
 from flovopy.processing.metrics import compute_amplitude_spectra, estimate_snr #, compute_stationEnergy
 #from flovopy.seisanio.core.ampengfft import compute_ampengfft_stream, write_aef_file
 

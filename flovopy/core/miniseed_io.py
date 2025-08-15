@@ -1,29 +1,19 @@
 """
 miniseed_io.py
 
-Waveform I/O utilities for reading, writing, and handling gaps in ObsPy Trace and Stream objects.
-Designed to support gap-aware reading from and writing to MiniSEED files, while preserving or
-encoding information about masked regions (e.g., zero-padding, data gaps).
-
-Key features:
-- Detect and mask long spans of zero padding.
-- Preserve gap metadata in `trace.stats.processing`.
-- Fill or unfill gaps safely when writing MiniSEED.
-- Avoid overwriting files by writing indexed alternatives.
-
-Typical usage:
-    st = read_mseed_with_gap_masking("file.mseed")
-    write_safely(st, "output.mseed")
+Waveform I/O utilities for reading and writing MiniSEED, and merging ObsPy Trace and Stream objects.
+Designed to support gap-aware reading from and writing to MiniSEED files
 
 Author: Glenn Thompson (2025)
 """
 
 import os
 import numpy as np
-from obspy import read, Stream, Trace, UTCDateTime
+from obspy import read, Stream, Trace
 from collections import defaultdict
-from math import ceil
-from flovopy.core.trace_utils import sanitize_stream, split_trace_at_midnight, streams_equal, downsample_stream_to_common_rate
+from flovopy.core.trace_utils import sanitize_stream, streams_equal, downsample_stream_to_common_rate
+from flovopy.core.gaputils import unmask_gaps
+from obspy.signal.quality_control import MSEEDMetadata 
 
 def smart_merge(stream_in, debug=False, strategy='obspy', allow_timeshift=False, max_shift_seconds=2):
     """
@@ -191,95 +181,6 @@ def smart_merge(stream_in, debug=False, strategy='obspy', allow_timeshift=False,
     return report
 
 
-def mask_gaps(trace, fill_value=0.0, inplace=True, validate_fill_value=False):
-    """
-    Re-applies a mask to gap regions recorded in trace.stats.processing.
-
-    Parameters
-    ----------
-    trace : obspy.Trace
-        The trace with previously unmasked gaps.
-    fill_value : float, optional
-        Expected value used to fill gaps. Only used if `validate_fill_value=True`.
-    inplace : bool, optional
-        If True, modify in-place. If False, return a copy.
-    validate_fill_value : bool, optional
-        If True, only mask gaps where values match `fill_value`. Slower but safer.
-    """
-    if not inplace:
-        trace = trace.copy()
-
-    if not hasattr(trace.stats, "processing"):
-        return trace if not inplace else None
-
-    processing_lines = [p for p in trace.stats.processing if p.startswith("GAP")]
-    if not processing_lines:
-        return trace if not inplace else None
-
-    sr = trace.stats.sampling_rate
-    start = trace.stats.starttime
-    npts = trace.stats.npts
-
-    mask = np.zeros(npts, dtype=bool)
-
-    for line in processing_lines:
-        try:
-            parts = line.split()
-            t1 = UTCDateTime(parts[3])
-            t2 = UTCDateTime(parts[5])
-            idx1 = max(0, int((t1 - start) * sr))
-            idx2 = min(npts, int((t2 - start) * sr))
-            if idx2 > idx1:
-                if validate_fill_value:
-                    segment = trace.data[idx1:idx2]
-                    if np.allclose(segment, fill_value, equal_nan=True):
-                        mask[idx1:idx2] = True
-                else:
-                    mask[idx1:idx2] = True
-        except Exception as e:
-            print(f"✘ Could not parse gap line '{line}': {e}")
-
-    trace.data = np.ma.masked_array(trace.data, mask=mask)
-    return trace if not inplace else None
-
-def unmask_gaps(trace, fill_value=0.0, inplace=True, verbose=False, log_gaps=False):
-    if not inplace:
-        trace = trace.copy()
-
-    if not isinstance(trace.data, np.ma.MaskedArray) or trace.data.mask is np.ma.nomask:
-        return trace if not inplace else None
-
-    sr = trace.stats.sampling_rate
-    start = trace.stats.starttime
-    mask = trace.data.mask
-
-    if isinstance(mask, np.ndarray):
-        gap_idxs = np.where(mask)[0]
-    else:
-        gap_idxs = np.arange(trace.stats.npts) if mask else []
-
-    n_gaps = 0
-    if gap_idxs.size:
-        if log_gaps:
-            split_idx = np.where(np.diff(gap_idxs) != 1)[0] + 1
-            gap_groups = np.split(gap_idxs, split_idx)
-            n_gaps = len(gap_groups)
-
-            if not hasattr(trace.stats, "processing"):
-                trace.stats.processing = []
-            trace.stats.processing.append(f"Filled {n_gaps} gaps with {fill_value}")
-
-            for group in gap_groups:
-                t1 = start + group[0] / sr
-                t2 = start + (group[-1] + 1) / sr
-                trace.stats.processing.append(f"GAP {t2 - t1:.2f}s from {t1} to {t2}")
-
-    trace.data = trace.data.filled(fill_value)
-
-    if verbose and n_gaps > 500:
-        print(f"⚠️ Large number of GAP lines added to trace.stats.processing: {n_gaps}")
-
-    return trace if not inplace else None
 
 
 
@@ -443,3 +344,87 @@ def compare_mseed_files(src_file, dest_file):
         return streams_equal(src_stream, dest_stream), None
     except Exception as e:
         return False, str(e)
+    
+
+def _can_write_to_miniseed_and_read_back(tr, return_metrics=True):
+    """
+    Tests whether an ObsPy Trace can be written to and successfully read back from MiniSEED format.
+
+    This function attempts to:
+    1. **Convert trace data to float** (if necessary) to avoid MiniSEED writing issues.
+    2. **Write the trace to a temporary MiniSEED file**.
+    3. **Read the file back to confirm integrity**.
+    4. If `return_metrics=True`, computes MiniSEED metadata using `MSEEDMetadata()`.
+
+    Parameters:
+    ----------
+    tr : obspy.Trace
+        The seismic trace to test for MiniSEED compatibility.
+    return_metrics : bool, optional
+        If `True`, computes MiniSEED quality control metrics and stores them in `tr.stats['metrics']` (default: True).
+
+    Returns:
+    -------
+    bool
+        `True` if the trace can be written to and read back from MiniSEED successfully, `False` otherwise.
+
+    Notes:
+    ------
+    - **Converts `tr.data` to float** (`trace.data.astype(float)`) if necessary.
+    - **Removes temporary MiniSEED files** after testing.
+    - Uses `MSEEDMetadata()` to compute quality metrics similar to **ISPAQ/MUSTANG**.
+    - Sets `tr.stats['quality_factor'] = -100` if the trace has **no data**.
+
+    Example:
+    --------
+    ```python
+    from obspy import read
+
+    # Load a trace
+    tr = read("example.mseed")[0]
+
+    # Check if it can be written & read back
+    success = _can_write_to_miniseed_and_read_back(tr, return_metrics=True)
+
+    print(f"MiniSEED compatibility: {success}")
+    if success and "metrics" in tr.stats:
+        print(tr.stats["metrics"])  # Print MiniSEED quality metrics
+    ```
+    """
+    if len(tr.data) == 0:
+        tr.stats['quality_factor'] = 0.0
+        return False
+
+    # Convert data type to float if necessary (prevents MiniSEED write errors)
+    if not np.issubdtype(tr.data.dtype, np.floating):
+        tr.data = tr.data.astype(float)
+
+    tmpfilename = f"{tr.id}_{tr.stats.starttime.isoformat()}.mseed"
+
+    try:
+        # Attempt to write to MiniSEED
+        if hasattr(tr.stats, "mseed") and "encoding" in tr.stats.mseed:
+            del tr.stats.mseed["encoding"]
+        tr.write(tmpfilename)
+
+        # Try reading it back
+        _ = read(tmpfilename)
+
+        if return_metrics:
+            # Compute MiniSEED metadata
+            mseedqc = MSEEDMetadata([tmpfilename])
+            tr.stats['metrics'] = mseedqc.meta
+            add_to_trace_history(tr, "MSEED metrics computed (similar to ISPAQ/MUSTANG).")
+
+        return True  # Successfully wrote and read back
+
+    except Exception as e:
+        if return_metrics:
+            tr.stats['quality_factor'] = 0.0
+        print(f"Failed MiniSEED write/read test for {tr.id}: {e}")
+        return False
+
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(tmpfilename):
+            os.remove(tmpfilename)

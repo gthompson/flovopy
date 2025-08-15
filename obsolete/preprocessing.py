@@ -4,7 +4,17 @@ from obspy import read, read_inventory, Stream, Trace, UTCDateTime
 from scipy.signal import welch
 from obspy.signal.quality_control import MSEEDMetadata 
 #from flovopy.core.trace_utils import fix_trace_id
-
+# Leverage your modules
+from flovopy.core.gaputils import (
+    smart_fill as gap_smart_fill,
+    classify_gaps,
+    fill_stream_gaps,
+    fill_gaps_with_constant,
+    fill_gaps_with_linear_interpolation,
+    fill_gaps_with_previous_value,
+    fill_gaps_with_filtered_noise,
+)
+from flovopy.core.miniseed_io import unmask_gaps
 """
 
 If you’re processing daily data, call it like:
@@ -17,7 +27,8 @@ If you’re processing event-sized data:
 
 Optional: In _interpolate_small_gaps(), treat 0 as a null value only when you want to.
 
-If you’re padding 0.0 into gaps in daily data, it’s better to exclude 0 from null values (to avoid masking valid data). When calling detrend_trace(), do:
+If you’re padding 0.0 into gaps in daily data, it’s better to exclude 0 from null values (to avoid masking valid data). 
+When calling detrend_trace(), do:
 
     detrend_trace(tr, null_values=[np.nan], ...)
 
@@ -465,88 +476,7 @@ def add_to_trace_history(tr, message):
     if message not in tr.stats.history:
         tr.stats.history.append(message)
 
-def _can_write_to_miniseed_and_read_back(tr, return_metrics=True):
-    """
-    Tests whether an ObsPy Trace can be written to and successfully read back from MiniSEED format.
 
-    This function attempts to:
-    1. **Convert trace data to float** (if necessary) to avoid MiniSEED writing issues.
-    2. **Write the trace to a temporary MiniSEED file**.
-    3. **Read the file back to confirm integrity**.
-    4. If `return_metrics=True`, computes MiniSEED metadata using `MSEEDMetadata()`.
-
-    Parameters:
-    ----------
-    tr : obspy.Trace
-        The seismic trace to test for MiniSEED compatibility.
-    return_metrics : bool, optional
-        If `True`, computes MiniSEED quality control metrics and stores them in `tr.stats['metrics']` (default: True).
-
-    Returns:
-    -------
-    bool
-        `True` if the trace can be written to and read back from MiniSEED successfully, `False` otherwise.
-
-    Notes:
-    ------
-    - **Converts `tr.data` to float** (`trace.data.astype(float)`) if necessary.
-    - **Removes temporary MiniSEED files** after testing.
-    - Uses `MSEEDMetadata()` to compute quality metrics similar to **ISPAQ/MUSTANG**.
-    - Sets `tr.stats['quality_factor'] = -100` if the trace has **no data**.
-
-    Example:
-    --------
-    ```python
-    from obspy import read
-
-    # Load a trace
-    tr = read("example.mseed")[0]
-
-    # Check if it can be written & read back
-    success = _can_write_to_miniseed_and_read_back(tr, return_metrics=True)
-
-    print(f"MiniSEED compatibility: {success}")
-    if success and "metrics" in tr.stats:
-        print(tr.stats["metrics"])  # Print MiniSEED quality metrics
-    ```
-    """
-    if len(tr.data) == 0:
-        tr.stats['quality_factor'] = 0.0
-        return False
-
-    # Convert data type to float if necessary (prevents MiniSEED write errors)
-    if not np.issubdtype(tr.data.dtype, np.floating):
-        tr.data = tr.data.astype(float)
-
-    tmpfilename = f"{tr.id}_{tr.stats.starttime.isoformat()}.mseed"
-
-    try:
-        # Attempt to write to MiniSEED
-        if hasattr(tr.stats, "mseed") and "encoding" in tr.stats.mseed:
-            del tr.stats.mseed["encoding"]
-        tr.write(tmpfilename)
-
-        # Try reading it back
-        _ = read(tmpfilename)
-
-        if return_metrics:
-            # Compute MiniSEED metadata
-            mseedqc = MSEEDMetadata([tmpfilename])
-            tr.stats['metrics'] = mseedqc.meta
-            add_to_trace_history(tr, "MSEED metrics computed (similar to ISPAQ/MUSTANG).")
-
-        return True  # Successfully wrote and read back
-
-    except Exception as e:
-        if return_metrics:
-            tr.stats['quality_factor'] = 0.0
-        print(f"Failed MiniSEED write/read test for {tr.id}: {e}")
-        return False
-
-    finally:
-        # Clean up the temporary file
-        if os.path.exists(tmpfilename):
-            os.remove(tmpfilename)
 
 
 def _compute_trace_metrics(trace):
@@ -779,243 +709,142 @@ def _detect_and_correct_artifacts(tr, amp_limit=1e10, count_thresh=10, spike_thr
         # Update trace data
         tr.data = y
 
-def detrend_trace(tr, gap_threshold=10, null_values=[0, np.nan], detrend_type='linear', verbose=False):
+from flovopy.core.gaputils import smart_fill, piecewise_detrend
+def detrend_trace(tr: Trace,
+                  gap_threshold: int = 10,
+                  null_values = (0.0, np.nan),
+                  detrend_type: str = 'linear',
+                  verbose: bool = False) -> Trace:
     """
-    Detrends a seismic trace while handling gaps appropriately.
-
-    This function first checks for gaps marked by NaNs or a specified null value 
-    (e.g., 0). It handles small gaps by interpolating them, while large gaps 
-    are treated by splitting the trace and detrending each segment separately.
-
-    Parameters:
-    ----------
-    tr : obspy.Trace
-        The seismic trace to be detrended.
-    gap_threshold : int, optional
-        The maximum gap size (in samples) that will be interpolated. 
-        Larger gaps will trigger piecewise detrending (default: 10).
-    null_values : list, optional
-        Values indicating missing data (default: [0, np.nan]).
-    detrend_type : str, optional
-        Type of detrending to apply ('linear' or 'simple') (default: 'linear').
-    verbose : bool, optional
-        If `True`, prints debug messages (default: False).
-
-    Returns:
-    -------
-    tr : obspy.Trace
-        The detrended seismic trace.
+    DEPRECATED: Use prepare_stream_for_analysis_v2() or gaputils.piecewise_detrend(_linear).
+    Kept for backward compatibility; avoids split/merge and masks-aware.
     """
-
-    # Ensure the trace hasn't already been detrended
-    if 'detrended' in tr.stats.get('history', []):
-        return tr  # Already detrended
-
-    success = False  # Flag to track successful detrending
-
-    try:
-        # Detect and interpolate small gaps (gap ≤ threshold)
-        tr = _interpolate_small_gaps(tr, gap_threshold, null_values, verbose)
-
-        # Attempt standard detrending
-        tr.detrend(detrend_type)
-        success = True
-
-    except Exception:
-        if verbose:
-            print(f"- Standard detrending failed for {tr.id}, trying piecewise detrending.")
-
-        # Handle larger gaps by piecewise detrending
-        tr2 = _piecewise_detrend(tr, null_values=null_values, detrend_type=detrend_type, verbose=verbose)
-
-        if tr2:
-            tr = tr2
-            success = True
-        else:
-            # Fall back to simple detrend if all else fails
-            if verbose:
-                print(f"- Using simple detrend for {tr.id}")
-            tr.detrend('simple')
-            success = True
-
-    if success:
-        add_to_trace_history(tr, 'detrended')
-
-    return tr
-
-
-def _interpolate_small_gaps(tr, gap_threshold, null_values, verbose=False):
-    """
-    Identifies and interpolates small gaps in a seismic trace.
-
-    Gaps marked by specified null values (e.g., 0 or NaN) are interpolated 
-    if their length does not exceed `gap_threshold`. Larger gaps remain unchanged.
-
-    Parameters:
-    ----------
-    tr : obspy.Trace
-        The seismic trace containing gaps.
-    gap_threshold : int
-        Maximum number of consecutive null samples to interpolate.
-    null_values : list
-        Values indicating missing data (e.g., [0, np.nan]).
-    verbose : bool, optional
-        If `True`, prints debug messages (default: False).
-
-    Returns:
-    -------
-    tr : obspy.Trace
-        The trace with small gaps interpolated.
-    """
-    data = tr.data.copy()
-    mask = np.isin(data, null_values)
-
-    # Identify gap start and end indices
-    gap_starts = np.where(np.diff(np.concatenate(([False], mask, [False]))))[0][::2]
-    gap_ends = np.where(np.diff(np.concatenate(([False], mask, [False]))))[0][1::2]
-
-    for start, end in zip(gap_starts, gap_ends):
-        gap_size = end - start
-        if gap_size <= gap_threshold:
-            if verbose:
-                print(f"- Interpolating small gap ({gap_size} samples) in {tr.id}")
-            data[start:end] = np.interp(
-                np.arange(start, end),
-                [start - 1, end],
-                [data[start - 1], data[end]]
-            )
-
-    tr.data = data
-    return tr
-
-
-def _piecewise_detrend(tr, null_values=[0, np.nan], detrend_type='linear', verbose=False):
-    """
-    Applies piecewise detrending to a trace with large gaps.
-
-    This function identifies contiguous segments of valid data, detrends them separately,
-    and merges the results back together, filling large gaps with NaNs.
-
-    Parameters:
-    ----------
-    tr : obspy.Trace
-        The seismic trace to be processed.
-    null_values : list, optional
-        Values indicating missing data (default: [0, np.nan]).
-    detrend_type : str, optional
-        Type of detrending to apply ('linear' or 'simple') (default: 'linear').
-    verbose : bool, optional
-        If `True`, prints debug messages (default: False).
-
-    Returns:
-    -------
-    obspy.Trace or None
-        - If successful, returns the detrended trace.
-        - If unsuccessful, returns `None`.
-    """
-    if verbose:
-        print(f"{tr.id}: Checking for large gaps...")
-
-    # Mask null values (gaps)
-    data_masked = np.ma.masked_where(np.isin(tr.data, null_values), tr.data)
-
-    if data_masked.mask.any():  # If there are masked values (gaps)
-        if verbose:
-            print(f"{tr.id}: Large gaps detected, applying piecewise detrending.")
-
-        # Split into contiguous segments
-        st_segments = tr.split()
-        if verbose:
-            print(f"{tr.id}: Split into {len(st_segments)} segments.")
-
-        # Apply detrending to each segment
-        for tr_segment in st_segments:
-            tr_segment.detrend(detrend_type)
-
-        # Merge the segments back together
-        st_merged = st_segments.merge(method=0, fill_value=np.nan)
-
-        if len(st_merged) == 1:
-            return st_merged[0]
-        else:
-            return None  # Failed to properly merge
-
+    # Interpolate small gaps (based on sample count) but keep long gaps masked
+    sr = float(tr.stats.sampling_rate or 0.0)
+    if sr > 0 and gap_threshold > 0 and isinstance(tr.data, np.ma.MaskedArray):
+        # use smart_fill to interpolate short gaps; mark long gaps as NaN
+        short_sec = gap_threshold / sr
+        tmp = smart_fill(tr, short_thresh=short_sec, long_fill_value=np.nan)
+        arr = np.asarray(tmp.data)
+        masked = np.ma.masked_array(arr, mask=~np.isfinite(arr))
+        work = tr.copy(); work.data = masked
     else:
-        return tr  # No large gaps, return original trace
+        work = tr.copy()
 
-def _pad_trace(tr, seconds, method="mirror"):
+    # Piecewise detrend (linear or simple)
+    mode = 'linear' if detrend_type == 'linear' else 'simple'
+    out = piecewise_detrend(work, mode=mode, use_null_values=True)
+   
+    # Mark history (to mirror old behavior)
+    try:
+        if 'history' not in out.stats: out.stats['history'] = []
+        if 'detrended' not in out.stats.history:
+            out.stats.history.append('detrended')
+    except Exception:
+        pass
+
+    if verbose:
+        print(f"[deprecated] detrend_trace: mode={mode}, gap_threshold={gap_threshold} samples")
+
+    return out
+
+from flovopy.core.gaputils import _generate_spectrally_matched_noise as _gen_spec_noise
+
+def _pad_trace(tr: Trace, seconds: float, method: str = "mirror") -> None:
     """
-    Pads a seismic trace by extending it with mirrored data, zeros, or spectrally-matched noise.
+    Pad both ends of a Trace by `seconds` using one of:
+      - "mirror": reflect the existing ends (best for filtering/decon)
+      - "zeros" : zero pad
+      - "noise" : spectrally matched noise (uses gaputils._generate_spectrally_matched_noise)
 
-    This function extends the **start and end** of a given **ObsPy Trace** by `seconds`, using 
-    one of three methods:
-    - **"mirror" (default)**: Reverses and appends the first and last `seconds` of data.
-    - **"zeros"**: Pads with zeros.
-    - **"noise"**: Generates and appends spectrally-matched noise.
-
-    Parameters:
-    ----------
-    tr : obspy.Trace
-        The seismic trace to be padded.
-    seconds : float
-        The number of seconds to extend at both ends.
-    method : str, optional
-        Padding method (`"mirror"`, `"zeros"`, or `"noise"`). Default: `"mirror"`.
-
-    Returns:
-    -------
-    None
-        The function modifies `tr` **in place**, updating its `starttime`.
-
-    Notes:
-    ------
-    - Stores original start and end times in `tr.stats['originalStartTime']` and `tr.stats['originalEndTime']`.
-    - **Mirror padding** is best for filtering and deconvolution.
-    - **Noise padding** helps maintain spectral continuity.
-
-    Example:
-    --------
-    ```python
-    from obspy import read
-
-    tr = read("example.mseed")[0]
-    print(f"Before padding: {tr.stats.starttime}")
-
-    _pad_trace(tr, 5.0, method="noise")
-
-    print(f"After padding: {tr.stats.starttime}")
-    ```
+    Notes
+    -----
+    - Works if tr.data is masked or ndarray; masked data are treated with a
+      non-destructive filled copy *only* for computing the pad content.
+    - Stores pad metadata for clean removal in `_unpad_trace()`:
+        tr.stats._pad = {"seconds": seconds, "npts": npts_pad, "method": method}
+      and also stores original times:
+        tr.stats.originalStartTime / tr.stats.originalEndTime
+    - Does not taper; your pad→taper→filter→unpad sequence stays intact.
     """
-    if seconds <= 0.0:
+    if seconds is None or seconds <= 0:
+        return
+    sr = float(tr.stats.sampling_rate or 0.0)
+    if sr <= 0:
+        raise ValueError("Cannot pad trace with non-positive sampling_rate.")
+    npts_pad = int(round(seconds * sr))
+    if npts_pad == 0:
         return
 
-    # Store original time range
-    tr.stats['originalStartTime'] = tr.stats.starttime
-    tr.stats['originalEndTime'] = tr.stats.endtime
+    # Preserve original timing
+    tr.stats["originalStartTime"] = tr.stats.starttime
+    tr.stats["originalEndTime"] = tr.stats.endtime
 
-    npts_pad = int(tr.stats.sampling_rate * seconds)
-
-    if method == "mirror":
-        # Extract waveform segments and reverse them
-        y_prepend = np.flip(tr.data[:npts_pad])  # Reverse first N samples
-        y_postpend = np.flip(tr.data[-npts_pad:])  # Reverse last N samples
-    elif method == "zeros":
-        # Create zero-padding
-        y_prepend = np.zeros(npts_pad)
-        y_postpend = np.zeros(npts_pad)
-    elif method == "noise":
-        # Generate spectrally-matched noise
-        y_prepend = _generate_spectrally_matched_noise(tr, npts_pad)
-        y_postpend = _generate_spectrally_matched_noise(tr, npts_pad)
+    # Build a read-only ndarray view of the data for constructing the pad
+    data = tr.data
+    if isinstance(data, np.ma.MaskedArray):
+        y = np.asarray(data.filled(0.0))  # non-destructive fill for padding only
     else:
-        raise ValueError(f"Invalid padding method: {method}. Choose 'mirror', 'zeros', or 'noise'.")
+        y = np.asarray(data)
 
-    # Concatenate padded trace
-    tr.data = np.concatenate([y_prepend, tr.data, y_postpend])
+    n = y.size
+    if n == 0:
+        # Degenerate: pad just with zeros or noise
+        if method == "noise":
+            pre = _gen_spec_noise(tr, taper_percentage=0.2)[:npts_pad]
+            post = _gen_spec_noise(tr, taper_percentage=0.2)[:npts_pad]
+        elif method == "mirror":
+            pre = np.zeros(npts_pad, dtype=y.dtype)
+            post = np.zeros(npts_pad, dtype=y.dtype)
+        elif method == "zeros":
+            pre = np.zeros(npts_pad, dtype=y.dtype)
+            post = np.zeros(npts_pad, dtype=y.dtype)
+        else:
+            raise ValueError("method must be one of {'mirror','zeros','noise'}")
+    else:
+        if method == "mirror":
+            # Reflect edges; if request exceeds available samples, tile the reflected edge
+            k = min(npts_pad, n)
+            left_edge = np.flip(y[:k])
+            right_edge = np.flip(y[-k:])
+            if k < npts_pad:
+                reps = int(np.ceil(npts_pad / k))
+                left_edge = np.resize(np.tile(left_edge, reps), npts_pad)
+                right_edge = np.resize(np.tile(right_edge, reps), npts_pad)
+            pre = left_edge.astype(y.dtype, copy=False)
+            post = right_edge.astype(y.dtype, copy=False)
 
-    # Update starttime to reflect new padding
+        elif method == "zeros":
+            pre = np.zeros(npts_pad, dtype=y.dtype)
+            post = np.zeros(npts_pad, dtype=y.dtype)
+
+        elif method == "noise":
+            # Generate noise with the same spectrum as valid samples
+            noise_full = _gen_spec_noise(tr, taper_percentage=0.2)
+            # In case _gen_spec_noise returns length n, slice/resize as needed
+            if noise_full.size < npts_pad:
+                reps = int(np.ceil(npts_pad / max(1, noise_full.size)))
+                noise_full = np.tile(noise_full, reps)
+            pre = noise_full[:npts_pad].astype(y.dtype, copy=False)
+            post = noise_full[:npts_pad].astype(y.dtype, copy=False)
+
+        else:
+            raise ValueError("method must be one of {'mirror','zeros','noise'}")
+
+    # Concatenate pad + original + pad
+    tr.data = np.concatenate([pre, y.astype(pre.dtype, copy=False), post])
+
+    # Update timing and metadata
     tr.stats.starttime -= npts_pad * tr.stats.delta
-    add_to_trace_history(tr, f'padded using {method}')
+    tr.stats["_pad"] = {"seconds": float(seconds), "npts": int(npts_pad), "method": str(method)}
+
+    # History (optional, keep concise)
+    try:
+        if not hasattr(tr.stats, "history"):
+            tr.stats.history = []
+        tr.stats.history.append(f"padded:{method}({seconds:.3f}s)")
+    except Exception:
+        pass
 
 def _update_trace_filter(tr, filtertype, freq, zerophase):
     """
@@ -1120,44 +949,68 @@ def _get_calib(tr, this_inv):
 
 def _unpad_trace(tr):
     """
-    Removes padding from a previously padded seismic trace.
+    Remove padding applied by `_pad_trace()`, restoring the original extent.
 
-    This function trims a trace back to its **original start and end times**, assuming it was 
-    previously padded using `_pad_trace()`.
+    Strategy:
+      1) If originalStartTime/originalEndTime exist -> trim by time (robust to resampling).
+      2) Else if stats._pad.npts exists and is plausible -> slice by sample count (fast).
+      3) Otherwise do nothing.
 
-    Parameters:
-    ----------
-    tr : obspy.Trace
-        The seismic trace to unpad.
-
-    Returns:
-    -------
-    None
-        The function modifies `tr` **in place**, restoring its original time range.
-
-    Notes:
-    ------
-    - Uses `tr.stats['originalStartTime']` and `tr.stats['originalEndTime']` for trimming.
-    - Calls `tr.trim()` to remove the extra data.
-    - Adds `"unpadded"` to the trace's history.
-
-    Example:
-    --------
-    ```python
-    from obspy import read
-
-    tr = read("example.mseed")[0]
-    
-    _pad_trace(tr, 5.0, method="noise")
-    print(f"Padded start time: {tr.stats.starttime}")
-
-    _unpad_trace(tr)
-    print(f"Restored start time: {tr.stats.starttime}")
-    ```
+    Always clears pad-related metadata and records 'unpadded' in history.
     """
-    if 'originalStartTime' in tr.stats and 'originalEndTime' in tr.stats:
-        tr.trim(starttime=tr.stats['originalStartTime'], endtime=tr.stats['originalEndTime'], pad=False)
-        add_to_trace_history(tr, 'unpadded')     
+    # Prefer time-based trim (robust even if npts/delta changed)
+    t0 = tr.stats.get("originalStartTime", None)
+    t1 = tr.stats.get("originalEndTime", None)
+    if t0 is not None and t1 is not None:
+        try:
+            # pad=False ensures we only remove, never add
+            tr.trim(starttime=t0, endtime=t1, pad=False)
+        except Exception as e:
+            # If trim fails for any reason, try sample-slice fallback below
+            pass
+        else:
+            # Success -> cleanup metadata & history
+            for k in ("_pad", "originalStartTime", "originalEndTime"):
+                if k in tr.stats:
+                    try:
+                        del tr.stats[k]
+                    except Exception:
+                        pass
+            try:
+                if not hasattr(tr.stats, "history"):
+                    tr.stats.history = []
+                tr.stats.history.append("unpadded")
+            except Exception:
+                pass
+            return
+
+    # Fallback: sample-slice using stored pad size
+    meta = getattr(tr.stats, "_pad", None)
+    if meta and isinstance(meta, dict):
+        npts_pad = int(meta.get("npts", 0))
+        if npts_pad > 0 and tr.stats.npts >= 2 * npts_pad:
+            tr.data = tr.data[npts_pad: tr.stats.npts - npts_pad]
+            # If original times exist, restore starttime exactly; otherwise shift by delta
+            if t0 is not None:
+                tr.stats.starttime = t0
+            else:
+                tr.stats.starttime += npts_pad * tr.stats.delta
+            # Cleanup
+            for k in ("_pad", "originalStartTime", "originalEndTime"):
+                if k in tr.stats:
+                    try:
+                        del tr.stats[k]
+                    except Exception:
+                        pass
+            try:
+                if not hasattr(tr.stats, "history"):
+                    tr.stats.history = []
+                tr.stats.history.append("unpadded")
+            except Exception:
+                pass
+            return
+    # Nothing to do
+    return
 
 
 def remove_low_quality_traces(st, quality_threshold=1.0, verbose=False):
@@ -1206,55 +1059,7 @@ def remove_low_quality_traces(st, quality_threshold=1.0, verbose=False):
             st.remove(tr)
 
 
-def Stream_min_starttime(all_traces):
-    """
-    Computes the minimum and maximum start and end times for a given Stream.
 
-    This function takes an **ObsPy Stream** containing multiple traces and 
-    determines the following time statistics:
-    - **Earliest start time** (`min_stime`)
-    - **Latest start time** (`max_stime`)
-    - **Earliest end time** (`min_etime`)
-    - **Latest end time** (`max_etime`)
-
-    Parameters:
-    ----------
-    all_traces : obspy.Stream
-        A Stream object containing multiple seismic traces.
-
-    Returns:
-    -------
-    tuple:
-        - **min_stime (UTCDateTime)**: The earliest start time among all traces.
-        - **max_stime (UTCDateTime)**: The latest start time among all traces.
-        - **min_etime (UTCDateTime)**: The earliest end time among all traces.
-        - **max_etime (UTCDateTime)**: The latest end time among all traces.
-
-    Notes:
-    ------
-    - Useful for determining the **temporal coverage** of a Stream.
-    - Created for the **CALIPSO data archive** (Alan Linde).
-
-    Example:
-    --------
-    ```python
-    from obspy import read
-
-    # Load a Stream of seismic data
-    st = read("example.mseed")
-
-    # Compute time bounds
-    min_stime, max_stime, min_etime, max_etime = Stream_min_starttime(st)
-
-    print(f"Start Time Range: {min_stime} to {max_stime}")
-    print(f"End Time Range: {min_etime} to {max_etime}")
-    ```
-    """ 
-    min_stime = min([tr.stats.starttime for tr in all_traces])
-    max_stime = max([tr.stats.starttime for tr in all_traces])
-    min_etime = min([tr.stats.endtime for tr in all_traces])
-    max_etime = max([tr.stats.endtime for tr in all_traces])    
-    return min_stime, max_stime, min_etime, max_etime
 
 def preprocess_stream(st, bool_despike=True, bool_clean=True, inv=None, \
                       quality_threshold=-np.inf, taperFraction=0.05, \
@@ -1365,111 +1170,3 @@ def order_traces_by_id(st):
     sorted_ids = sorted(tr.id for tr in st)
     return Stream([tr.copy() for id in sorted_ids for tr in st if tr.id == id])
 
-
-def clean_velocity_stream(st, max_gap_sec=10.0, verbose=True):
-    """
-    Clean a Stream already in physical units (e.g., from SDS_VEL).
-
-    Parameters
-    ----------
-    st : obspy.Stream
-        Input Stream (already in velocity units).
-    max_gap_sec : float
-        Max gap (in seconds) to fill/interpolate.
-    verbose : bool
-        Print diagnostics.
-
-    Returns
-    -------
-    st_clean : obspy.Stream
-        Cleaned Stream.
-    """
-
-    st_clean = st.copy()
-    for tr in st_clean:
-        if verbose:
-            print(f"\n[INFO] Cleaning trace: {tr.id}")
-
-        # Convert max gap to samples
-        max_gap_samples = int(max_gap_sec * tr.stats.sampling_rate)
-
-        # Handle gaps and dropouts
-        gap_ok = _detect_and_handle_gaps(tr, gap_threshold=max_gap_samples, verbose=verbose)
-        drop_ok = _detect_and_handle_dropouts(tr, max_dropout=1.0, verbose=verbose)
-
-        if not (gap_ok and drop_ok):
-            print(f"[WARN] Trace {tr.id} had large gaps. Consider trimming.")
-            continue
-
-        # Remove artifacts (e.g., clipping, spikes)
-        _detect_and_correct_artifacts(tr, amp_limit=1e10, spike_thresh=4.0, fill_method="interpolate")
-
-        # Detrend and taper (optional)
-        detrend_trace(tr, gap_threshold=10, detrend_type='linear', verbose=verbose)
-
-        add_to_trace_history(tr, "gap-cleaned without response removal")
-
-    return st_clean
-
-def prepare_stream_for_analysis(st: Stream,
-                                zero_gap_threshold=500,
-                                artifact_kwargs=None,
-                                fill_method="smart",
-                                use_smart_merge=True) -> Stream:
-    """
-    Detect and correct artifacts, fill short gaps, and return a merged, clean Stream.
-    This is designed for use on a raw Stream, and to prepare the Stream for further processing
-    It could optionally be used instead, or in combination with, preprocess_Stream from flovopy.core.preprocessing
-
-    Parameters:
-    -----------
-    st : Stream
-        Input Stream object.
-    zero_gap_threshold : int
-        Number of consecutive zeros to consider a gap.
-    artifact_kwargs : dict
-        Keyword args for `detect_and_correct_artifacts()`.
-    fill_method : str
-        How to fill gaps: "smart", "interpolate", "zero", etc.
-    use_smart_merge : bool
-        Whether to use custom `smart_merge()` instead of `Stream.merge()`.
-
-    Returns:
-    --------
-    Stream
-        Cleaned, filled, and merged stream.
-    """
-    # 1. Mask zeros
-    st = mask_zeros_as_gaps(st, zero_gap_threshold=zero_gap_threshold)
-
-    # 2. Correct artifacts per trace
-    for tr in st:
-        detect_and_correct_artifacts(tr, **(artifact_kwargs or {}))
-
-    # 3. Sort traces by start time for deterministic merging
-    st.traces.sort(key=lambda tr: tr.stats.starttime)
-
-    # 4. Merge and preserve masking
-    if use_smart_merge:
-        st, _ = smart_merge(st)
-    else:
-        st.merge(method=1, fill_value=None)
-
-    # 5. Ensure masking was preserved
-    for tr in st:
-        ensure_masked(tr)
-
-    # 6. Fill short gaps with specified method
-    st = smart_fill(st, method=fill_method)
-
-    return st
-
-if __name__ == "__main__":
-    from obspy.clients.filesystem.sds import Client
-    from obspy import UTCDateTime
-
-    sds_path = "/data/SDS_VEL"
-    client = Client(sds_path)
-
-    st = client.get_waveforms("MV", "MBLG", "", "BHZ", UTCDateTime(1997, 6, 25, 0), UTCDateTime(1997, 6, 25, 23, 59))
-    st_clean = clean_velocity_stream(st, max_gap_sec=15.0, verbose=True)

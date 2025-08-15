@@ -31,7 +31,7 @@ from flovopy.processing.metrics import (
     plot_amplitude_ratios,
 )
 
-from flovopy.core.preprocessing import _pad_trace
+from flovopy.core.remove_response import pad_trace
 
 from flovopy.core.enhanced import get_bandwidth
 

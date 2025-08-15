@@ -1,5 +1,5 @@
 # flovopy/stationmetadata/utils.py
-from obspy import UTCDateTime
+from obspy import UTCDateTime, Trace
 from obspy.core.inventory import Inventory, Network, Station, Channel, Site
 from obspy.io.xseed import Parser
 from obspy.geodetics import locations2degrees, degrees2kilometers
@@ -577,3 +577,16 @@ def validate_inventory(inv: Inventory, verbose=True) -> list:
             print("[OK] No structural or temporal issues detected.")
 
     return issues
+
+
+def get_calib(tr: Trace, inv) -> float:
+    calib_value = 1.0
+    try:
+        for station in inv.networks[0].stations:
+            if station.code == tr.stats.station:
+                for channel in station.channels:
+                    if channel.code == tr.stats.channel:
+                        _, calib_value = channel.response._get_overall_sensitivity_and_gain()
+    except Exception:
+        pass
+    return float(calib_value)

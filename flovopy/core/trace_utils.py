@@ -1338,3 +1338,63 @@ def print_nslc_tree(nslc_or_seed_list):
                     print(f"{indent}{key}/{cha}")
 
     _print_branch(tree)
+
+def Stream_min_starttime(all_traces):
+    """
+    Computes the minimum and maximum start and end times for a given Stream.
+
+    This function takes an **ObsPy Stream** containing multiple traces and 
+    determines the following time statistics:
+    - **Earliest start time** (`min_stime`)
+    - **Latest start time** (`max_stime`)
+    - **Earliest end time** (`min_etime`)
+    - **Latest end time** (`max_etime`)
+
+    Parameters:
+    ----------
+    all_traces : obspy.Stream
+        A Stream object containing multiple seismic traces.
+
+    Returns:
+    -------
+    tuple:
+        - **min_stime (UTCDateTime)**: The earliest start time among all traces.
+        - **max_stime (UTCDateTime)**: The latest start time among all traces.
+        - **min_etime (UTCDateTime)**: The earliest end time among all traces.
+        - **max_etime (UTCDateTime)**: The latest end time among all traces.
+
+    Notes:
+    ------
+    - Useful for determining the **temporal coverage** of a Stream.
+    - Created for the **CALIPSO data archive** (Alan Linde).
+
+    Example:
+    --------
+    ```python
+    from obspy import read
+
+    # Load a Stream of seismic data
+    st = read("example.mseed")
+
+    # Compute time bounds
+    min_stime, max_stime, min_etime, max_etime = Stream_min_starttime(st)
+
+    print(f"Start Time Range: {min_stime} to {max_stime}")
+    print(f"End Time Range: {min_etime} to {max_etime}")
+    ```
+    """ 
+    min_stime = min([tr.stats.starttime for tr in all_traces])
+    max_stime = max([tr.stats.starttime for tr in all_traces])
+    min_etime = min([tr.stats.endtime for tr in all_traces])
+    max_etime = max([tr.stats.endtime for tr in all_traces])    
+    return min_stime, max_stime, min_etime, max_etime
+
+
+# -------------------------------
+# Processing markers (use stats.processing)
+# -------------------------------
+
+def add_processing_step(tr: Trace, msg: str) -> None:
+    if not hasattr(tr.stats, "processing") or tr.stats.processing is None:
+        tr.stats.processing = []
+    tr.stats.processing.append(str(msg))
