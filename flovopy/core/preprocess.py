@@ -37,23 +37,44 @@ def is_empty_trace(tr: Trace) -> bool:
 
 
 #from collections import defaultdict
-def compute_stream_metrics(st: Stream) -> dict:
+def compute_stream_metrics(
+    st: Stream,
+    *,
+    mode: str = "fast",          # "fast" or "heavy"
+    heavy_max_traces: int = 200, # only use heavy mode if <= this many traces
+    heavy_max_segments: int = 4000,  # rough cap; beyond this force fast
+    attach_per_trace: bool = True,   # attach per-id metrics to each trace of that id
+) -> dict:
     """
-    Compute per-trace gap/overlap counts and percent availability using
-    Stream.get_gaps(), and store results in tr.stats.metrics.
+    Compute per-trace gap/overlap counts and percent availability.
 
-    Adds (per Trace):
-      - tr.stats.metrics["num_gaps"]         : int
-      - tr.stats.metrics["num_overlaps"]     : int
-      - tr.stats.metrics["lost_seconds"]     : float (sum of gap durations > 0)
-      - tr.stats.metrics["percent_availability"] : float in [0, 100]
-    Returns a small stream-level summary dict.
+    Modes
+    -----
+    - mode="fast" (default): no st.get_gaps(); compute per-ID metrics by sorting
+      segments (O(n log n) per ID) and walking them once.
+    - mode="heavy": uses st.get_gaps() BUT only if the stream is small enough,
+      otherwise falls back to fast mode.
+
+    Populates for each trace (if attach_per_trace=True):
+      tr.stats.metrics = {
+        "num_gaps": int,
+        "num_overlaps": int,
+        "lost_seconds": float,
+        "percent_availability": float in [0, 100],
+        "id_union_span_s": float,       # extra: union span per NSLC
+        "id_union_covered_s": float,    # extra: covered (deduped) seconds per NSLC
+        "id_segment_count": int,        # extra: segments for this NSLC in Stream
+        "id_sampling_rates": list[float]
+      }
+
+    Returns
+    -------
+    dict stream-level summary
     """
-    # Ensure metrics dicts exist
+    # Ensure metrics dict on each trace
     for tr in st:
         if not hasattr(tr.stats, "metrics") or tr.stats.metrics is None:
             tr.stats.metrics = {}
-        # initialize defaults
         tr.stats.metrics.update({
             "num_gaps": 0,
             "num_overlaps": 0,
@@ -61,51 +82,160 @@ def compute_stream_metrics(st: Stream) -> dict:
             "percent_availability": 100.0,
         })
 
-    # Build a quick NSLC -> traces list map (usually 1 trace per id)
-    by_id = {}
+    # Group by NSLC
+    by_id: Dict[Tuple[str, str, str, str], List[Trace]] = {}
     for tr in st:
         key = (tr.stats.network, tr.stats.station, tr.stats.location, tr.stats.channel)
         by_id.setdefault(key, []).append(tr)
 
-    # Stream-level gaps: tuples are typically
-    # (net, sta, loc, cha, t0, t1, dt_seconds, nsamples)  <-- 8 fields
-    # but be defensive and only use the first 7 if needed.
-    gaps = st.get_gaps() or []
+    # Decide mode
+    total_traces = len(st)
+    total_segments = sum(len(v) for v in by_id.values())
+    use_heavy = (mode == "heavy" and
+                 total_traces <= heavy_max_traces and
+                 total_segments <= heavy_max_segments)
 
-    # Attribute each gap/overlap to its NSLC
-    for rec in gaps:
-        if len(rec) < 7:
-            # Unexpected shape; skip
-            continue
-        net, sta, loc, cha, t0, t1, dt = rec[:7]
-        key = (net, sta, loc, cha)
-        # Only care about traces we have in this stream
-        for tr in by_id.get(key, []):
+    stream_num_gaps = 0
+    stream_num_overlaps = 0
+    stream_total_lost_seconds = 0.0
+
+    if use_heavy:
+        # ---- HEAVY (ObsPy gap scanner), but only when small enough
+        gaps = st.get_gaps() or []
+        # Attribute gap/overlap counts to IDs (and then to each trace of that ID)
+        id_counters: Dict[Tuple[str, str, str, str], Dict[str, float]] = {}
+        for rec in gaps:
+            if len(rec) < 7:
+                continue
+            net, sta, loc, cha, t0, t1, dt = rec[:7]
+            key = (net, sta, loc, cha)
+            c = id_counters.setdefault(key, {"gaps": 0, "overlaps": 0, "lost": 0.0})
             if dt > 0:
-                tr.stats.metrics["num_gaps"] += 1
-                tr.stats.metrics["lost_seconds"] += float(dt)
+                c["gaps"] += 1
+                c["lost"] += float(dt)
             elif dt < 0:
-                tr.stats.metrics["num_overlaps"] += 1
-            # dt == 0 is rare; ignore
+                c["overlaps"] += 1
 
-    # Finalize percent availability per trace
-    for tr in st:
-        dur = float(tr.stats.npts) * float(tr.stats.delta or 0.0)
-        if dur > 0.0:
-            lost = float(tr.stats.metrics.get("lost_seconds", 0.0))
-            pct = max(0.0, min(100.0, (dur - lost) / dur * 100.0))
-            tr.stats.metrics["percent_availability"] = pct
-        else:
-            tr.stats.metrics["percent_availability"] = 0.0
+        for key, traces in by_id.items():
+            # union span and covered (approx) from segments
+            spans = _sorted_spans(traces)
+            union_span_s, union_cov_s = _union_span_and_covered(spans)
+            sr_set = sorted({float(getattr(tr.stats, "sampling_rate", 0.0)) for tr in traces})
+            c = id_counters.get(key, {"gaps": 0, "overlaps": 0, "lost": 0.0})
+            stream_num_gaps += int(c["gaps"])
+            stream_num_overlaps += int(c["overlaps"])
+            stream_total_lost_seconds += float(c["lost"])
 
-    # Stream-level summary (optional, useful for logging)
-    summary = {
-        "stream_num_gaps": int(sum(tr.stats.metrics["num_gaps"] for tr in st)),
-        "stream_num_overlaps": int(sum(tr.stats.metrics["num_overlaps"] for tr in st)),
-        "stream_total_lost_seconds": float(sum(tr.stats.metrics["lost_seconds"] for tr in st)),
-        "num_traces": len(st),
+            if attach_per_trace:
+                for tr in traces:
+                    _attach_metrics(tr, c["gaps"], c["overlaps"], c["lost"],
+                                    union_span_s, union_cov_s, len(traces), sr_set)
+
+    else:
+        # ---- FAST per-ID pass (no st.get_gaps())
+        for key, traces in by_id.items():
+            spans = _sorted_spans(traces)  # list of (start, end)
+            # Count gaps/overlaps by walking sorted spans
+            gaps, overlaps, lost_s = _count_gaps_overlaps(spans)
+            union_span_s, union_cov_s = _union_span_and_covered(spans)
+            sr_set = sorted({float(getattr(tr.stats, "sampling_rate", 0.0)) for tr in traces})
+
+            stream_num_gaps += gaps
+            stream_num_overlaps += overlaps
+            stream_total_lost_seconds += lost_s
+
+            if attach_per_trace:
+                for tr in traces:
+                    _attach_metrics(tr, gaps, overlaps, lost_s,
+                                    union_span_s, union_cov_s, len(traces), sr_set)
+
+    return {
+        "stream_num_gaps": int(stream_num_gaps),
+        "stream_num_overlaps": int(stream_num_overlaps),
+        "stream_total_lost_seconds": float(stream_total_lost_seconds),
+        "num_traces": int(total_traces),
+        "num_ids": int(len(by_id)),
+        "mode_used": "heavy" if use_heavy else "fast",
     }
-    return summary
+
+
+# ---------------- helpers ----------------
+
+def _sorted_spans(traces: List[Trace]) -> List[Tuple[float, float]]:
+    """Return list of (start_s, end_s) as float seconds since epoch, sorted by start."""
+    spans = []
+    for tr in traces:
+        t0 = float(tr.stats.starttime)
+        t1 = float(tr.stats.endtime)
+        if t1 > t0:
+            spans.append((t0, t1))
+    spans.sort(key=lambda x: x[0])
+    return spans
+
+def _count_gaps_overlaps(spans: List[Tuple[float, float]]) -> Tuple[int, int, float]:
+    """Single pass over sorted spans to count gaps/overlaps and sum lost seconds (gaps)."""
+    if not spans:
+        return 0, 0, 0.0
+    gaps = overlaps = 0
+    lost = 0.0
+    cur_s, cur_e = spans[0]
+    for s, e in spans[1:]:
+        if s > cur_e:            # gap
+            gaps += 1
+            lost += (s - cur_e)
+            cur_s, cur_e = s, e
+        else:                     # overlap or touch
+            if e <= cur_e:
+                overlaps += 1     # fully contained
+            else:
+                if s < cur_e:
+                    overlaps += 1 # partial overlap
+                cur_e = e
+    return gaps, overlaps, lost
+
+def _union_span_and_covered(spans: List[Tuple[float, float]]) -> Tuple[float, float]:
+    """Compute total union span (max_e - min_s) and covered seconds (deduped)."""
+    if not spans:
+        return 0.0, 0.0
+    min_s = spans[0][0]
+    covered = 0.0
+    cur_s, cur_e = spans[0]
+    for s, e in spans[1:]:
+        if s > cur_e:
+            covered += (cur_e - cur_s)
+            cur_s, cur_e = s, e
+        else:
+            cur_e = max(cur_e, e)
+    covered += (cur_e - cur_s)
+    union_span = max(sp[1] for sp in spans) - min_s
+    return float(union_span), float(covered)
+
+def _attach_metrics(
+    tr: Trace,
+    num_gaps: int,
+    num_overlaps: int,
+    lost_seconds: float,
+    id_union_span_s: float,
+    id_union_cov_s: float,
+    id_segment_count: int,
+    id_sampling_rates: List[float],
+) -> None:
+    """Attach metrics to a trace’s stats.metrics (per-ID metrics mirrored to each trace)."""
+    tr.stats.metrics["num_gaps"] = int(num_gaps)
+    tr.stats.metrics["num_overlaps"] = int(num_overlaps)
+    tr.stats.metrics["lost_seconds"] = float(lost_seconds)
+    # availability: use covered/union; if union=0, fallback to per-trace duration
+    if id_union_span_s > 0.0:
+        pct = max(0.0, min(100.0, (id_union_cov_s / id_union_span_s) * 100.0))
+    else:
+        dur = float(tr.stats.npts) * float(getattr(tr.stats, "delta", 0.0) or 0.0)
+        pct = 100.0 if dur > 0.0 else 0.0
+    tr.stats.metrics["percent_availability"] = float(pct)
+    # extras (handy for debugging/decisions)
+    tr.stats.metrics["id_union_span_s"] = float(id_union_span_s)
+    tr.stats.metrics["id_union_covered_s"] = float(id_union_cov_s)
+    tr.stats.metrics["id_segment_count"] = int(id_segment_count)
+    tr.stats.metrics["id_sampling_rates"] = list(id_sampling_rates)
 
 # -------------------------------
 # Artifact detection/correction (mask-aware, robust)

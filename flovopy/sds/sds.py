@@ -83,22 +83,25 @@ class SDSobj:
         self.basedir = basedir
         self.metadata = metadata # for supporting a dataframe of allowable SEED ids (from same Excel spreadsheet used to generate StationXML)
 
+
     def read(self, startt, endt,
             skip_low_rate_channels=True,
             trace_ids=None,
             speed=2,
-            verbose=True,
+            verbose=False,
             progress=False,
             min_sampling_rate=50.0,
             max_sampling_rate=250.0,
-            merge_strategy='obspy'):
+            merge_strategy='obspy',
+            final_merge: str = "always"  # "always" | "never"
+            ):
         """
         Read data from the SDS archive into the internal stream.
 
         Guarantees (on success):
         - traces culled below `min_sampling_rate` (if not None),
         - downsampled to a common rate (<= `max_sampling_rate`),
-        - merged per-id with `smart_merge` when needed,
+        - merged per-id with `smart_merge`,
         - trimmed to [startt, endt],
         - tagged in stats.processing: "flovopy:smart_merge_v1".
         """
@@ -120,7 +123,7 @@ class SDSobj:
 
             try:
                 if speed == 1:
-                    # Read per-file using read_mseed() (which already sanitizes/merges per-file)
+                    # Per-file read (already sanitizes/merges per file)
                     sdsfiles = self.client._get_filenames(net, sta, loc, chan, startt, endt)
                     if verbose:
                         print(f"Found {len(sdsfiles)} matching SDS files")
@@ -143,17 +146,19 @@ class SDSobj:
                                     print(f"✘ Failed to read (v1) {sdsfile}: {e}")
 
                 elif speed == 2:
-                    # Read a whole window from the SDS client, then normalize like read_mseed()
-                    traces = self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=-1)
+                    # Fetch raw segments without letting ObsPy merge them
+                    traces = self.client.get_waveforms(net, sta, loc, chan, startt, endt, merge=0)
 
-                    # Cull below min_sampling_rate (match read_mseed policy)
+                    # Cull below min_sampling_rate
                     if min_sampling_rate is not None:
                         for tr in list(traces):
                             if tr.stats.sampling_rate < float(min_sampling_rate):
                                 traces.remove(tr)
 
-                    # Downsample to common rate (cap by max_sampling_rate), then merge
-                    ds_stream = downsample_stream_to_common_rate(traces, max_sampling_rate=max_sampling_rate)
+                    # Downsample to common rate, then merge once per-ID
+                    ds_stream = downsample_stream_to_common_rate(
+                        traces, max_sampling_rate=max_sampling_rate
+                    )
                     smart_merge(ds_stream, strategy=merge_strategy)
                     st += ds_stream
                     del ds_stream
@@ -172,9 +177,8 @@ class SDSobj:
         if len(st):
             st.trim(startt, endt)
 
-            # Merge only if needed: gaps exist or duplicate IDs present
-            needs_merge = bool(st.get_gaps()) or (len({tr.id for tr in st}) != len(st))
-            if needs_merge:
+            # *** FAST: avoid get_gaps() O(N^2) scan ***
+            if final_merge == "always" and merge_strategy:
                 smart_merge(st, strategy=merge_strategy)
                 if verbose:
                     print(f"\nAfter final smart_merge:\n{st}")

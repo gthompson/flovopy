@@ -93,16 +93,18 @@ Examples
 ...     verbose=True,
 ... )
 """
-
-from typing import Tuple, Optional, Literal
-from obspy import UTCDateTime, Stream
+import os
+import numpy as np
+import pandas as pd
+from typing import Tuple, Literal, Optional, List, Dict, Any
+from obspy import UTCDateTime, Stream, Trace
 from flovopy.sds.sds import SDSobj
 
 # Core, source-agnostic utilities
 from flovopy.core.preprocess import preprocess_stream
 from flovopy.core.miniseed_io import write_mseed  # your existing writer
 
-Preset = Literal["archive_preset", "analysis_preset"]
+Preset = Literal["raw_preset", "archive_preset", "analysis_preset"]
 
 
 def load_event_stream_from_sds(
@@ -133,7 +135,8 @@ def load_event_stream_from_sds(
     speed : int
         Passed to `SDSobj.read`; higher values can increase read performance
         (implementation-specific).
-    preset : {"archive_preset", "analysis_preset"}
+    preset : {"raw_present", "archive_preset", "analysis_preset"}
+        - "raw_preset": no preprocessing at all, best for reading from SDS and writing to event miniseed
         - "archive_preset": gap-normalize only (no filtering/response).
         - "analysis_preset": gap-normalize + pad→taper→filter (+ optional response).
     inv : obspy.Inventory or None
@@ -183,7 +186,9 @@ def load_event_stream_from_sds(
     if verbose:
         print(f"[SDS] {len(st)} traces for {t1}–{t2}")
 
-    if preset == "archive_preset":
+    if preset == "raw_preset": # No preprocessing applied
+        pass
+    elif preset == "archive_preset":
         # Gap normalize only; preserve spectral content for downstream choices.
         st = preprocess_stream(
             st,
@@ -226,73 +231,73 @@ def load_event_stream_from_sds(
     return st
 
 
+def _filesafe_iso(ts: UTCDateTime) -> str:
+    return str(UTCDateTime(ts)).replace(":", "-")
+
 def write_event_miniseed(
-    st: Stream,
+    st: Union[Stream, Trace],
     out_dir: str,
     *,
     event_id: Optional[str] = None,
-    folder_by_station: bool = True,
-    filename_template: str = "{net}.{sta}.{loc}.{cha}.{t0}_{t1}.mseed",
-    encoding: str = "STEIM2",
-    reclen: int = 4096,
+    filename_template: str = "{event_id}.{t0}_{t1}.mseed",
+    # NEW: allow caller to pass the fully resolved path; if given, we won't rebuild it
+    filename_path: Optional[str] = None,
+    encoding: Optional[str] = None,   # None → let ObsPy choose
+    reclen: Optional[int] = None,     # None → ObsPy default
+    overwrite_ok: bool = True,
     flush_empty: bool = False,
+    pickle_fallback: bool = False,
     verbose: bool = False,
 ) -> None:
-    """
-    Write a normalized Stream to per-trace MiniSEED files.
-
-    Parameters
-    ----------
-    st : obspy.Stream
-        Stream to write (ideally already normalized via `preprocess_stream()`).
-    out_dir : str
-        Root output directory.
-    event_id : str, optional
-        If provided, can be used by your `write_mseed()` to decorate paths or
-        filenames (e.g., include event ID in filenames).
-    folder_by_station : bool
-        If True, files are placed under `{out_dir}/{NET.STA}/...` for a clean
-        layout by station.
-    filename_template : str
-        Template for filenames. Available keys:
-          {net, sta, loc, cha, t0, t1} (t0/t1 are UTC ISO strings without spaces).
-        Example: "{net}.{sta}.{loc}.{cha}.{t0}_{t1}.mseed"
-    encoding : str
-        MiniSEED encoding, e.g., "STEIM2", "FLOAT32", "INT32".
-    reclen : int
-        MiniSEED record length (bytes).
-    flush_empty : bool
-        If True, write even traces that are all zeros. Usually False.
-    verbose : bool
-        If True, prints what is being written.
-
-    Returns
-    -------
-    None
-
-    Notes
-    -----
-    - This function delegates to your existing `flovopy.core.miniseed_io.write_mseed`.
-    - If you need per-trace gating (e.g., skip extremely short or low-SNR traces),
-      do that **before** calling this function.
-    """
-    if not len(st):
+    """Write ONE MiniSEED file per event window (multi-trace OK)."""
+    if isinstance(st, Trace):
+        st = Stream([st])
+    elif not isinstance(st, Stream) or len(st) == 0:
         if verbose:
-            print("[write_event_miniseed] Empty Stream, nothing to write.")
+            print("[write_event_miniseed] Empty or invalid input; nothing to write.")
         return
 
-    write_mseed(
+    # Build destination path
+    if filename_path is None:
+        # If no explicit path, derive from the stream union (previous behavior).
+        t0 = min(tr.stats.starttime for tr in st)
+        t1 = max(tr.stats.endtime   for tr in st)
+        t0s, t1s = _filesafe_iso(t0), _filesafe_iso(t1)
+        eid = event_id or f"event_{t0s}"
+        os.makedirs(out_dir, exist_ok=True)
+        fname = filename_template.format(event_id=eid, t0=t0s, t1=t1s)
+        mseedfile = os.path.join(out_dir, fname)
+    else:
+        mseedfile = filename_path
+        os.makedirs(os.path.dirname(mseedfile) or out_dir, exist_ok=True)
+
+    if verbose:
+        print(f"[write_event_miniseed] Writing event → {mseedfile}")
+
+    _ = write_mseed(
         st,
-        out_dir=out_dir,
-        folder_by_station=folder_by_station,
-        filename_template=filename_template,
-        encoding=encoding,
-        reclen=reclen,
-        event_id=event_id,
-        flush_empty=flush_empty,
-        verbose=verbose,
+        mseedfile=mseedfile,
+        fill_value=0.0,
+        overwrite_ok=overwrite_ok,
+        pickle_fallback=pickle_fallback,
+        encoding=encoding,   # None → dtype-driven by ObsPy
+        reclen=reclen,       # None → ObsPy default
     )
 
+
+def _build_event_filepath(
+    out_dir: str,
+    event_id: Optional[str],
+    t_start: UTCDateTime,
+    t_end: UTCDateTime,
+    filename_template: str,
+) -> str:
+    """Create the deterministic event file path from the *requested* window."""
+    t0s = _filesafe_iso(t_start)
+    t1s = _filesafe_iso(t_end)
+    eid = event_id or f"event_{t0s}"
+    fname = filename_template.format(event_id=eid, t0=t0s, t1=t1s)
+    return os.path.join(out_dir, fname)
 
 def sds_to_event_miniseed(
     sds_root: str,
@@ -300,7 +305,7 @@ def sds_to_event_miniseed(
     t2: UTCDateTime,
     out_dir: str,
     *,
-    preset: Preset = "archive_preset",
+    preset: Preset = "raw_preset",
     net: str = "*",
     sta: str = "*",
     loc: str = "*",
@@ -308,75 +313,31 @@ def sds_to_event_miniseed(
     speed: int = 2,
     inv=None,
     event_id: Optional[str] = None,
-    filename_template: str = "{net}.{sta}.{loc}.{cha}.{t0}_{t1}.mseed",
-    encoding: str = "STEIM2",
-    reclen: int = 4096,
-    folder_by_station: bool = True,
+    filename_template: str = "{event_id}.{t0}_{t1}.mseed",
+    encoding: Optional[str] = None,   # <- None: dtype-driven
+    reclen: Optional[int] = None,     # <- None: ObsPy default
     flush_empty: bool = False,
     verbose: bool = False,
+    # NEW: if True, skip SDS read+write when the target file already exists
+    skip_if_exists: bool = True,
 ) -> Stream:
-    """
-    One-shot convenience: read from SDS, normalize according to a preset,
-    and write MiniSEED files. Returns the normalized Stream.
+    """Read from SDS, normalize, and write one MiniSEED file for the event."""
+    #_preset = "archive_preset" if preset == "raw_preset" else preset
 
-    Parameters
-    ----------
-    sds_root : str
-        Root directory of the SDS archive.
-    t1, t2 : UTCDateTime
-        Start/end of the target time window.
-    out_dir : str
-        Where to write MiniSEED output.
-    preset : {"archive_preset", "analysis_preset"}
-        Processing flavor (see module docstring for intent and tradeoffs).
-    net, sta, loc, cha : str
-        SDS selectors (wildcards allowed).
-    speed : int
-        Passed to SDS reader; higher often means faster (implementation-specific).
-    inv : obspy.Inventory or None
-        StationXML for response removal (used only in analysis preset).
-    event_id : str, optional
-        Optional label to associate with the written products.
-    filename_template : str
-        MiniSEED filename pattern (see `write_event_miniseed`).
-    encoding : str
-        MiniSEED encoding ("STEIM2", "FLOAT32", "INT32", ...).
-    reclen : int
-        MiniSEED record length in bytes.
-    folder_by_station : bool
-        Group output by station under `{out_dir}/{NET.STA}`.
-    flush_empty : bool
-        If True, write even all-zero traces. Default False.
-    verbose : bool
-        If True, prints info at each stage.
+    # Build deterministic target path from the *requested* window (not stream union)
+    target_path = _build_event_filepath(out_dir, event_id, t1, t2, filename_template)
 
-    Returns
-    -------
-    obspy.Stream
-        The normalized Stream (possibly empty if no traces found or all failed).
+    if skip_if_exists and os.path.exists(target_path):
+        if verbose:
+            print(f"[sds_to_event_miniseed] Skip: file exists → {target_path}")
+        return Stream()  # empty Stream signals “nothing read/written”
 
-    Examples
-    --------
-    >>> from obspy import UTCDateTime
-    >>> t1 = UTCDateTime("2020-01-01T12:00:00")
-    >>> t2 = UTCDateTime("2020-01-01T12:03:00")
-    >>> st = sds_to_event_miniseed(
-    ...     sds_root="/data/SDS",
-    ...     t1=t1, t2=t2,
-    ...     out_dir="/tmp/launch_evt",
-    ...     preset="analysis_preset",
-    ...     net="1R", sta="BCHH", loc="10", cha="D*",
-    ...     verbose=True,
-    ... )
-    """
+    # Otherwise, read and write
     st = load_event_stream_from_sds(
         sds_root,
         t1,
         t2,
-        net=net,
-        sta=sta,
-        loc=loc,
-        cha=cha,
+        net=net, sta=sta, loc=loc, cha=cha,
         speed=speed,
         preset=preset,
         inv=inv,
@@ -387,11 +348,139 @@ def sds_to_event_miniseed(
             st,
             out_dir=out_dir,
             event_id=event_id,
-            folder_by_station=folder_by_station,
             filename_template=filename_template,
+            filename_path=target_path,   # ensure name matches the existence check
             encoding=encoding,
             reclen=reclen,
+            overwrite_ok=True,
             flush_empty=flush_empty,
+            pickle_fallback=False,
             verbose=verbose,
         )
     return st
+
+def _to_utc_any(val) -> UTCDateTime:
+    """Epoch, ISO (with/without TZ), or '...Z' -> UTCDateTime."""
+    if val is None or (isinstance(val, float) and np.isnan(val)) or pd.isna(val):
+        raise ValueError("Missing time value")
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return UTCDateTime(float(val))
+    s = str(val).strip()
+    if "T" not in s and " " in s:
+        s = s.replace(" ", "T", 1)
+    ts = pd.to_datetime(s.replace("Z", "+00:00"), utc=True, errors="coerce")
+    if not pd.isna(ts):
+        return UTCDateTime(ts.to_pydatetime())
+    return UTCDateTime(s)
+
+def _safe_event_id(row: pd.Series, idx: int, event_id_col: Optional[str]) -> str:
+    if event_id_col and event_id_col in row and pd.notna(row[event_id_col]):
+        s = str(row[event_id_col])
+    else:
+        s = f"evt_{idx:06d}"
+    # Sanitise for filenames
+    return "".join(c for c in s if c.isalnum() or c in ("-", "_"))
+
+def csv_to_event_miniseed(
+    *,
+    sds_root: str,
+    csv_path: str,
+    start_col: str,
+    end_col: Optional[str] = None,
+    out_dir: str,
+    pad_before: float = 60.0,
+    pad_after: float = 600.0,
+    net: str = "*",
+    sta: str = "*",
+    loc: str = "*",
+    cha: str = "*",
+    preset: "Preset" = "raw_preset",
+    inv=None,
+    speed: int = 2,
+    year_month_dirs: bool = True,
+    event_id_col: Optional[str] = None,
+    filename_template: str = "{event_id}.{t0}_{t1}.mseed",
+    encoding: Optional[str] = None,   # <- None: dtype-driven
+    reclen: Optional[int] = None,     # <- None: ObsPy default
+    flush_empty: bool = False,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """Loop CSV and write ONE MiniSEED per window using sds_to_event_miniseed()."""
+    os.makedirs(out_dir, exist_ok=True)
+    df = pd.read_csv(csv_path)
+    if start_col not in df.columns:
+        raise ValueError(f"CSV missing required start_col '{start_col}'.")
+
+    summary: List[Dict[str, Any]] = []
+
+    for i, row in df.iterrows():
+        try:
+            t_start = _to_utc_any(row[start_col])
+        except Exception as e:
+            if verbose:
+                print(f"[{i:06d}] ✖ bad {start_col}: {e}")
+            summary.append({
+                "row_index": i, "event_id": _safe_event_id(row, i, event_id_col),
+                "t_start": None, "t_end": None, "t1": None, "t2": None,
+                "year": None, "month": None, "n_traces": 0, "wrote": False, "out_subdir": None
+            })
+            continue
+
+        t_end_val = None
+        if end_col and end_col in df.columns and pd.notna(row[end_col]):
+            try:
+                t_end_val = _to_utc_any(row[end_col])
+            except Exception as e:
+                if verbose:
+                    print(f"[{i:06d}] ! bad {end_col}: {e} -> using start==end")
+        t_end = t_end_val or t_start
+
+        t1 = t_start - float(pad_before)
+        t2 = t_end   + float(pad_after)
+
+        yyyy = f"{t_start.year:04d}"
+        mm   = f"{t_start.month:02d}"
+        out_subdir = os.path.join(out_dir, yyyy, mm) if year_month_dirs else out_dir
+        os.makedirs(out_subdir, exist_ok=True)
+
+        event_id = _safe_event_id(row, i, event_id_col)
+
+        if verbose:
+            print(f"[{i:06d}] {event_id}  {t1} → {t2}  out={out_subdir}  "
+                  f"(net={net} sta={sta} loc={loc} cha={cha})")
+
+        st = sds_to_event_miniseed(
+            sds_root=sds_root,
+            t1=t1, t2=t2,
+            out_dir=out_subdir,
+            preset=preset,
+            net=net, sta=sta, loc=loc, cha=cha,
+            speed=speed,
+            inv=inv,
+            event_id=event_id,
+            filename_template=filename_template,
+            encoding=encoding,   # None → dtype-driven
+            reclen=reclen,       # None → ObsPy default
+            flush_empty=flush_empty,
+            verbose=verbose,
+        )
+
+        wrote = len(st) > 0
+        if verbose and not wrote:
+            print(f"[{i:06d}] – no traces found in SDS for window")
+
+        summary.append({
+            "row_index": i,
+            "event_id": event_id,
+            "t_start": str(t_start),
+            "t_end": str(t_end),
+            "t1": str(t1),
+            "t2": str(t2),
+            "year": int(yyyy),
+            "month": int(mm),
+            "n_traces": int(len(st)),
+            "wrote": bool(wrote),
+            "out_subdir": out_subdir,
+        })
+
+    return pd.DataFrame(summary)
