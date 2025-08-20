@@ -373,13 +373,9 @@ def _to_utc_any(val) -> UTCDateTime:
         return UTCDateTime(ts.to_pydatetime())
     return UTCDateTime(s)
 
-def _safe_event_id(row: pd.Series, idx: int, event_id_col: Optional[str]) -> str:
-    if event_id_col and event_id_col in row and pd.notna(row[event_id_col]):
-        s = str(row[event_id_col])
-    else:
-        s = f"evt_{idx:06d}"
-    # Sanitise for filenames
-    return "".join(c for c in s if c.isalnum() or c in ("-", "_"))
+def _safe_event_id(row: pd.Series, idx: int, event_id: str) -> str:
+    """Return a sanitized event_id containing only alphanumeric characters, hyphens, or underscores."""
+    return "".join(c for c in event_id if c.isalnum() or c in ("-", "_"))
 
 def csv_to_event_miniseed(
     *,

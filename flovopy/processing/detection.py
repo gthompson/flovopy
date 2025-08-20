@@ -378,6 +378,100 @@ def real_time_optimization(band='all'):
     return sta_secs, lta_secs, threshON, threshOFF, freqmin, freqmax, corners
 
 
+
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from typing import Optional, Union, Tuple
+from obspy import Stream, UTCDateTime
+
+def plot_snr_windows_on_stream(
+    st: Stream,
+    split_time: Union[UTCDateTime, Tuple[UTCDateTime, UTCDateTime]],
+    window_length: float = 1.0,      # used only if split_time is a scalar onset
+    pre_noise_gap: float = 2.0,      # seconds to back off noise before onset
+    title: str = "Signal/Noise windows for SNR",
+    outfile: Optional[str] = None,
+    show: bool = True,
+):
+    """
+    Shade the windows used for SNR on each trace of a Stream:
+      - signal (green): [t_on, t_off]
+      - noise  (gray):  same duration, immediately before t_on with a guard gap
+
+    No padding is performed; traces lacking full coverage for a window simply won't be shaded.
+    """
+    # --- resolve signal duration and endpoints ---
+    if isinstance(split_time, (list, tuple)) and len(split_time) == 2:
+        t_on, t_off = split_time
+        if not isinstance(t_on, UTCDateTime):
+            t_on = UTCDateTime(t_on)
+        if not isinstance(t_off, UTCDateTime):
+            t_off = UTCDateTime(t_off)
+        dur = float(t_off - t_on)
+    else:
+        t_on = split_time if isinstance(split_time, UTCDateTime) else UTCDateTime(split_time)
+        dur = float(window_length)
+        t_off = t_on + dur
+
+    if not (dur > 0):
+        raise ValueError("Non-positive signal duration")
+
+    s1, s2 = t_on, t_off
+    n2 = t_on - pre_noise_gap
+    n1 = n2 - dur
+
+    # --- plot stream and shade spans ---
+    fig = st.plot(show=False, equal_scale=False)
+    fig.suptitle(title)
+    axes = [ax for ax in fig.axes if ax.has_data()]
+
+    # Convert span endpoints once
+    s1d, s2d = s1.matplotlib_date, s2.matplotlib_date
+    n1d, n2d = n1.matplotlib_date, n2.matplotlib_date
+
+    for tr, ax in zip(st, axes):
+        # coverage checks (no padding)
+        sig_ok = (tr.stats.starttime <= s1) and (tr.stats.endtime >= s2)
+        noi_ok = (tr.stats.starttime <= n1) and (tr.stats.endtime >= n2)
+
+        if noi_ok:
+            ax.axvspan(n1d, n2d, color="0.7", alpha=0.3, label="noise")
+        if sig_ok:
+            ax.axvspan(s1d, s2d, color="g", alpha=0.25, label="signal")
+
+        # annotate sample count if both windows exist
+        if sig_ok and noi_ok:
+            sr = float(tr.stats.sampling_rate or 0.0)
+            sig_ns = int(round(dur * sr)) if sr > 0 else 0
+            ax.text(
+                s2d, 0.9 * ax.get_ylim()[1],
+                f"{tr.id}\nlen={sig_ns} samp",
+                fontsize=8, ha="right", va="top"
+            )
+
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M:%S"))
+        # de-duplicate legend entries
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            seen = set()
+            uniq_handles, uniq_labels = [], []
+            for h, l in zip(handles, labels):
+                if l in seen:
+                    continue
+                seen.add(l)
+                uniq_handles.append(h)
+                uniq_labels.append(l)
+            ax.legend(uniq_handles, uniq_labels, loc="upper right", fontsize=8)
+
+    fig.autofmt_xdate()
+    if outfile:
+        fig.savefig(outfile, dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig
+
+
+
 def detect_network_event(st_in, minchans=None, threshon=3.5, threshoff=1.0, 
                          sta=0.5, lta=5.0, pad=0.0, best_only=False, verbose=False, 
                          freq=None, algorithm='recstalta', criterion='longest'):
@@ -487,7 +581,7 @@ def detect_network_event(st_in, minchans=None, threshon=3.5, threshoff=1.0,
     st = st_in.copy()
     if pad>0.0:
         for tr in st:
-            _pad_trace(tr, pad)
+            pad_trace(tr, pad)
 
     if freq:
         if verbose:

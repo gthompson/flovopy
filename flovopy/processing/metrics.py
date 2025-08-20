@@ -57,31 +57,58 @@ def estimate_snr(trace_or_stream, method='std', window_length=1.0, split_time=No
 
     try:
         # ---- Get signal and noise data ----
+        # ---- Get signal and noise data (no padding; well-defined noise) ----
+        def _extract_win(tr, t1, t2):
+            trc = tr.copy().trim(starttime=t1, endtime=t2, pad=False)
+            return trc.data if trc.stats.npts > 0 else None
+
+        pre_noise_gap = 2.0  # seconds to back off noise from onset (adjustable)
+
         if split_time:
             if isinstance(split_time, (list, tuple)) and len(split_time) == 2:
-                signal_data = trace.copy().trim(starttime=split_time[0], endtime=split_time[1],
-                                                pad=True, fill_value=0).data
-                noise_data = trace.copy().trim(endtime=split_time[0],
-                                               pad=True, fill_value=0).data
+                t_on, t_off = split_time
+                dur = float(t_off - t_on)
+                if not np.isfinite(dur) or dur <= 0:
+                    return np.nan, np.nan, np.nan
+
+                # signal = [t_on, t_off]
+                sig = _extract_win(trace, t_on, t_off)
+
+                # noise = same duration before t_on with a small guard
+                n2 = t_on - pre_noise_gap
+                n1 = n2 - dur
+                noi = _extract_win(trace, n1, n2)
+
             else:
-                signal_data = trace.copy().trim(starttime=split_time,
-                                                pad=True, fill_value=0).data
-                noise_data = trace.copy().trim(endtime=split_time,
-                                               pad=True, fill_value=0).data
+                # split_time is an onset; use window_length for both windows
+                t_on = split_time
+                dur = float(window_length)
+                if not np.isfinite(dur) or dur <= 0:
+                    return np.nan, np.nan, np.nan
+
+                sig = _extract_win(trace, t_on, t_on + dur)
+                n2  = t_on - pre_noise_gap
+                n1  = n2 - dur
+                noi = _extract_win(trace, n1, n2)
         else:
+            # auto-mode (unchanged): loudest vs quietest equal windows of length window_length
             data = trace.data
-            npts = trace.stats.npts
+            fs = trace.stats.sampling_rate
             samples_per_window = int(fs * window_length)
-            num_windows = int(npts // samples_per_window)
-
+            num_windows = int(trace.stats.npts // samples_per_window)
             if num_windows < 2:
-                if verbose:
-                    print("Trace too short for SNR estimation.")
+                if verbose: print("Trace too short for SNR estimation.")
                 return np.nan, np.nan, np.nan
-
             reshaped = data[:samples_per_window * num_windows].reshape((num_windows, samples_per_window))
-            signal_data = reshaped[np.argmax(np.nanstd(reshaped, axis=1))]  # Most energetic window
-            noise_data = reshaped[np.argmin(np.nanstd(reshaped, axis=1))]  # Quietest window
+            sig = reshaped[np.argmax(np.nanstd(reshaped, axis=1))]
+            noi = reshaped[np.argmin(np.nanstd(reshaped, axis=1))]
+
+        # Bail if either window is missing (do NOT pad with zeros)
+        if sig is None or noi is None:
+            if verbose: print("[SNR] window not covered by trace; skipping (no padding).")
+            return np.nan, np.nan, np.nan
+        signal_data, noise_data = sig, noi
+
 
         # ---- Compute SNR based on method ----
         if method == 'max':
