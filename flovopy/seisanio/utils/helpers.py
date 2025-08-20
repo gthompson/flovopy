@@ -1,7 +1,7 @@
 import os
 from glob import glob
 #import datetime as dt
-from obspy import UTCDateTime
+from obspy import UTCDateTime, Stream
 
 # need to leave this here to prevent circular imports between Wavfile and Sfile
 def filetime2spath(filetime, mainclass='L', db=None, seisan_top=None, fullpath=True):
@@ -137,3 +137,60 @@ def find_matching_wavfiles(filetime, sfilepath, y2kfix=False):
         potentialwavfiles = glob(wavpattern.split('.')[0]+".*")
         matching_wavfiles.extend(potentialwavfiles)
     return matching_wavfiles
+
+
+
+
+def write_wavfile(
+    st: Stream,
+    out_root: str,
+    dbstring: str,
+    numchans: int,
+    year_month_dirs: bool = True,
+    fmt: str = "MSEED"
+) -> str:
+    """
+    Write a detected event stream into a year/month subdir with a SEISAN-like basename.
+
+    Parameters
+    ----------
+    st : obspy.Stream
+        The event waveform (assumed non-empty).
+    out_root : str
+        Root output directory.
+    dbstring : str
+        Database identifier string to append to filename.
+    numchans : int
+        Number of channels in the event (often len(st)).
+    year_month_dirs : bool
+        If True, output into <out_root>/<YYYY>/<MM>/, else directly under out_root.
+    fmt : str
+        ObsPy write format (default: "MSEED").
+
+    Returns
+    -------
+    str
+        Full path to the written MiniSEED file.
+    """
+    if not st or len(st) == 0:
+        raise ValueError("Empty stream given to write_event_stream")
+
+    filetime: UTCDateTime = st[0].stats.starttime
+
+    # Build basename: YYYY-MM-DD-HHMM-SSS.DBSTRING_NUMCHANS
+    basename = "%4d-%02d-%02d-%02d%02d-%02dS.%s_%03d" % (
+        filetime.year, filetime.month, filetime.day,
+        filetime.hour, filetime.minute, filetime.second,
+        dbstring, numchans
+    )
+
+    # Year/month subdir
+    if year_month_dirs:
+        out_dir = os.path.join(out_root, f"{filetime.year:04d}", f"{filetime.month:02d}")
+    else:
+        out_dir = out_root
+    os.makedirs(out_dir, exist_ok=True)
+
+    out_path = os.path.join(out_dir, basename)
+    st.write(out_path, format=fmt)
+    return out_path
