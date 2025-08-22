@@ -470,169 +470,207 @@ def plot_snr_windows_on_stream(
         plt.show()
     return fig
 
+###############################################################################
+# THIS BLOCK OF CODE IS ALL RELATED TO DETECTING EVENTS ACROSS A NETWORK
 
+from typing import List, Dict, Any, Tuple, Optional
+from obspy import UTCDateTime
+from obspy.signal.trigger import coincidence_trigger
 
-def detect_network_event(st_in, minchans=None, threshon=3.5, threshoff=1.0, 
-                         sta=0.5, lta=5.0, pad=0.0, best_only=False, verbose=False, 
-                         freq=None, algorithm='recstalta', criterion='longest'):
+# --- helpers (module-private) ------------------------------------------------
+
+def _event_window(ev: Dict[str, Any]) -> Tuple[UTCDateTime, UTCDateTime]:
+    t_on = UTCDateTime(ev["time"])
+    t_off = t_on + float(ev["duration"])
+    return t_on, t_off
+
+def _union_list(a: List[Any], b: List[Any]) -> List[Any]:
+    seen = set(a)
+    out = list(a)
+    for x in b:
+        if x not in seen:
+            out.append(x); seen.add(x)
+    return out
+
+def consolidate_triggers(
+    trig: List[Dict[str, Any]],
+    *,
+    join_within: float = 90.0
+) -> Tuple[List[Dict[str, Any]], List[UTCDateTime], List[UTCDateTime]]:
+    if not trig:
+        return [], [], []
+    trig_sorted = sorted(trig, key=lambda e: _event_window(e)[0])
+
+    merged: List[Dict[str, Any]] = []
+    cur_members: List[Dict[str, Any]] = [trig_sorted[0]]
+    _, cur_off = _event_window(trig_sorted[0])
+
+    def _flush(members: List[Dict[str, Any]]) -> Dict[str, Any]:
+        t_on = min(_event_window(e)[0] for e in members)
+        t_off = max(_event_window(e)[1] for e in members)
+        dur = float(t_off - t_on)
+        stations: List[str] = []
+        trace_ids: List[str] = []
+        cft_peaks_all: List[float] = []
+        cft_peak_wmean_vals: List[float] = []
+        coinc_vals: List[float] = []
+
+        for e in members:
+            s = e.get("stations") or []
+            t = e.get("trace_ids") or []
+            c = e.get("cft_peaks") or []
+            stations = _union_list(stations, s if isinstance(s, list) else [])
+            trace_ids = _union_list(trace_ids, t if isinstance(t, list) else [])
+            cft_peaks_all.extend([float(x) for x in (c if isinstance(c, list) else []) if x is not None])
+            cpwm = e.get("cft_peak_wmean")
+            if cpwm is not None:
+                try: cft_peak_wmean_vals.append(float(cpwm))
+                except Exception: pass
+            cs = e.get("coincidence_sum")
+            if cs is not None:
+                try: coinc_vals.append(float(cs))
+                except Exception: pass
+
+        return {
+            "time": UTCDateTime(t_on),
+            "duration": dur,
+            "stations": stations or None,
+            "trace_ids": trace_ids or None,
+            "cft_peaks": cft_peaks_all or None,
+            "cft_peak_wmean": (max(cft_peak_wmean_vals) if cft_peak_wmean_vals else None),
+            "coincidence_sum": (max(coinc_vals) if coinc_vals else None),
+            "cluster_size": len(members),
+            "cluster_members": [{"time": e["time"], "duration": e["duration"]} for e in members],
+        }
+
+    for e in trig_sorted[1:]:
+        e_on, e_off = _event_window(e)
+        if e_on <= (cur_off + join_within):
+            cur_members.append(e)
+            if e_off > cur_off:
+                cur_off = e_off
+        else:
+            merged.append(_flush(cur_members))
+            cur_members = [e]
+            _, cur_off = _event_window(e)
+
+    merged.append(_flush(cur_members))
+    ontimes = [m["time"] for m in merged]
+    offtimes = [UTCDateTime(m["time"]) + float(m["duration"]) for m in merged]
+    return merged, ontimes, offtimes
+
+def drop_short_triggers(
+    trig: List[Dict[str, Any]],
+    *,
+    min_duration: float = 60.0
+) -> Tuple[List[Dict[str, Any]], List[UTCDateTime], List[UTCDateTime]]:
+    kept: List[Dict[str, Any]] = []
+    for e in trig:
+        try:
+            dur = float(e["duration"])
+        except Exception:
+            continue
+        if dur >= float(min_duration):
+            kept.append(e)
+    ontimes = [UTCDateTime(e["time"]) for e in kept]
+    offtimes = [UTCDateTime(e["time"]) + float(e["duration"]) for e in kept]
+    return kept, ontimes, offtimes
+
+# --- main API ----------------------------------------------------------------
+
+def detect_network_event(
+    st_in,
+    minchans: Optional[int] = None,
+    threshon: float = 3.5,
+    threshoff: float = 1.0,
+    sta: float = 0.5,
+    lta: float = 5.0,
+    pad: float = 0.0,
+    best_only: bool = False,
+    verbose: bool = False,
+    freq: Optional[List[float]] = None,       # [fmin, fmax]
+    algorithm: str = "recstalta",
+    criterion: str = "longest",
+    *,
+    # NEW options:
+    join_within: Optional[float] = None,      # e.g., 60–120 s
+    min_duration: Optional[float] = None,     # e.g., 60 s
+):
     """
-    Detects and associates seismic events across a network of stations using coincidence triggering.
+    Detects and associates seismic events across a network.
 
-    This function applies a short-term average / long-term average (STA/LTA) or other 
-    triggering algorithm to detect seismic events recorded across multiple stations. 
-    It identifies events based on a coincidence threshold and returns a list of detected 
-    triggers, including event start time, duration, number of stations that triggered, and 
-    characteristic function peak values.
-
-    If `best_only=True`, the function returns only the most significant event based on the 
-    specified `criterion`. Otherwise, it returns all detected events along with onset and 
-    offset times.
-
-    Parameters:
-    ----------
-    st_in : obspy.Stream
-        The input Stream object containing waveform data from multiple stations.
-    minchans : int, optional
-        Minimum number of stations required to trigger an event (default: half the number of traces in `st_in`, minimum 2).
-    threshon : float, optional
-        Trigger threshold for STA/LTA or other detection algorithm (default: 3.5).
-    threshoff : float, optional
-        De-trigger threshold for STA/LTA or other detection algorithm (default: 1.0).
-    sta : float, optional
-        Short-term average window length in seconds (default: 0.5s).
-    lta : float, optional
-        Long-term average window length in seconds (default: 5.0s).
-    pad : float, optional
-        Time (in seconds) to pad the traces before processing (default: 0.0s, no padding).
-    best_only : bool, optional
-        If `True`, returns only the most significant detected event based on `criterion` (default: False).
-    verbose : bool, optional
-        If `True`, prints debug information during processing (default: False).
-    freq : list of float, optional
-        If specified, applies a bandpass filter before processing using `[freq_min, freq_max]` in Hz (default: None).
-    algorithm : str, optional
-        The detection algorithm to use. Options: `"recstalta"`, `"zdetect"`, `"carlstatrig"` (default: `"recstalta"`).
-    criterion : str, optional
-        Criterion for selecting the "best" event when `best_only=True`:
-        - `"longest"` (default): Selects the event with the highest product of `coincidence_sum * duration`.
-        - `"cft"`: Selects the event with the highest sum of `cft_peaks`.
-        - `"cft_duration"`: Uses `cft_peaks * duration` to determine the best event.
-
-    Returns:
-    -------
-    If `best_only=True`:
-        dict or None
-            A dictionary containing information about the most significant detected event, 
-            or `None` if no event was found.
-
-    If `best_only=False`:
-        tuple:
-            - **trig (list of dicts)**: Each dict contains information about a detected event, 
-              with keys including:
-              ```
-              {
-                  'cft_peak_wmean': float,   # Mean peak characteristic function value
-                  'cft_peaks': list,         # Characteristic function peak values for each station
-                  'cft_std_wmean': float,    # Mean standard deviation of characteristic function
-                  'cft_stds': list,          # Standard deviation values per station
-                  'coincidence_sum': float,  # Number of stations triggering simultaneously
-                  'duration': float,         # Event duration (s)
-                  'stations': list,          # Stations that contributed to the event
-                  'time': UTCDateTime,       # Event start time
-                  'trace_ids': list          # List of trace IDs contributing to the event
-              }
-              ```
-            - **ontimes (list of UTCDateTime)**: List of event start times.
-            - **offtimes (list of UTCDateTime)**: List of event end times.
-
-    If no events are detected:
-        - If `best_only=True`: Returns `None`.
-        - If `best_only=False`: Returns `(None, None, None)`.
-
-    Notes:
-    ------
-    - If `sta` and `lta` are chosen such that `lta` is too long relative to the signal, 
-      event detection may fail.
-    - The function applies optional bandpass filtering if `freq` is specified.
-    - The `pad` option allows extending the trace duration before filtering or triggering.
-    - Detected events can be further refined using `trim_to_event()`.
-
-    Example:
-    --------
-    ```python
-    from obspy import read
-
-    # Load waveform data from multiple stations
-    st = read("network_data.mseed")
-
-    # Run event detection
-    events, onsets, offsets = detect_network_event(st, freq=[1, 20], verbose=True)
-
-    if events:
-        print(f"Detected {len(events)} events")
-        for event in events:
-            print(f"Event at {event['time']} with duration {event['duration']} s")
-
-    # Retrieve only the best event
-    best_event = detect_network_event(st, best_only=True, criterion="cft")
-    print(f"Best event: {best_event}")
-    ```
+    Post-processing (optional):
+      - If `join_within` is provided: merge adjacent/overlapping triggers.
+      - If `min_duration` is provided: drop triggers shorter than this duration (s).
     """
     st = st_in.copy()
-    if pad>0.0:
+    if pad > 0.0:
         for tr in st:
-            pad_trace(tr, pad)
+            # simple pad (zero) – replace with project-specific if available
+            try:
+                tr.trim(tr.stats.starttime - pad, tr.stats.endtime + pad, pad=True, fill_value=0.0)
+            except Exception:
+                pass
 
     if freq:
         if verbose:
-            print('Filtering traces')
+            print(f"[detect_network_event] bandpass {freq[0]}–{freq[1]} Hz; sta={sta} lta={lta} on={threshon} off={threshoff}")
         st.filter('bandpass', freqmin=freq[0], freqmax=freq[1], corners=4, zerophase=True)
-            
+
     if not minchans:
-        minchans = max(( int(len(st)/2), 2)) # half the channels or 2, whichever is greater
+        minchans = max(int(len(st)/2), 2)
     if verbose:
-        print('minchans=',minchans)
-    #trig = coincidence_trigger(algorithm, threshon, threshoff, st, minchans, sta=sta, lta=lta, max_trigger_length=180, delete_long_trigger=True, details=True) # 0.5s, 10s
+        print('[detect_network_event] minchans =', minchans)
+
+    # run coincidence trigger
     if algorithm == "zdetect":
         trig = coincidence_trigger(algorithm, threshon, threshoff, st, minchans, sta=sta, details=True)
     elif algorithm == "carlstatrig":
         trig = coincidence_trigger(algorithm, threshon, threshoff, st, minchans, sta=sta, lta=lta, ratio=1, quiet=True, details=True)
     else:
         trig = coincidence_trigger(algorithm, threshon, threshoff, st, minchans, sta=sta, lta=lta, details=True)
-    if trig:
 
-        if best_only:
-            best_trig = {}
-            best_product = 0
+    # no detections
+    if not trig:
+        return (None if best_only else (None, None, None))
 
-            for this_trig in trig:
-                #print(this_trig)
-                thistime = UTCDateTime(this_trig['time'])
-                if thistime > st[0].stats.starttime:
-                    if criterion=='longest':
-                        this_product = this_trig['coincidence_sum']*this_trig['duration']
-                    elif criterion=='cft':
-                        this_product = sum(this_trig["cft_peaks"])
-                    else:
-                        this_product = sum(this_trig["cft_peaks"])*this_trig['duration']
-                    if this_product > best_product:
-                        best_trig = this_trig
-                        best_product = this_product
-            return best_trig  
-        else:
-            ontimes = []
-            offtimes = []
-            for this_trig in trig:
-                thistime = UTCDateTime(this_trig['time'])
-                if thistime > st[0].stats.starttime:
-                    ontimes.append(this_trig['time'])
-                    offtimes.append(this_trig['time']+this_trig['duration'])
-            return trig, ontimes, offtimes
-    else:
-        if best_only:
-            return None
-        else:
-            return None, None, None
+    # normalize ontimes/offtimes lists
+    ontimes = [UTCDateTime(e["time"]) for e in trig]
+    offtimes = [UTCDateTime(e["time"]) + float(e["duration"]) for e in trig]
+
+    # --- NEW: post-processing pipeline --------------------------------------
+    # 1) Consolidate adjacent/splitting detections
+    if join_within is not None:
+        trig, ontimes, offtimes = consolidate_triggers(trig, join_within=float(join_within))
+
+    # 2) Drop short detections
+    if min_duration is not None:
+        trig, ontimes, offtimes = drop_short_triggers(trig, min_duration=float(min_duration))
+
+    # nothing left
+    if not trig:
+        return (None if best_only else (None, None, None))
+
+    if best_only:
+        # choose best AFTER consolidation/filtering
+        best_ev = None
+        best_score = -1.0
+        for ev in trig:
+            dur = float(ev["duration"])
+            if criterion == 'cft':
+                score = sum(ev.get("cft_peaks") or []) or 0.0
+            elif criterion == 'cft_duration':
+                score = (sum(ev.get("cft_peaks") or []) or 0.0) * dur
+            else:  # 'longest' ~ coincidence_sum * duration (original intent)
+                score = (float(ev.get("coincidence_sum") or 0.0)) * dur
+            if score > best_score:
+                best_score = score
+                best_ev = ev
+        return best_ev
+
+    return trig, ontimes, offtimes
+
+##############################################################
     
 def add_channel_detections(st, lta=5.0, threshon=0.5, threshoff=0.0, max_duration=120):
     """
