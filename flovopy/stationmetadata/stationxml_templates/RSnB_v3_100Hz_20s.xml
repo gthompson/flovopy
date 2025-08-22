@@ -33,17 +33,17 @@
       <Value>399650000</Value>
       <Frequency>5</Frequency>
       <InputUnits>
-       <Name>M/S</Name>
+       <Name>m/s</Name>
        <Description>Velocity in Meters Per Second</Description>
       </InputUnits>
       <OutputUnits>
-       <Name>COUNTS</Name>
+       <Name>count</Name>
       </OutputUnits>
      </InstrumentSensitivity>
      <Stage number="1">
       <PolesZeros resourceId="ResponsePAZ/20180720031953.100229.9" name="AM.RSNB3.00EHZ.2018.001.00.00.00">
        <InputUnits>
-        <Name>M/S</Name>
+        <Name>m/s</Name>
         <Description>Velocity in Meters Per Second</Description>
        </InputUnits>
        <OutputUnits>
@@ -92,7 +92,7 @@
         <Name>V</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <CfTransferFunctionType>DIGITAL</CfTransferFunctionType>
       </Coefficients>
@@ -111,10 +111,10 @@
      <Stage number="3">
       <FIR resourceId="ResponseFIR/20180720031953.099915.7" name="AM.RSNB3.00.EHZ.2018.001.00.00.00.stage_2">
        <InputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <Symmetry>ODD</Symmetry>
        <NumeratorCoefficient>-0.000151873</NumeratorCoefficient>
@@ -190,17 +190,17 @@
       <Value>56000</Value>
       <Frequency>5</Frequency>
       <InputUnits>
-       <Name>PA</Name>
+       <Name>Pa</Name>
        <Description>No Abbreviation Referenced</Description>
       </InputUnits>
       <OutputUnits>
-       <Name>COUNTS</Name>
+       <Name>count</Name>
       </OutputUnits>
      </InstrumentSensitivity>
      <Stage number="1">
       <PolesZeros resourceId="ResponsePAZ/20180720031953.100749.14" name="AM.RSNB3.00HDF.2018.001.00.00.00">
        <InputUnits>
-        <Name>PA</Name>
+        <Name>Pa</Name>
         <Description>No Abbreviation Referenced</Description>
        </InputUnits>
        <OutputUnits>
@@ -237,7 +237,7 @@
         <Name>V</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <CfTransferFunctionType>DIGITAL</CfTransferFunctionType>
       </Coefficients>
@@ -256,10 +256,10 @@
      <Stage number="3">
       <FIR resourceId="ResponseFIR/20180720031953.100541.12" name="AM.RSNB3.00.HDF.2018.001.00.00.00.stage_2">
        <InputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <Symmetry>ODD</Symmetry>
        <NumeratorCoefficient>-0.000151873</NumeratorCoefficient>

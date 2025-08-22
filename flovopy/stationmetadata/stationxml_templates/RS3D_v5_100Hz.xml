@@ -33,17 +33,17 @@
       <Value>360000000</Value>
       <Frequency>5</Frequency>
       <InputUnits>
-       <Name>M/S</Name>
+       <Name>m/s</Name>
        <Description>Velocity in Meters Per Second</Description>
       </InputUnits>
       <OutputUnits>
-       <Name>COUNTS</Name>
+       <Name>count</Name>
       </OutputUnits>
      </InstrumentSensitivity>
      <Stage number="1">
       <PolesZeros resourceId="ResponsePAZ/20190220141739.385689.9" name="AM.RS3D5.EHE.2018.001.00.00.00">
        <InputUnits>
-        <Name>M/S</Name>
+        <Name>m/s</Name>
         <Description>Velocity in Meters Per Second</Description>
        </InputUnits>
        <OutputUnits>
@@ -92,7 +92,7 @@
         <Name>V</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <CfTransferFunctionType>DIGITAL</CfTransferFunctionType>
       </Coefficients>
@@ -111,10 +111,10 @@
      <Stage number="3">
       <FIR resourceId="ResponseFIR/20190220141739.385299.7" name="AM.RS3D5..EHE.2018.001.00.00.00.stage_2">
        <InputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <Symmetry>ODD</Symmetry>
        <NumeratorCoefficient>-0.000151873</NumeratorCoefficient>
@@ -190,17 +190,17 @@
       <Value>360000000</Value>
       <Frequency>5</Frequency>
       <InputUnits>
-       <Name>M/S</Name>
+       <Name>m/s</Name>
        <Description>Velocity in Meters Per Second</Description>
       </InputUnits>
       <OutputUnits>
-       <Name>COUNTS</Name>
+       <Name>count</Name>
       </OutputUnits>
      </InstrumentSensitivity>
      <Stage number="1">
       <PolesZeros resourceId="ResponsePAZ/20190220141739.386296.14" name="AM.RS3D5.EHN.2018.001.00.00.00">
        <InputUnits>
-        <Name>M/S</Name>
+        <Name>m/s</Name>
         <Description>Velocity in Meters Per Second</Description>
        </InputUnits>
        <OutputUnits>
@@ -249,7 +249,7 @@
         <Name>V</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <CfTransferFunctionType>DIGITAL</CfTransferFunctionType>
       </Coefficients>
@@ -268,10 +268,10 @@
      <Stage number="3">
       <FIR resourceId="ResponseFIR/20190220141739.386061.12" name="AM.RS3D5..EHN.2018.001.00.00.00.stage_2">
        <InputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <Symmetry>ODD</Symmetry>
        <NumeratorCoefficient>-0.000151873</NumeratorCoefficient>
@@ -347,17 +347,17 @@
       <Value>360000000</Value>
       <Frequency>5</Frequency>
       <InputUnits>
-       <Name>M/S</Name>
+       <Name>m/s</Name>
        <Description>Velocity in Meters Per Second</Description>
       </InputUnits>
       <OutputUnits>
-       <Name>COUNTS</Name>
+       <Name>count</Name>
       </OutputUnits>
      </InstrumentSensitivity>
      <Stage number="1">
       <PolesZeros resourceId="ResponsePAZ/20190220141739.386812.19" name="AM.RS3D5.EHZ.2018.001.00.00.00">
        <InputUnits>
-        <Name>M/S</Name>
+        <Name>m/s</Name>
         <Description>Velocity in Meters Per Second</Description>
        </InputUnits>
        <OutputUnits>
@@ -406,7 +406,7 @@
         <Name>V</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <CfTransferFunctionType>DIGITAL</CfTransferFunctionType>
       </Coefficients>
@@ -425,10 +425,10 @@
      <Stage number="3">
       <FIR resourceId="ResponseFIR/20190220141739.386574.17" name="AM.RS3D5..EHZ.2018.001.00.00.00.stage_2">
        <InputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <Symmetry>ODD</Symmetry>
        <NumeratorCoefficient>-0.000151873</NumeratorCoefficient>

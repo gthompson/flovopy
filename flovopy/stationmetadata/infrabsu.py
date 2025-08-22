@@ -165,6 +165,117 @@ def _reset_overall_instrument_sensitivity(resp):
         output_units=_make_units(out_units_name, "Digital Counts" if out_units_name.upper() == "COUNTS" else None),
     )
 
+from obspy.core.inventory.response import StageGain
+
+def _fix_units_to_controlled_vocab(resp) -> None:
+    """
+    Force controlled vocab names for units:
+      - 'Pa', 'V', 'count'
+    Replace various 'COUNT', 'COUNTS', 'Counts' with 'count'.
+    """
+    def _norm_name(u):
+        if u is None:
+            return None
+        # obspy Units object or plain str
+        name = getattr(u, "name", u if isinstance(u, str) else None)
+        if not name:
+            return None
+        lname = str(name).strip()
+        if lname.upper() in ("COUNT", "COUNTS"):
+            return "count"
+        # Allow correct tokens to pass through as-is
+        if lname in ("Pa", "V", "count"):
+            return lname
+        return lname  # don't over-normalize other legal names
+
+    for stg in getattr(resp, "response_stages", []) or []:
+        for attr in ("input_units", "output_units"):
+            u = getattr(stg, attr, None)
+            new = _norm_name(u)
+            if new:
+                setattr(stg, attr, _make_units(new))
+
+    # Channel-level InstrumentSensitivity units
+    ins = getattr(resp, "instrument_sensitivity", None)
+    if ins is not None:
+        inu = getattr(ins, "input_units", None)
+        onu = getattr(ins, "output_units", None)
+        in_name = _norm_name(inu) or "Pa"
+        out_name = _norm_name(onu) or "count"
+        ins.input_units  = _make_units(in_name, "Pascals" if in_name == "Pa" else None)
+        ins.output_units = _make_units(out_name, "Digital counts" if out_name == "count" else None)
+
+def _ensure_stage_gain_and_decimation(resp, final_sample_rate: float) -> None:
+    """
+    Ensure every stage has StageGain; ensure every stage has a Decimation object.
+    Do NOT overwrite existing meaningful decimation from the NRL;
+    if missing, create decimation with factor=1 to satisfy the validator.
+    """
+    stages = getattr(resp, "response_stages", []) or []
+    # We don't know the internal pre-decimation rate here; seed with channel rate for factor=1 fillers.
+    nominal_rate = float(final_sample_rate)
+
+    for stg in stages:
+        # StageGain
+        if getattr(stg, "stage_gain", None) is None:
+            stg.stage_gain = StageGain(value=1.0, frequency=1.0)
+
+        # Decimation: keep if present; otherwise create a factor-1 decimation
+        dec = getattr(stg, "decimation", None)
+        has_factor = False
+        if dec is not None:
+            f = getattr(dec, "factor", None)
+            try:
+                has_factor = float(f) not in (None, 0.0)
+            except Exception:
+                has_factor = False
+
+        if dec is None or not has_factor:
+            class _Decim:  # simple container
+                pass
+            dec = _Decim()
+            dec.input_sample_rate = nominal_rate
+            dec.factor = 1.0
+            dec.output_sample_rate = nominal_rate
+            dec.offset = 0.0
+            dec.delay = 0.0
+            dec.correction = 0.0
+            stg.decimation = dec
+
+        # Ensure legacy flat attrs exist but are None (some writers look for them)
+        stg.decimation_input_sample_rate = None
+        stg.decimation_output_sample_rate = None
+        stg.decimation_factor = None
+
+def _recompute_overall_instrument_sensitivity(resp) -> None:
+    """
+    Build top-level InstrumentSensitivity as the product of stage gains.
+    InputUnits from first stage, OutputUnits from last; default 'Pa'->'count'.
+    """
+    stages = getattr(resp, "response_stages", []) or []
+    if not stages:
+        return
+
+    in_units = getattr(stages[0], "input_units", None)
+    out_units = getattr(stages[-1], "output_units", None)
+    in_name  = getattr(in_units, "name", in_units if isinstance(in_units, str) else None) or "Pa"
+    out_name = getattr(out_units, "name", out_units if isinstance(out_units, str) else None) or "count"
+
+    overall = 1.0
+    for s in stages:
+        g = getattr(s, "stage_gain", None)
+        try:
+            overall *= float(getattr(g, "value", g))
+        except Exception:
+            pass
+
+    resp.instrument_sensitivity = InstrumentSensitivity(
+        value=overall,
+        frequency=1.0,
+        input_units=_make_units(in_name, "Pascals" if in_name == "Pa" else None),
+        output_units=_make_units(out_name, "Digital counts" if out_name == "count" else None),
+    )
+
 # ---------------------------------------------------------------------------
 # 1) Download & stash infraBSU sensor StationXML template
 # ---------------------------------------------------------------------------
@@ -258,9 +369,14 @@ def get_infrabsu_centaur(
     add_stages = stages[1:] if len(stages) >= 2 else []
     combined_resp.response_stages.extend(copy.deepcopy(add_stages))
 
-    # Normalize stage decimation metadata and recompute overall sensitivity
-    _normalize_decimation_fields(combined_resp, start_rate=float(fsamp))
-    _reset_overall_instrument_sensitivity(combined_resp)
+    # 1) Fix units to controlled vocabulary ('count' not 'COUNTS', etc.)
+    _fix_units_to_controlled_vocab(combined_resp)
+
+    # 2) Ensure StageGain on every stage and Decimation present (factor=1 if unknown)
+    _ensure_stage_gain_and_decimation(combined_resp, final_sample_rate=float(fsamp))
+
+    # 3) Recompute overall InstrumentSensitivity (counts/Pa)
+    _recompute_overall_instrument_sensitivity(combined_resp)
 
     # Stamp metadata
     net.code = network

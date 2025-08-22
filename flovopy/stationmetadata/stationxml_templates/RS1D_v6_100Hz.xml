@@ -4,13 +4,13 @@
  <Sender>GFZ</Sender>
  <Created>2025-08-08T17:59:11.968167Z</Created>
  <Network code="AM" startDate="1900-01-01T00:00:00Z" restrictedStatus="open">
-  <Description>dass</Description>
+  <Description>OSOP RaspShake Network</Description>
   <Station code="RS1D6" startDate="1900-01-01T00:00:00Z" restrictedStatus="open">
    <Latitude>0</Latitude>
    <Longitude>0</Longitude>
    <Elevation>0</Elevation>
    <Site>
-    <Name>saddsa</Name>
+    <Name>Raspberry Shake Personal Seismograph Station</Name>
    </Site>
    <CreationDate>1900-01-01T00:00:00Z</CreationDate>
    <Channel code="HHZ" startDate="1900-01-01T00:00:00Z" restrictedStatus="open" locationCode="">
@@ -35,16 +35,16 @@
       <Value>381407000</Value>
       <Frequency>5</Frequency>
       <InputUnits>
-       <Name>M/S</Name>
+       <Name>m/s</Name>
       </InputUnits>
       <OutputUnits>
-       <Name>COUNTS</Name>
+       <Name>count</Name>
       </OutputUnits>
      </InstrumentSensitivity>
      <Stage number="1">
       <PolesZeros resourceId="ResponsePAZ#20180116190458.256797.8" name="RS1D6.2018.001.HZ">
        <InputUnits>
-        <Name>M/S</Name>
+        <Name>m/s</Name>
        </InputUnits>
        <OutputUnits>
         <Name>V</Name>
@@ -104,7 +104,7 @@
         <Name>V</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <CfTransferFunctionType>DIGITAL</CfTransferFunctionType>
       </Coefficients>
@@ -123,10 +123,10 @@
      <Stage number="3">
       <FIR resourceId="ResponseFIR#20180116190458.256617.6" name="RS1D6..HHZ.2018.001.stage_2">
        <InputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <Symmetry>ODD</Symmetry>
        <NumeratorCoefficient>-0.000151873</NumeratorCoefficient>

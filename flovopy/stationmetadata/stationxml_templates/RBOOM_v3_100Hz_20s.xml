@@ -33,17 +33,17 @@
       <Value>56000</Value>
       <Frequency>5</Frequency>
       <InputUnits>
-       <Name>PA</Name>
+       <Name>Pa</Name>
        <Description>No Abbreviation Referenced</Description>
       </InputUnits>
       <OutputUnits>
-       <Name>COUNTS</Name>
+       <Name>count</Name>
       </OutputUnits>
      </InstrumentSensitivity>
      <Stage number="1">
       <PolesZeros resourceId="ResponsePAZ/20180720031939.236343.9" name="AM.RBOOM.00HDF.2018.001.00.00.00">
        <InputUnits>
-        <Name>PA</Name>
+        <Name>Pa</Name>
         <Description>No Abbreviation Referenced</Description>
        </InputUnits>
        <OutputUnits>
@@ -80,7 +80,7 @@
         <Name>V</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <CfTransferFunctionType>DIGITAL</CfTransferFunctionType>
       </Coefficients>
@@ -99,10 +99,10 @@
      <Stage number="3">
       <FIR resourceId="ResponseFIR/20180720031939.236031.7" name="AM.RBOOM.00.HDF.2018.001.00.00.00.stage_2">
        <InputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <Symmetry>ODD</Symmetry>
        <NumeratorCoefficient>-0.000151873</NumeratorCoefficient>

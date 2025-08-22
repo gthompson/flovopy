@@ -3,9 +3,9 @@
  <Source>SeisComP</Source>
  <Sender>GFZ</Sender>
  <Created>2025-08-08T17:59:10.908761Z</Created>
- <Network code="@STNNET@" startDate="1900-01-01T00:00:00Z" restrictedStatus="open">
+ <Network code="AM" startDate="1900-01-01T00:00:00Z" restrictedStatus="open">
   <Description>OSOP RaspShake Network</Description>
-  <Station code="@RS1D0@" startDate="1900-01-01T00:00:00Z" restrictedStatus="open">
+  <Station code="RSH" startDate="1900-01-01T00:00:00Z" restrictedStatus="open">
    <Latitude>0</Latitude>
    <Longitude>0</Longitude>
    <Elevation>0</Elevation>
@@ -13,7 +13,7 @@
     <Name>Raspberry Shake Personal Seismograph Station</Name>
    </Site>
    <CreationDate>1900-01-01T00:00:00Z</CreationDate>
-   <Channel code="SHZ" startDate="1900-01-01T00:00:00Z" restrictedStatus="open" locationCode="@STNLOC@">
+   <Channel code="SHZ" startDate="1900-01-01T00:00:00Z" restrictedStatus="open" locationCode="">
     <Latitude>0</Latitude>
     <Longitude>0</Longitude>
     <Elevation>0</Elevation>
@@ -35,16 +35,16 @@
       <Value>469118000</Value>
       <Frequency>5</Frequency>
       <InputUnits>
-       <Name>M/S</Name>
+       <Name>m/s</Name>
       </InputUnits>
       <OutputUnits>
-       <Name>COUNTS</Name>
+       <Name>count</Name>
       </OutputUnits>
      </InstrumentSensitivity>
      <Stage number="1">
-      <PolesZeros resourceId="ResponsePAZ#20161110031729.314002.8" name="@RS1D0@.2016.321.HZ">
+      <PolesZeros resourceId="ResponsePAZ#20161110031729.314002.8" name="RSH.2016.321.HZ">
        <InputUnits>
-        <Name>M/S</Name>
+        <Name>m/s</Name>
        </InputUnits>
        <OutputUnits>
         <Name>V</Name>
@@ -92,7 +92,7 @@
         <Name>V</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <CfTransferFunctionType>DIGITAL</CfTransferFunctionType>
       </Coefficients>
@@ -111,10 +111,10 @@
      <Stage number="3">
       <FIR resourceId="ResponseFIR#20161110031729.313805.6" name="@RS1D0@.@STNLOC@.SHZ.2016.321.stage_2">
        <InputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </InputUnits>
        <OutputUnits>
-        <Name>COUNTS</Name>
+        <Name>count</Name>
        </OutputUnits>
        <Symmetry>ODD</Symmetry>
        <NumeratorCoefficient>3.69606e-05</NumeratorCoefficient>
