@@ -68,3 +68,4 @@ logs/
 *.sqlite
 gmt.history
 RSAMplots.zip
+*.rover
