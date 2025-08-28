@@ -121,7 +121,7 @@ def NRL2inventory(
             raise ValueError(f"No fallback response available for sensor: {sensor}")
 
         input_units = units or 'm/s'
-        output_units = 'Counts'
+        output_units = 'counts'
 
         try:
             thisresponse = Response.from_paz(
@@ -143,61 +143,94 @@ def NRL2inventory(
     )
     return inventory
 
-'''
-def build_inventory_from_csv(csv_path: str, nrl_path: str = None) -> Inventory:
+
+
+# ---- Global StationXML unit normalizer -------------------------------------
+try:
+    # ObsPy ≥1.5: Units object
+    from obspy.core.inventory.util import Units as _ObsPyUnits
+    def _mk_units(name: str):
+        return _ObsPyUnits(name=name)
+except Exception:
+    # ObsPy 1.4: plain strings are fine
+    def _mk_units(name: str):
+        return name
+
+# Map any legacy/odd spellings to controlled tokens
+_UNIT_MAP = {
+    # counts
+    "count": "count",
+    "counts": "count",
+    "COUNT": "count",
+    "COUNTS": "count",
+    "Counts": "count",
+
+    # pascal
+    "pa": "Pa",
+    "PA": "Pa",
+    "Pa": "Pa",
+
+    # velocity
+    "m/s": "m/s",
+    "M/S": "m/s",
+
+    # (optional, commonly seen)
+    "v": "V",
+    "V": "V",
+}
+
+def _norm_unit_token(x) -> str | None:
     """
-    Builds a full ObsPy Inventory by reading a CSV file of station metadata.
-
-    Each row in the CSV defines one station's configuration and is converted into a
-    response using the IRIS NRL or local NRL. All stations are merged into one Inventory.
-
-    Parameters:
-    -----------
-    csv_path : str
-        Path to CSV file containing network, station, location, channel, and response info.
-    nrl_path : str, optional
-        Path to local NRL directory, or None to use remote IRIS NRL.
-
-    Returns:
-    --------
-    master_inventory : obspy.core.inventory.Inventory
-        Full Inventory containing all stations described in the CSV.
+    Accepts an ObsPy Units object, a string, or None. Returns normalized token or None.
     """
-    df = pd.read_csv(csv_path)
-    df.columns = df.columns.str.strip()
-    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
-    df["ondate"] = df["ondate"].apply(UTCDateTime)
-    df["offdate"] = df["offdate"].apply(UTCDateTime)
+    if x is None:
+        return None
+    # ObsPy Units or plain string
+    name = getattr(x, "name", x if isinstance(x, str) else None)
+    if not name:
+        return None
+    key = str(name).strip()
+    return _UNIT_MAP.get(key, key)  # keep unknowns unchanged
 
-    master_inventory = Inventory(networks=[], source="build_inventory_from_csv")
+def _set_units_attr(obj, attr: str, token: str | None):
+    if token is None:
+        return
+    try:
+        setattr(obj, attr, _mk_units(token))
+    except Exception:
+        setattr(obj, attr, token)  # fallback to plain string, ObsPy 1.4-safe
 
-    for _, row in df.iterrows():
-        net = str(row["network"]).strip()
-        sta = str(row["station"]).strip()
-        loc = str(row["location"]).strip()
-        chan_list = expand_channel_code(row["channel"])
-        lat = float(row["lat"] or 0.0)
-        lon = float(row["lon"] or 0.0)
-        elev = float(row["elev"] or 0.0)
-        depth = float(row["depth"] or 0.0)
-        fsamp = float(row["fsamp"] or 100.0)
-        vpp = float(row["vpp"] or 40.0)
-        datalogger = row['datalogger']
-        sensor = row['sensor']
+def sanitize_inventory_units(inv) -> None:
+    """
+    Replace units across the whole Inventory:
+      - 'COUNTS'/'Counts' -> 'count'
+      - 'M/S' -> 'm/s'
+      - 'PA' -> 'Pa'
+    Applies to per-stage input/output units and channel-level InstrumentSensitivity.
+    """
+    for net in inv.networks:
+        for sta in net.stations:
+            for cha in sta.channels:
+                resp = getattr(cha, "response", None)
+                if resp is None:
+                    continue
 
-        try:
-            inv = NRL2inventory(
-                nrl_path, net, sta, loc, chan_list,
-                datalogger=datalogger, sensor=sensor, Vpp=vpp, fsamp=fsamp,
-                lat=lat, lon=lon, elev=elev, depth=depth,
-                ondate=row["ondate"], offdate=row["offdate"]
-            )
-            master_inventory += inv
-        except Exception as e:
-            print(f"[ERROR] Skipped {net}.{sta}.{loc}: {e}")
+                # Stage-level input/output units
+                for stg in getattr(resp, "response_stages", []) or []:
+                    in_tok = _norm_unit_token(getattr(stg, "input_units", None))
+                    out_tok = _norm_unit_token(getattr(stg, "output_units", None))
+                    _set_units_attr(stg, "input_units", in_tok)
+                    _set_units_attr(stg, "output_units", out_tok)
 
-    return master_inventory
-'''
+                # Channel-level InstrumentSensitivity units
+                ins = getattr(resp, "instrument_sensitivity", None)
+                if ins is not None:
+                    inu = _norm_unit_token(getattr(ins, "input_units", None))
+                    onu = _norm_unit_token(getattr(ins, "output_units", None))
+                    _set_units_attr(ins, "input_units", inu)
+                    _set_units_attr(ins, "output_units", onu)
+
+
 def sensor_type_dispatch(
     row, 
     nrl_path=None, 
@@ -234,6 +267,7 @@ def sensor_type_dispatch(
             inv = build_inv_from_template(
                 kind=kind,
                 net=net, sta=sta, loc=loc,
+                #keep_channels=chans,                   # keep whatever is passed
                 keep_channels=None,                   # keep whatever’s in the template
                 coords=(lat, lon, elev, depth),
                 validity=(ondate, offdate),
@@ -273,24 +307,30 @@ def sensor_type_dispatch(
         return inv    
 
 
-    elif sensor.upper().startswith("CHAP"):
+
+    elif "chaparral" in sensor.lower():
         inv = NRL2inventory(
             nrl_path,
-            net,
-            sta,
-            loc,
-            chans,
-            fsamp=fsamp,
-            Vpp=vpp,
+            net, sta, loc, chans,
+            fsamp=fsamp, Vpp=vpp,
             datalogger=datalogger,
             sensor=sensor,
-            lat=lat,
-            lon=lon,
-            elev=elev,
-            depth=depth,
-            ondate=ondate,
-            offdate=offdate
+            lat=lat, lon=lon, elev=elev, depth=depth,
+            ondate=ondate, offdate=offdate
         )
+
+        # --- Chaparral M-25 overall sensitivity (counts/Pa) ---
+        # Sensor: 0.05 V/Pa
+        SENSOR_V_PER_PA = 0.05
+        # Centaur: counts/volt = 0.4e6 * 40 / inputVoltageRange
+        # p2p/range source: Excel column 'vpp' (already parsed to vpp above)
+        input_range = float(vpp) if vpp in (1, 40, 1.0, 40.0) else 40.0
+        counts_per_volt = 0.4e6 * 40.0 / input_range
+        desired_counts_per_pa = SENSOR_V_PER_PA * counts_per_volt  # -> 20_000 (40 Vpp) or 800_000 (1 Vpp)
+
+        # Normalize units, set instrument_sensitivity, and fix stage-gain product to match
+        _set_overall_counts_per_pa(inv, desired_counts_per_pa, freq_hz=1.0, tweak_stage=True, verbose=verbose)
+
         return inv
 
     else:
@@ -313,6 +353,205 @@ def sensor_type_dispatch(
             offdate=offdate
         )
         return inv
+    
+import math
+
+def _set_channel_orientation(inv, net, sta, loc, chan, azimuth, dip):
+    """
+    Find Channel(net, sta, loc, chan) in `inv` and set azimuth/dip if provided.
+    Accepts NaN/None as 'skip'.
+    """
+    def _isnum(x):
+        try:
+            return (x is not None) and (not (isinstance(x, float) and math.isnan(x)))
+        except Exception:
+            return False
+
+    if not _isnum(azimuth) and not _isnum(dip):
+        return  # nothing to set
+
+    for n in inv.networks:
+        if n.code != str(net):
+            continue
+        for s in n.stations:
+            if s.code != str(sta):
+                continue
+            for c in s.channels:
+                if c.location_code == str(loc) and c.code == str(chan):
+                    if _isnum(azimuth):
+                        # wrap [0, 360)
+                        c.azimuth = float(azimuth) % 360.0
+                    if _isnum(dip):
+                        c.dip = float(dip)
+                    return
+                
+# --- Units / response utilities ---------------------------------------------
+
+def _units_name(u):
+    # Works for ObsPy Units object or plain str
+    if u is None:
+        return None
+    return getattr(u, "name", u if isinstance(u, str) else None)
+
+def _make_units(name: str, desc: str | None = None):
+    try:
+        from obspy.core.inventory.util import Units
+        u = Units(name=name)
+        try:
+            if desc:
+                u.description = desc
+        except Exception:
+            pass
+        return u
+    except Exception:
+        # Older ObsPy accepts plain strings
+        return name
+
+def _normalize_units_on_inventory(inv) -> None:
+    """
+    Replace 'COUNTS'/'Counts'->'count', 'M/S'->'m/s', 'PA'->'Pa' across all channels/stages.
+    """
+    def _norm(s):
+        if not s:
+            return s
+        t = str(s)
+        if t.upper() in ("COUNT", "COUNTS"):
+            return "count"
+        if t.upper() == "M/S":
+            return "m/s"
+        if t.upper() == "PA":
+            return "Pa"
+        return t
+
+    for net in inv.networks:
+        for sta in net.stations:
+            for cha in sta.channels:
+                resp = cha.response
+                if not resp:
+                    continue
+                # Stages
+                for stg in getattr(resp, "response_stages", []) or []:
+                    for attr in ("input_units", "output_units"):
+                        old = getattr(stg, attr, None)
+                        nm = _norm(_units_name(old))
+                        if nm:
+                            setattr(stg, attr, _make_units(nm))
+                # Top-level instrument_sensitivity (if present now or later)
+                ins = getattr(resp, "instrument_sensitivity", None)
+                if ins is not None:
+                    inu = _norm(_units_name(ins.input_units)) or "Pa"
+                    onu = _norm(_units_name(ins.output_units)) or "count"
+                    ins.input_units  = _make_units(inu, "Pascals" if inu == "Pa" else None)
+                    ins.output_units = _make_units(onu, "Digital counts" if onu == "count" else None)
+
+def _stage_gain_value(stg):
+    g = getattr(stg, "stage_gain", None)
+    if g is None:
+        return None
+    # ObsPy 1.5+ often stores float; 1.4 used StageGain(value=..)
+    v = getattr(g, "value", None)
+    try:
+        return float(v if v is not None else g)
+    except Exception:
+        return None
+
+def _set_stage_gain(stg, value, freq=1.0):
+    try:
+        from obspy.core.inventory.response import StageGain  # old style
+    except Exception:
+        stg.stage_gain = float(value)
+        stg.stage_gain_frequency = float(freq)
+    else:
+        stg.stage_gain = StageGain(value=float(value), frequency=float(freq))
+
+def _product_of_stage_gains(resp) -> float | None:
+    prod = 1.0
+    saw = False
+    for stg in getattr(resp, "response_stages", []) or []:
+        v = _stage_gain_value(stg)
+        if v is None:
+            continue
+        saw = True
+        prod *= float(v)
+    return prod if saw else None
+
+def _ensure_decimation_defaults(resp, channel_rate: float):
+    # Keep existing values; if missing, make a factor=1 decimation (validator-friendly)
+    try:
+        from obspy.core.inventory.response import Decimation
+    except Exception:
+        Decimation = None
+
+    for stg in getattr(resp, "response_stages", []) or []:
+        dec = getattr(stg, "decimation", None)
+        factor = getattr(dec, "factor", None) if dec is not None else None
+        ok = False
+        try:
+            ok = (factor is not None) and (int(factor) >= 1)
+        except Exception:
+            ok = False
+
+        if not ok:
+            if Decimation is not None:
+                stg.decimation = Decimation(
+                    input_sample_rate=float(channel_rate),
+                    factor=1,
+                    offset=0.0, delay=0.0, correction=0.0
+                )
+                stg.decimation.output_sample_rate = float(channel_rate)
+            else:
+                class _D: pass
+                d = _D()
+                d.input_sample_rate = float(channel_rate)
+                d.factor = 1
+                d.output_sample_rate = float(channel_rate)
+                d.offset = d.delay = d.correction = 0.0
+                stg.decimation = d
+
+def _set_overall_counts_per_pa(inv, desired_overall_counts_per_pa: float, freq_hz: float = 1.0, tweak_stage=True, verbose=False):
+    """
+    Set instrument_sensitivity (counts/Pa) and, optionally, scale the final stage gain
+    so the product of stage gains equals the total (to satisfy validator 412).
+    """
+    for net in inv.networks:
+        for sta in net.stations:
+            for cha in sta.channels:
+                resp = cha.response
+                if not resp:
+                    continue
+
+                # Ensure units are normalized before setting sensitivity
+                _normalize_units_on_inventory(inv)
+
+                # Set instrument_sensitivity
+                from obspy.core.inventory.response import InstrumentSensitivity
+                resp.instrument_sensitivity = InstrumentSensitivity(
+                    value=float(desired_overall_counts_per_pa),
+                    frequency=float(freq_hz),
+                    input_units=_make_units("Pa", "Pascals"),
+                    output_units=_make_units("count", "Digital counts"),
+                )
+
+                # Make stage-gain product match total (if requested)
+                if tweak_stage:
+                    prod = _product_of_stage_gains(resp)
+                    if prod is None or prod == 0.0:
+                        # If there are no stage gains yet, make a final synthetic one
+                        if verbose:
+                            print(f"[chaparral] No stage gains found; adding synthetic stage gain -> {desired_overall_counts_per_pa}")
+                        class _Stage: pass
+                        stg = _Stage()
+                        _set_stage_gain(stg, desired_overall_counts_per_pa, freq_hz)
+                        resp.response_stages = (resp.response_stages or []) + [stg]
+                    else:
+                        scale = float(desired_overall_counts_per_pa) / prod
+                        if not np.isclose(scale, 1.0, rtol=1e-6, atol=1e-6):
+                            last = (resp.response_stages or [])[-1]
+                            last_gain = _stage_gain_value(last) or 1.0
+                            _set_stage_gain(last, last_gain * scale, freq_hz)
+
+                # Decimation defaults (in case some stages lack it)
+                _ensure_decimation_defaults(resp, cha.sample_rate or 100.0)
     
 def build_inventory_from_dataframe(df, nrl_path=None, infrabsu_xml=None, verbose=True):
     """
@@ -345,6 +584,7 @@ def build_inventory_from_dataframe(df, nrl_path=None, infrabsu_xml=None, verbose
     for _, row in df.iterrows():
         if verbose:
             print('\n' + f'[INFO] build_inventory_from_dataframe: Processing {row.get("network", "?")}.{row.get("station", "?")}.{row.get("location", "")}.{row.get("channel", "")}')
+
         try:
             inv_piece = sensor_type_dispatch(
                 row,
@@ -352,6 +592,21 @@ def build_inventory_from_dataframe(df, nrl_path=None, infrabsu_xml=None, verbose
                 infrabsu_xml=infrabsu_xml,
                 verbose=verbose
             )
+
+            # --- NEW: push channel_azimuth / channel_dip into the Channel ---
+            az = row.get("channel_azimuth", None)
+            dp = row.get("channel_dip", None)
+            _set_channel_orientation(
+                inv_piece,
+                net=row.get("network", ""),
+                sta=row.get("station", ""),
+                loc=row.get("location", ""),
+                chan=row.get("channel", ""),
+                azimuth=az,
+                dip=dp
+            )
+            # ---------------------------------------------------------------
+            sanitize_inventory_units(inv_piece)
             inventory += inv_piece
         except Exception as e:
             if verbose:
@@ -362,7 +617,33 @@ def build_inventory_from_dataframe(df, nrl_path=None, infrabsu_xml=None, verbose
                 print(f"[WARN] Failed to parse {net}.{sta}.{loc}.{chan}: {e}")
                 traceback.print_exc()
 
-    return inventory
+    print('\nregular merge')
+    return merge_inventories(inventory)
+
+def print_station_epochs(inv: Inventory, *, stations=None, networks=None, limit=None):
+    """
+    Print (loc, chan, start, end) per station; optionally filter by station/network.
+    """
+    count = 0
+    for net in inv.networks:
+        if networks and net.code not in set(networks): 
+            continue
+        for sta in net.stations:
+            if stations and sta.code not in set(stations): 
+                continue
+            print(f"\n== {net.code}.{sta.code} [{sta.start_date} → {sta.end_date}] ==")
+            buckets = defaultdict(list)
+            for ch in sta.channels:
+                if ch.code=='DD1':
+                    buckets[(ch.location_code, ch.code)].append(ch)
+            for (loc, chan), chans in sorted(buckets.items()):
+                chans_sorted = sorted(chans, key=lambda c: (c.start_date, c.end_date or c.start_date))
+                for c in chans_sorted:
+                    print(f"  {loc}.{chan}  {c.start_date} → {c.end_date}")
+                    count += 1
+                    if limit and count >= limit:
+                        return
+
 
 def build_inventory_from_table(path, sheet_name='ksc_stations_master', nrl_path=None, infrabsu_xml=None, verbose=True):
     """
@@ -488,106 +769,6 @@ def create_trace_inventory(tr, netname='', sitename='', net_ondate=None, \
     return inv
 
 
-           
-'''            
-def merge_inventories(inv1, inv2):
-    """
-    Merge two ObsPy Inventory objects with code-aware deduplication and hierarchical merging.
-
-    This function merges `inv2` into `inv1` in place, taking care to avoid duplication
-    at the network, station, and channel levels. If a network, station, or channel in
-    `inv2` already exists in `inv1`, it is not blindly appended — instead, the function
-    recursively inspects and merges child elements.
-
-    ⚠️ This differs significantly from `inv1 += inv2` or `inv1 + inv2`, which simply
-    concatenates all elements and does not perform deduplication. Using `Inventory.__add__()`
-    may result in invalid StationXML if multiple networks, stations, or channels share
-    the same codes but have differing metadata.
-
-    This method is particularly useful when combining inventories from overlapping sources,
-    or when preserving clean NSLC structures is critical (e.g., for visualization, export,
-    or further metadata refinement).
-
-    Parameters:
-    ----------
-    inv1 : obspy.core.inventory.inventory.Inventory
-        The primary inventory object to be modified in place.
-
-    inv2 : obspy.core.inventory.inventory.Inventory
-        The secondary inventory to merge into `inv1`.
-
-    Returns:
-    -------
-    None
-        Modifies `inv1` in place.
-    """
-
-
-    
-    def _add_channel(chan1, chan):
-        """
-        Add a new channel to an existing list of channels.
-
-        Parameters:
-        chan1 (list[Channel]): List of existing channels in a station.
-        chan (Channel): New channel to add.
-        """
-        # add as new channel
-        print('Adding new channel %s' % chan.code)
-        chan1.append(chan)  
-        
-
-    def _merge_stations(sta1, sta, station_codes):
-        """
-        Merge a station into an existing list of stations by merging or adding channels.
-
-        Parameters:
-        sta1 (list[Station]): List of existing stations in a network.
-        sta (Station): New station to merge.
-        station_codes (list[str]): List of station codes in the network.
-        """
-        index = station_codes.index(sta.code)
-        print('Merging station')  
-        for chan in sta.channels:
-            channel_codes = [chan.code for chan in sta1[index].channels]
-            if chan.code in channel_codes:
-                print(f"Channel {chan.code} already exists — skipping.")
-                continue
-            else:
-                _add_channel(sta1[index].channels, chan)       
-                
-    def _add_station(sta1, sta):
-        """
-        Add a new station to a list of stations.
-
-        Parameters:
-        sta1 (list[Station]): List of existing stations in a network.
-        sta (Station): Station object to add.
-        """
-        # add as new station
-        print('Adding new station %s' % sta.code)
-        sta1.append(sta) 
-
-    netcodes1 = [this_net.code for this_net in inv1.networks]
-    for net2 in inv2.networks:
-        if net2.code in netcodes1:
-            netpos = netcodes1.index(net2.code)
-            for sta in net2.stations:
-                if inv1.networks[netpos].stations:
-                    station_codes = [sta.code for sta in inv1.networks[netpos].stations]
-                    if sta.code in station_codes: 
-                        _merge_stations(inv1.networks[netpos].stations, sta, station_codes)
-                    else:
-                        _add_station(inv1.networks[netpos].stations, sta)
-                else:
-                    _add_station(inv1.networks[netpos].stations, sta)            
-        else: # this network code from inv2 does not exist in inv1
-            inv1.networks.append(net2)
-            netpos = -1
-'''
-
-
-
 
 def merge_inventories(*inventories):
     """
@@ -682,7 +863,6 @@ def merge_inventories(*inventories):
                                             match_found = True  # exact duplicate
                                         else:
                                             print(f"[WARN] Channel metadata mismatch for {sta_code}.{new_chan.location_code}.{new_chan.code} during overlapping period")
-                                    # Else no time overlap — both can exist
                             if not match_found:
                                 current.channels.append(new_chan)
 
@@ -693,6 +873,25 @@ def merge_inventories(*inventories):
                         current.end_date = current_end
                     else:
                         i += 1
+
+                """
+                # >>> ADD: coalesce channel epochs by (loc, code, response) and stitch touching windows
+                _condense_station_channels(current, touch_tol=1e-6) # in the other merge_inv
+
+                # >>> ADD: ensure station epoch covers union of channel epochs
+                if current.channels:
+                    c_starts = [ch.start_date for ch in current.channels if ch.start_date]
+                    c_ends   = [ch.end_date   for ch in current.channels if ch.end_date]
+                    if c_starts:
+                        smin = min(c_starts)
+                        current.start_date = min(current.start_date or smin, smin)
+                    if any(ch.end_date is None for ch in current.channels):
+                        current.end_date = None
+                    elif c_ends:
+                        smax = max(c_ends)
+                        current.end_date = max(current.end_date or smax, smax)
+                # <<< END ADD
+                """
 
                 if not current.site.name:
                     current.site.name = f"AUTO_NAME_{sta_code}"
@@ -706,6 +905,7 @@ def merge_inventories(*inventories):
         merged_inv.networks.append(merged_net)
 
     return merged_inv
+
 
 if __name__ == "__main__":
     import traceback

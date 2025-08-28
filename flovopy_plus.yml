@@ -1,0 +1,31 @@
+# flovopy312.yml
+# Note the following are not compatible with this Python 3.12 version of flovopy YML, which is the recommended Python as of August 2025:
+# - pyrocko requires python 3.10 and generally needs to be installed first
+# - passoft requires python 3.9 or 3.10, but is verified to work with flovopy on 3.10
+# - ispaq requires python 3.8
+# It might be possible to build these from source code (github repos), if really needed in same env
+name: flovopy312
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - jupyterlab
+  - obspy
+  - pandas
+  - pygmt
+  - pytest
+  - sphinx
+  - sqlite
+  - tqdm
+  - seaborn
+  - plotly
+  - dash
+  - netcdf4
+  - packaging
+  - xarray
+  - scikit-learn
+  - mplcursors
+  - pip
+  - pip:
+      - -e /home/thompsong/Developer/flovopy

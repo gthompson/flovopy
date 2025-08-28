@@ -113,6 +113,65 @@ def expand_channel_code(base: str):
     suffix = base[2:]
     return [prefix + ch for ch in suffix]
 
+import math
+import pandas as pd
+
+def _is_non_directional_channel(ch: str) -> bool:
+    """
+    Treat common infrasound codes as non-directional: 'DF', 'DH', 'DO', 'DP', etc.
+    Adjust this set if you use other codes.
+    """
+    if not ch or not isinstance(ch, str):
+        return False
+    ch = ch.strip().upper()
+    # last two letters define physical quantity most of the time
+    tail2 = ch[-2:] if len(ch) >= 2 else ch
+    return tail2 in {"DF", "DH", "DO", "DP", "BN", "BD"}  # include any you use
+
+def _component_letter(ch: str) -> str:
+    """Return last character of channel (Z/N/E/1/2/R/T/...)."""
+    if not ch or not isinstance(ch, str):
+        return ""
+    return ch.strip()[-1].upper()
+
+def _wrap_deg(x: float) -> float:
+    """Wrap degrees to [0, 360)."""
+    return float((x % 360 + 360) % 360)
+
+def compute_orientation_for_channel(channel: str, n_azimuth_deg: float | None):
+    """
+    Given a SEED channel code and the azimuth (deg) of the N component,
+    return (azimuth, dip) for this specific channel.
+    """
+    comp = _component_letter(channel)
+    ch_up = (channel or "").upper()
+
+    # Non-directional sensors (infrasound, baro, etc.)
+    if _is_non_directional_channel(ch_up):
+        return (0.0, 0.0)
+
+    # Vertical
+    if comp == "Z":
+        return (0.0, -90.0)
+
+    # Radial/Transverse: orientation is event-dependent; leave as NaN to avoid misleading metadata
+    if comp in {"R", "T"}:
+        return (math.nan, math.nan)
+
+    # Horizontal components
+    A = None if n_azimuth_deg is None or (isinstance(n_azimuth_deg, float) and math.isnan(n_azimuth_deg)) else float(n_azimuth_deg)
+
+    if comp in {"N", "1"}:
+        az = 0.0 if A is None else _wrap_deg(A)
+        return (az, 0.0)
+
+    if comp in {"E", "2"}:
+        az = 90.0 if A is None else _wrap_deg(A + 90.0)
+        return (az, 0.0)
+
+    # Unknown component: leave blank
+    return (math.nan, math.nan)
+
 def build_dataframe_from_table(path, sheet_name='ksc_stations_master'):
     """
     Load and clean a metadata table from CSV or Excel.
@@ -179,6 +238,28 @@ def build_dataframe_from_table(path, sheet_name='ksc_stations_master'):
             expanded_rows.append(new_row)
 
     df = pd.DataFrame(expanded_rows)
+
+    # ---- NEW: normalize the 'azimuth' column and compute per-channel az/dip
+    if 'azimuth' in df.columns:
+        # Coerce to float, allowing blanks/None → NaN
+        df['azimuth'] = pd.to_numeric(df['azimuth'], errors='coerce')
+    else:
+        # If missing entirely, create as NaN
+        df['azimuth'] = float('nan')
+
+    # Compute per-channel orientation based on the N-component azimuth rule
+    az_list = []
+    dip_list = []
+    for _, row in df.iterrows():
+        ch = row.get('channel', '')
+        n_az = row.get('azimuth', float('nan'))
+        az, dip = compute_orientation_for_channel(ch, n_az)
+        az_list.append(az)
+        dip_list.append(dip)
+
+    # Store outputs (use standard column names you'll later map into StationXML)
+    df['channel_azimuth'] = az_list   # degrees CW from North
+    df['channel_dip'] = dip_list      # degrees, down from horizontal (Z = -90)
     return df
 
 def apply_coordinates_from_csv(inventory, csv_path):

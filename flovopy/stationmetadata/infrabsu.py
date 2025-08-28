@@ -43,6 +43,17 @@ except Exception:
         return name
     _UNITS_IS_OBJ = False
 
+# --- Decimation compatibility shim -------------------------------------------
+try:
+    # ObsPy ≤1.4.x
+    from obspy.core.inventory.response import Decimation as _ObsPyDecimation  # type: ignore
+except Exception:
+    try:
+        # Some newer builds expose it under util
+        from obspy.core.inventory.util import Decimation as _ObsPyDecimation  # type: ignore
+    except Exception:
+        _ObsPyDecimation = None  # we'll define a lightweight fallback
+
 DEFAULT_INFRABSU_URL = (
     "https://service.iris.edu/irisws/nrl/1/combine"
     "?instconfig=sensor_JeffreyBJohnson_infraBSU_LP21_SG0.000046_STairPressure"
@@ -165,7 +176,7 @@ def _reset_overall_instrument_sensitivity(resp):
         output_units=_make_units(out_units_name, "Digital Counts" if out_units_name.upper() == "COUNTS" else None),
     )
 
-from obspy.core.inventory.response import StageGain
+
 
 def _fix_units_to_controlled_vocab(resp) -> None:
     """
@@ -205,47 +216,39 @@ def _fix_units_to_controlled_vocab(resp) -> None:
         ins.input_units  = _make_units(in_name, "Pascals" if in_name == "Pa" else None)
         ins.output_units = _make_units(out_name, "Digital counts" if out_name == "count" else None)
 
+
+def _set_stage_gain(stage, value, freq):
+    """
+    ObsPy 1.4 used StageGain objects; 1.5+ uses float attrs.
+    This works for both without importing StageGain at module import time.
+    """
+    try:
+        from obspy.core.inventory.response import StageGain  # 1.4.x only
+    except Exception:
+        stage.stage_gain = float(value)
+        stage.stage_gain_frequency = float(freq)
+    else:
+        stage.stage_gain = StageGain(value=float(value), frequency=float(freq))
+
 def _ensure_stage_gain_and_decimation(resp, final_sample_rate: float) -> None:
-    """
-    Ensure every stage has StageGain; ensure every stage has a Decimation object.
-    Do NOT overwrite existing meaningful decimation from the NRL;
-    if missing, create decimation with factor=1 to satisfy the validator.
-    """
-    stages = getattr(resp, "response_stages", []) or []
-    # We don't know the internal pre-decimation rate here; seed with channel rate for factor=1 fillers.
+    stages = list(getattr(resp, "response_stages", []) or [])
     nominal_rate = float(final_sample_rate)
 
     for stg in stages:
-        # StageGain
+        # Stage gain shim (as you already have)
         if getattr(stg, "stage_gain", None) is None:
-            stg.stage_gain = StageGain(value=1.0, frequency=1.0)
+            _set_stage_gain(stg, 1.0, 1.0)
 
-        # Decimation: keep if present; otherwise create a factor-1 decimation
         dec = getattr(stg, "decimation", None)
-        has_factor = False
-        if dec is not None:
-            f = getattr(dec, "factor", None)
-            try:
-                has_factor = float(f) not in (None, 0.0)
-            except Exception:
-                has_factor = False
+        factor = getattr(dec, "factor", None) if dec is not None else None
+        try:
+            has_valid_factor = (factor is not None) and (int(factor) >= 1)
+        except Exception:
+            has_valid_factor = False
 
-        if dec is None or not has_factor:
-            class _Decim:  # simple container
-                pass
-            dec = _Decim()
-            dec.input_sample_rate = nominal_rate
-            dec.factor = 1.0
-            dec.output_sample_rate = nominal_rate
-            dec.offset = 0.0
-            dec.delay = 0.0
-            dec.correction = 0.0
-            stg.decimation = dec
-
-        # Ensure legacy flat attrs exist but are None (some writers look for them)
-        stg.decimation_input_sample_rate = None
-        stg.decimation_output_sample_rate = None
-        stg.decimation_factor = None
+        if not has_valid_factor:
+            stg.decimation = _make_decimation(nominal_rate, factor=1, offset=0.0, delay=0.0, correction=0.0)
+        # (If you care, you can also ensure output_sample_rate explicitly here.)
 
 def _recompute_overall_instrument_sensitivity(resp) -> None:
     """
@@ -275,6 +278,36 @@ def _recompute_overall_instrument_sensitivity(resp) -> None:
         input_units=_make_units(in_name, "Pascals" if in_name == "Pa" else None),
         output_units=_make_units(out_name, "Digital counts" if out_name == "count" else None),
     )
+
+def _make_decimation(input_rate: float, factor: int = 1,
+                     offset: float = 0.0, delay: float = 0.0, correction: float = 0.0):
+    """
+    Create a Decimation object compatible with your ObsPy version.
+    Falls back to a plain object with the expected attributes if the class is missing.
+    """
+    if _ObsPyDecimation is not None:
+        d = _ObsPyDecimation(
+            input_sample_rate=float(input_rate),
+            factor=int(factor),
+            offset=float(offset),
+            delay=float(delay),
+            correction=float(correction),
+        )
+        # some writers also look for this explicitly:
+        d.output_sample_rate = float(input_rate) / max(int(factor), 1)
+        return d
+
+    # Fallback: attribute container
+    class _DecimFallback:
+        __slots__ = ("input_sample_rate", "factor", "output_sample_rate", "offset", "delay", "correction")
+        def __init__(self):
+            self.input_sample_rate = float(input_rate)
+            self.factor = int(factor)
+            self.output_sample_rate = float(input_rate) / max(int(factor), 1)
+            self.offset = float(offset)
+            self.delay = float(delay)
+            self.correction = float(correction)
+    return _DecimFallback()
 
 # ---------------------------------------------------------------------------
 # 1) Download & stash infraBSU sensor StationXML template
@@ -404,6 +437,8 @@ def get_infrabsu_centaur(
     chan.start_date = start_date
     chan.end_date = end_date
     chan.response = combined_resp
+    chan.azimuth = 0.0
+    chan.dip = 0.0
 
     if verbose:
         print(f"[OK] Built infraBSU+Centaur for {network}.{station}.{location}.{channel} @ {fsamp} Hz")
@@ -426,3 +461,4 @@ if __name__ == "__main__":
     )
     print(inv)
     inv.write("TEST_INFRABSU_CENTAUR.xml", format="stationxml", validate=True)
+    print('Validate with: java -jar ~/bin/stationxml-validator-1.7.5.jar TEST_INFRABSU_CENTAUR.xml')

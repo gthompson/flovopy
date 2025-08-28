@@ -14,18 +14,7 @@ from obspy import Stream, Trace
 
 from flovopy.core.gaputils import normalize_stream_gaps
 from flovopy.core.trace_utils import add_processing_step
-
-# If you move/remove this module, keep these imports stable for callers.
-try:
-    from flovopy.core.remove_response import (
-        safe_pad_taper_filter,
-    )
-except Exception as _e:  # pragma: no cover
-    def safe_pad_taper_filter(*args, **kwargs) -> bool:  # type: ignore[override]
-        raise RuntimeError(
-            "safe_pad_taper_filter not available – ensure flovopy.core.remove_response is importable"
-        )
-
+from flovopy.core.remove_response import safe_pad_taper_filter, stationxml_match_report
 
 # -------------------------------
 # QC metrics & utilities
@@ -479,7 +468,6 @@ def preprocess_trace(
             inv=inv,
             output_type=output_type,
             verbose=verbose,
-            post_filter_after_response=post_filter_after_response,
         )
         if not ok:
             add_processing_step(tr, "clean:failed")
@@ -508,15 +496,15 @@ def preprocess_stream(
     inv=None,
     output_type: Literal["VEL", "DISP", "ACC", "DEF"] = "VEL",
     verbose: bool = False,
-    post_filter_after_response: Optional[Tuple[
-        Literal["bandpass", "highpass", "lowpass"], Union[float, Tuple[float, float]]
-    ]] = None,
+    precheck_response: bool = False,
 ) -> Stream:
     """Process each trace with :func:`preprocess_trace`. Traces that fail are dropped."""
     out = Stream()
 
     # compute metrics before
     presummary = compute_stream_metrics(st)
+    if inv and precheck_response:
+        stationxml_match_report(st, inv)
 
     for tr in st:
         tr2 = tr.copy()
@@ -539,7 +527,6 @@ def preprocess_stream(
             inv=inv,
             output_type=output_type,
             verbose=verbose,
-            post_filter_after_response=post_filter_after_response,
         )
         if ok:
             out.append(tr2)

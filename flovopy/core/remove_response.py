@@ -1,7 +1,8 @@
 from __future__ import annotations
 import numpy as np
 from typing import Tuple
-from obspy import Trace
+from obspy import Trace, UTCDateTime
+from collections import defaultdict
 
 # Reuse the local helpers (or import from core if colocated)
 from flovopy.core.gaputils import _generate_spectrally_matched_noise
@@ -194,7 +195,7 @@ def update_trace_filter_meta(tr: Trace, filtertype: str, freq, zerophase: bool) 
 
 
 def handle_instrument_response(tr: Trace, inv, pre_filt, outputType: str, verbose: bool) -> bool:
-    from flovopy.core.preprocessing import _get_calib  # reuse existing helper
+    #from flovopy.core.preprocessing import _get_calib  # reuse existing helper
     if inv is None:
         return True
     try:
@@ -215,7 +216,7 @@ def handle_instrument_response(tr: Trace, inv, pre_filt, outputType: str, verbos
             fig=None,
         )
         tr.stats.calib = 1.0
-        tr.stats["calib_applied"] = _get_calib(tr, inv)
+        #tr.stats["calib_applied"] = _get_calib(tr, inv)
         if tr.stats.channel[1] == 'H':
             tr.stats["units"] = 'm/s' if out == 'VEL' else ('m' if out == 'DISP' else tr.stats.get('units', ''))
         elif tr.stats.channel[1] == 'N':
@@ -230,3 +231,79 @@ def handle_instrument_response(tr: Trace, inv, pre_filt, outputType: str, verbos
         print(f"Error removing response for {tr.id}: {e}")
         return False
 
+
+
+def stationxml_match_report(st: Stream, inv, t1: UTCDateTime | None = None):
+    """
+    Report which traces in `st` are represented in the StationXML `inv`.
+
+    A trace is a TRUE match iff:
+      • Channel exists in inventory (same NSLC)
+      • A channel epoch covers `t1` (defaults to stream starttime)
+      • Channel has a Response with ≥1 stage
+
+    Prints a summary and returns a structured dict.
+    """
+    if inv is None or len(st) == 0:
+        return {"matched": [], "misses": {}}
+
+    if t1 is None:
+        t1 = st[0].stats.starttime
+
+    matched = []
+    misses = defaultdict(list)
+
+    def _epoch_covers(ch, when):
+        sd, ed = ch.start_date, ch.end_date
+        if sd and when < sd:
+            return False
+        if ed and when > ed:
+            return False
+        return True
+
+    for tr in st:
+        n, s, l, c = tr.stats.network, tr.stats.station, tr.stats.location, tr.stats.channel
+
+        # 1) Any channel objects with this NSLC?
+        sel = inv.select(network=n, station=s, location=l, channel=c)
+        chans = [ch for net in sel for sta in net.stations for ch in sta.channels]
+        if not chans:
+            misses["no_channel"].append(tr.id)
+            continue
+
+        # 2) Any of those channels cover t1?
+        chans_covering = [ch for ch in chans if _epoch_covers(ch, t1)]
+        if not chans_covering:
+            ranges = []
+            for ch in chans:
+                sd = ch.start_date.isoformat() if ch.start_date else "None"
+                ed = ch.end_date.isoformat() if ch.end_date else "None"
+                ranges.append(f"[{sd} → {ed}]")
+            misses["epoch_mismatch"].append(f"{tr.id} (have {', '.join(ranges)})")
+            continue
+
+        # 3) Response present and non-empty?
+        ok_resp = False
+        for ch in chans_covering:
+            resp = getattr(ch, "response", None)
+            stages = getattr(resp, "response_stages", None) if resp else None
+            if resp and stages and len(stages) > 0:
+                ok_resp = True
+                break
+
+        if not ok_resp:
+            any_resp_objs = any(getattr(ch, "response", None) is not None for ch in chans_covering)
+            key = "empty_response_stages" if any_resp_objs else "no_response"
+            misses[key].append(tr.id)
+            continue
+
+        matched.append(tr.id)
+
+    # ---- Printing summary ----
+    total = len(st)
+    nm = len(matched)
+    print(f"[INV] matched {nm}/{total} traces ({100.0*nm/total:.1f}%): {matched}")
+    for reason, ids in misses.items():
+        print(f"[INV] missing ({reason}): {ids}")
+
+    return {"matched": matched, "misses": dict(misses)}

@@ -186,6 +186,8 @@ def load_event_stream_from_sds(
     if verbose:
         print(f"[SDS] {len(st)} traces for {t1}–{t2}")
 
+    print(st)
+
     if preset == "raw_preset": # No preprocessing applied
         pass
     elif preset == "archive_preset":
@@ -203,6 +205,8 @@ def load_event_stream_from_sds(
         )
     elif preset == "analysis_preset":
         # Normalize + light filtering (and response removal if inv provided).
+
+
         st = preprocess_stream(
             st,
             run_artifact_fix=False,   # set True if spikes/clipping are common
@@ -219,6 +223,7 @@ def load_event_stream_from_sds(
             zerophase=True,
             inv=inv,
             output_type="VEL",
+            precheck_response=True,
             verbose=verbose,
         )
     else:
