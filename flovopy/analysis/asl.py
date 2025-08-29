@@ -120,7 +120,7 @@ def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, ce
             )
 
     if inv:
-        seed_ids = inventory2traceid(inv, force_location_code='')
+        seed_ids = inventory2traceid(inv)#, force_location_code='')
         if not stations:
             stations = [id.split('.')[1] for id in seed_ids]
             #invstations
@@ -154,12 +154,10 @@ def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, ce
             justify="TC",
             font="11p,Helvetica-Bold,black"
         )
-    print('GOT HERE 1')
     fig.basemap(region=region, frame=True)
 
     if show:
         fig.show();
-    print('GOT HERE 2')
     return fig
 
 class Grid:
@@ -205,7 +203,7 @@ def make_grid(center_lat=dome_location['lat'], center_lon=dome_location['lon'], 
 def simulate_VSAM(inv, source, units='m/s', surfaceWaves=False, wavespeed_kms=1.5, peakf=8.0, Q=None, noise_level_percent=0.0):
     npts = len(source['DR'])
     if isinstance(inv, Inventory):
-        seed_ids = inventory2traceid(inv, force_location_code='')
+        seed_ids = inventory2traceid(inv)#, force_location_code='')
     else:
         seed_ids = []
         return None
@@ -616,12 +614,10 @@ class ASL:
      
                     
                 maxi = np.argmax(DR)
-                print('Got here 0')
                 fig = montserrat_topo_map(zoom_level=zoom_level, inv=self.inventory, \
                                           centerlat=y[maxi], centerlon=x[maxi], add_labels=add_labels, 
                                           topo_color=False, stations=stations, title=title, region=region)
 
-                print('Got here 3')
                 if number:
                     if number<len(x):
                         ind = np.argpartition(DR, -number)[-number:]
@@ -632,9 +628,7 @@ class ASL:
                         symsize = symsize[ind]
                 pygmt.makecpt(cmap="viridis", series=[0, len(x)])
                 timecolor = [i for i in range(len(x))]
-                print('Got here 4')
                 fig.plot(x=x, y=y, size=symsize, style="cc", pen=None, fill=timecolor, cmap=True)
-                print('Got here 4.1')
                 fig.colorbar(
                     frame='+l"Sequence"',
                     #     position="x11.5c/6.6c+w6c+jTC+v" #for vertical colorbar
@@ -657,7 +651,6 @@ class ASL:
                     fig.plot(x=x, y=y, style="f1c/0.05c+c", fill='black', pen='0.5p,black')
                     fig.plot(x=x[maxi], y=y[maxi], size=symsize[maxi], style="cc", fill='red', pen='1p,red')
                 '''
-                print('Got here 5')
                 if region:
                     fig.basemap(region=region, frame=True)
                 if outfile:
