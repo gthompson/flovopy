@@ -27,5 +27,5 @@ dependencies:
   - scikit-learn
   - mplcursors
   - pip
-  - pip:
-      - -e /home/thompsong/Developer/flovopy
+  #- pip: Better to do this step manually, as in README
+  #    - -e /home/thompsong/Developer/flovopy

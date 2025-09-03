@@ -17,6 +17,9 @@ cd flovopy
 conda create -n flovopy-env python=3.10
 conda activate flovopy-env
 
+# Or from YML
+conda create -n flovopy-env -f flovopy_plus
+
 # Install dependencies and the package in editable mode
 pip install -e .
 ```
