@@ -69,3 +69,4 @@ logs/
 gmt.history
 RSAMplots.zip
 *.rover
+.DS_Store
