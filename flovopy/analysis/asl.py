@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 
 # PyGMT for mapping and relief data
 import pygmt
+pygmt.config(GMT_DATA_SERVER="https://oceania.generic-mapping-tools.org")
 
 # ObsPy core and event tools
 import obspy
@@ -21,62 +22,242 @@ from obspy.geodetics import locations2degrees, degrees2kilometers, gps2dist_azim
 # Your internal or local modules (assumed to exist)
 # For example:
 from flovopy.stationmetadata.utils import inventory2traceid
-from flovopy.processing.sam import VSAM  # VSAM class for corrections and simulation
+from flovopy.processing.sam import VSAM, DSAM  # VSAM class for corrections and simulation
 from flovopy.core.mvo import dome_location
+from scipy.ndimage import uniform_filter1d
 
 
+def topo_map(
+    show=False,
+    zoom_level=0,
+    inv=None,
+    add_labels=False,
+    centerlon=-62.177,
+    centerlat=16.711+0.01,  # slight north offset to center plot onto Montserrat, rather than volcano dome
+    contour_interval=100,      # legacy: still supported
+    topo_color=True,           # legacy: True=color topo, False=grayscale
+    resolution="03s",
+    DEM_DIR=None,    
+    # Not in original version:
+    stations=[], 
+    title=None, 
+    region=None,
+    # ---- modern/extended options ----
+    levels=None,               # explicit contour levels (list/array or CSV string)
+    level_interval=None,       # if set, overrides contour_interval for spacing
+    cmap=None,                 # explicit colormap name; if None, uses topo_color to choose
+    projection=None,
+    azimuth=135,               # hillshade light azimuth (deg)
+    elevation=30,              # hillshade light elevation (deg)
+    limit=None,                 # e.g., "-1300/1300" to clamp contour display range
+    figsize: float = 6.0,       # NEW: map width in inches):
+):
 
-def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, centerlon=-62.177, centerlat=16.711, contour_interval=100, \
-                        topo_color=True, resolution='03s', DEM_DIR=None, stations=[], title=None, region=None):
+    """
+    Plot a topographic map of Montserrat using modern PyGMT with backward-compatible options.
 
-    #define etopo data file
-    # ergrid = 'path_to_local_data_file'
-    #ergrid = '@earth_relief_30s' #30 arc second global relief (SRTM15+V2.1 @ 1.0 km)
-    #ergrid = '@earth_relief_15s' #15 arc second global relief (SRTM15+V2.1)
-    #ergrid = '@earth_relief_03s' #3 arc second global relief (SRTM3S)
+    This function wraps PyGMT’s `grdimage` and `grdcontour` to provide a shaded-relief map 
+    with optional seismic station overlays. It preserves legacy arguments (`contour_interval`, 
+    `topo_color`) for compatibility with older code, while also supporting modern options 
+    like `levels` and `cmap`.
+
+    Parameters
+    ----------
+    show : bool, default=False
+        If True, immediately display the map in an interactive viewer.
+    zoom_level : int, default=0
+        Zoom level scaling for the map extent. Higher values zoom in closer.
+    inv : obspy.Inventory or None
+        Station inventory. If provided, station locations are plotted as symbols.
+    add_labels : bool, default=False
+        If True, annotate stations with their codes.
+    centerlon, centerlat : float, defaults=(-62.177, 16.711)
+        Map center in decimal degrees (Montserrat coordinates).
+    contour_interval : int, default=100
+        **Legacy option.** Contour spacing in meters when `levels` is not specified.
+    topo_color : bool, default=True
+        **Legacy option.** If True, use a hypsometric color map ("topo"). 
+        If False, use grayscale shaded relief.
+    resolution : str, default="03s"
+        Resolution of the topography grid. Options include "30s", "15s", "03s", etc.
+    DEM_DIR : str or None
+        Directory for caching Earth relief grids as pickled files. If None, caching is skipped.
+
+    levels : list, array, str, or None, default=None
+        **Modern option.** Explicit contour levels (e.g., [-1200,-800,-400,0,400,800,1200]) 
+        or comma-separated string ("0,100,200,..."). Overrides `contour_interval`.
+    level_interval : int or None, default=None
+        **Modern option.** Contour spacing. Used if `levels` is None. Overrides `contour_interval` 
+        if both are provided.
+    cmap : str or None, default=None
+        Colormap for topography. If None, chosen automatically from `topo_color` 
+        ("topo" if True, "gray" if False).
+    projection : str, default="M4i"
+        GMT projection string, e.g., "M4i" for Mercator with 4-inch width.
+    azimuth : float, default=135
+        Azimuth (direction of illumination) for shaded relief in degrees.
+    elevation : float, default=30
+        Elevation angle of illumination in degrees.
+    limit : str or None, default=None
+        Depth/elevation range to display contours, e.g., "-1300/1300".
+    figsize : float, default=6.0
+        Width of the map in inches. The height is scaled automatically to match the region aspect ratio.
+    
+
+    Returns
+    -------
+    fig : pygmt.Figure
+        The PyGMT figure object containing the rendered map.
+
+    Notes
+    -----
+    - Hillshading is applied using `pygmt.grdgradient` with `radiance=[azimuth, elevation]`.
+    - Contours are drawn with either `levels` (modern) or `contour_interval`/`level_interval` (legacy).
+    - Colorbar is shown only if a non-grayscale colormap is used.
+    - This function is backward-compatible with older calls that used 
+      `contour_interval` and `topo_color`.
+
+    Examples
+    --------
+    Basic (legacy-style): use hypsometric colors and 100 m contour spacing
+    >>> fig = topo_map(
+    ...     show=False,
+    ...     contour_interval=100,   # legacy spacing
+    ...     topo_color=True,        # legacy color map toggle → uses "topo"
+    ...     resolution="03s",
+    ... )
+    >>> fig.show()
+
+    Grayscale shaded relief (legacy-style toggle)
+    >>> fig = topo_map(
+    ...     show=False,
+    ...     contour_interval=100,
+    ...     topo_color=False,       # grayscale instead of color
+    ... )
+    >>> fig.show()
+
+    Modern: explicit contour levels and a custom colormap
+    >>> fig = topo_map(
+    ...     show=False,
+    ...     levels=[-1200, -800, -400, 0, 400, 800, 1200],  # explicit levels
+    ...     cmap="geo",               # override color map
+    ...     limit="-1300/1300",       # clip displayed contours
+    ... )
+    >>> fig.show()
+
+    Modern: provide levels as a CSV-like string and annotate every 200 m
+    >>> fig = topo_map(
+    ...     show=False,
+    ...     levels="0,200,400,600,800,1000,1200",
+    ...     cmap="oleron",
+    ...     level_interval=None,      # ignored when `levels` is provided
+    ... )
+    # If you want labels on contours, set annotation inside the function call to grdcontour.
+
+    Station overlay from an ObsPy Inventory (with labels)
+    >>> from obspy import read_inventory
+    >>> inv = read_inventory("MVO_inventory.xml")  # example path
+    >>> fig = topo_map(
+    ...     show=False,
+    ...     inv=inv,
+    ...     add_labels=True,
+    ...     topo_color=True,
+    ... )
+    >>> fig.show()
+
+    Zoom and illumination control
+    >>> fig = topo_map(
+    ...     show=False,
+    ...     zoom_level=2,         # zoom in further
+    ...     azimuth=135,          # light from SE
+    ...     elevation=35,         # higher sun angle
+    ...     topo_color=True,
+    ... )
+    >>> fig.show()
+
+    Use a local cache for Earth relief grids (speeds up repeats)
+    >>> fig = topo_map(
+    ...     show=False,
+    ...     DEM_DIR="/path/to/cache_dir",  # pickled grid cache
+    ...     contour_interval=100,
+    ...     topo_color=True,
+    ... )
+    >>> fig.show()
+
+    Pick a different projection (e.g., 5-inch wide Mercator)
+    >>> fig = topo_map(
+    ...     show=False,
+    ...     projection="M5i",
+    ...     topo_color=True,
+    ... )
+    >>> fig.show()
+
+    """
     if region:
         centerlon = (region[0]+region[1])/2
         centerlat = ((region[2]+region[3])/2)
+
+    # --- optional cache file ---
+    pklfile = None
     if DEM_DIR:
-        pklfile = os.path.join(DEM_DIR, f'EarthReliefData{centerlon}.{centerlat}.{zoom_level}.{resolution}.pkl')
-    else:
-        pklfile = None
+        os.makedirs(DEM_DIR, exist_ok=True)
+        pklfile = os.path.join(
+            DEM_DIR,
+            f"EarthReliefData{centerlon}.{centerlat}.{zoom_level}.{resolution}.pkl"
+        )
+
     #f stations is None:
     #    stations = []
 
     if not region:
         # define plot geographical range
-        diffdeglat = 0.08/(2**zoom_level)
+        diffdeglat = 0.1/(1.5**zoom_level)
         diffdeglon = diffdeglat/np.cos(np.deg2rad(centerlat))
         minlon, maxlon = centerlon-diffdeglon, centerlon+diffdeglon  #-62.25, -62.13
         minlat, maxlat = centerlat-diffdeglat, centerlat+diffdeglat  # 16.66, 16.83
         region=[minlon, maxlon, minlat, maxlat]
-        print(f'montserrat_topo_map: region={region}')
+        print(f'topo_map: region={region}')
 
-    if pklfile:
-        if os.path.exists(pklfile):
-            print(f'Loading {pklfile}')
-            with open(pklfile, 'rb') as fileptr:
-                ergrid = pickle.load(fileptr)    
-    else:        
+    # --- load relief grid ---
+    ergrid = None
+    if pklfile and os.path.exists(pklfile):
         try:
-            print('Reading topo (earth relief) data from GMT website')
-            ergrid = pygmt.datasets.load_earth_relief(resolution=resolution, region=region, registration=None)
-            print("ergrid downloaded")
+            with open(pklfile, "rb") as f:
+                ergrid = pickle.load(f)
+        except Exception:
+            ergrid = None
+
+    if ergrid is None:
+        try:
+            ergrid = pygmt.datasets.load_earth_relief(
+                resolution=resolution, region=region, registration=None
+            )
             if pklfile:
-                with open(pklfile, 'wb') as fileptr: 
-                    print(f'Writing {pklfile}')
-                    # A new file will be created 
-                    pickle.dump(ergrid, fileptr)
-        except:
+                with open(pklfile, "wb") as f:
+                    pickle.dump(ergrid, f)
+        except Exception:
             print("Cannot load any topo data")
             return None
 
-    #print(ergrid)
+    # --- hillshade (modern approach) ---
+    shade = pygmt.grdgradient(
+        grid=ergrid,
+        radiance=[azimuth, elevation],
+        normalize="t1",
+    )
+
+    # --- choose colormap (back-compat + override) ---
+    if cmap is None:
+        cmap = "topo" if topo_color else "gray"
+
+    # --- projection / figure size ---
+    if projection is None:
+        projection = f"M{figsize}i"   # width in inches    
     
     # Visualization
     fig = pygmt.Figure()
     
+    '''
     if topo_color:
         # make color pallets
         print('Making color pallet')
@@ -94,36 +275,54 @@ def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, ce
             shading=True,
             frame=True
             )
+    '''
     
-    # plot continents, shorelines, rivers, and borders
+    # --- raster with hillshade ---
+    fig.grdimage(
+        grid=ergrid,
+        region=region,
+        projection=projection,
+        cmap=cmap,
+        shading=shade,
+        frame=True,
+    )
+
+    # Coastlines for crisp edges
     fig.coast(
         region=region,
-        projection='M4i',
-        shorelines=True,
-        frame=True
+        projection=projection,
+        shorelines="1/0.5p,black",
+        frame=["WSen", "af"],
+    )
+    
+    # --- contours: support both new `levels` and old `contour_interval` ---
+    if levels is not None:
+        # Explicit levels provided
+        fig.grdcontour(
+            grid=ergrid,
+            levels=levels,             # explicit
+            pen="0.25p,black",
+            limit=limit,               # e.g., "-1300/1300"
+        )
+    else:
+        # Fall back to spacing (prefer level_interval if given; else contour_interval)
+        step = level_interval if level_interval is not None else contour_interval
+        fig.grdcontour(
+            grid=ergrid,
+            levels=contour_interval,             # legacy-compatible
+            annotation=None,           # add e.g., annotation=200 if you want labels
+            pen="0.25p,black",
+            limit=limit,
         )
     
-    # plot the topographic contour lines
-    fig.grdcontour(
-        grid=ergrid,
-        #interval=contour_interval,
-        levels=contour_interval,
-        annotation="%d+f6p" % contour_interval,
-        limit="-1300/1300", #to only display it below 
-        pen="a0.15p"
-        )
-    
-    if topo_color:
-        fig.colorbar(
-            frame='+l"Topography"',
-        #     position="x11.5c/6.6c+w6c+jTC+v" #for vertical colorbar
-            )
+    # Colorbar only if we're using a meaningful color map
+    if cmap and cmap != "gray":
+        fig.colorbar(frame='+l"Topography (m)"')
 
     if inv:
-        seed_ids = inventory2traceid(inv, force_location_code='')
+        seed_ids = inventory2traceid(inv)#, force_location_code='')
         if not stations:
             stations = [id.split('.')[1] for id in seed_ids]
-            #invstations
         stalat = [inv.get_coordinates(seed_id)['latitude'] for seed_id in seed_ids]
         stalon = [inv.get_coordinates(seed_id)['longitude'] for seed_id in seed_ids]
         
@@ -132,19 +331,19 @@ def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, ce
             for thislat, thislon, this_id in zip(stalat, stalon, seed_ids):
                 net, sta, loc, chan = this_id.split('.')
                 if sta in stations:
-                    fig.plot(x=thislon, y=thislat, style="s0.3c", fill="green", pen='darkgreen') 
+                    fig.plot(x=thislon, y=thislat, style="s0.5c", fill="white", pen='black') 
                     fig.text(x=thislon, y=thislat, text=sta, textfiles=None, \
-                            font="darkgreen",
+                            font="white",
                             justify="ML",
                             offset="0.2c/0c",)
                 else:
-                    fig.plot(x=thislon, y=thislat, style="s0.3c", fill="red", pen='darkred') 
+                    fig.plot(x=thislon, y=thislat, style="s0.4c", fill="black", pen='white') 
                     fig.text(x=thislon, y=thislat, text=sta, textfiles=None, \
-                            font="darkred",
+                            font="black",
                             justify="ML",
                             offset="0.2c/0c",)
         else:
-            fig.plot(x=stalon, y=stalat, style="s0.3c", fill="dodgerblue4", pen='2p,blue') 
+            fig.plot(x=stalon, y=stalat, style="s0.4c", fill="black", pen='white') 
 
     if title:
         fig.text(
@@ -154,26 +353,47 @@ def montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, ce
             justify="TC",
             font="11p,Helvetica-Bold,black"
         )
-    print('GOT HERE 1')
+    
     fig.basemap(region=region, frame=True)
 
     if show:
         fig.show();
-    print('GOT HERE 2')
+    
     return fig
 
 class Grid:
     def __init__(self, centerlat, centerlon, nlat, nlon, node_spacing_m):
-        deg2m = degrees2kilometers(1.0) * 1000.0
-        node_spacing_lat = node_spacing_m / deg2m
-        minlat = centerlat - (nlat-1)/2 * node_spacing_lat
-        maxlat = centerlat + (nlat-1)/2 * node_spacing_lat
-        latrange = np.array([lat for lat in np.arange(minlat, maxlat, node_spacing_lat)])
-        node_spacing_lon = node_spacing_lat / np.cos(centerlat / (2 * math.pi))
-        minlon = centerlon - (nlon-1)/2 * node_spacing_lon
-        maxlon = centerlon + (nlon+1)/2 * node_spacing_lon
-        lonrange = np.array([lon for lon in np.arange(minlon, maxlon, node_spacing_lon)])
-        gridlon, gridlat = np.meshgrid(lonrange, latrange)
+        """
+        Build a regular lat/lon grid with square spacing (node_spacing_m),
+        centered at (centerlat, centerlon), with nlat x nlon nodes.
+        Keeps attribute names compatible with your existing code:
+        - self.gridlat, self.gridlon
+        - self.node_spacing_lat, self.node_spacing_lon (in degrees)
+        - self.latrange, self.lonrange (1D arrays)
+        """
+        # meters per degree at the center latitude
+        meters_per_deg_lat = degrees2kilometers(1.0) * 1000.0  # ~111,320 m
+        meters_per_deg_lon = meters_per_deg_lat * np.cos(np.deg2rad(centerlat))
+
+        # degree spacing that corresponds to node_spacing_m
+        node_spacing_lat = node_spacing_m / meters_per_deg_lat
+        node_spacing_lon = node_spacing_m / meters_per_deg_lon
+
+        # symmetric endpoints so we get exactly n points
+        half_lat = (nlat - 1) / 2.0
+        half_lon = (nlon - 1) / 2.0
+        minlat = centerlat - half_lat * node_spacing_lat
+        maxlat = centerlat + half_lat * node_spacing_lat
+        minlon = centerlon - half_lon * node_spacing_lon
+        maxlon = centerlon + half_lon * node_spacing_lon
+
+        # exact counts with inclusive endpoints
+        latrange = np.linspace(minlat, maxlat, num=nlat, endpoint=True)
+        lonrange = np.linspace(minlon, maxlon, num=nlon, endpoint=True)
+
+        gridlon, gridlat = np.meshgrid(lonrange, latrange, indexing="xy")
+
+        # store (keep your original attribute names)
         self.gridlon = gridlon
         self.gridlat = gridlat
         self.node_spacing_lat = node_spacing_lat
@@ -181,17 +401,55 @@ class Grid:
         self.lonrange = lonrange
         self.latrange = latrange
 
-    def plot(self, node_spacing_m, DEM_DIR=None, inv=None, add_labels=False):
-        fig = montserrat_topo_map(DEM_DIR=DEM_DIR, inv=inv, add_labels=add_labels)
-        #plt.plot(self.gridlon, self.gridlat, marker='+', color='k', linestyle='none')
-        #plt.show()
-        symsize = node_spacing_m/2000
-        stylestr = f'+{symsize}c'
-        
-        fig.plot(x=self.gridlon.reshape(-1), y=self.gridlat.reshape(-1), style=stylestr, pen='black')
-        #fig.basemap(region=[self.minlon, self.maxlon, self.minlat, self.maxlat], frame=True)
-        fig.show()
-        #fig._cleanup()
+        # also store convenient metadata
+        self.centerlat = centerlat
+        self.centerlon = centerlon
+        self.nlat = nlat
+        self.nlon = nlon
+        self.node_spacing_m = node_spacing_m
+
+    def plot(self, fig=None, show=True,
+            symbol="c", scale=1.0, fill="white", pen="0.5p,black",
+            topo_map_kwargs=None):
+        """
+        Plot grid nodes on a PyGMT topo map.
+
+        Parameters
+        ----------
+        DEM_DIR : path or None
+        fig : pygmt.Figure or None
+            If None, creates a new topo map. Otherwise overlays on given figure.
+        show : bool
+        symbol : str
+            GMT symbol code, e.g. 'c' (circle), 's' (square), 't' (triangle), 'x' (x-mark).
+            (Note: '+' may not be supported; use 'x' for a cross.)
+        scale : float
+            Multiplier on default size (default size ~ node_spacing_m / 2000 cm).
+        fill : str or None
+            Fill color for filled symbols (ignored for line-only symbols like 'x').
+        pen : str or None
+            Outline/line pen (e.g. '0.5p,black').
+        topo_map_kwargs : dict or None
+            Extra kwargs forwarded to topo_map when creating a new figure.
+        """
+        if fig is None:
+            topo_map_kwargs = topo_map_kwargs or {}
+            fig = topo_map(show=False, **topo_map_kwargs)
+
+        size_cm = (self.node_spacing_m / 2000.0) * float(scale)
+        stylestr = f"{symbol}{size_cm}c"
+
+        fig.plot(
+            x=self.gridlon.reshape(-1),
+            y=self.gridlat.reshape(-1),
+            style=stylestr,
+            pen=pen,
+            fill=fill if symbol not in ("x", "+") else None,  # no fill for line-only marks
+        )
+
+        if show:
+            fig.show()
+        return fig
 
 def initial_source(lat=dome_location['lat'], lon=dome_location['lon']):
     return {'lat':lat, 'lon':lon}
@@ -201,11 +459,35 @@ def make_grid(center_lat=dome_location['lat'], center_lon=dome_location['lon'], 
     nlon = int(grid_size_lon_m/node_spacing_m) + 1
     return Grid(center_lat, center_lon, nlat, nlon, node_spacing_m)  
 
+def synthetic_source_from_grid(
+    grid: Grid,
+    sampling_interval: float = 60.0,
+    DR_cm2: float = 100.0,
+    t0: obspy.UTCDateTime | None = None,
+    order: str = "C",
+):
+    """
+    Build a synthetic_source dict (lat, lon, DR, t) from a Grid.
+    """
+    if t0 is None:
+        t0 = obspy.UTCDateTime(0)
 
-def simulate_VSAM(inv, source, units='m/s', surfaceWaves=False, wavespeed_kms=1.5, peakf=8.0, Q=None, noise_level_percent=0.0):
+    lat_flat = grid.gridlat.ravel(order=order).astype(float)
+    lon_flat = grid.gridlon.ravel(order=order).astype(float)
+    npts = lat_flat.size
+
+    return {
+        "lat": lat_flat,
+        "lon": lon_flat,
+        "DR": np.full(npts, float(DR_cm2)),
+        "t": [t0 + i * sampling_interval for i in range(npts)],
+    }
+
+
+def simulate_SAM(inv, source, units='m/s', surfaceWaves=False, wavespeed_kms=1.5, peakf=8.0, Q=None, noise_level_percent=0.0):
     npts = len(source['DR'])
     if isinstance(inv, Inventory):
-        seed_ids = inventory2traceid(inv, force_location_code='')
+        seed_ids = inventory2traceid(inv)#, force_location_code='')
     else:
         seed_ids = []
         return None
@@ -219,7 +501,10 @@ def simulate_VSAM(inv, source, units='m/s', surfaceWaves=False, wavespeed_kms=1.
         tr = obspy.Trace()
         tr.id = id
         tr.stats.starttime = source['t'][0]
-        tr.stats.delta = source['t'][1] - source['t'][0]
+        if len(source['t'])>1:
+            tr.stats.delta = source['t'][1] - source['t'][0]
+        else:
+            tr.stats.delta = 1.0
         gsc = VSAM.compute_geometrical_spreading_correction(distance_km, tr.stats.channel, surfaceWaves=surfaceWaves, wavespeed_kms=wavespeed_kms, peakf=peakf)
         isc = VSAM.compute_inelastic_attenuation_correction(distance_km, peakf, wavespeed_kms, Q)
         tr.data = source['DR'] / (gsc * isc) * 1e-7
@@ -228,20 +513,133 @@ def simulate_VSAM(inv, source, units='m/s', surfaceWaves=False, wavespeed_kms=1.
             pass # do something here
         tr.stats['units'] = units
         st.append(tr)
-    return VSAM(stream=st, sampling_interval=tr.stats.delta)
-
+    if units == 'm/s':
+        return VSAM(stream=st, sampling_interval=tr.stats.delta)
+    elif units == 'm':
+        return DSAM(stream=st, sampling_interval=tr.stats.delta)
+'''
 def plot_VSAM(dsamobj, gridobj, nodenum, metric='mean', DEM_DIR=None):
     x = [id for id in dsamobj.dataframes]
     st = dsamobj.to_stream(metric=metric)
     y = [tr.data[nodenum] for tr in st]
     plt.figure()
     plt.bar(x, y, width=1.0)
-    fig = montserrat_topo_map(show=False, zoom_level=0, inv=None, add_labels=False, centerlon=-62.177, centerlat=16.711, contour_interval=100, topo_color=True, resolution='03s', DEM_DIR=DEM_DIR)
+    fig = topo_map(show=False, zoom_level=0, inv=None, add_labels=False, centerlon=-62.177, centerlat=16.711, contour_interval=100, topo_color=True, resolution='03s', DEM_DIR=DEM_DIR)
     print('is figure?', isinstance(fig, pygmt.Figure))
     #ax = fig.axes()
     #ax[0].plot(gridobj.gridlon[nodenum], gribobj.gridlat[nodenum], 'o')
     fig.plot(gridobj.gridlon[nodenum], gridobj.gridlat[nodenum], 'o')
     #fig._cleanup()
+'''
+
+
+
+def plot_SAM(
+    samobj,
+    gridobj,
+    K: int = 3,                         # number of random source nodes
+    metric: str = "mean",
+    DEM_DIR=None,
+    inv=None,
+    colors=None,                         # list like ["yellow","red","magenta"]
+    seed: int | None = None,             # set for reproducibility
+    show_map: bool = True,
+    figsize: float = 6.0,               # map width in inches
+):
+    """
+    Plot SAM values for K randomly-chosen source nodes.
+
+    - PyGMT map: each chosen source node is plotted as a colored circle.
+    - Matplotlib: grouped bars per station in the same colors (width = 0.9/K).
+
+    Returns
+    -------
+    fig_map : pygmt.Figure
+        The PyGMT map figure (or None if show_map=False).
+    chosen_nodes : np.ndarray
+        The flattened-node indices that were selected.
+    """
+
+    # ----- choose K random nodes -----
+    rng = np.random.default_rng(seed)
+    total_nodes = gridobj.gridlat.size
+    K = max(1, min(K, total_nodes))  # clamp
+    chosen_nodes = rng.choice(total_nodes, size=K, replace=False)
+
+    # ----- prepare DSAM values -----
+    # x tick labels = station codes (from dsamobj.dataframes keys)
+    stations = [sid.split(".")[1] for sid in samobj.dataframes]
+    st = samobj.to_stream(metric=metric)
+
+    # for each chosen node, collect one y-value per station
+    # y_matrix shape: (K, nstations)
+    y_matrix = np.empty((K, len(stations)), dtype=float)
+    for i, node in enumerate(chosen_nodes):
+        y_matrix[i, :] = [tr.data[node] for tr in st]
+
+    # ----- Matplotlib grouped bar chart -----
+    x = np.arange(len(stations))
+    if colors is None:
+        # default palette (expand if K > 3)
+        base = ["yellow", "red", "magenta", "dodgerblue", "limegreen", "orange", "purple"]
+        colors = (base * ((K + len(base) - 1) // len(base)))[:K]
+    barw = 0.9 / K
+    # center offsets so the group is centered on each station tick
+    offsets = (np.arange(K) - (K - 1) / 2.0) * barw
+
+    plt.figure()
+    bars = []
+    for i in range(K):
+        bars.append(
+            plt.bar(
+                x + offsets[i],
+                y_matrix[i, :],
+                width=barw,
+                color=colors[i],
+                edgecolor="black",
+                linewidth=0.5,
+                label=f"Node {chosen_nodes[i]}",
+            )
+        )
+
+    plt.xticks(x, stations, rotation=45, fontsize=8)
+    plt.xlabel("Station")
+    plt.ylabel(metric)
+    plt.title(f"{metric} by station for {K} source node(s)")
+    plt.legend(ncols=min(K, 4), fontsize=8, frameon=False)
+
+    # ----- PyGMT topo map with colored source nodes -----
+    fig_map = None
+    if show_map:
+        fig_map = topo_map(
+            show=False,
+            zoom_level=0,
+            inv=inv,
+            add_labels=True,
+            centerlon=-62.177,
+            centerlat=16.711,
+            contour_interval=100,
+            topo_color=False,        # keeps your old behavior
+            resolution="03s",
+            DEM_DIR=DEM_DIR,
+            figsize=figsize,
+        )
+
+        # plot each chosen node in matching color
+        lon_flat = gridobj.gridlon.ravel()
+        lat_flat = gridobj.gridlat.ravel()
+        for i, node in enumerate(chosen_nodes):
+            fig_map.plot(
+                x=[lon_flat[node]],
+                y=[lat_flat[node]],
+                style="c0.28c",
+                pen=f"1p,{colors[i]}",
+                fill=colors[i],
+            )
+
+        fig_map.show()
+
+    return fig_map, chosen_nodes
 
 # pretty sure that i had a different version here that worked. this one is crashing because trying to plot nodenum 100 of a 100-length tr.data
 # what I really should be plotting is the corrections at node 100
@@ -365,6 +763,7 @@ class ASL:
         Q=None,
         fix_peakf=None,
         cache_dir="asl_cache",
+        force_recompute=False,
     ):
         """
         Compute amplitude corrections for all channels in the inventory using geometric spreading
@@ -393,7 +792,7 @@ class ASL:
         cache_path = os.path.join(cache_dir, cache_key)
 
         # Try loading cached corrections
-        if os.path.exists(cache_path):
+        if os.path.exists(cache_path) and not force_recompute:
             try:
                 with open(cache_path, "rb") as f:
                     self.amplitude_corrections = pickle.load(f)
@@ -441,13 +840,61 @@ class ASL:
 
 
 
+    '''
     def metric2stream(self):
         st = self.samobject.to_stream(metric=self.metric)
         if st[0].stats.sampling_rate != self.window_seconds:
             window = np.ones(self.window_seconds) / self.window_seconds
             for tr in st:
                 tr.data = np.convolve(tr.data, window, mode='same')
-        return st        
+        return st       
+    '''
+
+
+
+    def metric2stream(self):
+        """
+        Return the SAM stream (already produced by self.samobject).
+        If window_seconds > samobject.sampling_interval, apply a centered moving
+        average of length round(window_seconds / sampling_interval) samples.
+
+        Assumes self.samobject.to_stream(metric=...) returns a Stream whose traces
+        are sampled at ~1 / sampling_interval Hz (typically 1 Hz).
+        """
+        st = self.samobject.to_stream(metric=self.metric)
+
+        # Get the DSAM/VSAM sampling interval (seconds per sample)
+        dt = float(getattr(self.samobject, "sampling_interval", 1.0))
+        if not np.isfinite(dt) or dt <= 0:
+            # Fallback to trace metadata if needed
+            fs = float(getattr(st[0].stats, "sampling_rate", 1.0) or 1.0)
+            dt = 1.0 / fs
+
+        win_sec = float(getattr(self, "window_seconds", 0.0) or 0.0)
+
+        # Only smooth if the window is strictly longer than one sample
+        if win_sec > dt:
+            win_samples = max(2, int(round(win_sec / dt)))  # at least 2 samples for an actual window
+            for tr in st:
+                # If someone hands you a non-1/dt stream, scale the window accordingly
+                fs_tr = float(getattr(tr.stats, "sampling_rate", 1.0) or 1.0)
+                dt_tr = 1.0 / fs_tr
+                w_tr = max(2, int(round(win_sec / dt_tr)))
+
+                x = tr.data.astype(float)
+                # NaN-safe centered moving average
+                m = np.isfinite(x).astype(float)
+                xf = np.where(np.isfinite(x), x, 0.0)
+
+                num = uniform_filter1d(xf, size=w_tr, mode="nearest")
+                den = uniform_filter1d(m,  size=w_tr, mode="nearest")
+                tr.data = np.divide(num, den, out=np.zeros_like(num), where=den > 0)
+
+                # Keep metadata consistent
+                tr.stats.sampling_rate = fs_tr
+        # else: window ≤ sample spacing → no smoothing
+
+        return st
     
     def locate(self):
         gridlat = self.gridobj.gridlat.reshape(-1)
@@ -506,6 +953,118 @@ class ASL:
         return self.source
 
         # Here is where i would add loop over shrinking grid
+
+    def locate(self, *, min_stations=3, eps=1e-9):
+        gridlat = self.gridobj.gridlat.reshape(-1)
+        gridlon = self.gridobj.gridlon.reshape(-1)
+
+        # Stream and station order (frozen)
+        st = self.metric2stream()
+        seed_ids = [tr.id for tr in st]
+        nsta = len(seed_ids)
+        lendata = len(st[0].data)
+        t = st[0].times('utcdatetime')
+
+        # Build data matrix once: (nsta, lendata)
+        Y = np.vstack([tr.data.astype(float) for tr in st])  # rows match seed_ids order
+
+        # Build corrections matrix once: C[sta, node]
+        # Assert node length & ordering match gridlat/gridlon
+        first_corr = self.amplitude_corrections[seed_ids[0]]
+        nnodes = len(first_corr)
+        assert nnodes == gridlat.size == gridlon.size, \
+            f"Node count mismatch: corr={nnodes}, grid={gridlat.size}"
+
+        C = np.empty((nsta, nnodes), dtype=float)
+        for k, sid in enumerate(seed_ids):
+            ck = np.asarray(self.amplitude_corrections[sid], dtype=float)
+            if ck.size != nnodes:
+                raise ValueError(f"Corrections length mismatch for {sid}: {ck.size} != {nnodes}")
+            C[k, :] = ck
+
+        # Precompute station coordinates (for azgap) once
+        station_coords = []
+        for sid in seed_ids:
+            coords = self.station_coordinates.get(sid)
+            if coords:
+                station_coords.append((coords['latitude'], coords['longitude']))
+
+        # Outputs
+        source_DR     = np.empty(lendata, dtype=float)
+        source_lat    = np.empty(lendata, dtype=float)
+        source_lon    = np.empty(lendata, dtype=float)
+        source_misfit = np.empty(lendata, dtype=float)
+        source_azgap  = np.empty(lendata, dtype=float)
+        source_nsta   = np.empty(lendata, dtype=int)
+
+        # Loop over time samples
+        for i in range(lendata):
+            y = Y[:, i]  # shape (nsta,)
+
+            best_j = -1
+            best_m = np.inf
+
+            # Iterate nodes; use vector ops on the station dimension
+            for j in range(nnodes):
+                reduced = y * C[:, j]                    # (nsta,)
+                finite  = np.isfinite(reduced)
+                nfin    = int(finite.sum())
+                if nfin < min_stations:
+                    continue
+                r = reduced[finite]
+                med = np.nanmedian(r)
+                if not np.isfinite(med):
+                    continue
+                # robust scatter: MAD instead of std (optional)
+                # mad = 1.4826 * np.nanmedian(np.abs(r - med))
+                # m = mad / (abs(med) + eps)
+                m = float(np.nanstd(r) / (abs(med) + eps))  # your original metric with eps
+                if m < best_m:
+                    best_m = m
+                    best_j = j
+
+            # If nothing passed the min_stations gate, fall back (all stations)
+            if best_j < 0:
+                # Choose node with minimal m even without min_stations
+                for j in range(nnodes):
+                    reduced = y * C[:, j]
+                    r = reduced[np.isfinite(reduced)]
+                    if r.size == 0:
+                        continue
+                    med = np.nanmedian(r)
+                    if not np.isfinite(med):
+                        continue
+                    m = float(np.nanstd(r) / (abs(med) + eps))
+                    if m < best_m:
+                        best_m = m
+                        best_j = j
+
+            # DR from the chosen node: median across stations (finite only)
+            reduced_best = y * C[:, best_j]
+            rbest = reduced_best[np.isfinite(reduced_best)]
+            source_DR[i] = np.nanmedian(rbest) if rbest.size else np.nan
+
+            source_lat[i] = gridlat[best_j]
+            source_lon[i] = gridlon[best_j]
+            source_misfit[i] = best_m
+
+            # Azimuthal gap (station set is fixed per call)
+            azgap, nsta_eff = compute_azimuthal_gap(source_lat[i], source_lon[i], station_coords)
+            source_azgap[i] = azgap
+            source_nsta[i]  = nsta_eff
+
+        self.source = {
+            't': t,
+            'lat': source_lat,
+            'lon': source_lon,
+            'DR': source_DR * 1e7,
+            'misfit': source_misfit,
+            'azgap': source_azgap,
+            'nsta': source_nsta
+        }
+        self.source_to_obspyevent()
+        self.located = True
+        return self.source
 
     def fast_locate(self):
         gridlat = self.gridobj.gridlat.reshape(-1)
@@ -584,6 +1143,7 @@ class ASL:
              add_labels=False, equal_size=False, outfile=None, 
              stations=None, title=None, region=None, normalize=True):
         source = self.source
+
         if source:
                 
             # timeseries of DR vs threshold_amp
@@ -601,75 +1161,59 @@ class ASL:
                 source['lat'][indices]=None
                 source['lon'][indices]=None
             
+
+            # Trajectory map
+            x = source['lon']
+            y = source['lat']
+            DR = source['DR']
+            if equal_size:
+                symsize = scale * np.ones(len(DR))
+            elif normalize:
+                symsize = np.divide(DR, np.nanmax(DR))*scale
+            else:
+                symsize = scale * np.sqrt(DR)
+            #print('symbol size = ',symsize)
+    
+                
+            maxi = np.argmax(DR)
+
+            fig = topo_map(zoom_level=zoom_level, inv=self.inventory, \
+                                        centerlat=y[maxi], centerlon=x[maxi], add_labels=add_labels, 
+                                        topo_color=False, stations=stations, title=title, region=region)
+
+
+            if number:
+                if number<len(x):
+                    ind = np.argpartition(DR, -number)[-number:]
+                    x = x[ind]
+                    y = y[ind]
+                    DR = DR[ind]
+                    mascxi = np.argmax(DR)
+                    symsize = symsize[ind]
+            pygmt.makecpt(cmap="viridis", series=[0, len(x)])
+            timecolor = [i for i in range(len(x))]
+
+            fig.plot(x=x, y=y, size=symsize, style="cc", pen=None, fill=timecolor, cmap=True)
+
+            fig.colorbar(
+                frame='+l"Sequence"',
+                #     position="x11.5c/6.6c+w6c+jTC+v" #for vertical colorbar
+                )
+
+            if region:
+                fig.basemap(region=region, frame=True)
+            if outfile:
+                fig.savefig(outfile)
+            else:
+                fig.show();  
+
             if join:
-                # Trajectory map
-                x = source['lon']
-                y = source['lat']
-                DR = source['DR']
-                if equal_size:
-                    symsize = scale * np.ones(len(DR))
-                elif normalize:
-                    symsize = np.divide(DR, np.nanmax(DR))*scale
-                else:
-                    symsize = scale * np.sqrt(DR)
-                #print('symbol size = ',symsize)
-     
-                    
-                maxi = np.argmax(DR)
-                print('Got here 0')
-                fig = montserrat_topo_map(zoom_level=zoom_level, inv=self.inventory, \
-                                          centerlat=y[maxi], centerlon=x[maxi], add_labels=add_labels, 
-                                          topo_color=False, stations=stations, title=title, region=region)
-
-                print('Got here 3')
-                if number:
-                    if number<len(x):
-                        ind = np.argpartition(DR, -number)[-number:]
-                        x = x[ind]
-                        y = y[ind]
-                        DR = DR[ind]
-                        mascxi = np.argmax(DR)
-                        symsize = symsize[ind]
-                pygmt.makecpt(cmap="viridis", series=[0, len(x)])
-                timecolor = [i for i in range(len(x))]
-                print('Got here 4')
-                fig.plot(x=x, y=y, size=symsize, style="cc", pen=None, fill=timecolor, cmap=True)
-                print('Got here 4.1')
-                fig.colorbar(
-                    frame='+l"Sequence"',
-                    #     position="x11.5c/6.6c+w6c+jTC+v" #for vertical colorbar
-                    )
-
-                '''
-                    fig.plot(x=x, y=y, size=symsize, style="cc", fill='black', pen='1p,black')
-                    k = 1
-                    for i in range(len(x)):
-                        if DR[i] > threshold_DR:
-                            fig.text(x=x[i], y=y[i], text=f"{k}", textfiles=None, \
-                                #font="Courier-Bold",
-                                font="red",
-                                justify="ML",
-                                offset="0.2c/0c",)
-                            k += 1
-                         
-                else:
-                    fig.plot(x=x, y=y, size=symsize, style="cc", fill='black', pen='1p,black')
-                    fig.plot(x=x, y=y, style="f1c/0.05c+c", fill='black', pen='0.5p,black')
-                    fig.plot(x=x[maxi], y=y[maxi], size=symsize[maxi], style="cc", fill='red', pen='1p,red')
-                '''
-                print('Got here 5')
-                if region:
-                    fig.basemap(region=region, frame=True)
-                if outfile:
-                    fig.savefig(outfile)
-                else:
-                    fig.show();  
-                print('\n')
-                #fig._cleanup()           
+                fig.plot(x=x, y=y, style="r-", pen="1p,red")
+    
 
             
         else: # no location data      
-            fig = montserrat_topo_map(zoom_level=zoom_level, inv=self.inventory, show=True, add_labels=add_labels)
+            fig = topo_map(zoom_level=zoom_level, inv=self.inventory, show=True, add_labels=add_labels)
             #fig._cleanup()
 
 
@@ -769,7 +1313,7 @@ def plot_heatmap_montserrat_colored(df, lat_col='latitude', lon_col='longitude',
     Parameters:
     - df: pandas DataFrame with lat/lon and amplitude columns
     - lat_col, lon_col, amp_col: column names
-    - zoom_level: zoom level for montserrat_topo_map
+    - zoom_level: zoom level for topo_map
     - inventory: ObsPy Inventory for station overlay
     - color_scale: multiplier for colormap normalization
     - cmap: GMT colormap name (e.g., 'turbo', 'hot', 'viridis')
@@ -802,7 +1346,7 @@ def plot_heatmap_montserrat_colored(df, lat_col='latitude', lon_col='longitude',
                   continuous=True)
 
     # Create base map
-    fig = montserrat_topo_map(zoom_level=zoom_level, inv=inventory, topo_color=False, region=region, title=title)
+    fig = topo_map(zoom_level=zoom_level, inv=inventory, topo_color=False, region=region, title=title)
 
     # Plot colored square tiles
 
@@ -972,12 +1516,65 @@ def extract_asl_diagnostics(topdir, outputcsv, timestamp=True):
     print(f"[✓] Saved ASL diagnostics to: {outputcsv}")
     return df
 
+def compare_asl_sources(asl1, asl2, atol=1e-8, rtol=1e-5):
+    """
+    Compare the 'source' output dictionaries from two ASL objects.
+    
+    Returns True if all values match; otherwise, returns a dict of diffs.
+    """
+    source1 = asl1.locate()
+    source2 = asl2.locate()
+    
+    diffs = {}
+    keys1 = set(source1.keys())
+    keys2 = set(source2.keys())
+    
+    if keys1 != keys2:
+        diffs['key_mismatch'] = {'only_in_1': keys1 - keys2, 'only_in_2': keys2 - keys1}
+        return diffs
+    
+    for key in keys1:
+        v1 = source1[key]
+        v2 = source2[key]
+
+        # Convert ObsPy UTCDateTime to float timestamps for comparison
+        if hasattr(v1, '__getitem__') and hasattr(v1[0], 'timestamp'):
+            v1 = np.array([x.timestamp for x in v1])
+            v2 = np.array([x.timestamp for x in v2])
+
+        if isinstance(v1, np.ndarray) and isinstance(v2, np.ndarray):
+            if v1.shape != v2.shape:
+                diffs[key] = f"Shape mismatch: {v1.shape} vs {v2.shape}"
+            elif np.issubdtype(v1.dtype, np.number):
+                if not np.allclose(v1, v2, atol=atol, rtol=rtol, equal_nan=True):
+                    diffs[key] = f"Numeric mismatch in {key} (not allclose)"
+            else:
+                if not np.array_equal(v1, v2):
+                    diffs[key] = f"Non-numeric mismatch in {key} (not array_equal)"
+        elif isinstance(v1, (list, tuple)):
+            if v1 != v2:
+                diffs[key] = f"Mismatch in list/tuple {key}: {v1} != {v2}"
+        else:
+            if v1 != v2:
+                diffs[key] = f"Mismatch in {key}: {v1} != {v2}"
+
+    result = True if not diffs else diffs
+
+    if result is True:
+        print("✅ ASL sources are identical.")
+    else:
+        print("❌ Differences found:")
+        for k, v in result.items():
+            print(f"{k}: {v}")
+    
+    
+
 if __name__ == "__main__":
     import os
     import sys
     import numpy as np
     from obspy import read_inventory
-    RESPONSE_DIR = '/Users/GlennThompson/Dropbox'
+    RESPONSE_DIR = '/Users/GlennThompson/Dropbox/BRIEFCASE/SSADenver'
     invMVO = obspy.read_inventory(os.path.join(RESPONSE_DIR,'MV.xml'), format='stationxml')
     #invMVO=None
     startt = UTCDateTime(2003,7,12,23,0,0)
@@ -986,7 +1583,7 @@ if __name__ == "__main__":
     invMVO = invMVO.select(channel='*Z')
     import pygmt
     pygmt.config(GMT_DATA_SERVER="https://oceania.generic-mapping-tools.org")
-    montserrat_topo_map(inv=invMVO, show=True, add_labels=True, resolution='03s');
+    topo_map(inv=invMVO, show=True, add_labels=True, resolution='03s');
     
 
     sampling_interval = 60

@@ -1,5 +1,5 @@
 # flovopy/stationmetadata/utils.py
-from obspy import UTCDateTime, Trace
+from obspy import UTCDateTime, Trace, Stream
 from obspy.core.inventory import Inventory, Network, Station, Channel, Site
 from obspy.io.xseed import Parser
 from obspy.geodetics import locations2degrees, degrees2kilometers
@@ -69,32 +69,55 @@ def calculate_sensitivity_all(inventory):
                     channel.response.recalculate_overall_sensitivity()
 
 
-def subset_inv(inv, st, st_subset):
+
+def subset_inv(inv: Inventory, st: Stream, level: str = "station") -> Inventory:
     """
-    Return a subset of the inventory corresponding to a given stream subset.
+    Return an Inventory containing only metadata needed for the traces in `st`.
 
-    Parameters:
-    inv (Inventory): Full ObsPy inventory.
-    st (Stream): Original full stream.
-    st_subset (Stream): Subset of the stream.
+    Parameters
+    ----------
+    inv : Inventory
+        Full ObsPy inventory.
+    st : Stream
+        Stream whose stations/channels define the subset.
+    level : {"station", "channel"}, default "station"
+        - "station": keep all channels for any station that appears in `st`.
+        - "channel": keep only the exact NET.STA.LOC.CHA in `st` (deduplicated).
 
-    Returns:
-    Inventory: Subsetted inventory.
+    Returns
+    -------
+    Inventory
+        Subset of `inv` containing only the requested metadata.
     """
-    try:
-        inv_new = inv.copy()
-        for tr in st:
-            if len(st_subset.select(id=tr.id)) == 0:
-                inv_new = inv_new.remove(
-                    network=tr.stats.network,
-                    station=tr.stats.station,
-                    location=tr.stats.location,
-                    channel=tr.stats.channel)
-        return inv_new
-    except Exception:
-        print('Failed to subset inventory. Returning unchanged')
-        return inv
+    if level not in {"station", "channel"}:
+        raise ValueError("level must be 'station' or 'channel'")
 
+    # Deduplicate ids once; avoid O(N^2) selects
+    if level == "station":
+        nets = sorted({tr.stats.network for tr in st})
+        stas = sorted({tr.stats.station for tr in st})
+        # Use select on sets; this is efficient and preserves other station metadata
+        return inv.select(network=",".join(nets), station=",".join(stas))
+
+    # level == "channel"
+    # Build unique (net, sta, loc, cha) tuples
+    chan_keys = sorted({(tr.stats.network, tr.stats.station,
+                         tr.stats.location, tr.stats.channel) for tr in st})
+
+    # Start empty, carry over source
+    inv_sub = Inventory(networks=[], source=inv.source)
+
+    # Select once per unique channel; ObsPy dedup is not guaranteed, so we control it
+    for net, sta, loc, cha in chan_keys:
+        # Use wildcards for optional empty location codes if needed
+        inv_part = inv.select(network=net, station=sta, location=loc, channel=cha)
+        if len(inv_part.networks):
+            inv_sub += inv_part
+
+    # Optional: prune empty containers to be tidy (usually already handled)
+    inv_sub = inv_sub.select()  # no args: acts as a prune/no-op
+
+    return inv_sub
 
 def expand_channel_code(base: str):
     """
