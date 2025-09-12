@@ -3,7 +3,7 @@ import os
 import glob
 from obspy import UTCDateTime
 from flovopy.seisanio.core.sfile import get_sfile_list, Sfile
-from flovopy.core.preprocessing import preprocess_stream
+from flovopy.core.preprocess import preprocess_stream
 from flovopy.core.mvo import read_mvo_waveform_file
 
 
