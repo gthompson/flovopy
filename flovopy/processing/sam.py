@@ -1218,27 +1218,25 @@ class SAM:
                     continue
             dataframes[thisid]=thisdf
         return self.__class__(dataframes=dataframes)       
-     
+    
     def to_stream(self, metric='mean', ylims=None):
         ''' Convert one column (specified by metric) of each DataFrame in an SAM object to an obspy.Trace, 
             return an ObsPy.Stream that is the combination of all of these Trace objects'''
         st = Stream()
         for key in self.dataframes:
-            #print(key)
             df = self.dataframes[key]
             if metric in df.columns:
                 dataSeries = df[metric]
                 if isinstance(ylims, list) or isinstance(ylims, tuple):
                     dataSeries = dataSeries.clip(lower=ylims[0], upper=ylims[1])
-                tr = Trace(data=np.array(dataSeries))
-                #timeSeries = pd.to_datetime(df['time'], unit='s')
+                # Ensure float dtype for Trace data
+                tr = Trace(data=np.array(dataSeries, dtype=float))
                 tr.stats.delta = self.get_sampling_interval(df)
                 tr.stats.starttime = UTCDateTime(df.iloc[0]['time'])
                 tr.id = key
-                #print(min(tr.data))
+                # Only append if there is at least one non-NaN value
                 if tr.data.size - np.count_nonzero(np.isnan(tr.data)):
                     st.append(tr)
-                
         return st
     
     def trim(self, starttime=None, endtime=None, pad=False, keep_empty=False, fill_value=None):
@@ -1370,17 +1368,16 @@ class SAM:
             
     def __remove_empty(self):
         ''' remove empty dataframes from an SAM object - these are net.sta.loc.chan for which there are no non-zero data '''
-        #print('removing empty dataframes')
-        dfs_dict = self.dataframes.copy() # store this so we can delete during loop, otherwise complains about deleting during iteration
+        dfs_dict = self.dataframes.copy()
         for id in self.dataframes:
             df = self.dataframes[id]
-            #print(id, self.dataframes[id]['mean'])
-            metrics=self.get_metrics(df=df)
+            metrics = self.get_metrics(df=df)
             for metric in metrics:
-                if (df[metric] == 0).all() or pd.isna(df[metric]).all():
-                    #print('dropping ', metric)
-                    dfs_dict[id].drop(columns=[metric])
-            if len(df)==0:
+                # Only check numeric columns
+                if pd.api.types.is_numeric_dtype(df[metric]):
+                    if (df[metric] == 0).all() or pd.isna(df[metric]).all():
+                        dfs_dict[id] = dfs_dict[id].drop(columns=[metric])
+            if len(df) == 0:
                 del dfs_dict[id]
         self.dataframes = dfs_dict
 

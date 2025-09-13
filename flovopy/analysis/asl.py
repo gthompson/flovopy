@@ -409,7 +409,7 @@ class Grid:
         self.node_spacing_m = node_spacing_m
 
     def plot(self, fig=None, show=True,
-            symbol="c", scale=1.0, fill="white", pen="0.5p,black",
+            symbol="c", scale=1.0, fill="blue", pen="0.5p,black",
             topo_map_kwargs=None):
         """
         Plot grid nodes on a PyGMT topo map.
@@ -484,55 +484,41 @@ def synthetic_source_from_grid(
     }
 
 
-def simulate_SAM(inv, source, units='m/s', surfaceWaves=False, wavespeed_kms=1.5, peakf=8.0, Q=None, noise_level_percent=0.0):
+def simulate_SAM(inv, source, units='m/s', surfaceWaves=False, wavespeed_kms=1.5, peakf=8.0, Q=None, noise_level_percent=0.0, verbose=False):
+    if units == 'm/s':
+        sam_class = VSAM
+    elif units == 'm':
+        sam_class = DSAM
     npts = len(source['DR'])
     if isinstance(inv, Inventory):
         seed_ids = inventory2traceid(inv)#, force_location_code='')
     else:
         seed_ids = []
         return None
-    st = obspy.Stream()
     
+    dataframes = {}
     for id in seed_ids:
+        net, sta, loc, chan = id.split('.') 
         coordinates = inv.get_coordinates(id)
         stalat = coordinates['latitude']
         stalon = coordinates['longitude']
         distance_km = degrees2kilometers(locations2degrees(stalat, stalon, source['lat'], source['lon']))
-        tr = obspy.Trace()
-        tr.id = id
-        tr.stats.starttime = source['t'][0]
-        if len(source['t'])>1:
-            tr.stats.delta = source['t'][1] - source['t'][0]
-        else:
-            tr.stats.delta = 1.0
-        gsc = VSAM.compute_geometrical_spreading_correction(distance_km, tr.stats.channel, surfaceWaves=surfaceWaves, wavespeed_kms=wavespeed_kms, peakf=peakf)
-        isc = VSAM.compute_inelastic_attenuation_correction(distance_km, peakf, wavespeed_kms, Q)
-        tr.data = source['DR'] / (gsc * isc) * 1e-7
+
+        gsc = sam_class.compute_geometrical_spreading_correction(distance_km, chan, surfaceWaves=surfaceWaves, wavespeed_kms=wavespeed_kms, peakf=peakf)
+        isc = sam_class.compute_inelastic_attenuation_correction(distance_km, peakf, wavespeed_kms, Q)
+
+        # Instead of assigning arrays as single elements, build the DataFrame properly:
+        times = [UTCDateTime().timestamp + i for i in range(npts)]  # or use source['t'] if available
+        amplitude = source['DR'] / (gsc * isc) * 1e-7
         if noise_level_percent > 0.0:
-            tr.data += np.multiply(np.nanmax(tr.data), np.random.uniform(0, 1, size=npts) )
-            pass # do something here
-        tr.stats['units'] = units
-        st.append(tr)
-    if units == 'm/s':
-        return VSAM(stream=st, sampling_interval=tr.stats.delta)
-    elif units == 'm':
-        return DSAM(stream=st, sampling_interval=tr.stats.delta)
-'''
-def plot_VSAM(dsamobj, gridobj, nodenum, metric='mean', DEM_DIR=None):
-    x = [id for id in dsamobj.dataframes]
-    st = dsamobj.to_stream(metric=metric)
-    y = [tr.data[nodenum] for tr in st]
-    plt.figure()
-    plt.bar(x, y, width=1.0)
-    fig = topo_map(show=False, zoom_level=0, inv=None, add_labels=False, centerlon=-62.177, centerlat=16.711, contour_interval=100, topo_color=True, resolution='03s', DEM_DIR=DEM_DIR)
-    print('is figure?', isinstance(fig, pygmt.Figure))
-    #ax = fig.axes()
-    #ax[0].plot(gridobj.gridlon[nodenum], gribobj.gridlat[nodenum], 'o')
-    fig.plot(gridobj.gridlon[nodenum], gridobj.gridlat[nodenum], 'o')
-    #fig._cleanup()
-'''
+            amplitude += np.multiply(amplitude, np.random.uniform(0, 1, size=npts))
 
+        dataframes[id] = pd.DataFrame({
+            'time': times,
+            'mean': amplitude
+        })
 
+    return sam_class(dataframes=dataframes, sampling_interval=1.0, verbose=verbose)
 
 def plot_SAM(
     samobj,
@@ -1064,7 +1050,7 @@ class ASL:
         }
         self.source_to_obspyevent()
         self.located = True
-        return self.source
+        return 
 
     def fast_locate(self):
         gridlat = self.gridobj.gridlat.reshape(-1)
@@ -1133,7 +1119,7 @@ class ASL:
 
         self.source_to_obspyevent()
         self.located = True
-        return self.source
+        return
 
         # TODO: Refactor module to use station-based amplitude corrections consistently, rather than full SEED IDs.
 
@@ -1247,10 +1233,15 @@ class ASL:
                 plt.show()
     
     def print_source(self):
-        pprint(self.source)
+        print(pd.DataFrame(self.source))
+
+    def source_to_csv(self, csvfile):
+        source = self.source
+        if source:
+            df = pd.DataFrame(source)
+            df.to_csv(csvfile, index=False)
+            print(f"CSV file created: {csvfile}")
         
-
-
     def source_to_obspyevent(self, event_id=None):
         """
         Converts self.source (dict) into an ObsPy Event with Origins and Amplitudes,
@@ -1554,8 +1545,8 @@ def compare_asl_sources(asl1, asl2, atol=1e-8, rtol=1e-5):
     
     Returns True if all values match; otherwise, returns a dict of diffs.
     """
-    source1 = asl1.locate()
-    source2 = asl2.locate()
+    source1 = asl1.source
+    source2 = asl2.source
     
     diffs = {}
     keys1 = set(source1.keys())
