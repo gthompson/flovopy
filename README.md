@@ -9,21 +9,27 @@ FLOVOpy is a Python package providing advanced tools for volcano observatories a
 To install FLOVOpy in **editable mode** using a Conda environment:
 
 ```bash
-# Clone the repository
+# 1. Clone the repository
 git clone https://github.com/gthompson/flovopy.git
 cd flovopy
 
-# Create and activate a Conda environment
+# 2. Create and activate a Conda environment
 conda create -n flovopy-env python=3.10
 conda activate flovopy-env
 
 # Or from YML
-conda create -n flovopy-env -f flovopy_plus
+conda env create --name flovopy_plus --file flovopy_plus.yml
 
-# Install dependencies and the package in editable mode
+# 3. Install dependencies and the package in editable mode
 pip install -e .
 ```
 
+Alternate step 2: Install FLOVOpy from a YML file - this adds some other useful tools too:
+conda env create --name flovopy --file flovopy_plus.yml
+pip install -e .
+
+Optionally add this to your .bashrc or .zshrc file:
+conda activate flovopy
 ---
 
 ## 🚀 Available CLI Tools

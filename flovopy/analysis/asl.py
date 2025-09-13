@@ -666,6 +666,38 @@ class ASL:
             #fig._cleanup()
 
 
+    def plot_reduced_displacement(self, threshold_DR=0, outfile=None):
+        source = self.source
+        if source:
+            # timeseries of DR vs threshold_amp
+            t_dt = [this_t.datetime for this_t in source['t']]
+            plt.figure()
+            plt.plot(t_dt, source['DR'])
+            plt.plot(t_dt, np.ones(source['DR'].size) * threshold_DR)
+            plt.xlabel('Date/Time (UTC)')
+            plt.ylabel('Reduced Displacement (${cm}^2$)')
+            if outfile:
+                plt.savefig(outfile)
+            else:   
+                plt.show()
+
+    def plot_misfit(self, outfile=None):
+        source = self.source
+        if source:
+            t_dt = [this_t.datetime for this_t in source['t']]
+            # repeat but for misfit rather than DR
+            plt.figure()
+            plt.plot(t_dt, source['misfit'])
+            plt.xlabel('Date/Time (UTC)')
+            plt.ylabel('Misfit (std/median)')
+            if outfile:
+                plt.savefig(outfile)
+            else:   
+                plt.show()
+    
+    def print_source(self):
+        pprint(self.source)
+        
 
 
     def source_to_obspyevent(self, event_id=None):
