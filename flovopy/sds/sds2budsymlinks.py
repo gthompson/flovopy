@@ -79,17 +79,10 @@ def bud_dir(root: Path, net: str, sta: str, chan: str) -> Path:
     # <BUD_ROOT>/<NET>/<STA>/<CHAN>/
     return root / net / sta / chan
 
-<<<<<<< Updated upstream
 def bud_filename(sta: str, net: str, loc: str, chan: str, year: str, doy: str, ext: str, loc_blank_as="..") -> str:
     # BUD filename daily form: STA.LOC.CHAN.YYYY.DDD[.ext]
     loc_field = loc_blank_as if (loc == "" or loc == "--") else loc
     return f"{sta}.{net}.{loc_field}.{chan}.{year}.{doy}{ext}"
-=======
-def bud_filename(sta: str, loc: str, chan: str, year: str, doy: str, ext: str, loc_blank_as="..") -> str:
-    # BUD filename daily form: STA.LOC.CHAN.YYYY.DDD[.ext]
-    loc_field = loc_blank_as if (loc == "" or loc == "--") else loc
-    return f"{sta}.{loc_field}.{chan}.{year}.{doy}{ext}"
->>>>>>> Stashed changes
 
 def create_symlink(src: Path, dest: Path, overwrite: bool = False):
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -152,11 +145,7 @@ def main():
     for src, p in collect_sds_files(sds_root):
         # Build destination path
         dest_dir = bud_dir(bud_root, p["net"], p["sta"], p["chan"])
-<<<<<<< Updated upstream
         dest_name = bud_filename(p["sta"], p['net'], p["loc"], p["chan"], p["year"], p["doy"], p["ext"], loc_blank_as=args.loc_blank_as)
-=======
-        dest_name = bud_filename(p["sta"], p["loc"], p["chan"], p["year"], p["doy"], p["ext"], loc_blank_as=args.loc_blank_as)
->>>>>>> Stashed changes
         dest = dest_dir / dest_name
 
         rel_src = os.path.relpath(src, dest_dir)  # nice relative symlink
