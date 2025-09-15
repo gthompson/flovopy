@@ -3,9 +3,10 @@ from __future__ import annotations
 import os, pickle
 import numpy as np
 import pygmt
-from obspy import Inventory
+from obspy import Inventory, UTCDateTime
+import pandas as pd
 from flovopy.stationmetadata.utils import inventory2traceid
-
+import xarray as xr
 pygmt.config(GMT_DATA_SERVER="https://oceania.generic-mapping-tools.org")
 
 def topo_map(
@@ -116,5 +117,45 @@ def topo_map(
     fig.basemap(region=region, frame=True)
 
     if show:
+        fig.show()
+    return fig
+
+
+def plot_heatmap_montserrat_colored(
+    df, lat_col="latitude", lon_col="longitude", amp_col="amplitude",
+    zoom_level=0, inventory=None, color_scale=0.4, cmap="turbo",
+    log_scale=True, node_spacing_m=50, outfile=None, region=None, title=None,
+):
+    """
+    Render tessellated color squares for node energy (sum amp^2) on Montserrat topo.
+    """
+    df = df.copy()
+    df["energy"] = df[amp_col] ** 2
+    grouped = df.groupby([lat_col, lon_col])["energy"].sum().reset_index()
+
+    x = grouped[lon_col].to_numpy()
+    y = grouped[lat_col].to_numpy()
+    z = grouped["energy"].to_numpy()
+    if log_scale:
+        z = np.log10(z + 1e-12)
+
+    # color palette
+    pygmt.makecpt(cmap=cmap,
+                  series=[np.nanmin(z), np.nanmax(z),
+                          (np.nanmax(z) - np.nanmin(z)) / 100.0],
+                  continuous=True)
+
+    fig = topo_map(zoom_level=zoom_level, inv=inventory, topo_color=False, region=region, title=title)
+
+    # approximate symbol size in cm
+    symbol_size_cm = node_spacing_m * 0.077 / 50.0
+    fig.plot(x=x, y=y, style=f"s{symbol_size_cm}c", fill=z, cmap=True, pen=None)
+
+    fig.colorbar(frame='+l"Log10 Total Energy"' if log_scale else '+l"Total Energy"')
+    if region:
+        fig.basemap(region=region, frame=True)
+    if outfile:
+        fig.savefig(outfile)
+    else:
         fig.show()
     return fig

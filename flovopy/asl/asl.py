@@ -14,23 +14,33 @@ from obspy.geodetics import gps2dist_azimuth
 from flovopy.processing.sam import VSAM
 from flovopy.utils.make_hash import make_hash
 from flovopy.core.mvo import dome_location
-
-from .map import topo_map
-from .grid import Grid  # for typing only
+from flovopy.asl.map import topo_map #, plot_heatmap_montserrat_colored
+from flovopy.asl.diagnostics import extract_asl_diagnostics, compare_asl_sources
+from flovopy.asl.grid import Grid
+from flovopy.asl.misfit import plot_misfit_heatmap_for_peak_DR, StdOverMeanMisfit, R2DistanceMisfit
 
 # ---------- helpers ----------
-def compute_azimuthal_gap(origin_lat, origin_lon, station_coords):
+def compute_azimuthal_gap(origin_lat: float, origin_lon: float,
+                          station_coords: Iterable[Tuple[float, float]]) -> tuple[float, int]:
+    """
+    Compute the classical azimuthal gap and station count.
+
+    station_coords: iterable of (lat, lon)
+    Returns: (max_gap_deg, n_stations)
+    """
     azimuths = []
     for stalat, stalon in station_coords:
         _, az, _ = gps2dist_azimuth(origin_lat, origin_lon, stalat, stalon)
-        azimuths.append(az)
-    if len(azimuths) < 2:
-        return 360.0, len(azimuths)
-    azimuths = sorted(azimuths)
-    azimuths.append(azimuths[0] + 360.0)
-    gaps = [azimuths[i + 1] - azimuths[i] for i in range(len(azimuths) - 1)]
-    return max(gaps), len(azimuths) - 1
+        azimuths.append(float(az))
 
+    n = len(azimuths)
+    if n < 2:
+        return 360.0, n
+
+    azimuths.sort()
+    azimuths.append(azimuths[0] + 360.0)
+    gaps = [azimuths[i+1] - azimuths[i] for i in range(n)]
+    return max(gaps), n
 
 # ---------- ASL ----------
 class ASL:
@@ -202,70 +212,37 @@ class ASL:
     def fast_locate(
         self,
         *,
+        misfit_backend=None,
         min_stations: int = 3,
         eps: float = 1e-9,
         use_median_for_DR: bool = False,
         batch_size: int = 1024,
         verbose: bool = True,
     ):
-        """
-        Fast amplitude-based location using vectorized reductions.
+        if misfit_backend is None:
+            misfit_backend = StdOverMeanMisfit()
 
-        For each time sample t:
-        - Reduce station amplitudes to each node j: R[:, j] = Y[:, t] * C[:, j]
-        - Compute misfit per node: std(R[:, j]) / (mean(R[:, j]) + eps)  [finite stations only]
-        - Pick node with minimum misfit.
-        - DR(t) = median(R[:, j*]) if use_median_for_DR else mean(R[:, j*])
-
-        Parameters
-        ----------
-        min_stations : int
-            Minimum finite stations required to evaluate a node at a given time.
-        eps : float
-            Small number to stabilize divisions.
-        use_median_for_DR : bool
-            If True, use median across stations for DR; else mean (slightly faster).
-        batch_size : int
-            Number of time samples to process per batch (controls memory usage).
-        verbose : bool
-            Print progress info.
-        """
-        if verbose:
-            print("[ASL] fast_locate: preparing data…")
-
+        if verbose: print("[ASL] fast_locate: preparing data…")
         gridlat = self.gridobj.gridlat.reshape(-1)
         gridlon = self.gridobj.gridlon.reshape(-1)
 
-        # 1) Stream → matrix Y (nsta, ntime)
+        # Stream → Y
         st = self.metric2stream()
         seed_ids = [tr.id for tr in st]
-        nsta = len(seed_ids)
-        if nsta == 0:
-            raise RuntimeError("No traces in stream for fast_locate().")
-        Y = np.vstack([tr.data.astype(float) for tr in st])  # (nsta, ntime)
-        ntime = Y.shape[1]
+        Y = np.vstack([tr.data.astype(np.float32, copy=False) for tr in st])
         t = st[0].times("utcdatetime")
+        nsta, ntime = Y.shape
 
-        # 2) Corrections → matrix C (nsta, nnodes)
-        first_corr = self.amplitude_corrections[seed_ids[0]]
-        nnodes = len(first_corr)
-        if nnodes != gridlat.size or nnodes != gridlon.size:
-            raise AssertionError(f"Node count mismatch: corr={nnodes}, grid={gridlat.size}")
-        C = np.empty((nsta, nnodes), dtype=float)
-        for k, sid in enumerate(seed_ids):
-            ck = np.asarray(self.amplitude_corrections[sid], dtype=float)
-            if ck.size != nnodes:
-                raise ValueError(f"Corrections length mismatch for {sid}: {ck.size} != {nnodes}")
-            C[k, :] = ck
+        # Backend context
+        ctx = misfit_backend.prepare(self, seed_ids, dtype=np.float32)
 
-        # 3) Station coords (for azgap)
+        # Station coords (azgap)
         station_coords = []
         for sid in seed_ids:
-            coords = self.station_coordinates.get(sid)
-            if coords:
-                station_coords.append((coords["latitude"], coords["longitude"]))
+            c = self.station_coordinates.get(sid)
+            if c: station_coords.append((c["latitude"], c["longitude"]))
 
-        # 4) Outputs
+        # Outputs
         source_DR     = np.empty(ntime, dtype=float)
         source_lat    = np.empty(ntime, dtype=float)
         source_lon    = np.empty(ntime, dtype=float)
@@ -273,68 +250,49 @@ class ASL:
         source_azgap  = np.empty(ntime, dtype=float)
         source_nsta   = np.empty(ntime, dtype=int)
 
-        if verbose:
-            print(f"[ASL] fast_locate: nsta={nsta}, ntime={ntime}, nnodes={nnodes}, batch_size={batch_size}")
+        if verbose: print(f"[ASL] fast_locate: nsta={nsta}, ntime={ntime}, batch={batch_size}")
 
-        # 5) Batched time loop
         for i0 in range(0, ntime, batch_size):
             i1 = min(i0 + batch_size, ntime)
-            if verbose:
-                print(f"[ASL] fast_locate: processing samples [{i0}:{i1})")
+            if verbose: print(f"[ASL] fast_locate: [{i0}:{i1})")
+            Yb = Y[:, i0:i1]
 
-            # Yb: (nsta, B)
-            Yb = Y[:, i0:i1]  # B = i1-i0
-
-            # For each time column, find best node
-            # We'll process one time column at a time to limit memory: (nsta, nnodes)
             for k in range(Yb.shape[1]):
-                y = Yb[:, k]  # (nsta,)
+                y = Yb[:, k]
+                misfit, extras = misfit_backend.evaluate(y, ctx, min_stations=min_stations, eps=eps)
+                jstar = int(np.nanargmin(misfit))
 
-                # Broadcast to nodes: reduced amplitudes R = y[:,None] * C  (nsta, nnodes)
-                R = y[:, None] * C
-
-                # Finite mask per station/node
-                finite = np.isfinite(R)
-
-                # Count usable stations per node
-                nfin = finite.sum(axis=0)  # (nnodes,)
-
-                # Guard: nodes with too few stations → set misfit to +inf
-                valid_nodes = nfin >= min_stations
-
-                # Compute per-node stats on finite values only
-                # mean and std along station axis
-                # Use masked arrays for nan-safe stats
-                R_masked = np.ma.array(R, mask=~finite)
-                mean_j = R_masked.mean(axis=0).filled(np.nan)   # (nnodes,)
-                std_j  = R_masked.std(axis=0, ddof=0).filled(np.nan)
-
-                # Misfit = std/mean (stabilized)
-                misfit = std_j / (np.abs(mean_j) + eps)
-                misfit[~valid_nodes] = np.inf
-                jstar = int(np.nanargmin(misfit))  # best node index
-
-                # DR(t) across stations at best node
-                rbest = R[:, jstar]
-                rbest = rbest[np.isfinite(rbest)]
-                if rbest.size == 0:
-                    DR_t = np.nan
-                    nsta_eff = 0
+                # DR: default to mean at best node if backend provided it
+                DR_t = extras.get("mean", None)
+                if DR_t is not None and np.ndim(DR_t) == 1:
+                    DR_t = DR_t[jstar]
                 else:
-                    DR_t = (np.median(rbest) if use_median_for_DR else np.mean(rbest))
-                    nsta_eff = rbest.size
+                    # fallback compute using corrections for jstar (median optional)
+                    # NB: you can also let the backend return DR directly if desired.
+                    C = ctx.get("C", None)
+                    if C is not None:
+                        rbest = y * C[:, jstar]
+                        rbest = rbest[np.isfinite(rbest)]
+                        if rbest.size:
+                            DR_t = np.median(rbest) if use_median_for_DR else np.mean(rbest)
+                        else:
+                            DR_t = np.nan
+                    else:
+                        DR_t = np.nan
 
                 i = i0 + k
                 source_DR[i]     = DR_t
                 source_lat[i]    = gridlat[jstar]
                 source_lon[i]    = gridlon[jstar]
                 source_misfit[i] = float(misfit[jstar])
-                # azgap for this location (station set fixed)
-                azgap, nsta_all = compute_azimuthal_gap(source_lat[i], source_lon[i], station_coords)
-                source_azgap[i] = azgap
-                source_nsta[i]  = nsta_eff
 
-        # 6) Package results (note: your DR scale factor of 1e7 kept for continuity)
+                # station count used at jstar if backend reports vector N
+                N = extras.get("N", None)
+                source_nsta[i] = int(N if np.isscalar(N) else (N[jstar] if N is not None else np.sum(np.isfinite(y))))
+
+                azgap, _ = compute_azimuthal_gap(source_lat[i], source_lon[i], station_coords)
+                source_azgap[i] = azgap
+
         self.source = {
             "t": t,
             "lat": source_lat,
@@ -346,11 +304,8 @@ class ASL:
         }
         self.source_to_obspyevent()
         self.located = True
-        if hasattr(self, "set_id") and callable(self.set_id):
-            self.id = self.set_id()
-        if verbose:
-            print("[ASL] fast_locate: done.")
-        return
+        if hasattr(self, "set_id"): self.id = self.set_id()
+        if verbose: print("[ASL] fast_locate: done.")
 
     # ---------- plots ----------
     def plot(self, zoom_level=1, threshold_DR=0, scale=1, join=False, number=0,
@@ -415,6 +370,10 @@ class ASL:
         plt.figure(); plt.plot(t_dt, self.source["misfit"])
         plt.xlabel("Date/Time (UTC)"); plt.ylabel("Misfit (std/median)")
         (plt.savefig(outfile) if outfile else plt.show())
+
+    def plot_misfit_heatmap(self, outfile=None):
+        plot_misfit_heatmap_for_peak_DR(self, backend=StdOverMeanMisfit(), cmap="turbo", transparency=40, outfile=outfile)
+        #plot_misfit_heatmap_for_peak_DR(aslobj, backend=R2DistanceMisfit(), cmap="oleron", transparency=45)
 
     # ---------- ObsPy event ----------
     def source_to_obspyevent(self, event_id=None):
