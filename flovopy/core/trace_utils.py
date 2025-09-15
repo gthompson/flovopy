@@ -1398,3 +1398,7 @@ def add_processing_step(tr: Trace, msg: str) -> None:
     if not hasattr(tr.stats, "processing") or tr.stats.processing is None:
         tr.stats.processing = []
     tr.stats.processing.append(str(msg))
+
+def station_ids_from_stream(st: Stream) -> tuple[str, ...]:
+    """Return sorted, unique seed IDs from a Stream."""
+    return tuple(sorted({tr.id for tr in st}))

@@ -15,8 +15,7 @@ import pygmt
 pygmt.config(GMT_DATA_SERVER="https://oceania.generic-mapping-tools.org")
 
 # ObsPy core and event tools
-import obspy
-from obspy import UTCDateTime, read_events, Inventory
+from obspy import UTCDateTime, read_events, Inventory, Stream
 from obspy.core.event import Event, Catalog, ResourceIdentifier, Origin, Amplitude, QuantityError, OriginQuality, Comment
 from obspy.geodetics import locations2degrees, degrees2kilometers, gps2dist_azimuth
 # Your internal or local modules (assumed to exist)
@@ -25,6 +24,8 @@ from flovopy.stationmetadata.utils import inventory2traceid
 from flovopy.processing.sam import VSAM, DSAM  # VSAM class for corrections and simulation
 from flovopy.core.mvo import dome_location
 from scipy.ndimage import uniform_filter1d
+from flovopy.utils.make_hash import make_hash
+
 
 
 def topo_map(
@@ -407,10 +408,17 @@ class Grid:
         self.nlat = nlat
         self.nlon = nlon
         self.node_spacing_m = node_spacing_m
+        self.node_distances_km = None
+        self.station_coordinates = None  
+        self.id = self.set_id() 
+
+    def set_id(self):
+        self.id = make_hash(self.centerlat, self.centerlon, self.nlat, self.nlon, self.node_spacing_m, self.station_coordinates)
+        return self.id  
 
     def plot(self, fig=None, show=True,
             symbol="c", scale=1.0, fill="blue", pen="0.5p,black",
-            topo_map_kwargs=None):
+            topo_map_kwargs=None, outfile=None):
         """
         Plot grid nodes on a PyGMT topo map.
 
@@ -446,10 +454,90 @@ class Grid:
             pen=pen,
             fill=fill if symbol not in ("x", "+") else None,  # no fill for line-only marks
         )
-
+        if outfile:
+            fig.savefig(outfile, dpi=300)
         if show:
             fig.show()
         return fig
+    
+    def compute_grid_distances(self, inventory: Inventory=None, st: Stream=None):
+        """
+        Computes and stores distances from each grid node to each station/channel.
+
+        If a Stream object is passed, it will compute only for trace IDs in the Stream.
+        Otherwise, it uses all available channels in self.inventory.
+
+        Results are stored in:
+            - self.node_distances_km: dict of {seed_id: np.array of distances in km}
+            - self.station_coordinates: dict of {seed_id: {latitude, longitude, elevation}}
+        """
+
+
+        node_distances_km = {}
+        station_coordinates = {}
+
+        gridlat = self.gridlat.reshape(-1)
+        gridlon = self.gridlon.reshape(-1)
+        nodelatlon = list(zip(gridlat, gridlon))
+
+        if st:
+            trace_ids = list({tr.id for tr in st})
+            print(f"[INFO] Computing distances using {len(trace_ids)} trace IDs from stream.")
+        else:
+            trace_ids = []
+            for net in inventory:
+                for sta in net:
+                    for cha in sta:
+                        trace_ids.append(f"{net.code}.{sta.code}..{cha.code}")
+            print(f"[INFO] Computing distances using {len(trace_ids)} channels from inventory.")
+
+        for seed_id in trace_ids:
+            try:
+                coords = inventory.get_coordinates(seed_id)
+                stalat = coords['latitude']
+                stalon = coords['longitude']
+                station_coordinates[seed_id] = coords
+            except Exception as e:
+                print(f"[WARN] Skipping {seed_id}: {e}")
+                continue
+
+            try:
+                distances_deg = [
+                    locations2degrees(nlat, nlon, stalat, stalon)
+                    for nlat, nlon in nodelatlon
+                ]
+                distances_km = [degrees2kilometers(d) for d in distances_deg]
+                node_distances_km[seed_id] = np.array(distances_km)
+            except Exception as e:
+                print(f"[ERROR] Distance calc failed for {seed_id}: {e}")
+                continue
+
+        print(f"[DONE] Grid distances computed for {len(node_distances_km)} trace IDs.")
+        self.node_distances_km = node_distances_km
+        self.station_coordinates = station_coordinates
+        self.id = self.set_id()
+        return node_distances_km, station_coordinates
+    
+    def save(cache_dir, force_overwrite=False):
+        if not os.path.isdir(cache_dir):
+            os.makedirs(cache_dir)
+        pklfile = os.path.join(cache_dir, f"Grid_{self.id}.pkl")
+        if os.path.exists(pklfile) and not force_overwrite:
+            print(f"File {pklfile} already exists. Use force_overwrite=True to replace.")
+            return
+        with open(pklfile, "wb") as f:
+            pickle.dump(self, f)
+        print(f"Grid saved to {pklfile}")
+
+    def load(cache_file):
+        if not os.path.isfile(cache_file):
+            print(f"File {cache_file} does not exist.")
+            return None
+        with open(cache_file, "rb") as f:
+            gridobj = pickle.load(f)
+        print(f"Grid loaded from {cache_file}")
+        return gridobj
+
 
 def initial_source(lat=dome_location['lat'], lon=dome_location['lon']):
     return {'lat':lat, 'lon':lon}
@@ -463,14 +551,14 @@ def synthetic_source_from_grid(
     grid: Grid,
     sampling_interval: float = 60.0,
     DR_cm2: float = 100.0,
-    t0: obspy.UTCDateTime | None = None,
+    t0: UTCDateTime | None = None,
     order: str = "C",
 ):
     """
     Build a synthetic_source dict (lat, lon, DR, t) from a Grid.
     """
     if t0 is None:
-        t0 = obspy.UTCDateTime(0)
+        t0 = UTCDateTime(0)
 
     lat_flat = grid.gridlat.ravel(order=order).astype(float)
     lon_flat = grid.gridlon.ravel(order=order).astype(float)
@@ -627,6 +715,132 @@ def plot_SAM(
 
     return fig_map, chosen_nodes
 
+
+
+def compute_amplitude_corrections(
+    inventory: Inventory,
+    node_distances_km: dict,
+    *,
+    surface_waves: bool = False,
+    wave_speed_kms: float | None = None,
+    Q: float | None = None,
+    peakf: float | None = None,
+    geom_spread_fn=None,    # defaults to VSAM.compute_geometrical_spreading_correction
+    inelastic_att_fn=None,  # defaults to VSAM.compute_inelastic_attenuation_correction
+    cache_dir: str = "asl_cache",
+    cache_key_extra: str = "",  # e.g. grid hash or mask ID
+    force_recompute: bool = False,
+) -> tuple[dict, dict]:
+    """
+    Compute amplitude corrections per channel using geometric spreading and
+    inelastic attenuation. Results are cached for reuse.
+
+    Parameters
+    ----------
+    inventory : obspy.Inventory
+        Station/channel metadata.
+    node_distances_km : dict[str, np.ndarray]
+        Mapping seed_id -> distance vector (km) to each grid node.
+    surface_waves : bool
+        If True, use surface-wave assumptions (default False).
+    wave_speed_kms : float, optional
+        Wave speed [km/s]. Defaults: 1.5 (surface), 3.0 (body).
+    Q : float, optional
+        Attenuation factor.
+    peakf : float, optional
+        Peak frequency [Hz]. Defaults to 2.0.
+    geom_spread_fn, inelastic_att_fn : callable, optional
+        Functions to compute corrections. If not provided, will try to import VSAM.
+    cache_dir : str
+        Directory for cached pickle files.
+    cache_key_extra : str
+        Extra token (e.g. grid hash) to make cache unique.
+    force_recompute : bool
+        Ignore cache and recompute.
+
+    Returns
+    -------
+    corrections : dict[str, np.ndarray]
+        Per-channel amplitude corrections.
+    meta : dict
+        Metadata about parameters and cache.
+    """
+    # Defaults
+    if wave_speed_kms is None:
+        wave_speed_kms = 1.5 if surface_waves else 3.0
+    if peakf is None:
+        peakf = 2.0
+
+    # Default backends
+    if geom_spread_fn is None or inelastic_att_fn is None:
+        import VSAM  # make sure VSAM is in your environment
+        if geom_spread_fn is None:
+            geom_spread_fn = VSAM.compute_geometrical_spreading_correction
+        if inelastic_att_fn is None:
+            inelastic_att_fn = VSAM.compute_inelastic_attenuation_correction
+
+    # Build cache key using your make_hash()
+    # Include parameters + optional extra + sorted station list
+    station_list = tuple(sorted(
+        f"{net.code}.{sta.code}.{cha.location_code}.{cha.code}"
+        for net in inventory for sta in net for cha in sta
+    ))
+    cache_key = make_hash(surface_waves, wave_speed_kms, Q, peakf, cache_key_extra, station_list)
+    cache_name = f"ampcorr_{cache_key}.pkl"
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, cache_name)
+
+    # Try cache
+    if os.path.exists(cache_path) and not force_recompute:
+        try:
+            with open(cache_path, "rb") as f:
+                corrections = pickle.load(f)
+            return corrections, {
+                "from_cache": True,
+                "cache_path": cache_path,
+                "surface_waves": surface_waves,
+                "wave_speed_kms": wave_speed_kms,
+                "Q": Q,
+                "peakf": peakf,
+                "cache_key": cache_key,
+            }
+        except Exception as e:
+            print(f"[WARN] Failed to load cache ({e}), recomputing.")
+
+    # Compute
+    corrections = {}
+    n_missing = 0
+    for net in inventory:
+        for sta in net:
+            for cha in sta:
+                seed_id = f"{net.code}.{sta.code}.{cha.location_code}.{cha.code}"
+                dist_km = node_distances_km.get(seed_id)
+                if dist_km is None:
+                    n_missing += 1
+                    continue
+                chan_code3 = cha.code[-3:]
+                gsc = geom_spread_fn(dist_km, chan_code3, surface_waves, wave_speed_kms, peakf)
+                isc = inelastic_att_fn(dist_km, peakf, wave_speed_kms, Q)
+                corrections[seed_id] = np.asarray(gsc) * np.asarray(isc)
+
+    # Save cache
+    try:
+        with open(cache_path, "wb") as f:
+            pickle.dump(corrections, f)
+    except Exception as e:
+        print(f"[WARN] Failed to save cache: {e}")
+
+    return corrections, {
+        "from_cache": False,
+        "cache_path": cache_path,
+        "surface_waves": surface_waves,
+        "wave_speed_kms": wave_speed_kms,
+        "Q": Q,
+        "peakf": peakf,
+        "cache_key": cache_key,
+        "n_channels_missing_distances": n_missing,
+    }
+
 # pretty sure that i had a different version here that worked. this one is crashing because trying to plot nodenum 100 of a 100-length tr.data
 # what I really should be plotting is the corrections at node 100
 
@@ -665,10 +879,32 @@ class ASL:
         self.located = False
         self.source = None
         self.event = None
+        self.id= self.set_id()
         
-    def setup(self, surfaceWaves=False):  
-        self.compute_grid_distances()
-        self.compute_amplitude_corrections(surfaceWaves = surfaceWaves)
+
+    def set_id(self):
+        self.id = make_hash(self.samobject, self.metric, self.amplitude_corrections, self.window_seconds, self.source)
+        return self.id
+    
+    def save(self, cache_dir, force_overwrite=False):
+        if not os.path.isdir(cache_dir):
+            os.makedirs(cache_dir)
+        pklfile = os.path.join(cache_dir, f"ASL_{self.id}.pkl")
+        if os.path.exists(pklfile) and not force_overwrite:
+            print(f"File {pklfile} already exists. Use force_overwrite=True to replace.")
+            return
+        with open(pklfile, "wb") as f:
+            pickle.dump(self, f)
+        print(f"ASL saved to {pklfile}")
+
+    def load(cache_file):
+        if not os.path.isfile(cache_file):
+            print(f"File {cache_file} does not exist.")
+            return None
+        with open(cache_file, "rb") as f:
+            aslobj = pickle.load(f)
+        print(f"ASL loaded from {cache_file}")
+        return aslobj
 
     def compute_grid_distances(self, use_stream=False):
         """
@@ -681,52 +917,11 @@ class ASL:
             - self.node_distances_km: dict of {seed_id: np.array of distances in km}
             - self.station_coordinates: dict of {seed_id: {latitude, longitude, elevation}}
         """
-
-
-        node_distances_km = {}
-        station_coordinates = {}
-
-        gridlat = self.gridobj.gridlat.reshape(-1)
-        gridlon = self.gridobj.gridlon.reshape(-1)
-        nodelatlon = list(zip(gridlat, gridlon))
-
+        st = None
         if use_stream:
             st = self.samobject.to_stream()
-            trace_ids = list({tr.id for tr in st})
-            print(f"[INFO] Computing distances using {len(trace_ids)} trace IDs from stream.")
-        else:
-            trace_ids = []
-            for net in self.inventory:
-                for sta in net:
-                    for cha in sta:
-                        trace_ids.append(f"{net.code}.{sta.code}..{cha.code}")
-            print(f"[INFO] Computing distances using {len(trace_ids)} channels from inventory.")
-
-        for seed_id in trace_ids:
-            try:
-                coords = self.inventory.get_coordinates(seed_id)
-                stalat = coords['latitude']
-                stalon = coords['longitude']
-                station_coordinates[seed_id] = coords
-            except Exception as e:
-                print(f"[WARN] Skipping {seed_id}: {e}")
-                continue
-
-            try:
-                distances_deg = [
-                    locations2degrees(nlat, nlon, stalat, stalon)
-                    for nlat, nlon in nodelatlon
-                ]
-                distances_km = [degrees2kilometers(d) for d in distances_deg]
-                node_distances_km[seed_id] = np.array(distances_km)
-            except Exception as e:
-                print(f"[ERROR] Distance calc failed for {seed_id}: {e}")
-                continue
-
-        self.node_distances_km = node_distances_km
-        self.station_coordinates = station_coordinates
-        print(f"[DONE] Grid distances computed for {len(node_distances_km)} trace IDs.")
-
+        self.node_distances_km, self.station_coordinates = self.gridobj.compute_grid_distances(inventory=self.inventory, Stream=st)
+        self.id = self.set_id()
             
     @staticmethod
     def set_peakf(metric, df):
@@ -741,7 +936,7 @@ class ASL:
             peakf = 8.0
         return peakf
 
-
+    '''
     def compute_amplitude_corrections(
         self,
         surfaceWaves=False,
@@ -823,8 +1018,106 @@ class ASL:
         self.Q = Q
         self.peakf = peakf
         self.wavelength_km = peakf * wavespeed_kms
+        self.id = self.set_id()
+    '''
 
+    def compute_amplitude_corrections(
+        self,
+        *,
+        surface_waves: bool = False,
+        wave_speed_kms: float | None = None,
+        Q: float | None = None,
+        peakf: float | None = None,
+        cache_dir: str = "asl_cache",
+        force_recompute: bool = False,
+        geom_spread_fn=None,         # optional override
+        inelastic_att_fn=None,       # optional override
+    ):
+        """
+        Wrapper around the standalone compute_amplitude_corrections() that:
+          - builds a grid-aware cache key (so caches don't mix between grids),
+          - calls the standalone function with this ASL's inventory and distances,
+          - stores corrections & metadata on the ASL instance,
+          - validates node counts vs the current grid (and optional mask).
 
+        Side-effects:
+          - self.amplitude_corrections : dict[seed_id] -> np.ndarray (len = nnodes_used)
+          - self.ampcorr_meta          : dict (parameters, cache path, etc.)
+          - self.surfaceWaves, self.wavespeed_kms, self.Q, self.peakf
+          - self.wavelength_km
+        """
+        # ----- Build a grid-aware extra key for the cache -----
+        grid = getattr(self, "gridobj", None)
+        if grid is None:
+            raise RuntimeError("ASL.gridobj is not set; cannot build grid-aware cache key.")
+
+        # Summarize grid without hashing full arrays (fast & deterministic)
+        grid_sig = (
+            getattr(grid, "nlat", None),
+            getattr(grid, "nlon", None),
+            float(np.nanmin(grid.gridlat)),
+            float(np.nanmax(grid.gridlat)),
+            float(np.nanmin(grid.gridlon)),
+            float(np.nanmax(grid.gridlon)),
+            float(getattr(grid, "node_spacing_m", 0.0)),
+        )
+        # Optional valid-node mask you may keep on ASL (length = grid.size, bool)
+        valid_mask = getattr(self, "amplitude_valid_mask", None)
+        mask_sig = None
+        if valid_mask is not None:
+            mask_sig = (int(np.count_nonzero(valid_mask)), int(valid_mask.size))
+
+        cache_key_extra = make_hash("grid", grid_sig, "mask", mask_sig)
+
+        # ----- Call the standalone function -----
+        corrections, meta = compute_amplitude_corrections(
+            inventory=self.inventory,
+            node_distances_km=self.node_distances_km,
+            surface_waves=surface_waves,
+            wave_speed_kms=wave_speed_kms,
+            Q=Q,
+            peakf=peakf,
+            geom_spread_fn=geom_spread_fn,
+            inelastic_att_fn=inelastic_att_fn,
+            cache_dir=cache_dir,
+            cache_key_extra=cache_key_extra,
+            force_recompute=force_recompute,
+        )
+
+        # ----- Validate node counts against the current grid -----
+        grid_size = grid.gridlat.size
+        # If you use a valid-node mask, the corrections length should match mask.sum()
+        expected_nodes = int(np.count_nonzero(valid_mask)) if valid_mask is not None else grid_size
+
+        # Pick any channel to check length
+        any_seed = next(iter(corrections)) if corrections else None
+        if any_seed is not None:
+            corr_len = len(corrections[any_seed])
+            if corr_len != expected_nodes:
+                raise ValueError(
+                    f"Amplitude corrections node count ({corr_len}) does not match "
+                    f"{'mask.sum()' if valid_mask is not None else 'grid size'} "
+                    f"({expected_nodes}). Ensure distances/corrections were built for this grid/mask."
+                )
+
+        # ----- Store on the ASL instance -----
+        self.amplitude_corrections = corrections
+        self.ampcorr_meta = meta
+
+        # Mirror key parameters on the instance (for provenance)
+        self.surfaceWaves   = surface_waves
+        self.wavespeed_kms  = meta.get("wave_speed_kms") if "wave_speed_kms" in meta else (1.5 if surface_waves else 3.0) if wave_speed_kms is None else wave_speed_kms
+        self.Q              = Q
+        self.peakf          = 2.0 if peakf is None else peakf
+        # wavelength := velocity / frequency (km)  (your earlier code had peakf * wavespeed, which is 1/that)
+        # Keep your original if you prefer; below is the usual definition:
+        self.wavelength_km  = (self.wavespeed_kms / self.peakf) if (self.peakf and self.wavespeed_kms) else None
+
+        # If you keep an ASL-level ID, refresh it
+        if hasattr(self, "set_id") and callable(self.set_id):
+            self.id = self.set_id()
+
+        return
 
     '''
     def metric2stream(self):
@@ -1050,6 +1343,7 @@ class ASL:
         }
         self.source_to_obspyevent()
         self.located = True
+        self.id= self.set_id()
         return 
 
     def fast_locate(self):
@@ -1119,6 +1413,7 @@ class ASL:
 
         self.source_to_obspyevent()
         self.located = True
+        self.id= self.set_id()
         return
 
         # TODO: Refactor module to use station-based amplitude corrections consistently, rather than full SEED IDs.
@@ -1227,6 +1522,35 @@ class ASL:
             plt.plot(t_dt, source['misfit'])
             plt.xlabel('Date/Time (UTC)')
             plt.ylabel('Misfit (std/median)')
+            if outfile:
+                plt.savefig(outfile)
+            else:   
+                plt.show()
+
+    def plot_misfit_heatmap(self, outfile=None):
+        '''
+        We find the peak signal amplitude in the entire time series
+        Then we plot a heatmap of misfit values for all nodes at that time
+        '''
+        source = self.source
+        if source:
+            maxi = np.argmax(source['DR'])
+            print('max DR at time ',source['t'][maxi],' index ',maxi)
+            gridlat = self.gridobj.gridlat
+            gridlon = self.gridobj.gridlon
+            nlat, nlon = gridlat.shape
+            misfit_grid = np.empty((nlat, nlon), dtype=float)
+            for i in range(nlat):
+                for j in range(nlon):
+                    index = i*nlon + j
+                    misfit_grid[i, j] = source['misfit'][index]
+
+            plt.figure()
+            plt.imshow(misfit_grid, origin='lower', extent=(np.min(gridlon), np.max(gridlon), np.min(gridlat), np.max(gridlat)), cmap='hot', interpolation='nearest')
+            plt.colorbar(label='Misfit (std/median)')
+            plt.xlabel('Longitude')
+            plt.ylabel('Latitude')
+            plt.title(f'Misfit Heatmap at {source["t"][maxi]} UTC')
             if outfile:
                 plt.savefig(outfile)
             else:   

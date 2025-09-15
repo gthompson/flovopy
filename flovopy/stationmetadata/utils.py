@@ -15,7 +15,7 @@ def get_templates_dir() -> Path:
     """
     return Path(__file__).resolve().parent / "stationxml_templates"
 
-def inventory2traceid(inv):
+def inventory2traceid(inv: Inventory) -> tuple[str, ...]:
     """
     Convert an ObsPy Inventory to a list of trace IDs in NET.STA.LOC.CHA format.
 
@@ -35,7 +35,8 @@ def inventory2traceid(inv):
             for cha in sta.channels:
                 trace_id = f"{net.code}.{sta.code}.{cha.location_code}.{cha.code}"
                 trace_ids.append(trace_id)
-    return trace_ids
+    return sorted(trace_ids)
+
 
 def has_response(inventory, trace):
     """
