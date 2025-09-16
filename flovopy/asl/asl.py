@@ -302,6 +302,24 @@ class ASL:
             "azgap": source_azgap,
             "nsta": source_nsta,
         }
+
+        # ---- NEW: spatial connectedness (stores diagnostics on the object) ----
+        conn = compute_spatial_connectedness(
+            source_lat,
+            source_lon,
+            dr=source_DR,          # uses top DR samples
+            top_frac=0.15,         # tweak if you like (10–25% works well)
+            min_points=12,
+            max_points=200,
+        )
+        self.connectedness = conn  # dict with score, n_used, stats, indices
+        if verbose:
+            print(f"[ASL] connectedness: score={conn['score']:.3f}  "
+                  f"n_used={conn['n_used']}  mean_km={conn['mean_km']:.2f}  p90_km={conn['p90_km']:.2f}")
+
+        # Optional: expose the scalar score in the source dict (broadcast is OK in pandas)
+        self.source["connectedness"] = conn["score"]
+
         self.source_to_obspyevent()
         self.located = True
         if hasattr(self, "set_id"): self.id = self.set_id()
@@ -492,3 +510,289 @@ class ASL:
         df.to_csv(csvfile, index=index)
         print(f"[ASL] Source written to CSV: {csvfile}")
         return csvfile
+    
+
+def compute_spatial_connectedness(
+    lat: np.ndarray,
+    lon: np.ndarray,
+    *,
+    dr: np.ndarray | None = None,
+    top_frac: float = 0.15,
+    min_points: int = 12,
+    max_points: int = 200,
+    eps_km: float = 1e-6,
+) -> dict:
+    """
+    Quantify how tightly clustered the ASL locations are in space.
+
+    Idea: take the strongest subset of points (by DR), compute the mean
+    pairwise great-circle distance (km) among them, and map it to a
+    unitless score in (0, 1] where higher means more compact.
+
+    score = 1 / (1 + mean_pairwise_distance_km)
+
+    Parameters
+    ----------
+    lat, lon : arrays of shape (N,)
+        Per-sample lat/lon from ASL (may contain NaN).
+    dr : array or None
+        Per-sample DR; if provided, selects the top fraction by DR.
+        If None, use all finite lat/lon equally.
+    top_frac : float
+        Fraction (0-1] of samples (by DR) to use. Ignored if dr=None.
+    min_points : int
+        Minimum number of points to include (if available).
+    max_points : int
+        Hard cap for pairwise work (keeps O(K^2) reasonable).
+    eps_km : float
+        Small epsilon to avoid division issues.
+
+    Returns
+    -------
+    dict with keys:
+      - 'score' : float in (0, 1]
+      - 'n_used' : number of points used
+      - 'mean_km', 'median_km', 'p90_km' : distance diagnostics
+      - 'indices' : indices (into original arrays) of points used
+
+      
+    •	The score increases as the track tightens (mean pairwise distance shrinks).
+	•	score = 1 / (1 + mean_km) → 1.0 for perfectly colocated, ~0 for very spread.
+	•	Using top_frac focuses the metric on the most energetic portion of the track.
+	•	self.connectedness is a dict with rich diagnostics; self.source["connectedness"]
+        is a convenient scalar for tables/CSV (pandas will broadcast the scalar when building a DataFrame).
+	•	If you’d prefer a different mapping (e.g., exp(-mean_km / s0)), it’s a one-liner change.
+  
+    """
+    lat = np.asarray(lat, float)
+    lon = np.asarray(lon, float)
+    mask = np.isfinite(lat) & np.isfinite(lon)
+    if dr is not None:
+        dr = np.asarray(dr, float)
+        mask &= np.isfinite(dr)
+
+    idx_all = np.flatnonzero(mask)
+    if idx_all.size == 0:
+        return {'score': 0.0, 'n_used': 0, 'mean_km': np.nan, 'median_km': np.nan, 'p90_km': np.nan, 'indices': []}
+
+    if dr is None:
+        idx = idx_all
+    else:
+        k = max(min_points, int(np.ceil(top_frac * idx_all.size)))
+        k = min(k, max_points, idx_all.size)
+        # choose top-k by DR
+        order = np.argsort(dr[idx_all])[::-1]  # descending
+        idx = idx_all[order[:k]]
+
+    if idx.size < 2:
+        return {'score': 1.0, 'n_used': idx.size, 'mean_km': 0.0, 'median_km': 0.0, 'p90_km': 0.0, 'indices': idx.tolist()}
+
+    # Vectorized haversine (km)
+    R = 6371.0
+    phi = np.radians(lat[idx])
+    lam = np.radians(lon[idx])
+    # pairwise via broadcasting
+    dphi = phi[:, None] - phi[None, :]
+    dlam = lam[:, None] - lam[None, :]
+    a = np.sin(dphi / 2.0) ** 2 + np.cos(phi)[:, None] * np.cos(phi)[None, :] * np.sin(dlam / 2.0) ** 2
+    d = 2.0 * R * np.arcsin(np.minimum(1.0, np.sqrt(a)))  # (K,K) symmetric, zeros on diag
+
+    iu = np.triu_indices(idx.size, k=1)
+    pair = d[iu]
+    mean_km = float(np.nanmean(pair))
+    median_km = float(np.nanmedian(pair))
+    p90_km = float(np.nanpercentile(pair, 90))
+
+    score = 1.0 / (1.0 + max(eps_km, mean_km))
+
+    return {
+        'score': float(score),
+        'n_used': int(idx.size),
+        'mean_km': mean_km,
+        'median_km': median_km,
+        'p90_km': p90_km,
+        'indices': idx.tolist(),
+    }
+
+
+# run on each event
+import os
+from typing import Optional
+from obspy import Stream
+from flovopy.processing.sam import VSAM
+from flovopy.asl.ampcorr import AmpCorr, AmpCorrParams
+from flovopy.asl.station_corrections import apply_interval_station_gains
+
+def asl_sausage(
+    stream: Stream,
+    event_dir: str,
+    asl_config: dict,
+    output_dir: str,
+    dry_run: bool = False,
+    peakf_override: Optional[float] = None,
+    station_gains_df: Optional["pd.DataFrame"] = None,  # interval table; columns=seed_ids; rows define start_time/end_time
+    allow_station_fallback: bool = True,
+):
+    """
+    Run ASL on a single (already preprocessed) event stream.
+
+    Required in asl_config:
+      - gridobj : Grid
+      - node_distances_km : dict[seed_id -> np.ndarray]
+      - station_coords : dict[seed_id -> {latitude, longitude, ...}]
+      - ampcorr : AmpCorr
+      - vsam_metric, window_seconds, min_stations, interactive, Q, surfaceWaveSpeed_kms
+
+    Optional:
+      - station_gains_df : DataFrame with columns:
+            start_time, end_time, <seed_id_1>, <seed_id_2>, ...
+        We divide each trace by the gain matching the event time interval.
+    """
+    import numpy as np
+    import pandas as pd
+
+    print(f"[ASL] Preparing VSAM for event folder: {event_dir}")
+    os.makedirs(event_dir, exist_ok=True)
+
+    # --------------------------
+    # 1) Apply station gains (interval table)
+    # --------------------------
+    if station_gains_df is not None and len(station_gains_df):
+        try:
+            info = apply_interval_station_gains(
+                stream,
+                station_gains_df,
+                allow_station_fallback=allow_station_fallback,
+                verbose=True,
+            )
+            _ = info  # not used further; printed for transparency
+        except Exception as e:
+            print(f"[GAINS:WARN] Failed to apply interval gains: {e}")
+    else:
+        print("[GAINS] No station gains DataFrame provided; skipping.")
+
+    # Ensure velocity units for downstream plots
+    for tr in stream:
+        tr.stats["units"] = "m/s"
+
+    # --------------------------
+    # 2) Build VSAM
+    # --------------------------
+    vsamObj = VSAM(stream=stream, sampling_interval=1.0)
+    if len(vsamObj.dataframes) == 0:
+        raise IOError("[ASL:ERR] No dataframes in VSAM object")
+
+    if not dry_run:
+        print("[ASL:PLOT] Writing VSAM preview (VSAM.png)")
+        vsamObj.plot(equal_scale=False, outfile=os.path.join(event_dir, "VSAM.png"))
+
+    # --------------------------
+    # 3) Decide event peakf
+    # --------------------------
+    if peakf_override is None:
+        freqs = [df.attrs.get("peakf") for df in vsamObj.dataframes.values() if df.attrs.get("peakf") is not None]
+        if freqs:
+            peakf_event = int(round(sum(freqs) / len(freqs)))
+            print(f"[ASL] Event peak frequency inferred from VSAM: {peakf_event} Hz")
+        else:
+            peakf_event = int(round(asl_config["ampcorr"].params.peakf))
+            print(f"[ASL] Using global/default peak frequency from ampcorr: {peakf_event} Hz")
+    else:
+        peakf_event = int(round(peakf_override))
+        print(f"[ASL] Using peak frequency override: {peakf_event} Hz")
+
+    # --------------------------
+    # 4) Amplitude corrections cache (swap if peakf differs)
+    # --------------------------
+    ampcorr: AmpCorr = asl_config["ampcorr"]
+    if abs(float(ampcorr.params.peakf) - float(peakf_event)) > 1e-6:
+        print(f"[ASL] Switching amplitude corrections to peakf={peakf_event} Hz (from {ampcorr.params.peakf})")
+        params = ampcorr.params
+        new_params = AmpCorrParams(
+            surface_waves=params.surface_waves,
+            wave_speed_kms=params.wave_speed_kms,
+            Q=params.Q,
+            peakf=float(peakf_event),
+            grid_sig=params.grid_sig,
+            inv_sig=params.inv_sig,
+            dist_sig=params.dist_sig,
+            mask_sig=params.mask_sig,
+            code_version=params.code_version,
+        )
+        ampcorr = AmpCorr(new_params, cache_dir=ampcorr.cache_dir)
+        ampcorr.compute_or_load(asl_config["node_distances_km"])  # inventory not needed here
+        asl_config[f"ampcorr_peakf_{peakf_event}"] = ampcorr
+    else:
+        print(f"[ASL] Using existing amplitude corrections (peakf={ampcorr.params.peakf} Hz)")
+
+    # --------------------------
+    # 5) Build ASL object and inject geometry/corrections
+    # --------------------------
+    print("[ASL] Building ASL object…")
+    aslobj = ASL(
+        vsamObj,
+        asl_config["vsam_metric"],
+        asl_config["gridobj"],
+        asl_config["window_seconds"],
+    )
+    aslobj.node_distances_km   = asl_config["node_distances_km"]
+    aslobj.station_coordinates = asl_config["station_coords"]
+    aslobj.amplitude_corrections = ampcorr.corrections
+
+    # Params for provenance / filenames
+    aslobj.Q = ampcorr.params.Q
+    aslobj.peakf = ampcorr.params.peakf
+    aslobj.wavespeed_kms = ampcorr.params.wave_speed_kms
+    aslobj.surfaceWaves = ampcorr.params.surface_waves
+
+    # --------------------------
+    # 6) Locate
+    # --------------------------
+    print("[ASL] Locating source with fast_locate()…")
+    try:
+        aslobj.fast_locate()
+        print("[ASL] Location complete.")
+    except Exception:
+        print("[ASL:ERR] Location failed.")
+        raise
+
+    aslobj.print_event()
+
+    # --------------------------
+    # 7) Outputs
+    # --------------------------
+    if not dry_run:
+        qml_out = os.path.join(event_dir, f"event_Q{int(aslobj.Q)}_F{int(peakf_event)}.qml")
+        print(f"[ASL:OUT] Writing QuakeML: {qml_out}")
+        aslobj.save_event(outfile=qml_out)
+
+        try:
+            print("[ASL:PLOT] Writing map and diagnostic plots…")
+            aslobj.plot(
+                zoom_level=0,
+                threshold_DR=0.0,
+                scale=0.2,
+                join=True,
+                number=0,
+                add_labels=True,
+                stations=[tr.stats.station for tr in stream],
+                outfile=os.path.join(event_dir, f"map_Q{int(aslobj.Q)}_F{int(peakf_event)}.png"),
+            )
+            aslobj.source_to_csv(os.path.join(event_dir, f"source_Q{int(aslobj.Q)}_F{int(peakf_event)}.csv"))
+            aslobj.plot_reduced_displacement(
+                outfile=os.path.join(event_dir, f"reduced_disp_Q{int(aslobj.Q)}_F{int(peakf_event)}.png")
+            )
+            aslobj.plot_misfit(
+                outfile=os.path.join(event_dir, f"misfit_Q{int(aslobj.Q)}_F{int(peakf_event)}.png")
+            )
+            aslobj.plot_misfit_heatmap(
+                outfile=os.path.join(event_dir, f"misfit_heatmap_Q{int(aslobj.Q)}_F{int(peakf_event)}.png")
+            )
+        except Exception:
+            print("[ASL:ERR] Plotting failed.")
+            raise
+
+        if asl_config.get("interactive", False):
+            input("[ASL] Press Enter to continue to next event…")
+
+    return aslobj  # handy if the caller wants the object
