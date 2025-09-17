@@ -105,68 +105,162 @@ class StdOverMeanMisfit:
 # Alternative backend: linear fit vs distance → misfit = 1 - R^2
 # Requires per-station, per-node distances in aslobj.node_distances_km
 # ---------------------------------------------------------------------
+# flovopy/asl/misfit.py
+
+import numpy as np
+
 class R2DistanceMisfit:
     """
-    Misfit_j = 1 - R^2 of linear regression y = a + b * d_j across stations,
-    where d_j are station→node distances (km) at node j.
+    Correlation/R²-style backend between station amplitudes y and a
+    per-node regressor built from station→node distances.
+
+    cost_j = alpha * (1 - R2_j) + (1 - alpha) * (std/|mean|)_j
+
+    Options
+    -------
+    use_log : regress log|y| against log(distance)   (power-law proxy)
+    square  : if not use_log, regress y against 1/d  (body-wave proxy). If False, use d.
+    alpha   : 1.0 => pure R²; 0.0 => pure StdOverMean (blend in between).
     """
-    def prepare(self, aslobj, seed_ids: list[str], *, dtype=np.float32):
-        # Build distance matrix D (nsta, nnodes) from aslobj.node_distances_km
-        first_sid = seed_ids[0]
-        nnodes = len(aslobj.amplitude_corrections[first_sid])  # ensure same length as corrections
-        D = np.empty((len(seed_ids), nnodes), dtype=dtype)
+    def __init__(self, use_log: bool = True, square: bool = True, alpha: float = 0.5):
+        self.use_log = bool(use_log)
+        self.square = bool(square)
+        self.alpha = float(alpha)
+
+    def prepare(self, aslobj, seed_ids, dtype=np.float32):
+        # Corrections matrix C (nsta, nnodes)
+        C = np.empty((len(seed_ids), aslobj.gridobj.gridlat.size), dtype=dtype)
         for k, sid in enumerate(seed_ids):
-            dk = np.asarray(aslobj.node_distances_km[sid], dtype=dtype)
-            if dk.size != nnodes:
-                raise ValueError(f"Distance vector mismatch for {sid}: {dk.size} != {nnodes}")
-            D[k, :] = dk
-        return {"D": D}
+            C[k, :] = np.asarray(aslobj.amplitude_corrections[sid], dtype=dtype)
+
+        # Pre-stack distances as a matrix D (nsta, nnodes) for speed
+        # node_distances_km is {seed_id -> (nnodes,)}; order must match seed_ids
+        D = np.vstack([np.asarray(aslobj.node_distances_km[sid], dtype=float) for sid in seed_ids]).astype(dtype, copy=False)
+
+        # Standard backend for the blend term
+        from .misfit import StdOverMeanMisfit
+        std_backend = StdOverMeanMisfit()
+        std_ctx = std_backend.prepare(aslobj, seed_ids, dtype=dtype)
+
+        return {"C": C, "D": D, "seed_ids": tuple(seed_ids),
+                "std_backend": std_backend, "std_ctx": std_ctx}
+
+    @staticmethod
+    def _r2_from_zscores(yz: np.ndarray, xz: np.ndarray) -> float:
+        # R² via Pearson r^2 on z-scored variables
+        # (finite-safe; returns [0,1])
+        num = np.nansum(yz * xz)
+        den = np.sqrt(np.nansum(yz**2) * np.nansum(xz**2))
+        if den <= 0:
+            return 0.0
+        r = num / den
+        if not np.isfinite(r):
+            return 0.0
+        r2 = r * r
+        # guard tiny negative from rounding
+        return 0.0 if r2 < 0 else (1.0 if r2 > 1.0 else float(r2))
 
     def evaluate(self, y, ctx, *, min_stations=3, eps=1e-9):
-        D = ctx["D"]                       # (nsta, nnodes)
-        dtype = D.dtype
+        """
+        Parameters
+        ----------
+        y : (nsta,)
+        Returns
+        -------
+        misfit : (nnodes,) cost (lower is better)
+        extras : dict with keys:
+           'mean' : per-node mean reduced amplitude (for DR extraction)
+           'N'    : per-node usable station count
+        """
+        C = ctx["C"]                     # (nsta, nnodes)
+        D = ctx["D"]                     # (nsta, nnodes)
+        nsta, nnodes = C.shape
 
-        y_fin = np.isfinite(y)
-        N_total = int(y_fin.sum())
-        if N_total < min_stations:
-            return np.full(D.shape[1], np.inf, dtype=dtype), {"N": 0}
+        fin_y = np.isfinite(y)
+        if fin_y.sum() < min_stations:
+            return np.full(nnodes, np.inf, dtype=float), {"N": 0}
 
-        y0 = np.where(y_fin, y, 0.0).astype(dtype, copy=False)
-        D_fin = np.isfinite(D)             # should be all True; keep robust
+        # Optionally log the amplitudes (power-law flavor) — use |y| and clip
+        y_work = np.where(fin_y, y, 0.0).astype(float, copy=False)
+        if self.use_log:
+            y_work = np.log(np.clip(np.abs(y_work), 1e-12, None))
 
-        # Effective sample sizes per node (stations with finite y and finite D)
-        Nj = (y_fin.astype(np.int16) @ D_fin.astype(np.int16)).astype(np.float32)
-        valid = Nj >= min_stations
+        # z-score y over the finite stations
+        ym = np.nanmean(y_work[fin_y])
+        ys = np.nanstd(y_work[fin_y])
+        yz_all = (y_work - ym) / (ys if (np.isfinite(ys) and ys > 0) else 1.0)
 
-        X  = np.where(D_fin, D, 0.0)
-        X2 = X * X
-        Y  = y0[:, None]
+        # Optional blend with std/|mean|
+        std_misfit = None
+        if self.alpha < 1.0:
+            std_misfit, _extras_std = ctx["std_backend"].evaluate(
+                y, ctx["std_ctx"], min_stations=min_stations, eps=eps
+            )
+            std_misfit = np.where(np.isfinite(std_misfit), std_misfit, np.inf)
 
-        # Sufficient statistics
-        Sx  = (X  * y_fin[:, None]).sum(axis=0)    # Σx
-        Sx2 = (X2 * y_fin[:, None]).sum(axis=0)    # Σx^2
-        Sy  = (Y  * D_fin).sum(axis=0)             # Σy
-        Sy2 = ((y0**2)[:, None] * D_fin).sum(axis=0)  # Σy^2
-        Sxy = (X * Y).sum(axis=0)                  # Σxy
+        # R² for each node
+        r2 = np.empty(nnodes, dtype=float)
+        N_used = np.zeros(nnodes, dtype=int)
 
-        N   = Nj
-        denom = (N * Sx2 - Sx*Sx)
-        b = np.divide(N * Sxy - Sx * Sy, denom, out=np.zeros_like(denom), where=(denom != 0))
-        a = (Sy - b * Sx) / np.maximum(N, 1.0)
+        # Precompute correction finite mask once
+        Cfin = np.isfinite(C)
 
-        # R^2 = 1 - SSE/SST
-        SSE = (Sy2
-               - 2*a*Sy - 2*b*Sxy
-               + (a*a)*N + 2*a*b*Sx + (b*b)*Sx2)
-        SST = Sy2 - (Sy*Sy) / np.maximum(N, 1.0)
+        # Build x feature per node from distances:
+        # - if use_log: x = log(d)
+        # - elif square: x = 1/d
+        # - else: x = d
+        # Then z-score per node using its valid-station subset.
+        for j in range(nnodes):
+            mask = fin_y & Cfin[:, j]
+            nuse = int(mask.sum())
+            N_used[j] = nuse
+            if nuse < min_stations:
+                r2[j] = 0.0
+                continue
 
-        with np.errstate(invalid="ignore", divide="ignore"):
-            R2 = 1.0 - np.divide(SSE, SST, out=np.zeros_like(SSE), where=(SST > 0))
+            dj = D[:, j].astype(float, copy=False)
+            if self.use_log:
+                x = np.log(np.clip(dj, 1e-6, None))
+            else:
+                x = 1.0 / np.clip(dj, 1e-6, None) if self.square else dj
 
-        misfit = 1.0 - R2
-        misfit[~valid] = np.inf
-        return misfit.astype(dtype), {"a": a, "b": b, "N": N, "R2": R2}
+            x = x[mask]
+            yz = yz_all[mask]
 
+            # z-score x on the masked subset
+            xm = np.nanmean(x)
+            xs = np.nanstd(x)
+            if not np.isfinite(xs) or xs <= 0:
+                r2[j] = 0.0
+                continue
+            xz = (x - xm) / xs
+
+            r2[j] = self._r2_from_zscores(yz, xz)
+
+        # Cost to minimize: 1 - R²
+        r2_cost = 1.0 - r2
+
+        # Blend with std/|mean| if requested
+        if self.alpha >= 1.0 or std_misfit is None:
+            misfit_out = r2_cost
+        elif self.alpha <= 0.0:
+            misfit_out = std_misfit
+        else:
+            misfit_out = self.alpha * r2_cost + (1.0 - self.alpha) * std_misfit
+
+        # Enforce min-station rule and finite guard
+        valid_nodes = N_used >= min_stations
+        misfit_out = np.where(valid_nodes, misfit_out, np.inf)
+        misfit_out = np.where(np.isfinite(misfit_out), misfit_out, np.inf)
+
+        # Extras: per-node mean of reduced amplitudes R = y * C[:, j]
+        Rmask = Cfin
+        y0 = np.where(fin_y, y, 0.0)
+        num = (y0[:, None] * np.where(Rmask, C, 0.0)).sum(axis=0)
+        den = (fin_y[:, None] & Rmask).sum(axis=0)  # integer counts per node
+        mean = np.divide(num, den, out=np.full_like(num, np.nan, dtype=float), where=den > 0)
+
+        return misfit_out, {"mean": mean, "N": N_used.astype(float)}
 
 # ---------------------------------------------------------------------
 # Single-time, full per-node misfit (no nsta×nnodes temporaries)

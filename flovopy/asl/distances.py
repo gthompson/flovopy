@@ -114,3 +114,6 @@ def compute_or_load_distances(
 
     meta = bundle["meta"] | {"from_cache": False, "cache_path": path}
     return distances, coords, meta
+
+def distances_signature(node_distances_km: Dict[str, np.ndarray]) -> tuple:
+    return tuple(sorted((sid, int(np.asarray(d).size)) for sid, d in node_distances_km.items()))

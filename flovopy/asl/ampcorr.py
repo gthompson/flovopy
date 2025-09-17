@@ -9,6 +9,7 @@ import numpy as np
 from obspy.core.inventory import Inventory
 from flovopy.processing.sam import VSAM
 from flovopy.utils.make_hash import make_hash
+#from flovopy.asl.distances import distances_signature
 
 
 # ----------------------------------------------------------------------
@@ -224,6 +225,7 @@ class AmpCorr:
 # ----------------------------------------------------------------------
 # Signature helpers (keep colocated for convenience)
 # ----------------------------------------------------------------------
+'''
 def grid_signature(grid) -> tuple:
     return (
         getattr(grid, "nlat", grid.gridlat.shape[0]),
@@ -234,12 +236,10 @@ def grid_signature(grid) -> tuple:
         float(np.nanmax(grid.gridlon)),
         float(getattr(grid, "node_spacing_m", 0.0)),
     )
-
+'''
 def inv_signature(inventory: Inventory) -> tuple:
     return tuple(sorted(
         f"{net.code}.{sta.code}.{cha.location_code}.{cha.code}"
         for net in inventory for sta in net for cha in sta
     ))
 
-def distances_signature(node_distances_km: Dict[str, np.ndarray]) -> tuple:
-    return tuple(sorted((sid, int(np.asarray(d).size)) for sid, d in node_distances_km.items()))

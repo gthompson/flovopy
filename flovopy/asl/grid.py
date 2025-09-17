@@ -11,22 +11,8 @@ import numpy as np
 from obspy.core.inventory import Inventory
 from obspy import Stream
 
-# --------------------------------------------------------------------
-# Optional helpers expected elsewhere in your project
-# --------------------------------------------------------------------
-try:
-    from .utils.hashing import make_hash   # your canonical hasher
-except Exception:
-    import hashlib
-    def make_hash(*args) -> str:
-        s = "|".join(map(str, args))
-        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:10]
-
-try:
-    from .defaults import dome_location
-except Exception:
-    dome_location = {"lat": 16.72, "lon": -62.18}  # sensible fallback
-
+from flovopy.utils.make_hash import make_hash   
+from flovopy.core.mvo import dome_location
 
 # ------------------------------
 # Compact grid signature (for IDs)

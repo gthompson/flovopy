@@ -7,7 +7,7 @@ from obspy import UTCDateTime, Inventory
 from obspy.geodetics import locations2degrees, degrees2kilometers
 from flovopy.processing.sam import VSAM, DSAM
 from flovopy.stationmetadata.utils import inventory2traceid
-from .map import topo_map
+from flovopy.asl.map import topo_map
 
 def synthetic_source_from_grid(grid, sampling_interval: float = 60.0, DR_cm2: float = 100.0, t0: UTCDateTime | None = None, order: str = "C"):
     if t0 is None:
