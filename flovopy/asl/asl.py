@@ -368,6 +368,7 @@ class ASL:
             print("[ASL] locate (slow): done.")
 
 
+
     def fast_locate(
         self,
         *,
@@ -376,8 +377,8 @@ class ASL:
         eps: float = 1e-9,
         use_median_for_DR: bool = False,
         batch_size: int = 1024,
-        spatial_smooth_sigma: float = 0.0,   # NEW: Gaussian sigma (in node units)
-        temporal_smooth_win: int = 0,        # NEW: centered window (odd int); 0 disables
+        spatial_smooth_sigma: float = 0.0,   # Gaussian sigma in node units (0 disables)
+        temporal_smooth_win: int = 0,        # centered odd window length (0 disables)
         verbose: bool = True,
     ):
         if misfit_backend is None:
@@ -394,14 +395,15 @@ class ASL:
         t = st[0].times("utcdatetime")
         nsta, ntime = Y.shape
 
-        # Backend context
+        # Backend context (honors self._node_mask if present)
         ctx = misfit_backend.prepare(self, seed_ids, dtype=np.float32)
 
-        # Station coords (azgap)
+        # Station coords (for azgap)
         station_coords = []
         for sid in seed_ids:
             c = self.station_coordinates.get(sid)
-            if c: station_coords.append((c["latitude"], c["longitude"]))
+            if c:
+                station_coords.append((c["latitude"], c["longitude"]))
 
         # Outputs
         source_DR     = np.empty(ntime, dtype=float)
@@ -410,18 +412,20 @@ class ASL:
         source_misfit = np.empty(ntime, dtype=float)
         source_azgap  = np.empty(ntime, dtype=float)
         source_nsta   = np.empty(ntime, dtype=int)
+        source_node   = np.empty(ntime, dtype=int)
 
-        # NEW: can we reshape misfit to (nlat,nlon) for spatial blur?
+        # Spatial blur feasibility
         grid_shape = _grid_shape_or_none(self.gridobj)
         can_blur = (
             spatial_smooth_sigma and spatial_smooth_sigma > 0.0 and
             (grid_shape is not None) and (gaussian_filter is not None)
         )
+
         if verbose:
             print(f"[ASL] fast_locate: nsta={nsta}, ntime={ntime}, batch={batch_size}, "
                 f"spatial_blur={'on' if can_blur else 'off'}, "
                 f"temporal_smooth_win={temporal_smooth_win or 0}")
-        chosen = np.full(ntime, -1, dtype=int)
+
         for i0 in range(0, ntime, batch_size):
             i1 = min(i0 + batch_size, ntime)
             if verbose: print(f"[ASL] fast_locate: [{i0}:{i1})")
@@ -431,26 +435,58 @@ class ASL:
                 y = Yb[:, k]
                 misfit, extras = misfit_backend.evaluate(y, ctx, min_stations=min_stations, eps=eps)
 
-                # NEW: optional spatial smoothing of per-time misfit
+                # Optional per-time spatial smoothing (requires full-grid shape)
                 if can_blur:
                     nlat, nlon = grid_shape
-                    m2 = misfit.reshape(nlat, nlon)
-                    m2 = gaussian_filter(m2, sigma=spatial_smooth_sigma, mode="nearest")
-                    misfit = m2.reshape(-1)
+                    try:
+                        m2 = misfit.reshape(nlat, nlon)
 
-                jstar = int(np.nanargmin(misfit))
+                        # Build validity mask: finite = True
+                        valid = np.isfinite(m2)
 
-                # DR: from backend if available
+                        if valid.any():
+                            # Replace invalid with a very large finite number so the minimum
+                            # never migrates into previously invalid nodes.
+                            LARGE = np.nanmax(m2[valid]) if np.isfinite(m2[valid]).any() else 1.0
+                            LARGE = float(LARGE) if np.isfinite(LARGE) else 1.0
+                            F = np.where(valid, m2, LARGE)
+
+                            # Blur the *finite* costs and the mask separately, then renormalize
+                            W = gaussian_filter(valid.astype(float), sigma=spatial_smooth_sigma, mode="nearest")
+                            G = gaussian_filter(F,                sigma=spatial_smooth_sigma, mode="nearest")
+
+                            # Avoid division by ~0: where W is tiny (all-invalid neighborhood), keep LARGE
+                            with np.errstate(invalid="ignore", divide="ignore"):
+                                Mblur = np.where(W > 1e-6, G / np.maximum(W, 1e-6), LARGE)
+
+                            # Re-impose invalid cells as LARGE so they can’t be selected
+                            Mblur = np.where(valid, Mblur, LARGE)
+                            misfit = Mblur.reshape(-1)
+                        else:
+                            # everything invalid – leave as is
+                            pass
+                    except Exception:
+                        # silently fall back if sub-grid shape doesn't match full grid
+                        pass
+
+                jstar_local = int(np.nanargmin(misfit))
+                # Map local index to global grid index if backend subsetted the grid
+                jstar_global = jstar_local
+                node_index = ctx.get("node_index", None)
+                if node_index is not None:
+                    jstar_global = int(node_index[jstar_local])
+
+                # DR from backend if available (vector)
                 DR_t = extras.get("mean", None)
                 if DR_t is None:
                     DR_t = extras.get("DR", None)
                 if DR_t is not None and np.ndim(DR_t) == 1:
-                    DR_t = DR_t[jstar]
+                    DR_t = DR_t[jstar_local]
                 else:
-                    # fallback compute using corrections for jstar (median optional)
+                    # fallback: compute reduced amplitudes at jstar using C if provided
                     C = ctx.get("C", None)
-                    if C is not None:
-                        rbest = y * C[:, jstar]
+                    if C is not None and C.shape[0] == y.shape[0]:
+                        rbest = y * C[:, jstar_local]
                         rbest = rbest[np.isfinite(rbest)]
                         if rbest.size:
                             DR_t = np.median(rbest) if use_median_for_DR else np.mean(rbest)
@@ -460,25 +496,53 @@ class ASL:
                         DR_t = np.nan
 
                 i = i0 + k
-                chosen[i] = jstar
                 source_DR[i]     = DR_t
-                source_lat[i]    = gridlat[jstar]
-                source_lon[i]    = gridlon[jstar]
-                source_misfit[i] = float(misfit[jstar])
+                source_lat[i]    = gridlat[jstar_global]
+                source_lon[i]    = gridlon[jstar_global]
+                source_misfit[i] = float(misfit[jstar_local])
+                source_node[i]   = jstar_global
 
-                # station count used at jstar if backend reports vector N
+                # Station count at best node (if backend reported N as vector)
                 N = extras.get("N", None)
-                source_nsta[i] = int(N if np.isscalar(N) else (N[jstar] if N is not None else np.sum(np.isfinite(y))))
+                source_nsta[i] = int(N if np.isscalar(N) else (N[jstar_local] if N is not None else np.sum(np.isfinite(y))))
 
                 azgap, _ = compute_azimuthal_gap(source_lat[i], source_lon[i], station_coords)
                 source_azgap[i] = azgap
 
-        # NEW: optional temporal smoothing of tracks
+        # Optional temporal smoothing (centered moving average)
         if temporal_smooth_win and temporal_smooth_win >= 3 and temporal_smooth_win % 2 == 1:
-            source_lat = _movavg_1d(source_lat, temporal_smooth_win)
-            source_lon = _movavg_1d(source_lon, temporal_smooth_win)
-            source_DR  = _movavg_1d(source_DR,  temporal_smooth_win)
+            # Smooth the chosen node path, not the coordinates directly
+            sm_node = _median_filter_indices(source_node, temporal_smooth_win)
 
+            # Optionally guard gigantic jumps: if the smoothed node differs
+            # by > JUMP_KM from the raw node, keep the raw pick for that time.
+            # (Tune or remove if not needed.)
+            try:
+                from obspy.geodetics.base import gps2dist_azimuth
+                def _km(j1, j2):
+                    return 0.001 * gps2dist_azimuth(
+                        float(self.gridobj.gridlat.ravel()[j1]),
+                        float(self.gridobj.gridlon.ravel()[j1]),
+                        float(self.gridobj.gridlat.ravel()[j2]),
+                        float(self.gridobj.gridlon.ravel()[j2]),
+                    )[0]
+                JUMP_KM = 5.0
+                for i in range(len(sm_node)):
+                    if _km(source_node[i], sm_node[i]) > JUMP_KM:
+                        sm_node[i] = source_node[i]
+            except Exception:
+                pass  # if geodetics isn’t around, skip jump guard
+
+            # Re-derive coordinates & (optionally) DR at smoothed nodes
+            flat_lat = self.gridobj.gridlat.ravel()
+            flat_lon = self.gridobj.gridlon.ravel()
+            source_lat = flat_lat[sm_node].astype(float, copy=False)
+            source_lon = flat_lon[sm_node].astype(float, copy=False)
+
+            # If you want DR smoothed in time, keep your moving average for DR only:
+            source_DR = _movavg_1d(source_DR, temporal_smooth_win)
+
+        # Save source
         self.source = {
             "t": t,
             "lat": source_lat,
@@ -487,10 +551,10 @@ class ASL:
             "misfit": source_misfit,
             "azgap": source_azgap,
             "nsta": source_nsta,
-            "node_index": chosen,
+            "node_index": source_node,
         }
 
-        # Connectedness (unchanged)
+        # Connectedness metric
         conn = compute_spatial_connectedness(
             source_lat, source_lon, dr=source_DR,
             top_frac=0.15, min_points=12, max_points=200,
@@ -1195,7 +1259,84 @@ class ASL:
             temporal_smooth_win=temporal_smooth_win,
         )
         return self    
-    
+
+    def refine_and_relocate(
+        self,
+        *,
+        top_frac: float = 0.20,
+        margin_km: float = 1.0,
+        misfit_backend=None,
+        spatial_smooth_sigma: float | None = None,
+        temporal_smooth_win: int | None = None,
+        min_stations: int | None = None,
+        eps: float | None = None,
+        use_median_for_DR: bool | None = None,
+        batch_size: int | None = None,
+        verbose: bool = True,
+    ):
+        """
+        Subset the current grid to a tight box around the top-DR samples, then
+        call fast_locate() again. No recomputation of corrections is needed.
+
+        Accepts the same smoothing/locate kwargs as fast_locate() and forwards them.
+        """
+        if self.source is None:
+            raise RuntimeError("No source yet. Run fast_locate() first.")
+
+        lat = np.asarray(self.source["lat"], float)
+        lon = np.asarray(self.source["lon"], float)
+        dr  = np.asarray(self.source["DR"],  float)
+
+        mask_fin = np.isfinite(lat) & np.isfinite(lon) & np.isfinite(dr)
+        if mask_fin.sum() == 0:
+            if verbose: print("[ASL] refine_and_relocate: no finite samples; skipping")
+            return
+
+        # choose top-fraction by DR
+        idx_all = np.flatnonzero(mask_fin)
+        k = max(1, int(np.ceil(top_frac * idx_all.size)))
+        order = np.argsort(dr[idx_all])[::-1]
+        idx_top = idx_all[order[:k]]
+
+        # bounding box with margin (km → deg)
+        lat_top = lat[idx_top]; lon_top = lon[idx_top]
+        lat0 = float(np.nanmedian(lat_top))
+        dlat = margin_km / 111.0
+        dlon = margin_km / (111.0 * max(0.1, np.cos(np.deg2rad(lat0))))
+        lat_min, lat_max = np.nanmin(lat_top) - dlat, np.nanmax(lat_top) + dlat
+        lon_min, lon_max = np.nanmin(lon_top) - dlon, np.nanmax(lon_top) + dlon
+
+        # build node mask in *global* coordinates
+        g_lat = self.gridobj.gridlat.reshape(-1)
+        g_lon = self.gridobj.gridlon.reshape(-1)
+        node_mask = (g_lat >= lat_min) & (g_lat <= lat_max) & (g_lon >= lon_min) & (g_lon <= lon_max)
+        sub_idx = np.flatnonzero(node_mask)
+        if sub_idx.size == 0:
+            if verbose:
+                print("[ASL] refine_and_relocate: sub-grid empty; keeping full grid")
+            self._node_mask = None
+        else:
+            if verbose:
+                print(f"[ASL] refine_and_relocate: restricting to {sub_idx.size} nodes "
+                    f"(~{100*sub_idx.size/g_lat.size:.1f}% of grid)")
+            self._node_mask = sub_idx  # <-- consumed by misfit backends
+
+        # Forward selected kwargs to fast_locate()
+        kwargs = {}
+        if misfit_backend is not None:     kwargs["misfit_backend"] = misfit_backend
+        if spatial_smooth_sigma is not None: kwargs["spatial_smooth_sigma"] = spatial_smooth_sigma
+        if temporal_smooth_win is not None:  kwargs["temporal_smooth_win"]  = temporal_smooth_win
+        if min_stations is not None:       kwargs["min_stations"] = min_stations
+        if eps is not None:                kwargs["eps"] = eps
+        if use_median_for_DR is not None:  kwargs["use_median_for_DR"] = use_median_for_DR
+        if batch_size is not None:         kwargs["batch_size"] = batch_size
+
+        try:
+            self.fast_locate(verbose=verbose, **kwargs)
+        finally:
+            # always clear the mask so future calls run on full grid unless refined again
+            self._node_mask = None
+ 
 # ---------- helpers ----------
 def compute_azimuthal_gap(origin_lat: float, origin_lon: float,
                           station_coords: Iterable[Tuple[float, float]]) -> tuple[float, int]:
@@ -1593,3 +1734,19 @@ def _grid_shape_or_none(gridobj):
     if nlat and nlon and nlat * nlon == glat.size:
         return int(nlat), int(nlon)
     return None
+
+def _median_filter_indices(idx: np.ndarray, win: int) -> np.ndarray:
+    """Centered odd-window median filter on integer indices with 'edge' padding."""
+    if win < 3 or win % 2 == 0:
+        return idx
+    n = idx.size
+    r = win // 2
+    out = idx.copy()
+    # reflect-pad
+    pad_left  = idx[1:r+1][::-1] if n > 1 else idx[:1]
+    pad_right = idx[-r-1:-1][::-1] if n > 1 else idx[-1:]
+    padded = np.concatenate([pad_left, idx, pad_right])
+    for i in range(n):
+        w = padded[i:i+win]
+        out[i] = int(np.median(w))
+    return out

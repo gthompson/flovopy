@@ -13,28 +13,29 @@ To install FLOVOpy in **editable mode** using a Conda environment:
 git clone https://github.com/gthompson/flovopy.git
 cd flovopy
 
-# 2. Create and activate a Conda environment
-conda create -n flovopy-env python=3.10
-conda activate flovopy-env
-
-# Or from YML
+# 2. Create the conda environment from YML. 
+# The flovopy_plus environment contains more packages than we need, but these are generally useful for seismology
 conda env create --name flovopy_plus --file flovopy_plus.yml
+conda activate flovopy_plus
 
-# 3. Install dependencies and the package in editable mode
+# 3. Install dependencies and the package in editable mode (make sure you are still in the flovopy top directory)
 pip install -e .
+
+# 4. Optionally add this to your .bashrc or .zshrc file:
+conda activate flovopy_plus
 ```
 
-Alternate step 2: Install FLOVOpy from a YML file - this adds some other useful tools too:
-conda env create --name flovopy --file flovopy_plus.yml
-pip install -e .
+Other packages to consider installing, e.g. for DEMs:
 
-Optionally add this to your .bashrc or .zshrc file:
-conda activate flovopy
+```
+conda install rasterio
+conda install whitebox
+```
 ---
 
 ## 🚀 Available CLI Tools
 
-The following command-line tools are installed with the package:
+(THIS SECTION NEEDS UPDATTING) The following command-line tools are installed with the package:
 
 | Command            | Description                                                                 |
 |--------------------|-----------------------------------------------------------------------------|
@@ -50,6 +51,8 @@ Run any tool with `--help` for full usage.
 ---
 
 ## 🧰 Example Usage
+
+(THIS SECTION NEEDS UPDATING)
 
 ### `run-iceweb`
 
@@ -85,6 +88,8 @@ run-asl \
 
 ## 📂 Project Structure
 
+(SECTION NEEDS UPDATING)
+
 ```text
 flovopy/
 ├── analysis/             # Amplitude-based source location (ASL)
@@ -114,6 +119,8 @@ flovopy/
 
 ## 📖 Documentation
 
+(SECTION NEEDS UPDATING)
+
 Full documentation (under construction) is being developed using Sphinx and will include:
 - API reference
 - Tutorials for real-time observatory pipelines
@@ -130,5 +137,5 @@ FLOVOpy is released under the MIT License.
 
 ## 🤝 Acknowledgments
 
-FLOVOpy is developed at the University of South Florida as part of the Florida Virtual Volcano Observatory (FLO-VO) initiative, with contributions from volcano seismologists, geophysicists, and observatory partners across the Caribbean and the Americas.
+FLOVOpy is developed by Glenn Thompson at the University of South Florida as part of the Florida Virtual Volcano Observatory (FLO-VO) initiative, based on operational codes formerly developed at the Montserrat Volcano Observatory, Alaska Volcano Observatory, Alaska Earthquake Center, and the University of Alaska Fairbanks Geophysical Institute. 
 
