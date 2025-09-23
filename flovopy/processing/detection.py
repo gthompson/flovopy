@@ -25,15 +25,15 @@ from obspy.signal.trigger import (
 )
 
 # Custom or local functions assumed from other modules
-from flovopy.processing.metrics import (
-    estimate_snr,
+from flovopy.core.trace_qc import estimate_snr
+from flovopy.core.spectra import  (
     compute_amplitude_ratios,
     plot_amplitude_ratios,
+    get_bandwidth,
 )
 
 from flovopy.core.remove_response import pad_trace
 
-from flovopy.core.enhanced import get_bandwidth
 
 
 # for picker - everything else is for detection

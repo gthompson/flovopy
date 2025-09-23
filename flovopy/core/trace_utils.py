@@ -1402,3 +1402,39 @@ def add_processing_step(tr: Trace, msg: str) -> None:
 def station_ids_from_stream(st: Stream) -> tuple[str, ...]:
     """Return sorted, unique seed IDs from a Stream."""
     return tuple(sorted({tr.id for tr in st}))
+
+#####  Helper functions for machine learning workflow #####
+def choose_best_traces(st, MAX_TRACES=8, include_seismic=True, include_infrasound=False, include_uncorrected=False):
+
+    priority = np.array([float(tr.stats.quality_factor) for tr in st])      
+    for i, tr in enumerate(st):           
+        if tr.stats.channel[1]=='H':
+            if include_seismic:
+                if tr.stats.channel[2] == 'Z':
+                    priority[i] *= 2
+            else:
+                priority[i] = 0
+        if tr.stats.channel[1]=='D':
+            if include_infrasound:
+                priority[i] *= 2 
+            else:
+                priority[i] = 0
+        if not include_uncorrected:
+            if 'units' in tr.stats:
+                if tr.stats.units == 'Counts':
+                    priority[i] = 0
+            else:
+                priority[i] = 0
+
+    n = np.count_nonzero(priority > 0.0)
+    n = min([n, MAX_TRACES])
+    j = np.argsort(priority)
+    chosen = j[-n:]  
+    return chosen        
+        
+def select_by_index_list(st, chosen):
+    st2 = Stream()
+    for i, tr in enumerate(st):
+        if i in chosen:
+            st2.append(tr)
+    return st2 

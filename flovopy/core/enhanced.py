@@ -6,7 +6,7 @@ import pandas as pd
 from math import pi
 
 from scipy.signal import savgol_filter
-from scipy.stats import describe
+from scipy.stats import skew, kurtosis #. describe
 from collections import defaultdict
 
 import matplotlib.pyplot as plt
@@ -20,8 +20,8 @@ from obspy.core.event import (
 from obspy.core.util.attribdict import AttribDict
 from obspy.geodetics.base import gps2dist_azimuth
 
-from flovopy.processing.metrics import compute_amplitude_spectra, estimate_snr #, compute_stationEnergy
-#from flovopy.seisanio.core.ampengfft import compute_ampengfft_stream, write_aef_file
+from obsolete.core.trace_qc import estimate_snr
+from obsolete.core.spectra import compute_amplitude_spectra
 
 
 class EnhancedStream(Stream):
@@ -45,127 +45,178 @@ class EnhancedStream(Stream):
         write_aef_file(self, filepath, trigger_window=trigger_window, average_window=average_window)
 
 
-    def ampengfft(self, threshold=0.707, window_length=9, polyorder=2, differentiate=False):
+    def ampengfft(
+        self,
+        *,
+        # time-domain stays on by default (cheap)
+        differentiate: bool = False,          # True: input disp -> vel for energy/PGM
+        compute_spectral: bool = False,       # False = skip all FFT-based metrics
+        compute_ssam: bool = False,           # depends on spectral
+        compute_bandratios: bool = False,     # depends on spectral
+        # spectral params
+        threshold: float = 0.707,
+        window_length: int = 9,
+        polyorder: int = 2,
+    ) -> None:
         """
-        Compute amplitude, energy, and frequency metrics for all traces in a stream.
-        Note that we generally will want stream to be a displacement seismogram, and 
-        then compute amplitude on this, and differentiate to compute energy. This is because
-        we usually want to estimate a magnitude based on a displacement amplitude, but we 
-        compute energy magnitude based on a velocity seismogram.
-        However, this function by default will also then use displacement seismograms for
-        all the frequency metrics, which effectively divides by frequency. If this is not
-        the behaviour wanted, pass a velocity seismogram and pass differentiate=False.
+        Compute metrics per trace. Time-domain metrics are always computed.
+        Spectral metrics are optional (compute_spectral=False by default).
 
-        For each trace:
-        - Computes FFT and amplitude spectrum.
-        - Stores frequency and amplitude in trace.stats.spectral.
-        - Computes bandwidth metrics using get_bandwidth().
-        - Computes SSAM band-averaged amplitudes.
-        - Computes dominant and mean frequency.
-        - Computes band ratio metrics.
-        - Computes amplitude, energy, and scipy.stats metrics.
-        - Stores all results in trace.stats.metrics
-
-        Parameters
-        ----------
-        threshold : float, optional
-            Fraction of peak amplitude to define bandwidth cutoff (default is 0.707 for -3 dB).
-        window_length : int, optional
-            Length of Savitzky-Golay smoothing window (must be odd).
-        polyorder : int, optional
-            Polynomial order for smoothing filter.
-        differentiate: bool, optional
-            If stream contains displacement traces, then we want to differentiate to a velocity traces to compute energy
-
-        Returns
-        -------
-        Modifies self.stream in place.
+        differentiate:
+        If True, treat input as DISPLACEMENT, derive VEL (and ACC) for energy/PGM.
+        If False, treat input as already VEL, derive DISP (and ACC).
         """
-            
-        if len(self)==0:
+        if len(self) == 0:
             return
-        
-        '''
-        if not 'detrended' in self[0].stats.history: # change this to use better detrend from libseis?
-            for tr in self:
-                tr.detrend(type='linear')
-                add_to_trace_history(tr, 'detrended')    
-        '''
-        if not hasattr(self[0].stats, 'spectral'):
-            compute_amplitude_spectra(self)
 
         for tr in self:
-            dt = tr.stats.delta
-            N = len(tr.data)
-            fft_vals = np.fft.fft(tr.data)
-            freqs = np.fft.fftfreq(N, d=dt)
-            amps = np.abs(fft_vals)
-
-            pos_freqs = freqs[:N//2]
-            pos_amps = amps[:N//2]
-
-            if not hasattr(tr.stats, 'spectral'):
-                tr.stats.spectral = {}
-            tr.stats.spectral['freqs'] = pos_freqs
-            tr.stats.spectral['amplitudes'] = pos_amps
-
-            if not hasattr(tr.stats, 'metrics'):
+            # Ensure containers
+            if not hasattr(tr.stats, "metrics") or tr.stats.metrics is None:
                 tr.stats.metrics = {}
 
-            # Amplitude and energy metrics
-            y = np.abs(tr.data)
-            tr.stats.metrics['peakamp'] = np.max(y)
-            tr.stats.metrics['peaktime'] = tr.stats.starttime + np.argmax(y) / tr.stats.sampling_rate
+            # Choose working series (float64 for stability)
+            dt = float(tr.stats.delta)
+            y0 = np.asarray(tr.data, dtype=np.float64)
+
+            tr.detrend("linear").taper(0.01)
+
             if differentiate:
-                y = np.diff(y)
-            tr.stats.metrics['energy'] = np.sum(y**2) / tr.stats.sampling_rate
+                # input assumed DIS -> VEL,ACC
+                disp = tr.copy()
+                vel  = tr.copy().differentiate()
+                acc  = vel.copy().differentiate()
+            else:
+                # input assumed VEL -> DISP,ACC
+                vel  = tr
+                disp = tr.copy().integrate()
+                acc  = tr.copy().differentiate()
 
-            # Magnitude - should be a separate after function
-            # we need to convert tr.stats.metrics['energy'] to a source energy, Eseismic
-            # based on source and station location, and an attenuation/decay model
-            #tr.stats.metrics['Me'] = Eseismic2magnitude(Eseismic, correction=3.7)
+            y = np.asarray(vel.data, dtype=np.float64)
 
-            # Bandwidth
+            # ---------- TIME-DOMAIN METRICS (cheap) ----------
+            m = tr.stats.metrics
+            if y.size:
+                m["sample_min"]     = float(np.nanmin(y))
+                m["sample_max"]     = float(np.nanmax(y))
+                m["sample_mean"]    = float(np.nanmean(y))
+                m["sample_median"]  = float(np.nanmedian(y))
+                m["sample_rms"]     = float(np.sqrt(np.nanmean(y * y)))
+                m["sample_stdev"]   = float(np.nanstd(y))
+                from scipy.stats import skew, kurtosis
+                m["skewness"]       = float(skew(y, nan_policy="omit"))
+                m["kurtosis"]       = float(kurtosis(y, nan_policy="omit"))
+            else:
+                for k in ("sample_min","sample_max","sample_mean","sample_median",
+                        "sample_rms","sample_stdev","skewness","kurtosis"):
+                    m[k] = np.nan
+
+            # Peak amplitude/time on |VEL| (consistent with typical PGM use)
+            absy = np.abs(y)
+            if absy.size:
+                m["peakamp"] = float(np.nanmax(absy))
+                m["peaktime"] = tr.stats.starttime + (int(np.nanargmax(absy)) * dt)
+            else:
+                m["peakamp"] = np.nan
+                m["peaktime"] = None
+
+            # Energy on working series (VEL unless you changed via differentiate)
+            m["energy"] = float(np.nansum(y * y) * dt) if y.size else np.nan
+
+            # PGD / PGV / PGA
             try:
-                get_bandwidth(pos_freqs, pos_amps,
-                            threshold=threshold,
-                            window_length=window_length,
-                            polyorder=polyorder,
-                            trace=tr)
+                m["pgv"] = float(np.nanmax(np.abs(vel.data))) if vel.stats.npts else np.nan
+                m["pgd"] = float(np.nanmax(np.abs(disp.data))) if disp.stats.npts else np.nan
+                m["pga"] = float(np.nanmax(np.abs(acc.data))) if acc.stats.npts else np.nan
+            except Exception:
+                m.setdefault("pgv", np.nan)
+                m.setdefault("pgd", np.nan)
+                m.setdefault("pga", np.nan)
+
+            # Dominant frequency (time-domain ratio)
+            try:
+                num = np.abs(vel.data).astype(np.float64)
+                den = 2.0 * np.pi * np.abs(disp.data).astype(np.float64) + 1e-20
+                fdom_series = num / den
+                m["fdom"] = float(np.nanmedian(fdom_series)) if fdom_series.size else np.nan
+            except Exception:
+                m["fdom"] = np.nan
+
+            # (Optional) You can add RSAM/bandratio *without* FFT using time-domain filters
+            # if you want cheap band features here.
+
+            # ---------- SPECTRAL METRICS (optional; more expensive) ----------
+            if not compute_spectral:
+                # Cheap band features (no FFT):
+                # choose your default bands & statistic once
+                _band_pairs = [ (0.5, 2.0, 2.0, 8.0),  # LF vs HF
+                                (1.0, 3.0, 3.0, 12.0) ]  # alt split; optional
+
+                for (l1, l2, h1, h2) in _band_pairs[:1]:  # [:1] keeps just the first pair for speed
+                    br = _td_band_ratio(tr, low=(l1,l2), high=(h1,h2), stat="mean_abs", log2=True)
+                    # Persist RSAM scalars so they’re directly usable downstream
+                    tr.stats.metrics[f"rsam_{l1}_{l2}"] = br["RSAM_low"]
+                    tr.stats.metrics[f"rsam_{h1}_{h2}"] = br["RSAM_high"]
+                    tr.stats.metrics[ br["ratio_key"] ] = br["ratio"]
+                continue
+
+            # Use rFFT (one-sided) for efficiency
+            from numpy.fft import rfft, rfftfreq
+
+            N = tr.stats.npts
+            if N < 2:
+                continue
+
+            Y = np.abs(rfft(y0))  # choose raw series or vel; y0 is raw input
+            F = rfftfreq(N, d=dt)
+
+            if not hasattr(tr.stats, "spectral") or tr.stats.spectral is None:
+                tr.stats.spectral = {}
+            tr.stats.spectral["freqs"] = F
+            tr.stats.spectral["amplitudes"] = Y
+
+            # Bandwidth / cutoffs (uses your helper; stores into metrics)
+            try:
+                get_bandwidth(F, Y, threshold=threshold, window_length=window_length,
+                            polyorder=polyorder, trace=tr)
             except Exception as e:
                 print(f"[{tr.id}] Skipping bandwidth metrics: {e}")
 
-            # SSAM
-            try:
-                _ssam(tr)
-            except Exception as e:
-                print(f"[{tr.id}] SSAM computation failed: {e}")
+            # SSAM (optional)
+            if compute_ssam:
+                try:
+                    _ssam(tr)
+                except Exception as e:
+                    print(f"[{tr.id}] SSAM computation failed: {e}")
 
-            # Band ratios
-            try:
-                _band_ratio(tr, freqlims=[1.0, 6.0, 11.0])
-                _band_ratio(tr, freqlims=[0.5, 3.0, 18.0])
-            except Exception as e:
-                print(f"[{tr.id}] Band ratio computation failed: {e}")
+            # Band ratios (optional)
+            if compute_bandratios:
+                try:
+                    _band_ratio(tr, freqlims=[1.0, 6.0, 11.0])
+                    _band_ratio(tr, freqlims=[0.5, 3.0, 18.0])
+                except Exception as e:
+                    print(f"[{tr.id}] Band ratio computation failed: {e}")
 
-            # Dominant and mean frequency
+            # Spectral peak/means (store both camel/snake variants for compatibility)
             try:
-                f = tr.stats.spectral['freqs']
-                A = tr.stats.spectral['amplitudes']
-                tr.stats.metrics['peakf'] = f[np.argmax(A)]
-                tr.stats.metrics['meanf'] = np.sum(f * A) / np.sum(A) if np.sum(A) > 0 else np.nan
-            except Exception as e:
-                print(f"[{tr.id}] Dominant/mean frequency computation failed: {e}")
+                A = tr.stats.spectral["amplitudes"]
+                if A.size and np.any(A > 0):
+                    peak_idx = int(np.nanargmax(A))
+                    peakf = float(F[peak_idx])
+                    meanf = float(np.nansum(F * A) / np.nansum(A))
+                else:
+                    peakf = meanf = np.nan
+                m["peakf"]   = peakf
+                m["meanf"]   = meanf
+                m["medianf"] = float(np.nanmedian(F[A > 0])) if np.any(A > 0) else np.nan
 
-            # Scipy descriptive stats
-            try:
-                stats = describe(tr.data, nan_policy='omit')._asdict()
-                tr.stats.metrics['skewness'] = stats['skewness']
-                tr.stats.metrics['kurtosis'] = stats['kurtosis']
+                # Back-compat into s.stats.spectrum keys some code expects
+                s = getattr(tr.stats, "spectrum", {})
+                s["peakF"]   = peakf
+                s["medianF"] = m["medianf"]
+                s["peakA"]   = float(np.nanmax(A)) if A.size else np.nan
+                tr.stats.spectrum = s
             except Exception as e:
-                print(f"[{tr.id}] scipy.stats failed: {e}")
-
-            #add_to_trace_history(tr, 'ampengfft')
+                print(f"[{tr.id}] Spectral summary failed: {e}")
 
 
     def save(self, basepath, save_pickle=False):
@@ -250,7 +301,7 @@ class EnhancedStream(Stream):
             self.write(basepath + '.pickle', format='PICKLE')
 
     @classmethod
-    def read(cls, basepath):
+    def read(cls, basepath, match_on='id'):
         """
         Load EnhancedStream from .mseed and .csv file.
 
@@ -689,376 +740,147 @@ class EnhancedStream(Stream):
 
 ########################## METRICS FUNCTIONS FOLLOW ######################
 
-def _ssam(tr, freq_bins=None):
-    """
-    Compute single-station amplitude measurements (SSAM) by binning
-    the amplitude spectrum already stored in tr.stats.spectral.
+from collections import defaultdict
+import numpy as np
+from numpy.fft import rfft, rfftfreq
 
-    Parameters
-    ----------
-    tr : obspy.Trace
-        Trace with .stats.spectral['freqs'] and ['amplitudes'].
-    freq_bins : array-like, optional
-        Frequency bin edges (e.g., np.arange(0, 16, 1.0)).
-        Default is 0–16 Hz in 1-Hz bins.
+_COMPONENT_SETS = [
+    ("Z","N","E"),
+    ("Z","1","2"),
+    ("Z","R","T"),
+]
 
-    Returns
-    -------
-    None
-        Stores {'f': bin_centers, 'A': band_averaged_amplitudes} in tr.stats.metrics.ssam
-    """
-    if freq_bins is None:
-        freq_bins = np.arange(0.0, 16.0, 1.0)
+def _trim_to_overlap(traces):
+    if not traces:
+        return []
+    t0 = max(tr.stats.starttime for tr in traces)
+    t1 = min(tr.stats.endtime   for tr in traces)
+    if t1 <= t0:
+        return []
+    out = []
+    for tr in traces:
+        trc = tr.copy().trim(t0, t1, pad=False)
+        if trc.stats.npts <= 1:
+            return []
+        out.append(trc)
+    return out
 
-    if not hasattr(tr.stats, 'spectral'):
-        print(f"[{tr.id}] Missing tr.stats.spectral — run compute_amplitude_spectra() first.")
-        return
+def _vector_max_3c(trZ, trN, trE, *, kind="vel"):
+    def as_kind(tr):
+        if kind == "vel":  return tr.copy()
+        if kind == "disp": return tr.copy().integrate()
+        if kind == "acc":  return tr.copy().differentiate()
+        raise ValueError("kind must be vel|disp|acc")
+    trs = _trim_to_overlap([as_kind(trZ), as_kind(trN), as_kind(trE)])
+    if len(trs) != 3:
+        return np.nan
+    z, n, e = (np.asarray(t.data, dtype=np.float64) for t in trs)
+    vec = np.sqrt(z*z + n*n + e*e)
+    return float(np.nanmax(np.abs(vec))) if vec.size else np.nan
 
-    f = tr.stats.spectral.get('freqs')
-    A = tr.stats.spectral.get('amplitudes')
+def _group_by_station_band(stream):
+    groups = defaultdict(lambda: defaultdict(list))
+    for tr in stream:
+        net, sta, loc, cha = tr.stats.network, tr.stats.station, tr.stats.location, tr.stats.channel
+        if not cha or len(cha) < 3:
+            continue
+        band2 = cha[:2].upper()   # e.g., 'HH','BH','HD','BD'
+        comp  = cha[-1].upper()
+        key = (net, sta, loc, band2)
+        groups[key][comp].append(tr)
+    return groups
 
-    if f is None or A is None:
-        print(f"[{tr.id}] Missing spectral frequencies or amplitudes.")
-        return
+# ---------- time-domain "SSAM-lite" ----------
+def _td_rsam(tr, f1, f2, *, stat="mean_abs", corners=2, zerophase=True):
+    try:
+        trf = tr.copy().filter("bandpass", freqmin=float(f1), freqmax=float(f2),
+                               corners=int(corners), zerophase=bool(zerophase))
+        y = trf.data.astype(np.float64)
+        if not y.size:
+            return np.nan
+        if stat == "median_abs":
+            return float(np.nanmedian(np.abs(y)))
+        if stat == "rms":
+            return float(np.sqrt(np.nanmean(y*y)))
+        return float(np.nanmean(np.abs(y)))
+    except Exception:
+        return np.nan
 
-    f = np.asarray(f)
-    A = np.asarray(A)
-
-    bin_centers = []
-    ssam_values = []
-
-    for i in range(len(freq_bins) - 1):
-        fmin = freq_bins[i]
-        fmax = freq_bins[i+1]
-        idx = np.where((f >= fmin) & (f < fmax))[0]
-
-        bin_centers.append((fmin + fmax) / 2.0)
-        ssam_values.append(np.nanmean(A[idx]) if idx.size else np.nan)
-
-    tr.stats.metrics['ssam'] = {
-        'f': np.array(bin_centers),
-        'A': np.array(ssam_values)
+def _td_band_ratio(tr, low=(0.5,2.0), high=(2.0,8.0), *, stat="mean_abs", log2=True):
+    a1,b1 = low; a2,b2 = high
+    r_low  = _td_rsam(tr, a1, b1, stat=stat)
+    r_high = _td_rsam(tr, a2, b2, stat=stat)
+    if not np.isfinite(r_low) or not np.isfinite(r_high) or r_low <= 0:
+        ratio = np.nan
+    else:
+        ratio = r_high / r_low
+        if log2 and ratio > 0:
+            ratio = float(np.log2(ratio))
+    return {
+        "RSAM_low":  r_low,
+        "RSAM_high": r_high,
+        "ratio":     ratio,
+        "ratio_key": f"bandratio_{a1}_{b1}__{a2}_{b2}" + ("_log2" if log2 else ""),
     }
 
-
-    
-def _band_ratio(tr, freqlims=[1, 6, 11]):
-    """
-    Compute band ratio as log2(amplitude above split frequency / amplitude below),
-    using frequency limits defined by freqlims.
-
-    Parameters
-    ----------
-    tr : obspy.Trace
-        Trace object with spectral data.
-    freqlims : list of float
-        Frequency limits in Hz: [low, split, high]
-        Some values used before are:
-            [1, 6, 11]
-            [0.8, 4, 18]
-        Better values might be:
-            [0.5, 4.0, 32.0]
-            [0.5, 3.0, 18.0]
-        Or choose two sets of values to better differentiate LPs from hybrids from VTs?
-            [0.5, 2.0, 8.0]  LF vs HF
-            [2.0, 6.0, 18.0] hybrid vs VT?
-        Need to play around with data to determine     
-
-    Stores
-    -------
-    tr.stats.metrics.bandratio : list of dict
-        Appends a dictionary with 'freqlims', 'RSAM_low', 'RSAM_high', 'RSAM_ratio'.
-    """
-    A = None
-    f = None
-
-    # Preferred: new spectral storage
-    if hasattr(tr.stats, 'spectral'):
-        f = tr.stats.spectral.get('freqs')
-        A = tr.stats.spectral.get('amplitudes')
-
-    # Legacy support
-    elif hasattr(tr.stats, 'spectrum'):
-        f = tr.stats.spectrum.get('F')
-        A = tr.stats.spectrum.get('A')
-
-    elif hasattr(tr.stats, 'ssam'):
-        f = tr.stats.ssam.get('f')
-        A = np.array(tr.stats.ssam.get('A'))
-
-    # Proceed if valid spectral data found
-    if A is not None and f is not None and len(A) > 0:
-        f = np.array(f)
-        A = np.array(A)
-
-        idx_low = np.where((f > freqlims[0]) & (f < freqlims[1]))[0]
-        idx_high = np.where((f > freqlims[1]) & (f < freqlims[2]))[0]
-
-        A_low = A[idx_low]
-        A_high = A[idx_high]
-
-        sum_low = np.sum(A_low)
-        sum_high = np.sum(A_high)
-
-        ratio = np.log2(sum_high / sum_low) if sum_low > 0 else np.nan
-
-        br = {
-            'freqlims': freqlims,
-            'RSAM_low': sum_low,
-            'RSAM_high': sum_high,
-            'RSAM_ratio': ratio
-        }
-
-        if not hasattr(tr.stats.metrics, 'bandratio'):
-            tr.stats.metrics.bandratio = []
-
-        tr.stats.metrics.bandratio.append(br)
-
-def get_bandwidth(frequencies, amplitudes, threshold=0.707,
-                  window_length=9, polyorder=2, trace=None):
-    """
-    Estimate peak frequency, bandwidth, and cutoff frequencies from
-    a smoothed amplitude ratio spectrum. Optionally store results in
-    trace.stats.metrics if a Trace is provided.
-
-    Parameters
-    ----------
-    frequencies : np.ndarray
-        Frequency values (Hz).
-    amplitudes : np.ndarray
-        Amplitude (or amplitude ratio) spectrum.
-    threshold : float
-        Fraction of peak amplitude to define bandwidth cutoff (e.g. 0.707 for -3 dB).
-    window_length : int
-        Smoothing window length for Savitzky-Golay filter.
-    polyorder : int
-        Polynomial order for Savitzky-Golay filter.
-    trace : obspy.Trace, optional
-        If given, store metrics in trace.stats.metrics.
-
-    Returns
-    -------
-    dict
-        Dictionary with keys: 'f_peak', 'A_peak', 'f_low', 'f_high', 'bandwidth'
-    """
-    smoothed = savgol_filter(amplitudes, window_length=window_length, polyorder=polyorder)
-
-    peak_index = np.argmax(smoothed)
-    f_peak = frequencies[peak_index]
-    A_peak = smoothed[peak_index]
-    cutoff_level = A_peak * threshold
-
-    lower = np.where(smoothed[:peak_index] < cutoff_level)[0]
-    f_low = frequencies[lower[-1]] if lower.size else frequencies[0]
-
-    upper = np.where(smoothed[peak_index:] < cutoff_level)[0]
-    f_high = frequencies[peak_index + upper[0]] if upper.size else frequencies[-1]
-
-    bandwidth = f_high - f_low
-
-    metrics = {
-        "f_peak": f_peak,
-        "A_peak": A_peak,
-        "f_low": f_low,
-        "f_high": f_high,
-        "bandwidth": bandwidth
-    }
-
-    if trace is not None:
-        if not hasattr(trace.stats, 'metrics') or not isinstance(trace.stats.metrics, AttribDict):
-            trace.stats.metrics = {}
-        for key, val in metrics.items():
-            trace.stats.metrics[key] = val
-    return metrics
-
-
-
-def estimate_distance(trace, source_coords):
-    """
-    Compute hypocentral distance R (in meters) from trace coordinates to source.
-
-    Parameters
-    ----------
-    trace : obspy.Trace
-        Must have .stats.coordinates = {'latitude': ..., 'longitude': ..., 'elevation': ...}
-    source_coords : dict
-        {'latitude': ..., 'longitude': ..., 'depth': ...} in meters
-
-    Returns
-    -------
-    R : float
-        Hypocentral distance in meters
-    """
-    sta = trace.stats.coordinates
-    lat1, lon1, elev = sta['latitude'], sta['longitude'], sta.get('elevation', 0)
-    lat2, lon2, depth = source_coords['latitude'], source_coords['longitude'], source_coords.get('depth', 0)
-    print(trace.id, lat1, lat2, lon1, lon2)
-    epic_dist, _, _ = gps2dist_azimuth(lat1, lon1, lat2, lon2)
-    dz = (depth + elev)  # add elevation since depth is below surface
-    return np.sqrt(epic_dist**2 + dz**2)
-
-
-
-def estimate_source_energy(trace, R, model='body', Q=50, c_earth=2500):
-    """
-    Estimate source energy by correcting station energy for geometric spreading and attenuation.
-
-    Parameters
-    ----------
-    trace : obspy.Trace
-        Must have .stats.metrics['energy'] and .stats.spectral['freqs'] / 'peakF'
-    R : float
-        Distance in meters.
-    model : str
-        'body' or 'surface'
-    Q : float
-        Quality factor for attenuation.
-    c_earth : float
-        Seismic wave speed (m/s)
-
-    Returns
-    -------
-    Eseismic : float
-        Estimated source energy in Joules
-    """
-    E_obs = trace.stats.metrics.get('energy')
-    if E_obs is None:
-        return None
-
-    # Use peakF if available
-    f_peak = None
-    if 'peakF' in trace.stats.spectral:
-        f_peak = trace.stats.spectral['peakF']
-    else:
-        freqs = trace.stats.spectral.get('freqs')
-        amps = trace.stats.spectral.get('amplitudes')
-        if freqs is not None and amps is not None:
-            f_peak = freqs[np.argmax(amps)]
-
-    if f_peak is None:
-        return None
-
-    # Attenuation factor
-    A_att = np.exp(-np.pi * f_peak * R / (Q * c_earth))
-
-    # Geometric spreading correction
-    if model == 'body':
-        geom = R**2
-    elif model == 'surface':
-        wavelength = c_earth / f_peak
-        geom = R * wavelength
-    else:
-        raise ValueError("Model must be 'body' or 'surface'.")
-
-    Eseismic = E_obs * geom / A_att  # undo attenuation and spreading
-    return Eseismic
-
-def estimate_local_magnitude(trace, R_km, a=1.6, b=-0.15, g=0):
-    """
-    Estimate and store ML from peak amplitude and distance.
-
-    Parameters
-    ----------
-    trace : obspy.Trace
-    R_km : float
-        Distance from source in km
-    a, b, g : float
-        Richter scaling parameters
-
-    Returns
-    -------
-    ml : float
-    """
-    peakamp = trace.stats.metrics.get('peakamp')
-    if peakamp is None or R_km <= 0:
-        return None
-
-    ml = Mlrichter(peakamp, R_km, a=a, b=b, g=g)
-    trace.stats.metrics['local_magnitude'] = ml
-    return ml
-
-def Eseismic_Boatwright(val, R, rho_earth=2000, c_earth=2500, S=1.0, A=1.0):
-    # val can be a Stream, Trace, a stationEnergy or a list of stationEnergy
-    # R in m
-    # Following values assumed by Johnson and Aster, 2005:
-    # rho_earth 2000 kg/m^3
-    # c_earth 2500 m/s
-    # A is attenuation = 1
-    # S is site response = 1
-    #
-    # These equations seem to be valid for body waves only, that spread like hemispherical waves in a flat earth.
-    # But if surface waves dominate, they would spread like ripples on a pond, so energy density of wavefront like 2*pi*R
-    if isinstance(val,Trace): # Trace
-        stationEnergy = val.stats.metrics.energy
-        Eseismic = Eseismic_Boatwright(stationEnergy, R, rho_earth, c_earth, S, A)
-    elif isinstance(val, float): # stationEnergy
-        Eseismic = 2 * pi * (R ** 2) * rho_earth * c_earth * (S ** 2) * val / A 
-    return Eseismic
-
-def Eacoustic_Boatwright(val, R, rho_atmos=1.2, c_atmos=340, z=100000):
-    # val can be a Trace, or a float (a station energy)
-    # R in m
-    # Following values assumed by Johnson and Aster, 2005:
-    # rho_atmos 1.2 kg/m^3
-    # c_atmos 340 m/s  
-    # z is just an estimate of the atmospheric vertical scale length - the height of ripples of infrasound energy spreading globally
-    if isinstance(val, Trace): # Trace
-        #stationEnergy = compute_stationEnergy(val) 
-        stationEnergy = val.stats.metrics.energy
-        Eacoustic = Eacoustic_Boatwright(stationEnergy, R, rho_atmos, c_atmos)
-    elif isinstance(val, float): # list of stationEnergy
-        if R>100000:
-            E_if_station_were_at_z = 2 * pi * (z ** 2) / (rho_atmos * c_atmos) * val
-            Eacoustic = E_if_station_were_at_z* R/1e5
+# ---------- spectral block (optional) ----------
+def _spectral_block(tr, y, dt, threshold, window_length, polyorder, compute_ssam, compute_bandratios):
+    if tr.stats.npts < 2:
+        return
+    Y = np.abs(rfft(y))
+    F = rfftfreq(tr.stats.npts, d=dt)
+    if not hasattr(tr.stats, "spectral") or tr.stats.spectral is None:
+        tr.stats.spectral = {}
+    tr.stats.spectral["freqs"] = F
+    tr.stats.spectral["amplitudes"] = Y
+    try:
+        get_bandwidth(F, Y, threshold=threshold, window_length=window_length,
+                      polyorder=polyorder, trace=tr)
+    except Exception as e:
+        print(f"[{tr.id}] Skipping bandwidth metrics: {e}")
+    if compute_ssam:
+        try:
+            _ssam(tr)
+        except Exception as e:
+            print(f"[{tr.id}] SSAM computation failed: {e}")
+    if compute_bandratios:
+        try:
+            _band_ratio(tr, freqlims=[1.0, 6.0, 11.0])
+            _band_ratio(tr, freqlims=[0.5, 3.0, 18.0])
+        except Exception as e:
+            print(f"[{tr.id}] Band ratio computation failed: {e}")
+    try:
+        A = tr.stats.spectral["amplitudes"]
+        if A.size and np.any(A > 0):
+            peak_idx = int(np.nanargmax(A))
+            peakf = float(F[peak_idx])
+            meanf = float(np.nansum(F * A) / np.nansum(A))
         else:
-            Eacoustic = 2 * pi * R ** 2 / (rho_atmos * c_atmos) * val
-    return Eacoustic
+            peakf = meanf = np.nan
+        m = tr.stats.metrics
+        m["peakf"]   = peakf
+        m["meanf"]   = meanf
+        m["medianf"] = float(np.nanmedian(F[A > 0])) if np.any(A > 0) else np.nan
+        s = getattr(tr.stats, "spectrum", {})
+        s["peakF"]   = peakf
+        s["medianF"] = m["medianf"]
+        s["peakA"]   = float(np.nanmax(A)) if A.size else np.nan
+        tr.stats.spectrum = s
+    except Exception as e:
+        print(f"[{tr.id}] Spectral summary failed: {e}")
 
-def Eseismic2magnitude(Eseismic, correction=3.7):
-    # after equation 7 in Hanks and Kanamori 1979, where moment is substitute with energy
-    # energy in Joules rather than ergs, so correction is 3.7 rather than 10.7
-    if isinstance(Eseismic, list): # list of stationEnergy
-        mag = [] 
-        for thisE in Eseismic:
-            mag.append(Eseismic2magnitude(thisE, correction=correction))
-    else:
-        mag = np.log10(Eseismic)/1.5 - correction
-    return mag
-
-def magnitude2Eseismic(mag, correction=3.7):
-    # after equation 7 in Hanks and Kanamori 1979, where moment is substitute with energy
-    # energy in Joules rather than ergs, so correction is 3.7 rather than 10.7   
-    if isinstance(mag, list): # list of stationEnergy
-        Eseismic = [] 
-        for thismag in mag:
-            Eseismic.append(magnitude2Eseismic(thismag, correction=correction))
-    else:
-        Eseismic = np.power(10, 1.5 * mag + correction)
-    return Eseismic
-
-def Mlrichter(peakA, R, a=1.6, b=-0.15, g=0):
-    """
-    Compute Richter local magnitude (ML) from peak amplitude and distance.
-
-    Parameters
-    ----------
-    peakA : float
-        Peak amplitude (in mm or nm depending on calibration).
-    R : float
-        Epicentral distance in km.
-    a : float
-        Log-distance scaling (default 1.6).
-    b : float
-        Offset (default -0.15).
-    g : float
-        Station correction (default 0).
-
-    Returns
-    -------
-    ml : float
-        Local magnitude.
-    """
-    return np.log10(peakA) + a * np.log10(R) + b + g
+# ---------- pressure metrics ----------
+def _pressure_metrics(tr, band=(1.0, 20.0)):
+    y = np.asarray(tr.data, dtype=np.float64)
+    pap = float(np.nanmax(np.abs(y))) if y.size else np.nan
+    try:
+        trf = tr.copy().filter("bandpass", freqmin=band[0], freqmax=band[1],
+                               corners=2, zerophase=True)
+        yf = np.asarray(trf.data, dtype=np.float64)
+        pap_band = float(np.nanmax(np.abs(yf))) if yf.size else np.nan
+    except Exception:
+        pap_band = np.nan
+    return pap, pap_band
 
 
 class EventContainer:
