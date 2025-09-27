@@ -143,9 +143,9 @@ def hydrocondition_dem(dem_in: Path, outdir: Path, breach: bool = False) -> Tupl
     wbt.verbose = True
 
     dem_in = dem_in.resolve()
-    filled = (outdir / "dem_filled.tif").resolve()
-    fa     = (outdir / "dem_fa.tif").resolve()
-    pntr   = (outdir / "dem_d8pntr.tif").resolve()
+    filled = (outdir / "04_dem_filled.tif").resolve()
+    fa     = (outdir / "04_dem_fa.tif").resolve()
+    pntr   = (outdir / "04_dem_d8pntr.tif").resolve()
 
     # Breach vs fill with fallbacks
     try:
@@ -195,8 +195,8 @@ def extract_streams(fa_tif: Path, pntr_tif: Path, threshold: int, outdir: Path) 
     wbt.set_working_dir(str(outdir.resolve()))
     wbt.verbose = True
 
-    streams_tif = (outdir / "streams.tif").resolve()
-    streams_vec = (outdir / "streams.shp").resolve()
+    streams_tif = (outdir / "05_streams.tif").resolve()
+    streams_vec = (outdir / "05_streams.shp").resolve()
 
     wbt_run_abs(wbt, "ExtractStreams",
                 {"--flow_accum": fa_tif, "--output": streams_tif, "--threshold": str(threshold)}, expect=streams_tif)
@@ -217,11 +217,11 @@ def fix_streams_crs(streams_vector: Path, outdir: Path, reference_raster: Path, 
     if gdf.crs is None:
         gdf = gdf.set_crs(src_crs, allow_override=True)
 
-    shp_native = (outdir / "streams.shp").resolve()
+    shp_native = (outdir / "06_streams.shp").resolve()
     gdf.to_file(shp_native, driver="ESRI Shapefile")
 
     gdf_wgs84 = gdf.to_crs(epsg=to_epsg)
-    gpkg_wgs84 = (outdir / "streams.gpkg").resolve()
+    gpkg_wgs84 = (outdir / "06_streams.gpkg").resolve()
     gdf_wgs84.to_file(gpkg_wgs84, driver="GPKG")
 
     print(f"Wrote Shapefile (native CRS): {shp_native}")
@@ -366,6 +366,120 @@ def write_top_n_channels_csv(streams_gpkg: Path, outdir: Path, top_n: int = 30, 
     print(f"Wrote {len(keep_ll)} channel CSVs to {outdir}")
 
 
+def print_dem_resolution_stats(dem_ll: Path | None, utm_dem: Path | None):
+    if dem_ll and dem_ll.exists():
+        with rasterio.open(dem_ll) as src:
+            tr = src.transform
+            dlon_deg = float(tr.a)
+            dlat_deg = float(-tr.e)
+            # meters per degree at mid-lat of the DEM
+            ymin, ymax = src.bounds.bottom, src.bounds.top
+            lat_mid = 0.5 * (ymin + ymax)
+            mdeg_lat = 111_194.9266
+            mdeg_lon = mdeg_lat * np.cos(np.deg2rad(lat_mid))
+            dx_m = abs(dlon_deg) * mdeg_lon
+            dy_m = abs(dlat_deg) * mdeg_lat
+        print(f"[DEM] Lon/Lat DEM pixel ~ {dx_m:.1f} m (x) × {dy_m:.1f} m (y) at lat {lat_mid:.3f}")
+    if utm_dem and utm_dem.exists():
+        with rasterio.open(utm_dem) as src:
+            tr = src.transform
+            dx_m = abs(tr.a); dy_m = abs(tr.e)
+        print(f"[DEM] UTM DEM pixel   = {dx_m:.2f} m × {dy_m:.2f} m")
+
+def print_channel_sampling_stats(lon: np.ndarray, lat: np.ndarray):
+    # crude nearest-neighbour spacing proxy in meters (lon/lat)
+    if lon.size < 2:
+        print("[CHAN] Only one node; no spacing stats.")
+        return
+    # compute local meters per deg at each point to estimate spacings to next sample
+    mdeg_lat = 111_194.9266
+    mdeg_lon = mdeg_lat * np.cos(np.deg2rad(lat))
+    dx = np.diff(lon) * mdeg_lon[:-1]
+    dy = np.diff(lat) * mdeg_lat
+    ds = np.hypot(dx, dy)
+    ds = ds[np.isfinite(ds) & (ds > 0)]
+    if ds.size:
+        q = np.percentile(ds, [5, 50, 95])
+        print(f"[CHAN] Resampled along-channel spacing: "
+              f"p5={q[0]:.1f} m, p50={q[1]:.1f} m, p95={q[2]:.1f} m (N={ds.size})")
+
+# To create a NodeGrid object
+# --- New imports near the top of channel_finder.py ---
+from shapely.geometry import LineString, MultiLineString
+from flovopy.asl.grid import NodeGrid, sample_dem_elevations  # uses what you added in grid.py
+
+def _resample_polyline_lonlat(lon: np.ndarray, lat: np.ndarray, step_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Resample lon/lat polyline to ~uniform spacing (meters) along track."""
+    lon = np.asarray(lon, float); lat = np.asarray(lat, float)
+    if lon.size < 2: return lon, lat
+    # cumulative meters using local meters/deg
+    meters = [0.0]
+    for i in range(1, lon.size):
+        latm = 0.5 * (lat[i] + lat[i-1])
+        mdeg_lat = 111_194.9266
+        mdeg_lon = mdeg_lat * np.cos(np.deg2rad(latm))
+        dx = (lon[i]-lon[i-1]) * mdeg_lon
+        dy = (lat[i]-lat[i-1]) * mdeg_lat
+        meters.append(meters[-1] + float(np.hypot(dx, dy)))
+    meters = np.asarray(meters)
+    if meters[-1] <= step_m:
+        return lon, lat
+    tgt = np.arange(0.0, meters[-1] + step_m, step_m)
+    lon_i = np.interp(tgt, meters, lon)
+    lat_i = np.interp(tgt, meters, lat)
+    return lon_i, lat_i
+
+def nodegrid_from_streams_gpkg(
+    streams_gpkg_wgs84: Path,
+    dem_ll_tif: Path | None,
+    *,
+    step_m: float = 100.0,
+    max_points: int | None = None,
+) -> NodeGrid:
+    """
+    Build a sparse NodeGrid directly from streams (GeoPackage in WGS84).
+    Resamples polylines to ~step_m spacing and optionally samples DEM elevations (meters).
+    """
+    gdf = gpd.read_file(streams_gpkg_wgs84)
+    if gdf.crs is None:
+        gdf = gdf.set_crs(epsg=4326, allow_override=True)
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+
+    all_lon, all_lat = [], []
+    for geom in gdf.geometry:
+        if geom is None:
+            continue
+        lines = []
+        if isinstance(geom, LineString):
+            lines = [geom]
+        elif isinstance(geom, MultiLineString):
+            lines = list(geom.geoms)
+        for ls in lines:
+            arr = np.asarray(ls.coords, float)
+            if arr.shape[0] < 2:
+                continue
+            lon, lat = arr[:, 0], arr[:, 1]
+            lon, lat = _resample_polyline_lonlat(lon, lat, step_m=step_m)
+            all_lon.append(lon); all_lat.append(lat)
+
+    if not all_lon:
+        raise ValueError("No stream polylines found to build NodeGrid")
+
+    lon = np.concatenate(all_lon); lat = np.concatenate(all_lat)
+
+    if max_points and lon.size > max_points:
+        idx = np.linspace(0, lon.size - 1, num=max_points, dtype=int)
+        lon, lat = lon[idx], lat[idx]
+
+    elev = None
+    dem_tag = None
+    if dem_ll_tif:
+        elev = sample_dem_elevations(str(dem_ll_tif), lon, lat)
+        dem_tag = os.path.basename(dem_ll_tif)
+
+    # Approx spacing metadata is just the requested step_m
+    return NodeGrid(lon, lat, node_elev_m=elev, approx_spacing_m=step_m, dem_tag=dem_tag)
 # ================================ CLI ==============================
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
@@ -380,6 +494,9 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     p.add_argument("--min-len-m", type=float, default=200.0, help="Min channel length (m) for CSV export")
     p.add_argument("--flip", choices=["horizontal", "vertical", "both"],
                    help="Flip the DEM before processing (fix georeferencing issues)")
+    p.add_argument("--node-step-m", type=float, default=100.0, help="Node spacing (m) along channels")
+    p.add_argument("--node-max", type=int, help="Max total nodes (downsample if exceeded)")
+    p.add_argument("--no-nodegrid", action="store_true", help="Skip NodeGrid export")    
     return p.parse_args(argv)
 
 
@@ -396,21 +513,21 @@ def main(argv: List[str] | None = None) -> None:
     work_ll = args.dem.resolve()
     if args.prep:
         print("Normalizing DEM for WBT…")
-        work_ll = normalize_for_wbt(work_ll, outdir / "dem_norm.tif")
+        work_ll = normalize_for_wbt(work_ll, outdir / "01_dem_norm.tif")
         _print_path("Normalized DEM", work_ll)
         quick_raster_png(work_ll, outdir / "01_dem_norm.png", title="DEM (normalized)")
 
     # Stage 2 — Optional flip (labels-only if needed to fix E/W)
     if args.flip:
-        flipped = outdir / f"dem_flipped_{args.flip}.tif"
+        flipped = outdir / f"02_dem_flipped_{args.flip}.tif"
         # IMPORTANT: transform_only=True => flip the "labels", not the pixels
         flip_geotiff(work_ll, flipped, mode=args.flip, transform_only=True)
         work_ll = flipped
         _print_path(f"DEM (flipped {args.flip})", work_ll)
-        quick_raster_png(work_ll, outdir / "03_flipped_dem.png", title="Flipped DEM")
+        quick_raster_png(work_ll, outdir / "02_flipped_dem.png", title="Flipped DEM")
 
     # Stage 3 — Reproject to UTM for hydrology
-    utm_dem = reproject_to_utm(work_ll, outdir / "dem_utm.tif", dst_epsg=32620, dst_res=None)
+    utm_dem = reproject_to_utm(work_ll, outdir / "03_dem_utm.tif", dst_epsg=32620, dst_res=None)
     _print_path("DEM (UTM)", utm_dem)
 
     # Stage 4 — Hydro + FA + Pointer (UTM)
@@ -425,13 +542,34 @@ def main(argv: List[str] | None = None) -> None:
     streams_shp, streams_gpkg = fix_streams_crs(streams_vec, outdir, reference_raster=utm_dem)
 
     # Stage 7 — Plots (lon/lat + UTM)
-    plot_streams_only(streams_gpkg, work_ll, outdir / "08_streams_only.png")
-    plot_streams_over_dem_matplotlib(work_ll, streams_gpkg, outdir / "08_streams_over_dem.png")
-    plot_streams_only_metric(streams_gpkg, utm_dem, outdir / "08_streams_only_metric.png")
-    plot_streams_over_dem_metric(filled, streams_gpkg, outdir / "08_streams_over_dem_metric.png")
+    plot_streams_only(streams_gpkg, work_ll, outdir / "07_streams_only.png")
+    plot_streams_over_dem_matplotlib(work_ll, streams_gpkg, outdir / "07_streams_over_dem.png")
+    plot_streams_only_metric(streams_gpkg, utm_dem, outdir / "07_streams_only_metric.png")
+    plot_streams_over_dem_metric(filled, streams_gpkg, outdir / "07_streams_over_dem_metric.png")
 
     # Stage 8 — CSVs in lon/lat for ASL
     write_top_n_channels_csv(streams_gpkg, outdir / "channels_csv", top_n=args.top_n, min_len_m=args.min_len_m)
+
+    # Stage 9 — Build and save sparse NodeGrid directly from streams
+    try:
+        node_step_m = args.node_step_m   # or expose as CLI --node-step-m
+        max_nodes = args.node_max    # or expose as CLI --node-max
+        nodegrid = nodegrid_from_streams_gpkg(
+            streams_gpkg, dem_ll_tif=work_ll, step_m=node_step_m, max_points=max_nodes
+        )
+        # print stats
+        print_channel_sampling_stats(nodegrid.node_lon, nodegrid.node_lat)
+        print_dem_resolution_stats(work_ll, utm_dem)
+
+        ng_pkl = outdir / f"09_NodeGrid_{nodegrid.id}.pkl"
+        nodegrid.save(outdir)  # writes NodeGrid_<id>.pkl
+        print(f"[NG] NodeGrid ID: {nodegrid.id}")
+        print(f"[NG] Nodes: {nodegrid.node_lon.size}  bbox: "
+              f"lon[{nodegrid.node_lon.min():.4f},{nodegrid.node_lon.max():.4f}] "
+              f"lat[{nodegrid.node_lat.min():.4f},{nodegrid.node_lat.max():.4f}]  "
+              f"elev: {'yes' if nodegrid.node_elev_m is not None else 'no'}")
+    except Exception as e:
+        print(f"[warn] NodeGrid build failed: {e}")
 
     print("✅ Drainage extraction finished.")
     print("Check outputs in:", outdir.resolve())

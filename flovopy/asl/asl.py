@@ -15,12 +15,14 @@ from flovopy.processing.sam import VSAM
 from flovopy.utils.make_hash import make_hash
 from flovopy.core.mvo import dome_location
 from flovopy.asl.map import topo_map #, plot_heatmap_montserrat_colored
-from flovopy.asl.distances import compute_distances, distances_signature
+from flovopy.asl.distances import compute_distances, distances_signature, geo_distance_3d_km
 from flovopy.asl.diagnostics import extract_asl_diagnostics, compare_asl_sources
-from flovopy.asl.grid import make_grid, Grid
+from flovopy.asl.grid import make_grid, Grid, NodeGrid
 from flovopy.asl.misfit import plot_misfit_heatmap_for_peak_DR, StdOverMeanMisfit, R2DistanceMisfit
 
 from scipy.ndimage import gaussian_filter
+# add this import near the top of the module (outside the function)
+from flovopy.asl.station_corrections import apply_interval_station_gains
 
 # ---------- ASL ----------
 class ASL:
@@ -34,10 +36,9 @@ class ASL:
       - precomputed node_distances_km, station_coordinates, amplitude_corrections (injected by caller)
     """
 
-    def __init__(self, samobject: VSAM, metric: str, gridobj: Grid, window_seconds: int):
+    def __init__(self, samobject: VSAM, metric: str, gridobj: Grid | NodeGrid, window_seconds: int):    
         if not isinstance(samobject, VSAM):
             raise TypeError("samobject must be a VSAM instance")
-
         self.samobject = samobject
         self.metric = metric
         self.gridobj = gridobj
@@ -122,7 +123,7 @@ class ASL:
             wave_speed_kms=wavespeed_kms,
             Q=Q,
             peakf=float(peakf),
-            grid_sig=self.gridobj.signature(),
+            grid_sig=self.gridobj.signature().as_tuple(),
             inv_sig=tuple(sorted(self.node_distances_km.keys())),
             dist_sig=distances_signature(self.node_distances_km),
             mask_sig=None,
@@ -368,7 +369,6 @@ class ASL:
             print("[ASL] locate (slow): done.")
 
 
-
     def fast_locate(
         self,
         *,
@@ -378,9 +378,252 @@ class ASL:
         use_median_for_DR: bool = False,
         batch_size: int = 1024,
         spatial_smooth_sigma: float = 0.0,   # Gaussian sigma in node units (0 disables)
-        temporal_smooth_win: int = 0,        # centered odd window length (0 disables)
+        temporal_smooth_mode: str = "none",  # "none" | "median" | "viterbi"
+        temporal_smooth_win: int = 5,        # window (median) or horizon (viterbi)
+        viterbi_lambda_km: float = 5.0,      # km cost per step in viterbi
+        viterbi_max_step_km: float = 25.0,   # km hard cutoff for viterbi steps
         verbose: bool = True,
     ):
+        """
+        Locate seismic sources by minimizing a misfit function on a spatial grid.
+
+        Cheat-sheet (common options)
+        ----------------------------
+        misfit_backend        Which misfit engine to use
+                            - StdOverMeanMisfit (default, std/|mean|)
+                            - R2DistanceMisfit (amplitude vs. distance correlation)
+        min_stations          Require this many usable stations (default=3)
+        use_median_for_DR     DR at best node = median (True) or mean (False)
+        batch_size            Process this many time samples per loop (default=1024)
+
+        spatial_smooth_sigma  >0 → Gaussian blur misfit maps (stabilizes per-frame noise)
+                            Units = grid cells; e.g. 1.5 ≈ smooth over ~1.5 nodes
+        temporal_smooth_mode  Temporal smoothing strategy
+                            - "none"    : raw best nodes
+                            - "median"  : median filter over window
+                            - "viterbi" : dynamic-programming optimal path
+        temporal_smooth_win   Window length (odd int) for "median" or cost horizon for "viterbi"
+        viterbi_lambda_km     Step penalty (cost per km moved per frame) in "viterbi" mode
+        viterbi_max_step_km   Hard cutoff (disallow jumps > this distance) in "viterbi" mode
+
+        verbose               Print progress + diagnostics (default=True)
+
+        What it does (high level)
+        -------------------------
+        1) Converts the selected VSAM metric to a station×time matrix Y.
+        2) For each time step, evaluates a node-wise misfit across the grid using
+        the chosen backend and the precomputed amplitude corrections C (and, for
+        certain backends, station→node distances D).
+        3) Picks the best node per time; computes DR, azgap, etc.
+        4) Optionally smooths the per-time misfit spatially (Gaussian blur), and/or
+        smooths the resulting node track temporally (median / Viterbi).
+        5) Stores a source track in `self.source` and a scalar connectedness metric.
+
+        Returns (via object state)
+        --------------------------
+        self.source : dict of arrays/lists
+        - "t"          : UTCDateTime array (length T)
+        - "lat","lon"  : per-time best node coordinates (length T)
+        - "DR"         : reduced displacement (scaled by 1e7)
+        - "misfit"     : misfit at chosen node
+        - "azgap"      : azimuthal gap at chosen node
+        - "nsta"       : usable station count
+        - "node_index" : chosen node index (GLOBAL index on the full grid)
+        - "connectedness": scalar [0,1], spatial compactness of track (top-DR subset)
+        self.connectedness : full diagnostic dict for the connectedness computation
+        self.located       : set True
+        self.id            : optionally set via self.set_id() if present
+
+        -------------------------------------------------------------------------
+        Misfit backends (how the “goodness” per node is computed)
+        -------------------------------------------------------------------------
+
+        1) StdOverMeanMisfit  (default; robust, fast, no distances required)
+        ---------------------------------------------------------------
+        Definition:
+            Let R[:, j] = y * C[:, j] be the reduced amplitudes at node j.
+            misfit_j = std(R[:, j]) / (|mean(R[:, j])| + eps).
+
+        Intuition:
+            If a node is correct, station reductions should agree up to scatter
+            → small std and non-zero mean ⇒ small ratio.
+
+        Pros:
+            - Very stable when amplitudes are well corrected by C (geometry + Q).
+            - No explicit distance model; needs only C.
+            - Vectorized via dot-products; very fast.
+
+        Cons:
+            - Does not directly leverage a hypothesized decay law vs distance.
+
+        Options:
+            - None specific; use overall options like spatial/temporal smoothing.
+
+        When to use:
+            - As a baseline for most data (VT/RSAM/DSAM-style metrics).
+            - When distance corrections are already baked into C reasonably well.
+
+        2) R2DistanceMisfit  (distance-aware, correlation-style)
+        -----------------------------------------------------
+        Prereqs:
+            - Requires node distances per station: self.node_distances_km[sid] (nnodes,)
+
+        Definition (per node j):
+            Build a distance feature x_j from station→node distances d_ij, then
+            correlate with station amplitudes y (or log|y|), compute R², and
+            define cost as 1 − R² (lower is better). You can also blend this
+            with the StdOverMean cost via α:
+
+            cost_j = α * (1 − R²_j) + (1 − α) * (std/|mean|)_j
+
+        Feature choices:
+            - use_log=True  → x = log(d) and y' = log|y| (power-law proxy)
+            - square=True   → if use_log=False, x = 1/d (body-wave-like proxy),
+                            else x = d (surface-wave-like proxy)
+            - alpha ∈ [0,1] → blend with StdOverMean (α=1 pure R², α=0 pure StdOverMean)
+
+        Intuition:
+            If amplitudes decay with distance in a consistent way, a correct node
+            should maximize correlation between the distance feature and y (or log|y|).
+
+        Pros:
+            - Encodes distance physics directly; can be more discriminative for tremor.
+        Cons:
+            - Sensitive to amplitude sign, zero/near-zero values (we use |y| and clip for log).
+            - Needs distances; may be less stable if the decay law is weak/inverted.
+
+        When to use:
+            - Continuous tremor, flows, or when you expect a clear distance decay.
+
+        Recommended starting points:
+            - Pure distance:         R2DistanceMisfit(use_log=True,  alpha=1.0)
+            - Blended, more robust:  R2DistanceMisfit(use_log=True,  alpha=0.5)
+            - Body-wave flavor:      R2DistanceMisfit(use_log=False, square=True,  alpha=0.5)
+            - Surface-wave flavor:   R2DistanceMisfit(use_log=False, square=False, alpha=0.5)
+
+        Notes on amplitude corrections (C):
+        - Both backends use the same C matrix; R² backend also uses distances.
+        - If some channels lack corrections at certain nodes (NaN in C), those
+            stations are ignored for that node (respecting min_stations).
+
+        -------------------------------------------------------------------------
+        Smoothing options (why/when/how)
+        -------------------------------------------------------------------------
+
+        A) Spatial smoothing (per-frame Gaussian blur)
+        -------------------------------------------
+        What:
+            Before selecting the best node at each time frame, the node-wise misfit
+            map can be blurred with a Gaussian of sigma=spatial_smooth_sigma (in
+            *grid cells*). This suppresses pixel-level noise and encourages the
+            minimum to sit in a basin rather than a single spiky node.
+
+        Units:
+            Sigma is in node units. If grid spacing is ~400 m and sigma=1.5,
+            you smooth over roughly ~600 m scale. Convert as:
+                sigma_km ≈ sigma_nodes * node_spacing_km.
+
+        Edge behavior & sub-grids:
+            We use "nearest" mode at edges to avoid shrinking the domain. If the
+            backend prepared a sub-grid (refine pass), we blur in that sub-grid
+            shape. If shapes don’t match or blur is unavailable, we silently skip.
+
+        When to use:
+            - High-noise data, sparse stations, or coarse grids where you want
+            stability without committing to temporal smoothing.
+
+        Pitfalls:
+            - Too large sigma can bias the minimum toward broad basins and smear
+            distinct sources together.
+
+        B) Temporal smoothing (post-selection track filtering)
+        ---------------------------------------------------
+        1) "median" (robust local smoothing)
+            - Apply a centered, odd-length median filter to the chosen lat/lon/DR.
+            - Great for knocking down isolated jumps/outliers; preserves overall path.
+            - Choose temporal_smooth_win (3, 5, 7…). Larger → smoother but laggier.
+
+        2) "viterbi" (optimal path under movement penalty)
+            - Model a time series of node choices as a path through the grid,
+                with per-frame “emission” cost = misfit at that node, plus a
+                “transition” cost proportional to the distance moved between
+                consecutive frames:
+                    total_cost = Σ_t [ misfit(node_t) + λ * dist_km(node_{t-1}, node_t) ]
+            - λ is viterbi_lambda_km (km cost per step). Bigger λ → smoother paths
+                (less movement). Smaller λ → tracks hug the raw misfit minima.
+            - viterbi_max_step_km imposes a hard cap; jumps larger than this are disallowed.
+            - temporal_smooth_win acts as a horizon / band-limit in some implementations;
+                we use it to keep neighbor search tractable if you customize further.
+
+        When “viterbi” wins:
+            - Tremor/flows where a physically continuous source should move gradually,
+            and you want the best single, globally consistent track.
+
+        Pitfalls:
+            - If λ is too small and the misfit surface is noisy, you get twitchy tracks.
+            - If λ is too big, the track may lag or over-smooth real motion.
+            - Hard caps that are too tight can force suboptimal paths when the grid is sparse.
+
+        -------------------------------------------------------------------------
+        Follow-on refinement: refine_and_relocate()
+        -------------------------------------------------------------------------
+        `refine_and_relocate(top_frac=0.25, margin_km=1.0, …)` subsets the current grid
+        to a tight bounding box around the *top* fraction of DR locations and re-runs
+        `fast_locate` on that sub-grid. Because we keep the same amplitude corrections
+        (just masked), no recomputation of C is needed. This often sharpens source
+        tracks and reduces edge effects. You can combine refinement with the same
+        spatial/temporal smoothing options used here.
+
+        Example workflow:
+        >>> asl.fast_locate(spatial_smooth_sigma=1.5, temporal_smooth_mode="median", temporal_smooth_win=5)
+        >>> asl.refine_and_relocate(top_frac=0.25, margin_km=1.0,
+        ...                         spatial_smooth_sigma=1.0,
+        ...                         temporal_smooth_mode="viterbi",
+        ...                         temporal_smooth_win=7, viterbi_lambda_km=8.0)
+
+        -------------------------------------------------------------------------
+        Practical tips
+        -------------------------------------------------------------------------
+        - Start simple: default backend, no smoothing. If jittery, add spatial blur
+        (sigma ~1–2 nodes). If still jittery (tremor), switch temporal smoothing to
+        "median" (win=5) or "viterbi" (λ~5–10 km, cap 20–30 km).
+        - R² backend: begin with use_log=True, alpha=0.5. If distances dominate
+        (clear decay), increase alpha → 0.8–1.0. If unstable, reduce alpha.
+        - The connectedness metric in `self.connectedness` helps sanity-check how
+        spatially coherent the track is (higher ≈ tighter cluster).
+        - `batch_size` mainly impacts speed; accuracy is unchanged.
+
+        Implementation notes
+        --------------------
+        - Backends must implement:
+            prepare(aslobj, seed_ids, dtype) -> ctx
+            evaluate(y, ctx, min_stations, eps) -> (misfit, extras)
+        where `extras` may include per-node 'mean' (so we can extract DR) and 'N'.
+        - Spatial blur uses `scipy.ndimage.gaussian_filter` if available; otherwise
+        it is silently disabled.
+        - Temporal "median" uses a centered odd window; ends are handled by reflection.
+        - "Viterbi" requires a step-distance function (we compute great-circle km
+        between nodes) and a DP pass to recover the minimum-cost path.
+
+        Examples
+        --------
+        # 1) Default backend, no smoothing
+        asl.fast_locate()
+
+        # 2) R² backend (pure), log correlation
+        from flovopy.asl.misfit import R2DistanceMisfit
+        asl.fast_locate(misfit_backend=R2DistanceMisfit(use_log=True, alpha=1.0))
+
+        # 3) Spatial + median temporal smoothing
+        asl.fast_locate(spatial_smooth_sigma=1.5,
+                        temporal_smooth_mode="median", temporal_smooth_win=5)
+
+        # 4) Viterbi smoothing with moderate movement penalty
+        asl.fast_locate(temporal_smooth_mode="viterbi", temporal_smooth_win=7,
+                        viterbi_lambda_km=8.0, viterbi_max_step_km=30.0)
+        """
+
+
         if misfit_backend is None:
             misfit_backend = StdOverMeanMisfit()
 
@@ -434,6 +677,20 @@ class ASL:
             for k in range(Yb.shape[1]):
                 y = Yb[:, k]
                 misfit, extras = misfit_backend.evaluate(y, ctx, min_stations=min_stations, eps=eps)
+
+                # Keep full misfit & mean vectors if we’ll need Viterbi later
+                collect_for_viterbi = (temporal_smooth_mode.lower() == "viterbi")
+                if i0 == 0 and k == 0:
+                    misfit_hist = [] if collect_for_viterbi else None
+                    mean_hist   = [] if collect_for_viterbi else None
+
+                if collect_for_viterbi:
+                    misfit_hist.append(np.asarray(misfit, float).copy())
+                    # we expect 'mean' (or 'DR') vector to exist; if missing, stash NaNs (we’ll fallback)
+                    mvec = extras.get("mean", None)
+                    if mvec is None:
+                        mvec = np.full_like(misfit, np.nan, dtype=float)
+                    mean_hist.append(np.asarray(mvec, float).copy())
 
                 # Optional per-time spatial smoothing (requires full-grid shape)
                 if can_blur:
@@ -509,38 +766,67 @@ class ASL:
                 azgap, _ = compute_azimuthal_gap(source_lat[i], source_lon[i], station_coords)
                 source_azgap[i] = azgap
 
-        # Optional temporal smoothing (centered moving average)
-        if temporal_smooth_win and temporal_smooth_win >= 3 and temporal_smooth_win % 2 == 1:
-            # Smooth the chosen node path, not the coordinates directly
-            sm_node = _median_filter_indices(source_node, temporal_smooth_win)
-
-            # Optionally guard gigantic jumps: if the smoothed node differs
-            # by > JUMP_KM from the raw node, keep the raw pick for that time.
-            # (Tune or remove if not needed.)
-            try:
-                from obspy.geodetics.base import gps2dist_azimuth
-                def _km(j1, j2):
-                    return 0.001 * gps2dist_azimuth(
-                        float(self.gridobj.gridlat.ravel()[j1]),
-                        float(self.gridobj.gridlon.ravel()[j1]),
-                        float(self.gridobj.gridlat.ravel()[j2]),
-                        float(self.gridobj.gridlon.ravel()[j2]),
-                    )[0]
-                JUMP_KM = 5.0
-                for i in range(len(sm_node)):
-                    if _km(source_node[i], sm_node[i]) > JUMP_KM:
-                        sm_node[i] = source_node[i]
-            except Exception:
-                pass  # if geodetics isn’t around, skip jump guard
-
-            # Re-derive coordinates & (optionally) DR at smoothed nodes
             flat_lat = self.gridobj.gridlat.ravel()
             flat_lon = self.gridobj.gridlon.ravel()
-            source_lat = flat_lat[sm_node].astype(float, copy=False)
-            source_lon = flat_lon[sm_node].astype(float, copy=False)
 
-            # If you want DR smoothed in time, keep your moving average for DR only:
-            source_DR = _movavg_1d(source_DR, temporal_smooth_win)
+            mode = (temporal_smooth_mode or "none").lower()
+            if mode == "median" and (temporal_smooth_win and temporal_smooth_win >= 3 and temporal_smooth_win % 2 == 1):
+                sm_node = _median_filter_indices(source_node, temporal_smooth_win)
+
+                # Optional: small jump guard (keeps pathological flips out)
+                try:
+                    def _km(j1, j2):
+                        return 0.001 * gps2dist_azimuth(
+                            float(flat_lat[j1]), float(flat_lon[j1]),
+                            float(flat_lat[j2]), float(flat_lon[j2])
+                        )[0]
+                    JUMP_KM = 5.0
+                    for i in range(len(sm_node)):
+                        if _km(source_node[i], sm_node[i]) > JUMP_KM:
+                            sm_node[i] = source_node[i]
+                except Exception:
+                    pass
+
+                # Re-derive lat/lon at smoothed nodes; keep DR as (optionally) movavg
+                source_lat = flat_lat[sm_node].astype(float, copy=False)
+                source_lon = flat_lon[sm_node].astype(float, copy=False)
+                # If you still want a gentle DR temporal average:
+                if temporal_smooth_win and temporal_smooth_win >= 3 and temporal_smooth_win % 2 == 1:
+                    source_DR = _movavg_1d(source_DR, temporal_smooth_win)
+
+            elif mode == "viterbi":
+                if misfit_hist is None:
+                    # If we somehow didn’t collect, silently skip to no smoothing
+                    pass
+                else:
+                    M = np.vstack(misfit_hist)  # (T, J_subgrid_or_full)
+                    # If we used a sub-grid during locate, misfit is already in local-node space,
+                    # but the indices we stored in source_node are *global*. That’s OK; the
+                    # Viterbi path is chosen in the same (local) space we evaluated M in.
+                    sm_local = _viterbi_smooth_indices(
+                        misfits_TJ=M,
+                        flat_lat=flat_lat if "node_index" not in ctx else flat_lat[ctx["node_index"]],
+                        flat_lon=flat_lon if "node_index" not in ctx else flat_lon[ctx["node_index"]],
+                        lambda_km=float(viterbi_lambda_km),
+                        max_step_km=(None if viterbi_max_step_km is None else float(viterbi_max_step_km)),
+                    )
+                    # Map local indices back to global if needed
+                    node_index = ctx.get("node_index", None)
+                    sm_global = sm_local if node_index is None else np.asarray(node_index, int)[sm_local]
+
+                    source_lat = flat_lat[sm_global]
+                    source_lon = flat_lon[sm_global]
+                    # Re-pick DR at the smoothed node using stored per-time means (if present)
+                    try:
+                        mean_M = np.vstack(mean_hist)  # (T, J_local)
+                        source_DR = np.array([mean_M[t, sm_local[t]] for t in range(mean_M.shape[0])], dtype=float)
+                    except Exception:
+                        # fallback: keep previously computed DR scalars
+                        pass
+
+            else:
+                # no temporal smoothing; nothing to do
+                pass
 
         # Save source
         self.source = {
@@ -575,51 +861,294 @@ class ASL:
 
     # ---------- plots ----------
     def plot(self, zoom_level=1, threshold_DR=0, scale=1, join=False, number=0,
-             add_labels=False, outfile=None, stations=None, title=None, region=None, normalize=True):
+            add_labels=False, outfile=None, stations=None, title=None, region=None,
+            normalize=True, dem_tif: str | None = None, simple_basemap: bool = True):
         source = self.source
         if not source:
-            fig = topo_map(zoom_level=zoom_level, inv=None, show=True, add_labels=add_labels)
+            # even with no source, honor the simple basemap preference
+            fig = topo_map(
+                zoom_level=zoom_level, inv=None, show=True, add_labels=add_labels,
+                topo_color=True, cmap=("land" if simple_basemap else None),
+                region=region, dem_tif=dem_tif
+            )
             return
 
+        # 1) DR timeseries (matplotlib)
         t_dt = [this_t.datetime for this_t in source["t"]]
         plt.figure()
         plt.plot(t_dt, source["DR"])
         plt.plot(t_dt, np.ones(source["DR"].size) * threshold_DR)
         plt.xlabel("Date/Time (UTC)"); plt.ylabel("Reduced Displacement (${cm}^2$)")
+        # do not save here; caller has dedicated functions. This figure is transient.
+        plt.close()
 
-        if threshold_DR > 0:
-            mask = source["DR"] < threshold_DR
-            source["DR"][mask] = 0.0
-            source["lat"][mask] = None
-            source["lon"][mask] = None
+        # 2) Gate by threshold, compute symbol sizes
+        # Keep only finite rows
+        x = np.asarray(x, float)
+        y = np.asarray(y, float)
+        DR = np.asarray(DR, float)
+        symsize = np.asarray(symsize, float)
 
-        x, y, DR = source["lon"], source["lat"], source["DR"]
-        symsize = (scale * np.ones_like(DR) if normalize is False and number
-                   else (scale * np.ones_like(DR) if normalize and np.nanmax(DR) == 0
-                         else (np.divide(DR, np.nanmax(DR)) * scale if normalize else scale * np.sqrt(np.maximum(DR, 0)))))
+        m = np.isfinite(x) & np.isfinite(y) & np.isfinite(DR) & np.isfinite(symsize) & (symsize > 0)
+        if not np.any(m):
+            # fall back to a blank basemap
+            fig = topo_map(
+                zoom_level=zoom_level, inv=None,
+                centerlat=float(dome_location["lat"]), centerlon=float(dome_location["lon"]),
+                add_labels=add_labels, topo_color=False, stations=stations, title=title, region=region
+            )
+            if outfile:
+                fig.savefig(outfile)
+            else:
+                fig.show()
+            return
 
-        maxi = np.nanargmax(DR)
-        fig = topo_map(zoom_level=zoom_level, inv=None, centerlat=y[maxi], centerlon=x[maxi],
-                       add_labels=add_labels, topo_color=False, stations=stations, title=title, region=region)
+        x, y, DR, symsize = x[m], y[m], DR[m], symsize[m]
 
+        # Map center on the strongest valid point
+        maxi = int(np.nanargmax(DR))
+        fig = topo_map(
+            zoom_level=zoom_level, inv=None,
+            centerlat=float(y[maxi]), centerlon=float(x[maxi]),
+            add_labels=add_labels, topo_color=False,  # <- plain gray land, light-blue sea
+            stations=stations, title=title, region=region
+        )
+
+        # If user asked for top-N only
         if number and number < len(x):
             ind = np.argpartition(DR, -number)[-number:]
             x, y, DR, symsize = x[ind], y[ind], DR[ind], symsize[ind]
 
+        # Color by time index (simple sequential)
         pygmt = __import__("pygmt")
-        pygmt.makecpt(cmap="viridis", series=[0, len(x)])
-        timecolor = list(range(len(x)))
-        fig.plot(x=x, y=y, size=symsize, style="cc", pen=None, fill=timecolor, cmap=True)
+        pygmt.makecpt(cmap="viridis", series=[0, len(x) - 1])
+        timecolor = np.arange(len(x), dtype=float)
+
+        # NOTE: style="c" (not "cc") — sizes are provided via size=
+        fig.plot(x=x, y=y, size=symsize, style="c", pen=None, color=timecolor, cmap=True)
+
         fig.colorbar(frame='+l"Sequence"')
+
+        # Optional join
+        if join and len(x) > 1:
+            # Sort by time if you want a line in chronological order
+            order = np.argsort(timecolor)
+            fig.plot(x=x[order], y=y[order], pen="1p,red")
 
         if region:
             fig.basemap(region=region, frame=True)
+
         if outfile:
             fig.savefig(outfile)
         else:
             fig.show()
-        if join:
-            fig.plot(x=x, y=y, style="r-", pen="1p,red")
+
+
+    # ---------- plots ----------
+    def plot(
+        self,
+        zoom_level=0,
+        threshold_DR=0,
+        scale=1,
+        join=False,
+        number=0,
+        add_labels=False,
+        outfile=None,
+        stations=None,
+        title=None,
+        region=None,
+        normalize=True,
+        dem_tif: str | None = None,
+        simple_basemap: bool = True,
+    ):
+        """
+        Plot the time-ordered source track on a simple basemap.
+        - Uses lon/lat/DR from self.source (no external symsize input).
+        - If normalize=True: sizes ~ DR / max(DR) * scale
+        else: sizes ~ sqrt(max(DR,0)) * scale   (historic behavior)
+        - Thresholding zeroes DR and masks lon/lat below threshold.
+        - Emits detailed console logs; raises on hard failures.
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from datetime import datetime
+
+        def _ts(msg: str) -> None:
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{now}] [{now}] [ASL:PLOT] {msg}")
+
+        source = self.source
+        if not source:
+            _ts(f"no source; drawing simple basemap (dem_tif={dem_tif}, simple_basemap={simple_basemap})")
+            fig = topo_map(
+                zoom_level=zoom_level, inv=None, show=True, add_labels=add_labels,
+                topo_color=True, cmap=("land" if simple_basemap else None),
+                region=region, dem_tif=dem_tif
+            )
+            return
+
+        _ts("plot() called with args: "
+            f"zoom_level={zoom_level}, threshold_DR={float(threshold_DR)}, scale={float(scale)}, "
+            f"join={join}, number={number}, add_labels={add_labels}, outfile={outfile}, title={title}, "
+            f"region={region}, normalize={normalize}, dem_tif={dem_tif}, simple_basemap={simple_basemap}")
+        _ts(f"source keys: {sorted(list(source.keys()))}")
+
+        # --- DR time series quicklook (non-fatal)
+        try:
+            t_dt = [tt.datetime for tt in source["t"]]
+            DR_ts = np.asarray(source["DR"], float)
+            _ts(f"timeseries: len(t)={len(t_dt)} len(DR)={DR_ts.size} "
+                f"DR[min,max]=({np.nanmin(DR_ts):.3g},{np.nanmax(DR_ts):.3g})")
+            plt.figure()
+            plt.plot(t_dt, DR_ts)
+            plt.plot(t_dt, np.ones(DR_ts.size) * threshold_DR)
+            plt.xlabel("Date/Time (UTC)"); plt.ylabel("Reduced Displacement (${cm}^2$)")
+            plt.close()
+        except Exception as e:
+            _ts(f"WARNING: timeseries preview failed: {e!r}")
+
+        # --- Core arrays
+        try:
+            x = np.asarray(source["lon"], float)
+            y = np.asarray(source["lat"], float)
+            DR = np.asarray(source["DR"], float)
+        except KeyError as e:
+            _ts(f"ERROR: required key missing in source: {e!r}")
+            raise
+        except Exception as e:
+            _ts(f"ERROR: failed to coerce lon/lat/DR: {e!r}")
+            raise
+
+        if not (x.size == y.size == DR.size):
+            _ts(f"ERROR: length mismatch: len(lon)={x.size}, len(lat)={y.size}, len(DR)={DR.size}")
+            raise ValueError("ASL.plot(): lon, lat, DR must have identical lengths.")
+
+        # --- Thresholding (mirror GitHub semantics, but without mutating self.source)
+        if float(threshold_DR) > 0:
+            mask = DR < float(threshold_DR)
+            DR = DR.copy(); x = x.copy(); y = y.copy()
+            DR[mask] = 0.0
+            x[mask] = np.nan
+            y[mask] = np.nan
+            _ts(f"threshold applied at {threshold_DR}; masked {int(np.count_nonzero(mask))} points")
+
+        # --- Symbol sizes (what GitHub used, with guards)
+        try:
+            if normalize:
+                mx = float(np.nanmax(DR))
+                if not np.isfinite(mx) or mx <= 0:
+                    symsize = scale * np.ones_like(DR, dtype=float)
+                    _ts("normalize=True but max(DR)<=0; using constant symsize")
+                else:
+                    symsize = (DR / mx) * float(scale)
+            else:
+                symsize = float(scale) * np.sqrt(np.maximum(DR, 0.0))
+        except Exception as e:
+            _ts(f"ERROR: building symsize failed: {e!r}")
+            raise
+
+        # --- Validity mask
+        m = np.isfinite(x) & np.isfinite(y) & np.isfinite(DR) & np.isfinite(symsize) & (symsize > 0)
+        n_valid = int(np.count_nonzero(m))
+        _ts(f"valid mask: {n_valid}/{x.size} points valid")
+        if n_valid == 0:
+            _ts("ERROR: no valid points after filtering.")
+            raise RuntimeError("ASL.plot(): no valid points to plot after filtering.")
+
+        x, y, DR, symsize = x[m], y[m], DR[m], symsize[m]
+        _ts(f"filtered stats: x[{x.min():.5f},{x.max():.5f}] "
+            f"y[{y.min():.5f},{y.max():.5f}] "
+            f"DR[min,med,max]=({np.nanmin(DR):.3g},{np.nanmedian(DR):.3g},{np.nanmax(DR):.3g}); "
+            f"size[min,med,max]=({np.nanmin(symsize):.3g},{np.nanmedian(symsize):.3g},{np.nanmax(symsize):.3g})")
+
+        # --- Map center on max DR
+        maxi = int(np.nanargmax(DR))
+        center_lat, center_lon = float(y[maxi]), float(x[maxi])
+        _ts(f"center on max DR idx={maxi} at (lon,lat)=({center_lon:.5f},{center_lat:.5f})")
+
+        # --- Plain basemap
+        try:
+            fig = topo_map(
+                zoom_level=zoom_level,
+                inv=None,
+                centerlat=center_lat,
+                centerlon=center_lon,
+                add_labels=add_labels,
+                topo_color=False,                 # <- plain background
+                stations=stations,
+                title=title,
+                region=region,
+                dem_tif=dem_tif if dem_tif else None,
+                cmap='land',
+            )
+            _ts("basemap created.")
+        except Exception as e:
+            _ts(f"ERROR: topo_map() failed: {e!r}")
+            raise
+
+        # --- Top-N subselect (by DR) if requested
+        if number and number < len(x):
+            _ts(f"subselecting top-N by DR: N={number}")
+            ind = np.argpartition(DR, -number)[-number:]
+            x, y, DR, symsize = x[ind], y[ind], DR[ind], symsize[ind]
+
+        # --- Color by chronological index
+        import pygmt  # type: ignore
+        try:
+            pygmt.makecpt(cmap="viridis", series=[0, len(x) - 1])
+            timecolor = np.arange(len(x), dtype=float)
+            _ts("cpt created (viridis).")
+        except Exception as e:
+            _ts(f"ERROR: makecpt failed: {e!r}")
+            raise
+
+        # --- Scatter
+        try:
+            # NOTE: use style="c" with per-point sizes via `size=symsize`
+            fig.plot(x=x, y=y, size=symsize, style="c", pen=None, fill=timecolor, cmap=True)
+            _ts(f"scatter plotted: n={len(x)}")
+        except Exception as e:
+            _ts(f"ERROR: scatter plot failed: {e!r}")
+            raise
+
+        # --- Colorbar
+        try:
+            fig.colorbar(frame='+l"Sequence"')
+            _ts("colorbar added.")
+        except Exception as e:
+            _ts(f"ERROR: colorbar failed: {e!r}")
+            raise
+
+        # --- Optional line join in chronological order
+        if join and len(x) > 1:
+            order = np.argsort(timecolor)
+            try:
+                fig.plot(x=x[order], y=y[order], pen="1p,red")
+                _ts("joined points chronologically with red line.")
+            except Exception as e:
+                _ts(f"ERROR: join failed: {e!r}")
+                raise
+
+        if region:
+            try:
+                fig.basemap(region=region, frame=True)
+                _ts("frame drawn for region.")
+            except Exception as e:
+                _ts(f"ERROR: frame draw failed: {e!r}")
+                raise
+
+        # --- Output
+        if outfile:
+            try:
+                fig.savefig(outfile)
+                _ts(f"saved figure: {outfile}")
+            except Exception as e:
+                _ts(f"ERROR: savefig failed: {e!r}")
+                raise
+        else:
+            _ts("showing figure (interactive).")
+            fig.show()
+
 
     def plot_reduced_displacement(self, threshold_DR=0, outfile=None):
         if not self.source:
@@ -668,10 +1197,23 @@ class ASL:
             oq.azimuthal_gap = float(azgap[i]) if azgap[i] is not None else None
             oq.used_station_count = int(nsta[i]) if nsta[i] is not None else None
 
+            # pick a node elevation near the current origin (works for Grid or NodeGrid)
+            node_z = getattr(self.gridobj, "node_elev_m", None)
+            elev_node_m = 0.0
+            if node_z is not None and np.isfinite(node_z).any():
+                glat = np.asarray(self.gridobj.gridlat).reshape(-1)
+                glon = np.asarray(self.gridobj.gridlon).reshape(-1)
+                j0 = int(np.nanargmin((glat - lat)**2 + (glon - lon)**2))
+                elev_node_m = float(np.asarray(node_z).reshape(-1)[j0])
+
             distances_km = []
             for coords in self.station_coordinates.values():
-                dist_m, _, _ = gps2dist_azimuth(lat, lon, coords["latitude"], coords["longitude"])
-                distances_km.append(dist_m / 1000.0)
+                stalat = float(coords["latitude"])
+                stalon = float(coords["longitude"])
+                staelev = float(coords.get("elevation", 0.0))  # meters
+                d_km = geo_distance_3d_km(lat, lon, elev_node_m, stalat, stalon, staelev)
+                distances_km.append(d_km)
+
             if distances_km:
                 oq.minimum_distance = min(distances_km)
                 oq.maximum_distance = max(distances_km)
@@ -1032,7 +1574,6 @@ class ASL:
                 c = self.station_coordinates.get(sid)
                 if c is None:
                     d_km.append(np.nan); continue
-                from obspy.geodetics import gps2dist_azimuth
                 dm, _, _ = gps2dist_azimuth(lat_j, lon_j, c["latitude"], c["longitude"])
                 d_km.append(dm / 1000.0)
             d_km = np.asarray(d_km, float)
@@ -1535,13 +2076,13 @@ def asl_sausage(
     output_dir: str,
     dry_run: bool = False,
     peakf_override: Optional[float] = None,
-    station_gains_df: Optional["pd.DataFrame"] = None,  # interval table; columns=seed_ids; rows define start_time/end_time
+    station_gains_df: Optional["pd.DataFrame"] = None,  # long/tidy: start_time,end_time,seed_id,gain,…
     allow_station_fallback: bool = True,
 ):
     """
     Run ASL on a single (already preprocessed) event stream.
 
-    Required in asl_config:
+    Required in `asl_config`:
       - gridobj : Grid
       - node_distances_km : dict[seed_id -> np.ndarray]
       - station_coords : dict[seed_id -> {latitude, longitude, ...}]
@@ -1549,18 +2090,21 @@ def asl_sausage(
       - vsam_metric, window_seconds, min_stations, interactive, Q, surfaceWaveSpeed_kms
 
     Optional:
-      - station_gains_df : DataFrame with columns:
-            start_time, end_time, <seed_id_1>, <seed_id_2>, ...
-        We divide each trace by the gain matching the event time interval.
+      - station_gains_df : **long-form** DataFrame with columns:
+            start_time | end_time | seed_id | gain | (optional: method, n_events, …)
+        Behavior:
+          * Picks the row whose [start_time, end_time) contains the event start time.
+          * Divides each trace by the matching gain for its seed_id.
+          * If `allow_station_fallback=True`, tries station-scoped fallbacks:
+              NET.STA.LOC.CHA → NET.STA..CHA → NET.STA.*.CHA → NET.STA.*.* → NET.STA
+          * Traces without a matching gain are left unchanged.
     """
-    import numpy as np
-    import pandas as pd
 
     print(f"[ASL] Preparing VSAM for event folder: {event_dir}")
     os.makedirs(event_dir, exist_ok=True)
 
     # --------------------------
-    # 1) Apply station gains (interval table)
+    # 1) Apply station gains (interval table, long/tidy)
     # --------------------------
     if station_gains_df is not None and len(station_gains_df):
         try:
@@ -1570,15 +2114,18 @@ def asl_sausage(
                 allow_station_fallback=allow_station_fallback,
                 verbose=True,
             )
-            _ = info  # not used further; printed for transparency
+            s = info.get("interval_start"); e = info.get("interval_end")
+            used = info.get("used", []); miss = info.get("missing", [])
+            print(f"[GAINS] Interval used: {s} → {e} | corrected {len(used)} traces; missing {len(miss)}")
         except Exception as e:
             print(f"[GAINS:WARN] Failed to apply interval gains: {e}")
     else:
         print("[GAINS] No station gains DataFrame provided; skipping.")
 
-    # Ensure velocity units for downstream plots
+    # Ensure velocity units for downstream plots (don’t overwrite if already set)
     for tr in stream:
-        tr.stats["units"] = "m/s"
+        if tr.stats.get("units") in (None, ""):
+            tr.stats["units"] = "m/s"
 
     # --------------------------
     # 2) Build VSAM
@@ -1590,6 +2137,11 @@ def asl_sausage(
     if not dry_run:
         print("[ASL:PLOT] Writing VSAM preview (VSAM.png)")
         vsamObj.plot(equal_scale=False, outfile=os.path.join(event_dir, "VSAM.png"))
+        # close any pyplot figs opened by VSAM.plot to avoid figure buildup
+        try:
+            plt.close('all')
+        except Exception:
+            pass
 
     # --------------------------
     # 3) Decide event peakf
@@ -1612,20 +2164,27 @@ def asl_sausage(
     ampcorr: AmpCorr = asl_config["ampcorr"]
     if abs(float(ampcorr.params.peakf) - float(peakf_event)) > 1e-6:
         print(f"[ASL] Switching amplitude corrections to peakf={peakf_event} Hz (from {ampcorr.params.peakf})")
+
+        # Use the grid’s actual signature object and the distance signature you *already* computed
+        grid_sig = asl_config["gridobj"].signature()                # works for Grid or NodeGrid
+        dist_sig = distances_signature(asl_config["node_distances_km"])
+        inv_sig  = tuple(sorted(asl_config["node_distances_km"].keys()))
+
         params = ampcorr.params
         new_params = AmpCorrParams(
             surface_waves=params.surface_waves,
             wave_speed_kms=params.wave_speed_kms,
             Q=params.Q,
             peakf=float(peakf_event),
-            grid_sig=params.grid_sig,
-            inv_sig=params.inv_sig,
-            dist_sig=params.dist_sig,
-            mask_sig=params.mask_sig,
+            grid_sig=grid_sig,            # ← was wrong before
+            inv_sig=inv_sig,
+            dist_sig=dist_sig,
+            mask_sig=None,
             code_version=params.code_version,
         )
+
         ampcorr = AmpCorr(new_params, cache_dir=ampcorr.cache_dir)
-        ampcorr.compute_or_load(asl_config["node_distances_km"])  # inventory not needed here
+        ampcorr.compute_or_load(asl_config["node_distances_km"])    # reuse the same (now 3-D) distances
         asl_config[f"ampcorr_peakf_{peakf_event}"] = ampcorr
     else:
         print(f"[ASL] Using existing amplitude corrections (peakf={ampcorr.params.peakf} Hz)")
@@ -1653,6 +2212,21 @@ def asl_sausage(
     # --------------------------
     # 6) Locate
     # --------------------------
+    # Extra sanity check
+    # From asl_config
+    station_coords = asl_config["station_coords"]
+    meta = asl_config.get("dist_meta", {})
+
+    print(f"[DIST] used_3d={meta.get('used_3d')}  "
+        f"has_node_elevations={meta.get('has_node_elevations')}  "
+        f"n_nodes={meta.get('n_nodes')}  n_stations={meta.get('n_stations')}")
+    z_grid = getattr(asl_config["gridobj"], "node_elev_m", None)
+    if z_grid is not None:
+        import numpy as np
+        print(f"[GRID] Node elevations: min={np.nanmin(z_grid):.1f} m  max={np.nanmax(z_grid):.1f} m")
+    ze = [c.get("elevation", 0.0) for c in station_coords.values()]
+    print(f"[DIST] Station elevations: min={min(ze):.1f} m  max={max(ze):.1f} m")
+
     print("[ASL] Locating source with fast_locate()…")
     try:
         aslobj.fast_locate()
@@ -1671,8 +2245,11 @@ def asl_sausage(
         print(f"[ASL:OUT] Writing QuakeML: {qml_out}")
         aslobj.save_event(outfile=qml_out)
 
+        dem_tif_for_bmap = asl_config.get("dem_tif") or asl_config.get("dem_tif_for_bmap")
+
         try:
             print("[ASL:PLOT] Writing map and diagnostic plots…")
+            # Simple basemap, no shading, same DEM as channels if provided
             aslobj.plot(
                 zoom_level=0,
                 threshold_DR=0.0,
@@ -1682,17 +2259,33 @@ def asl_sausage(
                 add_labels=True,
                 stations=[tr.stats.station for tr in stream],
                 outfile=os.path.join(event_dir, f"map_Q{int(aslobj.Q)}_F{int(peakf_event)}.png"),
+                dem_tif=dem_tif_for_bmap,
+                simple_basemap=True,
             )
+            plt.close('all')
+
+            print("[ASL:SOURCE_TO_CSV] Writing source to a CSV…")
             aslobj.source_to_csv(os.path.join(event_dir, f"source_Q{int(aslobj.Q)}_F{int(peakf_event)}.csv"))
+
+            print("[ASL:PLOT_REDUCED_DISPLACEMENT]")
             aslobj.plot_reduced_displacement(
                 outfile=os.path.join(event_dir, f"reduced_disp_Q{int(aslobj.Q)}_F{int(peakf_event)}.png")
             )
+            plt.close()
+
+            print("[ASL:PLOT_MISFIT]")
             aslobj.plot_misfit(
                 outfile=os.path.join(event_dir, f"misfit_Q{int(aslobj.Q)}_F{int(peakf_event)}.png")
             )
+            plt.close()
+
+            print("[ASL:PLOT_MISFIT_HEATMAP]")
             aslobj.plot_misfit_heatmap(
                 outfile=os.path.join(event_dir, f"misfit_heatmap_Q{int(aslobj.Q)}_F{int(peakf_event)}.png")
             )
+            # PyGMT figures are managed inside; still good to close pyplot
+            plt.close('all')
+
         except Exception:
             print("[ASL:ERR] Plotting failed.")
             raise
@@ -1700,7 +2293,6 @@ def asl_sausage(
         if asl_config.get("interactive", False):
             input("[ASL] Press Enter to continue to next event…")
 
-    return aslobj  # handy if the caller wants the object
 
 from types import SimpleNamespace
 def _as_regular_view(obj):
@@ -1736,17 +2328,67 @@ def _grid_shape_or_none(gridobj):
     return None
 
 def _median_filter_indices(idx: np.ndarray, win: int) -> np.ndarray:
-    """Centered odd-window median filter on integer indices with 'edge' padding."""
+    """Centered odd-window median filter on integer indices with simple edge padding."""
     if win < 3 or win % 2 == 0:
         return idx
-    n = idx.size
-    r = win // 2
+    n, r = idx.size, win // 2
     out = idx.copy()
     # reflect-pad
     pad_left  = idx[1:r+1][::-1] if n > 1 else idx[:1]
     pad_right = idx[-r-1:-1][::-1] if n > 1 else idx[-1:]
     padded = np.concatenate([pad_left, idx, pad_right])
     for i in range(n):
-        w = padded[i:i+win]
-        out[i] = int(np.median(w))
+        out[i] = int(np.median(padded[i:i+win]))
     return out
+
+from obspy.geodetics.base import gps2dist_azimuth
+def _grid_pairwise_km(flat_lat: np.ndarray, flat_lon: np.ndarray) -> np.ndarray:
+    """Square matrix D[j,k] = great-circle distance (km) between grid nodes j,k."""
+    
+    J = flat_lat.size
+    D = np.empty((J, J), dtype=float)
+    for j in range(J):
+        latj, lonj = float(flat_lat[j]), float(flat_lon[j])
+        for k in range(J):
+            latk, lonk = float(flat_lat[k]), float(flat_lon[k])
+            D[j, k] = 0.001 * gps2dist_azimuth(latj, lonj, latk, lonk)[0]
+    return D
+
+def _viterbi_smooth_indices(
+    misfits_TJ: np.ndarray,    # shape (T, J)
+    flat_lat: np.ndarray,      # shape (J,)
+    flat_lon: np.ndarray,      # shape (J,)
+    lambda_km: float = 1.0,    # step penalty [cost per km]
+    max_step_km: float | None = None,  # forbid jumps larger than this (None=disabled)
+) -> np.ndarray:
+    """
+    Dynamic programming path: minimize sum_t ( misfit[t, j_t] + lambda_km * dist(j_{t-1}, j_t) ).
+    Returns best indices j_t (shape (T,)).
+    """
+    T, J = misfits_TJ.shape
+    D = _grid_pairwise_km(flat_lat, flat_lon)   # (J, J)
+    if max_step_km is not None:
+        # disallow large jumps by inflating cost to inf
+        mask = D > float(max_step_km)
+        D = np.where(mask, np.inf, D)
+
+    # DP tables
+    dp  = np.full((T, J), np.inf, dtype=float)
+    bp  = np.full((T, J), -1,   dtype=int)
+    dp[0, :] = misfits_TJ[0, :]
+
+    for t in range(1, T):
+        # cost to arrive at node j at time t from all k at t-1
+        # dp[t-1, k] + lambda*D[k,j]  → take min over k
+        trans = dp[t-1, :, None] + lambda_km * D[None, :, :]  # (J, J)
+        kbest = np.nanargmin(trans, axis=0)                   # (J,)
+        dp[t, :] = misfits_TJ[t, np.arange(J)] + trans[kbest, np.arange(J)]
+        bp[t, :] = kbest
+
+    # backtrack
+    jT = int(np.nanargmin(dp[-1, :]))
+    path = np.empty(T, dtype=int)
+    path[-1] = jT
+    for t in range(T-2, -1, -1):
+        path[t] = int(bp[t+1, path[t+1]])
+    return path

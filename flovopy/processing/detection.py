@@ -26,7 +26,7 @@ from obspy.signal.trigger import (
 
 # Custom or local functions assumed from other modules
 from flovopy.core.trace_qc import estimate_snr
-from flovopy.core.spectra import  (
+from flovopy.core.spectral import  (
     compute_amplitude_ratios,
     plot_amplitude_ratios,
     get_bandwidth,
@@ -895,14 +895,12 @@ def picker(st):
                 p_idx = aic_f.argmin()
                 print(f'aic_simple P for {tr.id}: ',tr.stats.starttime + p_idx / tr.stats.sampling_rate)
 
-def filter_picks(tr, p_sec, s_sec, starttime):
+def filter_picks(tr, p_sec, s_sec, starttime, min_sec=0.0):
     picks = {}
     p_time = starttime + p_sec
     s_time = starttime + s_sec    
-    if p_sec < 1.0:
-        p_sec = None
-    if s_sec < 1.0:
-        s_sec = None
+    if p_sec is not None and p_sec < min_sec: p_sec = None
+    if s_sec is not None and s_sec < min_sec: s_sec = None
     #print(p_sec, s_sec, p_time, s_time)
     if s_sec and p_sec:
         if s_sec > p_sec:
@@ -912,7 +910,11 @@ def filter_picks(tr, p_sec, s_sec, starttime):
     elif s_sec:
         picks[tr.id] = {'S': s_time}
     return picks
-    
+
+def _component_alias(code: str) -> str:
+    c = code[-1].upper()
+    return {'1':'E','2':'N'}.get(c, c)  # leave Z/E/N as-is
+
 def stream_picker(stream):
     picks = {}
 

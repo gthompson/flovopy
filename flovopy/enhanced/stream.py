@@ -3,16 +3,12 @@ from obspy import Stream, Trace, read
 import numpy as np
 import pandas as pd
 from collections import defaultdict
+from obspy.core.util.attribdict import AttribDict
 
-# import your helpers from the split modules
-from flovopy.core.spectral import get_bandwidth, _ssam, _band_ratio, compute_amplitude_spectra
+# new consolidated spectral API (writes scalars into m["spectral"])
+from flovopy.core.spectral import spectral_block
 
-def _copy_with_data(tr: Trace, data: np.ndarray) -> Trace:
-    tc = tr.copy()
-    tc.data = np.asarray(data, dtype=np.float64)
-    return tc
-
-# --- imports you likely already have near the top ---
+# physics / magnitude helpers
 from flovopy.core.physics import (
     estimate_distance,
     estimate_source_energy,
@@ -21,147 +17,58 @@ from flovopy.core.physics import (
     Eseismic2magnitude,
     estimate_local_magnitude,
 )
-# if your SNR util is elsewhere, adjust import:
-from flovopy.core.trace_qc import estimate_snr  # or wherever you put it
-import numpy as np
-import pandas as pd
-# if you kept the time-domain band-ratio helpers here:
-# from .stream import _td_rsam, _td_band_ratio   # (shown in your current file)
+
+# SNR
+from flovopy.core.trace_qc import estimate_snr
+
+def _copy_with_data(tr: Trace, data: np.ndarray) -> Trace:
+    tc = tr.copy()
+    tc.data = np.asarray(data, dtype=np.float64)
+    return tc
 
 class EnhancedStream(Stream):
     """ObsPy Stream with convenience metrics + station aggregation."""
     def __init__(self, stream=None, traces=None):
+        # no EnhancedTrace coercion; keep it simple/robust
         if traces is not None:
-            # coerce all to EnhancedTrace
-            coerced = [t if isinstance(t, EnhancedTrace) else EnhancedTrace(data=t.data, header=t.stats) for t in traces]
-            super().__init__(traces=coerced)
+            super().__init__(traces=traces)
         elif stream is not None:
-            coerced = [t if isinstance(t, EnhancedTrace) else EnhancedTrace(data=t.data, header=t.stats) for t in stream.traces]
-            super().__init__(traces=coerced)
+            super().__init__(traces=stream.traces)
         else:
             super().__init__()
-
-        # a place to store station-level results
         self.station_metrics: pd.DataFrame | None = None
 
-    # ---------------- core per-trace metrics ----------------
-    def ampengfft(
-        self,
-        *,
-        differentiate: bool = False,          # applies to seismic only
-        compute_spectral: bool = False,
-        compute_ssam: bool = False,
-        compute_bandratios: bool = False,
-        threshold: float = 0.707,
-        window_length: int = 9,
-        polyorder: int = 2,
-        td_band_pairs=((0.5,2.0, 2.0,8.0),),  # cheap TD band-features if spectral=False
-    ) -> None:
-        """Compute per-trace metrics; then aggregate per-station."""
+    # ---------------- convenience: metric container + type helpers ----------------
+    @staticmethod
+    def _ensure_metrics(tr: Trace) -> dict:
+        if not hasattr(tr.stats, "metrics") or tr.stats.metrics is None:
+            tr.stats.metrics = {}
+        return tr.stats.metrics
 
-        if len(self) == 0:
-            self.station_metrics = pd.DataFrame()
-            return
+    @staticmethod
+    def _is_infrasound(tr: Trace) -> bool:
+        cha = getattr(tr.stats, "channel", "") or ""
+        return len(cha) >= 2 and cha[1].upper() == "D"
 
-        for tr in self:
-            m = tr.ensure_metrics()
+    @staticmethod
+    def _is_seismic(tr: Trace) -> bool:
+        cha = getattr(tr.stats, "channel", "") or ""
+        # broaden as needed ('H','B','E','S','L' etc.)
+        return len(cha) >= 2 and cha[1].upper() in ("H", "B", "E", "S", "L")
 
-            # detrend/taper neutrally (feel free to disable if you do this elsewhere)
-            try:
-                tr.detrend("linear").taper(0.01)
-            except Exception:
-                pass
+    @staticmethod
+    def _component(tr: Trace) -> str:
+        cha = getattr(tr.stats, "channel", "") or ""
+        return cha[-1].upper() if cha else ""
 
-            dt = float(tr.stats.delta)
-            y_raw = np.asarray(tr.data, dtype=np.float64)
+    @staticmethod
+    def _station_key(tr: Trace) -> str:
+        # NET.STA.LOC
+        return ".".join([tr.stats.network, tr.stats.station, (tr.stats.location or "")])
 
-            # --- branch by data type ---
-            if tr.is_infrasound():
-                # infrasound: treat series as pressure [Pa] (or whatever units you're using)
-                # time-domain stats on raw series
-                self._td_stats(tr, y_raw)
-
-                # PAP + bandpassed PAP (1–20 Hz default inside helper)
-                pap, pap_bp = self._pressure_metrics(tr, band=(1.0, 20.0))
-                m["pap"] = pap
-                m["pap_bp_1_20"] = pap_bp
-
-                # optional spectral
-                if compute_spectral:
-                    self._spectral_block(tr, y_raw, dt, threshold, window_length, polyorder,
-                                         compute_ssam, compute_bandratios)
-                else:
-                    # optional cheap TD band-features
-                    if td_band_pairs:
-                        for (l1,l2,h1,h2) in td_band_pairs[:1]:
-                            br = self._td_band_ratio(tr, low=(l1,l2), high=(h1,h2), stat="mean_abs", log2=True)
-                            m[f"rsam_{l1}_{l2}"] = br["RSAM_low"]
-                            m[f"rsam_{h1}_{h2}"] = br["RSAM_high"]
-                            m[br["ratio_key"]]   = br["ratio"]
-
-            else:
-                # seismic: choose working series
-                if differentiate:
-                    # input is displacement → derive vel/acc
-                    disp = tr.copy()               # treat as displacement
-                    vel  = tr.copy().differentiate()
-                    acc  = vel.copy().differentiate()
-                else:
-                    # input is velocity → derive disp/acc
-                    vel  = tr
-                    disp = tr.copy().integrate()
-                    acc  = tr.copy().differentiate()
-
-                y = np.asarray(vel.data, dtype=np.float64)
-
-                # time-domain stats on working series (vel)
-                self._td_stats(tr, y)
-
-                # PGM suite
-                m["pgd"] = float(np.nanmax(np.abs(disp.data))) if disp.stats.npts else np.nan
-                m["pgv"] = float(np.nanmax(np.abs(vel.data)))  if vel.stats.npts  else np.nan
-                m["pga"] = float(np.nanmax(np.abs(acc.data)))  if acc.stats.npts  else np.nan
-
-                # “energy” (velocity-based by default)
-                m["energy"] = float(np.nansum(y * y) * dt) if y.size else np.nan
-
-                # dominant freq via time-domain ratio
-                try:
-                    num = np.abs(vel.data).astype(np.float64)
-                    den = 2.0 * np.pi * np.abs(disp.data).astype(np.float64) + 1e-20
-                    fdom_series = num / den
-                    m["fdom"] = float(np.nanmedian(fdom_series)) if fdom_series.size else np.nan
-                except Exception:
-                    m["fdom"] = np.nan
-
-                # spectral (optional)
-                if compute_spectral:
-                    self._spectral_block(tr, y_raw, dt, threshold, window_length, polyorder,
-                                         compute_ssam, compute_bandratios)
-                else:
-                    if td_band_pairs:
-                        for (l1,l2,h1,h2) in td_band_pairs[:1]:
-                            br = self._td_band_ratio(tr, low=(l1,l2), high=(h1,h2), stat="mean_abs", log2=True)
-                            m[f"rsam_{l1}_{l2}"] = br["RSAM_low"]
-                            m[f"rsam_{h1}_{h2}"] = br["RSAM_high"]
-                            m[br["ratio_key"]]   = br["ratio"]
-
-        # --- station-level aggregation after per-trace loop ---
-        self.station_metrics = self._station_level_metrics()
-        # mirror station values back to each trace (handy downstream)
-        if not self.station_metrics.empty:
-            station_map = self.station_metrics.set_index("station_key").to_dict(orient="index")
-            for tr in self:
-                key = tr.station_key()
-                if key in station_map:
-                    for k,v in station_map[key].items():
-                        if k == "station_key":
-                            continue
-                        tr.stats.metrics[f"station_{k}"] = v
-
-    # ---------------- internals (kept short & testable) ----------------
-    def _td_stats(self, tr, y: np.ndarray) -> None:
-        m = tr.ensure_metrics()
+    # ---------------- time-domain stats on series y ----------------
+    def _td_stats(self, tr: Trace, y: np.ndarray) -> None:
+        m = self._ensure_metrics(tr)
         if y.size:
             m["sample_min"]     = float(np.nanmin(y))
             m["sample_max"]     = float(np.nanmax(y))
@@ -180,210 +87,249 @@ class EnhancedStream(Stream):
                       "sample_rms","sample_stdev","skewness","kurtosis"):
                 m[k] = np.nan
 
-        # peakamp/peaktime on |y|
         absy = np.abs(y)
         if absy.size:
-            m["peakamp"] = float(np.nanmax(absy))
-            m["peaktime"] = tr.stats.starttime + (int(np.nanargmax(absy)) * float(tr.stats.delta))
+            m["abs_max"]      = float(np.nanmax(absy))
+            m["abs_max_time"] = tr.stats.starttime + (int(np.nanargmax(absy)) * float(tr.stats.delta))
+            m["abs_mean"]     = float(np.nanmean(absy))
+            m["abs_median"]   = float(np.nanmedian(absy))
+            m["abs_rms"]      = float(np.sqrt(np.nanmean(absy*absy)))
+            m["abs_stdev"]    = float(np.nanstd(absy))
         else:
-            m["peakamp"] = np.nan
-            m["peaktime"] = None
+            m["abs_max"] = m["abs_mean"] = m["abs_median"] = m["abs_rms"] = m["abs_stdev"] = np.nan
+            m["abs_max_time"] = None
 
-        # velocity-based energy if not already set elsewhere
         if "energy" not in m:
             m["energy"] = float(np.nansum(y*y) * float(tr.stats.delta)) if y.size else np.nan
 
-    def _spectral_block(
-        self,
-        tr,
-        y,
-        dt,
-        threshold,
-        window_length,
-        polyorder,
-        compute_ssam,
-        compute_bandratios,
-        *,
-        use_helper: bool = True,
-        helper_kwargs: dict | None = None,
-    ):
-        """
-        Populate tr.stats.spectral (freqs, amplitudes) and derive spectral metrics.
-
-        Parameters
-        ----------
-        y : np.ndarray
-            The time series you want to analyze (caller decides: raw/vel/disp).
-        use_helper : bool
-            If True, use flovopy.core.spectral.compute_amplitude_spectra() for
-            detrend/taper/window/padding. If False, fast inline rFFT.
-        helper_kwargs : dict
-            Extra knobs passed to compute_amplitude_spectra(), e.g.:
-            {
-            "one_sided": True, "detrend": True, "taper": 0.01,
-            "window": "hann", "pad_to_pow2": True
-            }
-        """
-        # ---- prepare target containers ----
-        m = tr.ensure_metrics() if hasattr(tr, "ensure_metrics") else (
-            tr.stats.metrics if hasattr(tr.stats, "metrics") else setattr(tr.stats, "metrics", {}) or tr.stats.metrics
-        )
-        if not hasattr(tr.stats, "spectral") or tr.stats.spectral is None:
-            tr.stats.spectral = {}
-
-        # ---- sanitize input ----
-        y = np.asarray(y, dtype=np.float64)
-        if y.size < 2:
-            return
-        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # ---- compute spectrum ----
-        if use_helper:
-            # delegate to shared helper for consistent preprocessing
-            try:
-                from obspy import Stream
-                from flovopy.core.spectral import compute_amplitude_spectra
-
-                tmp = tr.copy()
-                tmp.data = y  # analyze exactly what caller passed
-                st = Stream([tmp])
-
-                kw = {
-                    "one_sided": True,
-                    "detrend": True,
-                    "taper": 0.01,
-                    "window": "hann",
-                    "pad_to_pow2": True,
-                }
-                if helper_kwargs:
-                    kw.update(helper_kwargs)
-
-                compute_amplitude_spectra(st, **kw)
-
-                spec = getattr(st[0].stats, "spectral", None)
-                if not spec or "freqs" not in spec or "amplitudes" not in spec:
-                    return
-                F = np.asarray(spec["freqs"], dtype=np.float64)
-                A = np.asarray(spec["amplitudes"], dtype=np.float64)
-
-            except Exception as e:
-                # fall back to inline rFFT if helper path fails
-                # (keeps things robust in odd environments)
-                # print(f"[{tr.id}] helper spectra failed ({e}); falling back to rFFT.")
-                from numpy.fft import rfft, rfftfreq
-                N = tr.stats.npts
-                if N < 2:
-                    return
-                A = np.abs(rfft(y))
-                F = rfftfreq(N, d=dt)
-        else:
-            # fast inline rFFT
-            from numpy.fft import rfft, rfftfreq
-            N = tr.stats.npts
-            if N < 2:
-                return
-            A = np.abs(rfft(y))
-            F = rfftfreq(N, d=dt)
-
-        # store on trace
-        tr.stats.spectral["freqs"] = F
-        tr.stats.spectral["amplitudes"] = A
-
-        # ---- bandwidth/cutoffs ----
-        try:
-            get_bandwidth(
-                F, A,
-                threshold=threshold,
-                window_length=window_length,
-                polyorder=polyorder,
-                trace=tr
-            )
-        except Exception as e:
-            print(f"[{tr.id}] Skipping bandwidth metrics: {e}")
-
-        # ---- SSAM (optional) ----
-        if compute_ssam:
-            try:
-                _ssam(tr)
-            except Exception as e:
-                print(f"[{tr.id}] SSAM computation failed: {e}")
-
-        # ---- spectral band ratios (optional) ----
-        if compute_bandratios:
-            try:
-                _band_ratio(tr, freqlims=[1.0, 6.0, 11.0])
-                _band_ratio(tr, freqlims=[0.5, 3.0, 18.0])
-            except Exception as e:
-                print(f"[{tr.id}] Band ratio computation failed: {e}")
-
-        # ---- spectral summaries (+ back-compat to stats.spectrum) ----
-        try:
-            if A.size and np.any(A > 0):
-                peak_idx = int(np.nanargmax(A))
-                peakf = float(F[peak_idx])
-                meanf = float(np.nansum(F * A) / np.nansum(A))
-                medianf = float(np.nanmedian(F[A > 0]))
-                peakA = float(np.nanmax(A))
-            else:
-                peakf = meanf = medianf = peakA = np.nan
-
-            m["peakf"]   = peakf
-            m["meanf"]   = meanf
-            m["medianf"] = medianf
-
-            s = getattr(tr.stats, "spectrum", {}) or {}
-            s["peakF"]   = peakf
-            s["medianF"] = medianf
-            s["peakA"]   = peakA
-            tr.stats.spectrum = s
-        except Exception as e:
-            print(f"[{tr.id}] Spectral summary failed: {e}")
-
-    def _pressure_metrics(self, tr, band=(1.0, 20.0)):
+    # ---------------- pressure metrics (PAP, bandpassed PAP) ----------------
+    @staticmethod
+    def _pressure_metrics(tr: Trace, band=(1.0, 20.0)) -> tuple[float, float]:
         y = np.asarray(tr.data, dtype=np.float64)
         pap = float(np.nanmax(np.abs(y))) if y.size else np.nan
         try:
             trf = tr.copy().filter("bandpass", freqmin=band[0], freqmax=band[1],
                                    corners=2, zerophase=True)
             yf = np.asarray(trf.data, dtype=np.float64)
-            pap_band = float(np.nanmax(np.abs(yf))) if yf.size else np.nan
+            pap_bp = float(np.nanmax(np.abs(yf))) if yf.size else np.nan
         except Exception:
-            pap_band = np.nan
-        return pap, pap_band
+            pap_bp = np.nan
+        return pap, pap_bp
 
-    def _td_rsam(self, tr, f1, f2, *, stat="mean_abs", corners=2, zerophase=True):
-        try:
-            trf = tr.copy().filter("bandpass", freqmin=float(f1), freqmax=float(f2),
-                                   corners=int(corners), zerophase=bool(zerophase))
-            y = trf.data.astype(np.float64)
-            if not y.size:
-                return np.nan
-            if stat == "median_abs":
-                return float(np.nanmedian(np.abs(y)))
-            if stat == "rms":
-                return float(np.sqrt(np.nanmean(y*y)))
-            return float(np.nanmean(np.abs(y)))
-        except Exception:
+    # ---------------- unified SAM/SEM (single filter pass per band pair) ----------------
+    def _abs_stat(self, y: np.ndarray, stat: str) -> float:
+        if y.size == 0:
             return np.nan
+        if stat == "median_abs":
+            return float(np.nanmedian(np.abs(y)))
+        if stat == "rms":
+            return float(np.sqrt(np.nanmean(y*y)))
+        return float(np.nanmean(np.abs(y)))  # mean_abs default
 
-    def _td_band_ratio(self, tr, low=(0.5,2.0), high=(2.0,8.0), *, stat="mean_abs", log2=True):
-        a1,b1 = low; a2,b2 = high
-        r_low  = self._td_rsam(tr, a1, b1, stat=stat)
-        r_high = self._td_rsam(tr, a2, b2, stat=stat)
-        if not np.isfinite(r_low) or not np.isfinite(r_high) or r_low <= 0:
-            ratio = np.nan
-        else:
-            ratio = r_high / r_low
-            if log2 and ratio > 0:
-                ratio = float(np.log2(ratio))
-        return {
-            "RSAM_low":  r_low,
-            "RSAM_high": r_high,
-            "ratio":     ratio,
-            "ratio_key": f"bandratio_{a1}_{b1}__{a2}_{b2}" + ("_log2" if log2 else ""),
+    @staticmethod
+    def _ratio(high_val: float, low_val: float, *, log2: bool) -> float:
+        if not (np.isfinite(high_val) and np.isfinite(low_val)) or low_val <= 0:
+            return np.nan
+        r = high_val / low_val
+        return float(np.log2(r)) if (log2 and r > 0) else float(r)
+
+    def _bandpass_series(self, tr: Trace, f1: float, f2: float, *, corners=2, zerophase=True) -> np.ndarray:
+        try:
+            trf = tr.copy().filter(
+                "bandpass",
+                freqmin=float(f1), freqmax=float(f2),
+                corners=int(corners), zerophase=bool(zerophase),
+            )
+            return np.asarray(trf.data, dtype=np.float64)
+        except Exception:
+            return np.asarray([], dtype=np.float64)
+        
+    def _compute_sam_sem(
+        self,
+        tr: Trace,
+        *,
+        low: tuple[float, float],
+        high: tuple[float, float],
+        sam_stat: str = "mean_abs",
+        log2_ratio: bool = True,
+        corners: int = 2,
+        zerophase: bool = True,
+    ) -> None:
+        """
+        Compute SAM and SEM reusing the same bandpassed series.
+        Persists a single pair of bands into m["sam"] and m["sem"].
+        """
+        l1, l2 = low; h1, h2 = high
+        dt = float(tr.stats.delta)
+
+        y_low  = self._bandpass_series(tr, l1, l2, corners=corners, zerophase=zerophase)
+        y_high = self._bandpass_series(tr, h1, h2, corners=corners, zerophase=zerophase)
+        y_full = self._bandpass_series(tr, l1, h2, corners=corners, zerophase=zerophase)
+
+        # SAM (amplitude)
+        sam_low   = self._abs_stat(y_low,  sam_stat)
+        sam_high  = self._abs_stat(y_high, sam_stat)
+        sam_full  = self._abs_stat(y_full, sam_stat)
+        sam_ratio = self._ratio(sam_high, sam_low, log2=log2_ratio)
+
+        # SEM (energy)
+        sem_low   = float(np.nansum(y_low  * y_low )) * dt if y_low.size  else np.nan
+        sem_high  = float(np.nansum(y_high * y_high)) * dt if y_high.size else np.nan
+        sem_full  = float(np.nansum(y_full * y_full)) * dt if y_full.size else np.nan
+        sem_ratio = self._ratio(sem_high, sem_low, log2=log2_ratio)
+
+        m = self._ensure_metrics(tr)
+        band_meta = {
+            "low_band":  [float(l1), float(l2)],
+            "high_band": [float(h1), float(h2)],
+            "full_band": [float(l1), float(h2)],
         }
+        m["sam"] = {
+            **band_meta,
+            "stat": sam_stat,
+            "log2": bool(log2_ratio),
+            "values": {"low": sam_low, "high": sam_high, "full": sam_full, "ratio": sam_ratio},
+        }
+        m["sem"] = {
+            **band_meta,
+            "log2": bool(log2_ratio),
+            "values": {"low": sem_low, "high": sem_high, "full": sem_full, "ratio": sem_ratio},
+        }        
+
+    # ---------------- core per-trace metrics ----------------
+    def ampengfft(
+        self,
+        *,
+        differentiate: bool = False,          # applies to seismic only
+        compute_spectral: bool = False,
+        compute_ssam: bool = False,
+        compute_bandratios: bool = False,
+        # SAM / SEM controls
+        compute_sam: bool = True,
+        compute_sem: bool = False,
+        bands: tuple[float, float, float, float] = (0.5, 2.0, 2.0, 8.0),
+        sam_stat: str = "mean_abs",
+        sam_log2: bool = True,
+        sem_log2: bool = True,
+        # spectral params
+        threshold: float = 0.707,
+        window_length: int = 9,
+        polyorder: int = 2,
+    ) -> None:
+        """Compute per-trace metrics (TD + optional spectral) and station rollup."""
+        if len(self) == 0:
+            self.station_metrics = pd.DataFrame()
+            return
+
+        for tr in self:
+            m = self._ensure_metrics(tr)
+
+            # detrend/taper (light)
+            try:
+                tr.detrend("linear").taper(0.01)
+            except Exception:
+                pass
+
+            dt = float(tr.stats.delta)
+            y_raw = np.asarray(tr.data, dtype=np.float64)
+
+            # ----- branch by data type -----
+            if self._is_infrasound(tr):
+                # pressure series
+                self._td_stats(tr, y_raw)
+                pap, pap_bp = self._pressure_metrics(tr, band=(1.0, 20.0))
+                m["pap"] = pap
+                m["pap_bp_1_20"] = pap_bp
+            else:
+                # seismic: treat input as velocity unless differentiate=True flips semantics
+                if differentiate:
+                    disp = tr.copy()
+                    vel  = tr.copy().differentiate()
+                    acc  = vel.copy().differentiate()
+                else:
+                    vel  = tr
+                    disp = tr.copy().integrate()
+                    acc  = tr.copy().differentiate()
+
+                y = np.asarray(vel.data, dtype=np.float64)
+                self._td_stats(tr, y)
+
+                m["pgd"] = float(np.nanmax(np.abs(disp.data))) if disp.stats.npts else np.nan
+                m["pgv"] = float(np.nanmax(np.abs(vel.data)))  if vel.stats.npts  else np.nan
+                m["pga"] = float(np.nanmax(np.abs(acc.data)))  if acc.stats.npts  else np.nan
+
+                # dominant frequency (TD ratio)
+                try:
+                    num = np.abs(vel.data).astype(np.float64)
+                    den = 2.0 * np.pi * np.abs(disp.data).astype(np.float64) + 1e-20
+                    fdom_series = num / den
+                    m["fdom"] = float(np.nanmedian(fdom_series)) if fdom_series.size else np.nan
+                except Exception:
+                    m["fdom"] = np.nan
+
+            # ----- unified band features -----
+            if compute_sam or compute_sem:
+                l1, l2, h1, h2 = bands
+                self._compute_sam_sem(
+                    tr,
+                    low=(l1, l2),
+                    high=(h1, h2),
+                    sam_stat=sam_stat,
+                    log2_ratio=(sam_log2 if compute_sam else sem_log2),
+                    corners=2,
+                    zerophase=True,
+                )
+                # drop unused structure if only one requested
+                if not compute_sam:
+                    self._ensure_metrics(tr).pop("sam", None)
+                if not compute_sem:
+                    self._ensure_metrics(tr).pop("sem", None)
+
+            # ----- spectral (optional) -----
+            if compute_spectral:
+                spectral_block(
+                    tr, y_raw, dt,
+                    threshold=threshold,
+                    window_length=window_length,
+                    polyorder=polyorder,
+                    compute_ssam=compute_ssam,
+                    compute_bandratios=compute_bandratios,
+                    helper=None,  # or provide a callable adapter to compute_amplitude_spectra
+                )
+
+        # --- station-level aggregation after per-trace loop ---
+        self.station_metrics = self._station_level_metrics()
+        if self.station_metrics is not None and not self.station_metrics.empty:
+            station_map = self.station_metrics.set_index("station_key").to_dict(orient="index")
+            for tr in self:
+                key = self._station_key(tr)
+                if key in station_map:
+                    for k, v in station_map[key].items():
+                        if k != "station_key":
+                            self._ensure_metrics(tr)[f"station_{k}"] = v
+                            
 
     # ---------------- station-level aggregation ----------------
+
+    def _vector_max_3c(self, trZ: Trace, trN: Trace, trE: Trace, *, kind="vel") -> float:
+        def as_kind(tr):
+            if kind == "vel":  return tr.copy()
+            if kind == "disp": return tr.copy().integrate()
+            if kind == "acc":  return tr.copy().differentiate()
+            raise ValueError("kind must be vel|disp|acc")
+        # trim to overlap
+        t0 = max(tr.stats.starttime for tr in (trZ, trN, trE))
+        t1 = min(tr.stats.endtime   for tr in (trZ, trN, trE))
+        if t1 <= t0:
+            return np.nan
+        trs = [as_kind(tr).trim(t0, t1, pad=False) for tr in (trZ, trN, trE)]
+        if any(t.stats.npts <= 1 for t in trs):
+            return np.nan
+        z, n, e = (np.asarray(t.data, dtype=np.float64) for t in trs)
+        vec = np.sqrt(z*z + n*n + e*e)
+        return float(np.nanmax(np.abs(vec))) if vec.size else np.nan
+
+
     def _station_level_metrics(self) -> pd.DataFrame:
         """
         Return a DF with one row per NET.STA.LOC:
@@ -391,10 +337,10 @@ class EnhancedStream(Stream):
         """
         groups: dict[str, dict[str, list]] = defaultdict(lambda: {"seis": [], "infra": []})
         for tr in self:
-            key = tr.station_key()
-            if tr.is_seismic():
+            key = self._station_key(tr)
+            if self._is_seismic(tr):
                 groups[key]["seis"].append(tr)
-            elif tr.is_infrasound():
+            elif self._is_infrasound(tr):
                 groups[key]["infra"].append(tr)
 
         rows = []
@@ -402,14 +348,13 @@ class EnhancedStream(Stream):
             # seismic vector PGMs using components present (Z/N/E or Z/1/2 or Z/R/T)
             pgd_vec = pgv_vec = pga_vec = np.nan
             if d["seis"]:
-                # group by component; we’ll attempt plausible triplets
                 comp_groups = defaultdict(list)
                 for tr in d["seis"]:
-                    comp_groups[tr.component].append(tr)
-                def pick_one(c):  # pick the first if multiple
+                    comp_groups[self._component(tr)].append(tr)
+
+                def pick_one(c):  # first if multiple
                     return comp_groups[c][0] if comp_groups.get(c) else None
 
-                # try in order of preference
                 triplets = [("Z","N","E"), ("Z","1","2"), ("Z","R","T")]
                 got = False
                 for (cz, cx, cy) in triplets:
@@ -421,16 +366,18 @@ class EnhancedStream(Stream):
                         got = True
                         break
                 if not got:
-                    # fallback: L2 of per-trace PGMs that ampengfft already computed
+                    # fallback: L2 of per-trace PGMs
                     pgv_list = []; pgd_list=[]; pga_list=[]
                     for tr in d["seis"]:
-                        m = tr.ensure_metrics()
+                        m = self._ensure_metrics(tr)
                         pgv_list.append(m.get("pgv", np.nan))
                         pgd_list.append(m.get("pgd", np.nan))
                         pga_list.append(m.get("pga", np.nan))
+
                     def l2(vals):
                         arr = np.asarray([x for x in vals if np.isfinite(x)])
                         return float(np.sqrt(np.sum(arr**2))) if arr.size else np.nan
+
                     pgv_vec, pgd_vec, pga_vec = l2(pgv_list), l2(pgd_list), l2(pga_list)
 
             # infrasound median PAP across sensors
@@ -438,23 +385,24 @@ class EnhancedStream(Stream):
             if d["infra"]:
                 paps = []; paps_bp=[]
                 for tr in d["infra"]:
-                    m = tr.ensure_metrics()
+                    m = self._ensure_metrics(tr)
                     paps.append(m.get("pap", np.nan))
                     paps_bp.append(m.get("pap_bp_1_20", np.nan))
+
                 def med(vals):
                     arr = np.asarray([x for x in vals if np.isfinite(x)])
                     return float(np.nanmedian(arr)) if arr.size else np.nan
+
                 pap, pap_bp = med(paps), med(paps_bp)
 
-
-            # Mirror station-level metrics to member traces for convenience
+            # mirror station-level metrics to member traces
             for tr in d["seis"] + d["infra"]:
-                m = tr.ensure_metrics()  # or: m = getattr(tr.stats, "metrics", {}) ; tr.stats.metrics = m
-                m["station_pgv_vec"]   = pgv_vec
-                m["station_pgd_vec"]   = pgd_vec
-                m["station_pga_vec"]   = pga_vec
-                m["station_pap_med"]   = pap
-                m["station_pap_bp_1_20_med"] = pap_bp
+                m = self._ensure_metrics(tr)
+                m["station_pgv_vec"]          = pgv_vec
+                m["station_pgd_vec"]          = pgd_vec
+                m["station_pga_vec"]          = pga_vec
+                m["station_pap_med"]          = pap
+                m["station_pap_bp_1_20_med"]  = pap_bp
                 m["station_num_seis_traces"]  = len(d["seis"])
                 m["station_num_infra_traces"] = len(d["infra"])
 
@@ -468,94 +416,65 @@ class EnhancedStream(Stream):
             columns=["station_key","pgd_vec","pgv_vec","pga_vec","pap","pap_bp_1_20"]
         )
 
-    # --- small 3C helper (reused) ---
-    def _vector_max_3c(self, trZ, trN, trE, *, kind="vel") -> float:
-        def as_kind(tr):
-            if kind == "vel":  return tr.copy()
-            if kind == "disp": return tr.copy().integrate()
-            if kind == "acc":  return tr.copy().differentiate()
-            raise ValueError("kind must be vel|disp|acc")
-        # trim to common overlap
-        t0 = max(tr.stats.starttime for tr in (trZ, trN, trE))
-        t1 = min(tr.stats.endtime   for tr in (trZ, trN, trE))
-        if t1 <= t0:
-            return np.nan
-        trs = [as_kind(tr).trim(t0, t1, pad=False) for tr in (trZ, trN, trE)]
-        if any(t.stats.npts <= 1 for t in trs):
-            return np.nan
-        z, n, e = (np.asarray(t.data, dtype=np.float64) for t in trs)
-        vec = np.sqrt(z*z + n*n + e*e)
-        return float(np.nanmax(np.abs(vec))) if vec.size else np.nan
-    
-
+    # ---------------- magnitude/energy (seismic + infra) ----------------
     def compute_station_magnitudes(
         self,
         inventory,
         source_coords,
         *,
-        model: str = "body",         # 'body' or 'surface' for geometric spreading in legacy model
+        model: str = "body",
         Q: float = 50.0,
         c_earth: float = 2500.0,
-        correction: float = 3.7,     # Hanks & Kanamori correction (Joules)
-        a: float = 1.6, b: float = -0.15, g: float = 0.0,  # ML coefficients
+        correction: float = 3.7,
+        a: float = 1.6, b: float = -0.15, g: float = 0.0,
         use_boatwright: bool = True,
         rho_earth: float = 2000.0, S: float = 1.0, A: float = 1.0,
         rho_atmos: float = 1.2, c_atmos: float = 340.0, z: float = 100000.0,
         attach_coords: bool = True,
         compute_distances: bool = True,
     ) -> None:
-        """
-        Per-trace magnitude/energy calculations with seismic/infra branching.
-
-        Side-effects
-        ------------
-        - tr.stats['distance'] (meters) if compute_distances=True
-        - tr.stats.metrics['source_energy']
-        - tr.stats.metrics['energy_magnitude'] (Me from energy)
-        - tr.stats.metrics['local_magnitude'] (ML for seismic channels only)
-        """
         if attach_coords:
             self.attach_station_coordinates_from_inventory(inventory)
 
         for tr in self:
             try:
-                # distance
                 R = estimate_distance(tr, source_coords)
                 if compute_distances:
-                    tr.stats['distance'] = R
+                    tr.stats["distance"] = R
 
-                # ensure metrics
                 if not hasattr(tr.stats, "metrics") or tr.stats.metrics is None:
                     tr.stats.metrics = {}
 
-                # choose energy model
+                E0 = None
                 if use_boatwright:
                     if len(tr.stats.channel) >= 2 and tr.stats.channel[1].upper() == "D":
-                        # infrasound Boatwright
                         E0 = Eacoustic_Boatwright(tr, R, rho_atmos=rho_atmos, c_atmos=c_atmos, z=z)
                     else:
-                        # seismic Boatwright
                         E0 = Eseismic_Boatwright(tr, R, rho_earth=rho_earth, c_earth=c_earth, S=S, A=A)
 
                         # optional Q correction using spectral peak if present
                         spec = getattr(tr.stats, "spectral", {})
                         freqs = spec.get("freqs"); amps = spec.get("amplitudes")
-                        if freqs is not None and amps is not None and np.any(np.asarray(amps) > 0):
-                            f_peak = float(freqs[int(np.nanargmax(amps))])
-                            A_att = np.exp(-np.pi * f_peak * R / (Q * c_earth))
-                            if A_att > 0:
-                                E0 /= A_att
+                        if E0 is not None and freqs is not None and amps is not None:
+                            F = np.asarray(freqs, float); A = np.asarray(amps, float)
+                            if A.size and np.any(np.isfinite(A)) and np.any(A > 0):
+                                f_peak = float(F[int(np.nanargmax(A))])
+                                A_att = np.exp(-np.pi * f_peak * R / (Q * c_earth))
+                                if np.isfinite(A_att) and A_att > 0:
+                                    E0 = float(E0) / float(A_att)
                 else:
-                    # legacy geometric+attenuation model (uses tr.stats.metrics['energy'])
                     E0 = estimate_source_energy(tr, R, model=model, Q=Q, c_earth=c_earth)
 
-                # convert to magnitude from energy
-                ME = Eseismic2magnitude(E0, correction=correction) if E0 is not None else None
-                tr.stats.metrics["source_energy"] = E0
-                tr.stats.metrics["energy_magnitude"] = ME
+                # Convert only if E0 is usable
+                if E0 is not None and np.isfinite(E0) and E0 > 0:
+                    ME = Eseismic2magnitude(E0, correction=correction)
+                    tr.stats.metrics["source_energy"] = E0
+                    tr.stats.metrics["energy_magnitude"] = ME
+                else:
+                    tr.stats.metrics["source_energy"] = np.nan
+                    tr.stats.metrics["energy_magnitude"] = np.nan
 
-                # ML only for seismic
-                if len(tr.stats.channel) >= 2 and tr.stats.channel[1].upper() in ("H", "B", "E", "S", "L"):
+                if self._is_seismic(tr):
                     R_km = R / 1000.0
                     ML = estimate_local_magnitude(tr, R_km, a=a, b=b, g=g)
                     tr.stats.metrics["local_magnitude"] = ML
@@ -563,18 +482,9 @@ class EnhancedStream(Stream):
             except Exception as e:
                 print(f"[{tr.id}] Magnitude estimation failed: {e}")
 
+    # ---------------- summaries & orchestration ----------------
     def magnitudes2dataframe(self) -> pd.DataFrame:
-        """
-        Summarize per-trace and per-station magnitudes/energies.
-
-        Returns
-        -------
-        DataFrame with at least:
-        id, starttime, distance_m, ML, ME, source_energy, peakamp, energy
-        + station-level columns if available (station_pgv_vec, station_pap, ...)
-        """
         rows = []
-        # station mirrors (if ampengfft was run) live in tr.stats.metrics['station_*']
         for tr in self:
             m = getattr(tr.stats, "metrics", {}) or {}
             row = {
@@ -587,22 +497,13 @@ class EnhancedStream(Stream):
                 "peakamp": m.get("peakamp", np.nan),
                 "energy": m.get("energy", np.nan),
             }
-            # include station-level fields if present
             for k, v in m.items():
                 if k.startswith("station_"):
                     row[k] = v
             rows.append(row)
-
-        df = pd.DataFrame(rows)
-        return df
+        return pd.DataFrame(rows)
 
     def estimate_network_magnitude(self, key: str = "local_magnitude"):
-        """
-        Mean ± std of a given magnitude metric across traces.
-
-        key : 'local_magnitude' or 'energy_magnitude'
-        Returns (mean, std, n)
-        """
         vals = []
         for tr in self:
             m = getattr(tr.stats, "metrics", {}) or {}
@@ -613,6 +514,7 @@ class EnhancedStream(Stream):
             return None, None, 0
         arr = np.asarray(vals, dtype=float)
         return float(np.nanmean(arr)), float(np.nanstd(arr)), int(arr.size)
+
 
     def ampengfftmag(
         self,
@@ -644,17 +546,11 @@ class EnhancedStream(Stream):
         verbose: bool = True,
     ):
         """
-        Orchestrate per-trace metrics, SNR filtering, and magnitude calculations.
-
-        Returns
-        -------
-        (EnhancedStream, pd.DataFrame)
-            The stream (mutated in place) and a dataframe from magnitudes2dataframe()
+        Orchestrate SNR → metrics → magnitudes. Returns (self, magnitudes DF).
         """
-        # --- 1) SNR pass (before metrics) ---
-        if verbose:
-            print("[1] Estimating SNR…")
-        for tr in list(self):  # list() in case we filter later
+        # --- 1) SNR pass ---
+        if verbose: print("[1] Estimating SNR…")
+        for tr in list(self):
             if not hasattr(tr.stats, "metrics") or tr.stats.metrics is None:
                 tr.stats.metrics = {}
             if "snr" not in tr.stats.metrics:
@@ -674,49 +570,40 @@ class EnhancedStream(Stream):
                         print(f"[{tr.id}] SNR estimation failed: {e}")
                     tr.stats.metrics.setdefault("snr", np.nan)
 
-        # --- 2) Filter by SNR if requested ---
+        # --- 2) SNR filter ---
         if snr_min is not None:
-            if verbose:
-                print(f"[2] Filtering traces with SNR < {snr_min:.1f}…")
+            if verbose: print(f"[2] Filtering traces with SNR < {snr_min:.1f}…")
             keep = []
             for tr in self:
                 snr = tr.stats.metrics.get("snr", -np.inf)
                 if snr is not None and np.isfinite(snr) and snr >= snr_min:
                     keep.append(tr)
-            self._traces = keep  # mutate in place (ObsPy style)
+            self._traces = keep  # mutate in place
 
-        # --- 3) Per-trace metrics (time-domain + optional spectral) ---
-        if verbose:
-            print("[3] Computing amplitude/spectral metrics…")
+        # --- 3) Per-trace metrics ---
+        if verbose: print("[3] Computing amplitude/spectral metrics…")
         self.ampengfft(
             differentiate=differentiate,
             compute_spectral=compute_spectral,
             compute_ssam=compute_ssam,
             compute_bandratios=compute_bandratios,
-            threshold=threshold,
-            window_length=window_length,
-            polyorder=polyorder,
+            # SAM/SEM use defaults already set in ampengfft
         )
 
-        # --- 4) Magnitudes from physics models ---
-        if verbose:
-            print("[4] Estimating magnitudes/energies…")
+        # --- 4) Magnitudes ---
+        if verbose: print("[4] Estimating magnitudes/energies…")
         self.compute_station_magnitudes(
             inventory,
             source_coords,
-            model=model,
-            Q=Q,
-            c_earth=c_earth,
-            correction=correction,
+            model=model, Q=Q, c_earth=c_earth, correction=correction,
             a=a, b=b, g=g,
             use_boatwright=use_boatwright,
             rho_earth=rho_earth, S=S, A=A,
             rho_atmos=rho_atmos, c_atmos=c_atmos, z=z,
-            attach_coords=True,
-            compute_distances=True,
+            attach_coords=True, compute_distances=True,
         )
 
-        # --- 5) Summarize ---
+        # --- 5) Summary ---
         if verbose:
             mean_ml, std_ml, n_ml = self.estimate_network_magnitude("local_magnitude")
             mean_me, std_me, n_me = self.estimate_network_magnitude("energy_magnitude")
@@ -727,72 +614,46 @@ class EnhancedStream(Stream):
 
         df = self.magnitudes2dataframe()
         return self, df
-    
-    def compute_station_pgms(self, *, pressure_band=(1.0, 20.0)) -> pd.DataFrame:
+
+
+    def attach_station_coordinates_from_inventory(self, inventory):
         """
-        Compute station-level PGMs:
-        - seismic vector maxima: station_pgv_vec, station_pgd_vec, station_pga_vec
-        - infrasound (per-station): station_pap_max, station_pap_band_max, station_pap_median
+        Fill tr.stats.coordinates using ObsPy's Inventory.get_coordinates().
 
-        Mirrors station values back onto each member trace as tr.stats.metrics['station_*'].
-        Returns a station-level DataFrame.
+        Notes
+        -----
+        - Uses each trace's id (NET.STA.LOC.CHA) and starttime to query coordinates.
+        - Falls back to without time if time-dependent metadata isn’t available.
+        - Silently skips traces that cannot be found in the inventory.
         """
-        groups = _group_by_station_band(self)  # {(net,sta,loc,band2): {'Z':[...],'N':[...],'E':[...],'P':[...]}}
+        if inventory is None:
+            return
 
-        rows = []
-        for (net, sta, loc, band2), compmap in groups.items():
-            # --- seismic 3C vector PGMs ---
-            pgv_vec = pgd_vec = pga_vec = np.nan
-            for set_ in _COMPONENT_SETS:
-                if all(c in compmap and len(compmap[c]) > 0 for c in set_):
-                    # pick one trace per component (first); trim to common overlap
-                    trZ = compmap[set_[0]][0]
-                    trN = compmap[set_[1]][0]
-                    trE = compmap[set_[2]][0]
-                    pgv_vec = _vector_max_3c(trZ, trN, trE, kind="vel")
-                    pgd_vec = _vector_max_3c(trZ, trN, trE, kind="disp")
-                    pga_vec = _vector_max_3c(trZ, trN, trE, kind="acc")
-                    break
+        for tr in self:
+            try:
+                # Prefer time-resolved coordinates if possible
+                coords = inventory.get_coordinates(tr.id, tr.stats.starttime)
+            except Exception:
+                try:
+                    # Fallback: no time argument
+                    coords = inventory.get_coordinates(tr.id)
+                except Exception:
+                    coords = None
 
-            # --- infrasound per station (any “*D?” channel) ---
-            pap_vals = []
-            pap_band_vals = []
-            for comp, traces in compmap.items():
-                for tr in traces:
-                    if len(tr.stats.channel) >= 2 and tr.stats.channel[1].upper() == "D":
-                        pap, pap_band = _pressure_metrics(tr, band=pressure_band)
-                        pap_vals.append(pap)
-                        pap_band_vals.append(pap_band)
-
-            station_pap_max = np.nanmax(pap_vals) if pap_vals else np.nan
-            station_pap_band_max = np.nanmax(pap_band_vals) if pap_band_vals else np.nan
-            station_pap_median = float(np.nanmedian(pap_vals)) if pap_vals else np.nan
-
-            # mirror station vals back onto member traces for convenience
-            for comp, traces in compmap.items():
-                for tr in traces:
-                    m = getattr(tr.stats, "metrics", None) or {}
-                    m["station_pgv_vec"] = pgv_vec
-                    m["station_pgd_vec"] = pgd_vec
-                    m["station_pga_vec"] = pga_vec
-                    m["station_pap_max"] = station_pap_max
-                    m["station_pap_band_max"] = station_pap_band_max
-                    m["station_pap_median"] = station_pap_median
-                    tr.stats.metrics = m
-
-            rows.append({
-                "network": net, "station": sta, "location": loc, "band": band2,
-                "station_pgv_vec": pgv_vec, "station_pgd_vec": pgd_vec, "station_pga_vec": pga_vec,
-                "station_pap_max": station_pap_max, "station_pap_band_max": station_pap_band_max,
-                "station_pap_median": station_pap_median,
-                "n_infra_traces": int(np.sum([len(trs) for c, trs in compmap.items()
-                                            if len(trs) and len(trs[0].stats.channel) >= 2
-                                            and trs[0].stats.channel[1].upper() == "D"])),
-                "n_traces": int(np.sum([len(trs) for trs in compmap.values()])),
-            })
-
-        return pd.DataFrame(rows)
+            if coords:
+                # Only keep the common keys we actually use elsewhere
+                lat = coords.get("latitude")
+                lon = coords.get("longitude")
+                elev = coords.get("elevation")
+                if lat is not None and lon is not None:
+                    tr.stats.coordinates = AttribDict({
+                        "latitude": float(lat),
+                        "longitude": float(lon),
+                        "elevation": float(elev) if elev is not None else None,
+                    })
     
+    # ---------------- persistence ----------------
+
     @classmethod
     def read(cls, basepath: str, match_on: str = "id"):
         """
@@ -1024,3 +885,91 @@ class EnhancedStream(Stream):
                 pickle.dump(self, f)
 
         print(f"[✓] Saved {len(self)} traces to {basepath}.mseed/.csv and station summary.")
+
+# --------------------------------------------------------------------------------------
+# 0) Optional helpers: station-metrics–aware reduce_fn for EnhancedStream
+#    These return vector PGV or median peak pressure for a station
+# --------------------------------------------------------------------------------------
+def reduce_station_pgv_vec(seed_id: str, st: Stream, meta: dict) -> float:
+    """
+    Return the station-level vector PGV for the station that contains this seed_id.
+
+    Works best with EnhancedStream where `station_metrics` exists and includes:
+      - station_key, pgv_vec (and pgd_vec, pga_vec)
+
+    Fallback for plain Stream: take the L-infinity across trace-level PGV
+    at the same station (max of |pgv| across that station's traces).
+
+    Parameters
+    ----------
+    seed_id : str
+        "NET.STA.LOC.CHA"
+    st : Stream (ObsPy or EnhancedStream)
+    meta : dict
+        Unused here, kept for signature compatibility.
+
+    Returns
+    -------
+    float (np.nan if unavailable)
+    """
+    try:
+        # EnhancedStream fast-path
+        es = st if hasattr(st, "station_metrics") else None
+        net, sta, *_ = seed_id.split(".")
+        station_prefix = f"{net}.{sta}"
+
+        if es is not None and getattr(es, "station_metrics", None) is not None:
+            sm = es.station_metrics
+            if not sm.empty and "station_key" in sm.columns and "pgv_vec" in sm.columns:
+                row = sm.loc[sm["station_key"].str.startswith(station_prefix)]
+                if not row.empty:
+                    return float(row["pgv_vec"].median(skipna=True))
+
+        # Fallback: per-trace PGV at that station
+        vals = []
+        for tr in st:
+            if tr.stats.network == net and tr.stats.station == sta:
+                m = getattr(tr.stats, "metrics", {})
+                v = m.get("pgv")
+                if v is not None and np.isfinite(v):
+                    vals.append(float(v))
+        return float(np.nanmax(vals)) if vals else np.nan
+    except Exception:
+        return np.nan
+
+
+def reduce_station_pap(seed_id: str, st: Stream, meta: dict) -> float:
+    """
+    Return the median PAP (peak air pressure) across pressure sensors for the station.
+
+    Works best with EnhancedStream where `station_metrics` includes:
+      - station_key, pap
+
+    Fallback for plain Stream: median of trace-level `metrics['pap']` at station.
+
+    Returns
+    -------
+    float (np.nan if unavailable)
+    """
+    try:
+        es = st if hasattr(st, "station_metrics") else None
+        net, sta, *_ = seed_id.split(".")
+        station_prefix = f"{net}.{sta}"
+
+        if es is not None and getattr(es, "station_metrics", None) is not None:
+            sm = es.station_metrics
+            if not sm.empty and "station_key" in sm.columns and "pap" in sm.columns:
+                row = sm.loc[sm["station_key"].str.startswith(station_prefix)]
+                if not row.empty:
+                    return float(row["pap"].median(skipna=True))
+
+        vals = []
+        for tr in st:
+            if tr.stats.network == net and tr.stats.station == sta and tr.stats.channel[1].upper() == "D":
+                m = getattr(tr.stats, "metrics", {})
+                v = m.get("pap")
+                if v is not None and np.isfinite(v):
+                    vals.append(float(v))
+        return float(np.nanmedian(vals)) if vals else np.nan
+    except Exception:
+        return np.nan        

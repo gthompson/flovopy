@@ -7,6 +7,8 @@ import numpy as np
 from obspy.core.stream import Stream
 from obspy.core.trace import Trace
 from scipy.signal import savgol_filter, get_window
+from numpy.fft import rfft, rfftfreq
+
 
 # ---------------------------------------------------------------------------
 # Core spectrum computation
@@ -312,46 +314,152 @@ def plot_amplitude_ratios(
         plt.show()
 
 
-# ---------------------------------------------------------------------------
-# SSAM / band-ratio / bandwidth helpers
-# ---------------------------------------------------------------------------
+
+
+def _ensure_metrics(tr: Trace):
+    if not hasattr(tr.stats, "metrics") or tr.stats.metrics is None:
+        tr.stats.metrics = {}
+    return tr.stats.metrics
+
+def spectral_block(
+    tr: Trace,
+    y: np.ndarray,
+    dt: float,
+    *,
+    threshold: float = 0.707,
+    window_length: int = 9,
+    polyorder: int = 2,
+    compute_ssam: bool = False,
+    compute_bandratios: bool = False,
+    helper: callable | None = None,     # optional: fn(Stream, **opts) that fills .stats.spectral
+    helper_opts: dict | None = None,
+) -> None:
+    """
+    Compute one-sided amplitude spectrum for `y` and store:
+      - arrays:  tr.stats.spectral["freqs"], ["amplitudes"]
+      - summaries: tr.stats.metrics["spectral"] = {...}
+        keys include: peakf, meanf, medianf, peakA, bandwidth, f_low, f_high
+        and optional: ssam {f, A}, bandratio {freqlims, low_sum, high_sum, ratio}
+    """
+    m = _ensure_metrics(tr)
+    if "spectral" not in m or not isinstance(m["spectral"], dict):
+        m["spectral"] = {}
+    spm = m["spectral"]  # shorthand to the spectral sub-dict
+
+    if not hasattr(tr.stats, "spectral") or tr.stats.spectral is None:
+        tr.stats.spectral = {}
+
+    # ---- sanitize input ----
+    y = np.asarray(y, dtype=float)
+    if y.size < 2:
+        return
+    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # ---- compute spectrum (helper first, fallback to rFFT) ----
+    F = A = None
+    if helper is not None:
+        try:
+            from obspy import Stream
+            tmp = tr.copy(); tmp.data = y
+            st = Stream([tmp])
+            st = helper(st, **(helper_opts or {})) or st
+            spec = getattr(st[0].stats, "spectral", None)
+            if spec and "freqs" in spec and "amplitudes" in spec:
+                F = np.asarray(spec["freqs"], dtype=float)
+                A = np.asarray(spec["amplitudes"], dtype=float)
+        except Exception:
+            F = A = None
+
+    if F is None or A is None:
+        N = int(tr.stats.npts)
+        if N < 2:
+            return
+        A = np.abs(rfft(y))
+        F = rfftfreq(N, d=dt)
+
+    # persist arrays on trace
+    tr.stats.spectral["freqs"] = F
+    tr.stats.spectral["amplitudes"] = A
+
+    # ---- bandwidth/peak metrics (populate into m["spectral"]) ----
+    bw = get_bandwidth(
+        F, A,
+        threshold=threshold,
+        window_length=window_length,
+        polyorder=polyorder,
+        trace=None  # we’ll merge into m["spectral"] ourselves
+    )
+    spm.update(bw)
+
+    # ---- simple spectral summaries ----
+    if A.size and np.any(A > 0):
+        peak_idx = int(np.nanargmax(A))
+        peakf   = float(F[peak_idx])
+        meanf   = float(np.nansum(F * A) / np.nansum(A))
+        medianf = float(np.nanmedian(F[A > 0]))
+        peakA   = float(np.nanmax(A))
+    else:
+        peakf = meanf = medianf = peakA = np.nan
+
+    spm["peakf"]   = peakf
+    spm["meanf"]   = meanf
+    spm["medianf"] = medianf
+    spm["peakA"]   = peakA
+
+    # keep old back-compat mirror if someone uses tr.stats.spectrum
+    s = getattr(tr.stats, "spectrum", {}) or {}
+    s["peakF"] = peakf
+    s["medianF"] = medianf
+    s["peakA"] = peakA
+    tr.stats.spectrum = s
+
+    # ---- optional extras under m["spectral"] ----
+    if compute_ssam:
+        _ssam(tr)  # writes into m["spectral"]["ssam"]
+
+    if compute_bandratios:
+        _band_ratio(tr, freqlims=[1.0, 6.0, 11.0])     # writes into m["spectral"]["bandratio"]
+        _band_ratio(tr, freqlims=[0.5, 3.0, 18.0])
+
 
 def _ssam(tr: Trace, freq_bins: np.ndarray | None = None) -> None:
     """
     Bin the already-computed amplitude spectrum into SSAM bands.
-    Stores `tr.stats.metrics['ssam'] = {'f': centers, 'A': values}`.
+    Stores under: tr.stats.metrics["spectral"]["ssam"] = {'f': centers, 'A': values}
     """
     if freq_bins is None:
         freq_bins = np.arange(0.0, 16.0, 1.0)
 
     spec = getattr(tr.stats, "spectral", None)
     if not spec or "freqs" not in spec or "amplitudes" not in spec:
-        print(f"[{tr.id}] Missing tr.stats.spectral — run compute_amplitude_spectra() first.")
+        # silent no-op to keep pipelines flowing
         return
 
     f = np.asarray(spec["freqs"], dtype=float)
     A = np.asarray(spec["amplitudes"], dtype=float)
 
-    bin_centers = []
-    ssam_values = []
+    centers, values = [], []
     for i in range(len(freq_bins) - 1):
         fmin, fmax = freq_bins[i], freq_bins[i + 1]
         idx = np.where((f >= fmin) & (f < fmax))[0]
-        bin_centers.append(0.5 * (fmin + fmax))
-        ssam_values.append(np.nanmean(A[idx]) if idx.size else np.nan)
+        centers.append(0.5 * (fmin + fmax))
+        values.append(np.nanmean(A[idx]) if idx.size else np.nan)
 
-    m = getattr(tr.stats, "metrics", {}) or {}
-    m["ssam"] = {"f": np.asarray(bin_centers), "A": np.asarray(ssam_values)}
-    tr.stats.metrics = m
+    m = _ensure_metrics(tr)
+    spm = m.setdefault("spectral", {})
+    spm["ssam"] = {"f": np.asarray(centers), "A": np.asarray(values)}
 
 
 def _band_ratio(tr: Trace, freqlims: list[float] = [1.0, 6.0, 11.0]) -> None:
     """
-    Compute log2(sum(A_high)/sum(A_low)) using spectral data (preferred).
-    Appends a dict into tr.stats.metrics.bandratio.
+    Compute log2(sum(A_high)/sum(A_low)) using spectral data and store under:
+      tr.stats.metrics["spectral"]["bandratio"] = {
+        'freqlims': [low, split, high],
+        'low_sum': float, 'high_sum': float, 'ratio': float
+      }
     """
-    spec = getattr(tr.stats, "spectral", None)
     f = A = None
+    spec = getattr(tr.stats, "spectral", None)
     if spec and "freqs" in spec and "amplitudes" in spec:
         f = np.asarray(spec["freqs"], dtype=float)
         A = np.asarray(spec["amplitudes"], dtype=float)
@@ -362,27 +470,24 @@ def _band_ratio(tr: Trace, freqlims: list[float] = [1.0, 6.0, 11.0]) -> None:
     if f is None or A is None or f.size == 0 or A.size == 0:
         return
 
-    idx_low = np.where((f > freqlims[0]) & (f < freqlims[1]))[0]
+    idx_low  = np.where((f > freqlims[0]) & (f < freqlims[1]))[0]
     idx_high = np.where((f > freqlims[1]) & (f < freqlims[2]))[0]
 
-    sum_low = float(np.nansum(A[idx_low])) if idx_low.size else np.nan
-    sum_high = float(np.nansum(A[idx_high])) if idx_high.size else np.nan
+    low_sum  = float(np.nansum(A[idx_low]))  if idx_low.size  else np.nan
+    high_sum = float(np.nansum(A[idx_high])) if idx_high.size else np.nan
 
-    if np.isfinite(sum_low) and sum_low > 0 and np.isfinite(sum_high):
-        ratio = float(np.log2(sum_high / sum_low))
-    else:
-        ratio = np.nan
+    ratio = np.nan
+    if np.isfinite(low_sum) and low_sum > 0 and np.isfinite(high_sum):
+        ratio = float(np.log2(high_sum / low_sum))
 
-    m = getattr(tr.stats, "metrics", {}) or {}
-    br_list = m.get("bandratio", [])
-    br_list.append({
+    m = _ensure_metrics(tr)
+    spm = m.setdefault("spectral", {})
+    spm["bandratio"] = {
         "freqlims": freqlims,
-        "RSAM_low": sum_low,
-        "RSAM_high": sum_high,
-        "RSAM_ratio": ratio,
-    })
-    m["bandratio"] = br_list
-    tr.stats.metrics = m
+        "low_sum": low_sum,
+        "high_sum": high_sum,
+        "ratio": ratio,
+    }
 
 
 def get_bandwidth(
@@ -392,55 +497,50 @@ def get_bandwidth(
     threshold: float = 0.707,
     window_length: int = 9,
     polyorder: int = 2,
-    trace: Trace | None = None,
+    trace: Trace | None = None,  # kept for API compat; we return the dict
 ) -> dict:
     """
     Estimate peak frequency and -3 dB style bandwidth on a smoothed spectrum.
-    If `trace` is given, stores results into `trace.stats.metrics`.
+    Returns a dict; caller can merge into metrics.
     """
     f = np.asarray(frequencies, dtype=float)
     A = np.asarray(amplitudes, dtype=float)
+
     if f.size == 0 or A.size == 0:
-        metrics = {"f_peak": np.nan, "A_peak": np.nan, "f_low": np.nan, "f_high": np.nan, "bandwidth": np.nan}
-    else:
-        # ensure window_length valid
-        wl = int(window_length)
-        if wl < 3:
-            wl = 3
-        if wl % 2 == 0:
-            wl += 1
-        wl = min(wl, max(3, (A.size // 2) * 2 - 1))  # keep odd and <= A.size
+        return {"f_peak": np.nan, "A_peak": np.nan, "f_low": np.nan, "f_high": np.nan, "bandwidth": np.nan}
 
-        try:
-            smoothed = savgol_filter(A, window_length=wl, polyorder=int(polyorder))
-        except Exception:
-            smoothed = A
+    wl = int(window_length)
+    if wl < 3: wl = 3
+    if wl % 2 == 0: wl += 1
+    wl = min(wl, max(3, (A.size // 2) * 2 - 1))
 
-        peak_index = int(np.nanargmax(smoothed)) if np.any(np.isfinite(smoothed)) else 0
+    try:
+        smoothed = savgol_filter(A, window_length=wl, polyorder=int(polyorder))
+    except Exception:
+        smoothed = A
+
+    if np.any(np.isfinite(smoothed)):
+        peak_index = int(np.nanargmax(smoothed))
         f_peak = float(f[peak_index]) if f.size else np.nan
         A_peak = float(smoothed[peak_index]) if smoothed.size else np.nan
         cutoff = A_peak * float(threshold) if np.isfinite(A_peak) else np.nan
+    else:
+        f_peak = A_peak = cutoff = np.nan
+        peak_index = 0
 
-        if np.isfinite(cutoff):
-            lower = np.where(smoothed[:peak_index] < cutoff)[0]
-            f_low = float(f[lower[-1]]) if lower.size else float(f[0])
-            upper = np.where(smoothed[peak_index:] < cutoff)[0]
-            f_high = float(f[peak_index + upper[0]]) if upper.size else float(f[-1])
-            bw = f_high - f_low
-        else:
-            f_low = f_high = bw = np.nan
+    if np.isfinite(cutoff):
+        lower = np.where(smoothed[:peak_index] < cutoff)[0]
+        f_low = float(f[lower[-1]]) if lower.size else float(f[0])
+        upper = np.where(smoothed[peak_index:] < cutoff)[0]
+        f_high = float(f[peak_index + upper[0]]) if upper.size else float(f[-1])
+        bw = f_high - f_low
+    else:
+        f_low = f_high = bw = np.nan
 
-        metrics = {
-            "f_peak": f_peak,
-            "A_peak": A_peak,
-            "f_low": f_low,
-            "f_high": f_high,
-            "bandwidth": float(bw) if np.isfinite(bw) else np.nan,
-        }
-
-    if trace is not None:
-        m = getattr(trace.stats, "metrics", {}) or {}
-        m.update(metrics)
-        trace.stats.metrics = m
-
-    return metrics
+    return {
+        "f_peak": f_peak,
+        "A_peak": A_peak,
+        "f_low": f_low,
+        "f_high": f_high,
+        "bandwidth": float(bw) if np.isfinite(bw) else np.nan,
+    }

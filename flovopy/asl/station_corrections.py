@@ -6,7 +6,7 @@ from typing import Dict, Iterable, Tuple, Optional, Callable, Mapping, Any, Sequ
 
 import numpy as np
 import pandas as pd
-from obspy import Stream
+from obspy import Stream, Trace
 
 # --------------------------------------------------------------------------------------
 # Overview
@@ -31,7 +31,155 @@ from obspy import Stream
 #   missing you can include rows for "NET.STA..CHA", "NET.STA.*.CHA", "NET.STA" etc.
 # * All interval times are treated as UTC. Timestamps may be tz-aware or naive
 #   on input; they are normalized to UTC in the output CSV.
+# * New in this version:
+#     - enforce_calibrated_trace(): attempt response removal or counts→SI fallback; else drop.
+#     - robust_amplitude_metric(): spike-aware, band-limited median/RMS helpers for table building.
+#     - estimate_station_gains_from_table(): now enforces min_events_per_station strictly.
 # --------------------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------------------
+# 0) Utilities: robust amplitude & calibration enforcement
+# --------------------------------------------------------------------------------------
+def robust_amplitude_metric(
+    tr: Trace,
+    *,
+    metric: str = "median_env",           # "median_env" | "rms" | "abs_median"
+    band: Optional[Tuple[float, float]] = None,   # e.g., (0.5, 8.0)
+    spike_guard: bool = True,
+    spike_z: float = 8.0,                 # z-score threshold for spike fraction
+) -> Tuple[float, dict]:
+    """
+    Compute a robust amplitude proxy with optional bandpass & spike guard.
+
+    Returns
+    -------
+    value : float (np.nan on failure)
+    info  : dict { 'spike_fraction', 'metric', 'band' }
+
+    Notes
+    -----
+    - 'median_env' is a good default for heterogeneous data.
+    - 'rms' can overweight transients; median-based options are safer for gains.
+    """
+    try:
+        x = np.asarray(tr.data, float)
+        if not np.isfinite(x).any():
+            return np.nan, {"spike_fraction": np.nan, "metric": metric, "band": band}
+
+        # Optional bandpass
+        trw = tr.copy()
+        if band is not None:
+            lo, hi = map(float, band)
+            if hi > 0 and hi > lo:
+                trw.filter("bandpass", freqmin=lo, freqmax=hi, corners=2, zerophase=True)
+        x = np.asarray(trw.data, float)
+
+        # Spike guard: crude but effective
+        if spike_guard:
+            x_f = x[np.isfinite(x)]
+            if x_f.size >= 8:
+                mu = np.nanmedian(x_f)
+                mad = np.nanmedian(np.abs(x_f - mu)) + 1e-12
+                z = (x_f - mu) / (1.4826 * mad)
+                spike_fraction = float(np.mean(np.abs(z) > spike_z))
+            else:
+                spike_fraction = np.nan
+        else:
+            spike_fraction = np.nan
+
+        # Metric
+        if metric == "median_env":
+            # envelope ≈ |analytic signal|; use Hilbert amplitude proxy
+            # fall back to |x| median if hilbert not available
+            try:
+                from scipy.signal import hilbert
+                env = np.abs(hilbert(x_f))
+                val = float(np.nanmedian(env))
+            except Exception:
+                val = float(np.nanmedian(np.abs(x_f)))
+        elif metric == "rms":
+            val = float(np.sqrt(np.nanmean(x**2)))
+        elif metric == "abs_median":
+            val = float(np.nanmedian(np.abs(x)))
+        else:
+            raise ValueError(f"Unknown metric '{metric}'")
+
+        return val, {"spike_fraction": spike_fraction, "metric": metric, "band": band}
+    except Exception:
+        return np.nan, {"spike_fraction": np.nan, "metric": metric, "band": band}
+
+
+def enforce_calibrated_trace(
+    tr: Trace,
+    *,
+    inventory,
+    prefer_velocity: bool = True,
+    calib_fallback: Optional[Dict[str, float]] = None,  # seed_id -> counts_to_(m/s or m)
+    mean_thresh: float = 1.0,
+    max_thresh: float = 1.0,
+) -> Tuple[Optional[Trace], dict]:
+    """
+    Return (trace_in_physical_units, info) or (None, info) if we must skip.
+
+    Heuristic:
+      - If tr.stats.metrics['abs_mean'] > 1.0 → definitely uncorrected (Counts).
+      - Else if tr.stats.metrics['abs_max']  > 1.0 → likely spikes or uncorrected.
+      - Try remove_response(). If that fails and calib_fallback has a factor for this
+        seed_id, multiply by that factor; otherwise return None (drop trace).
+    """
+    info = {
+        "seed_id": tr.id,
+        "status": "ok",
+        "reason": "",
+        "response_applied": False,
+        "fallback_applied": False,
+        "units": "unknown",
+    }
+
+    m = getattr(tr.stats, "metrics", {})
+    abs_mean = float(m.get("abs_mean", np.nan))
+    abs_max  = float(m.get("abs_max",  np.nan))
+
+    needs_cal = False
+    if np.isfinite(abs_mean) and abs_mean > mean_thresh:
+        needs_cal = True
+    elif np.isfinite(abs_max) and abs_max > max_thresh:
+        needs_cal = True
+
+    tr_out = tr.copy()
+    if needs_cal:
+        # Try instrument correction first
+        try:
+            if inventory is not None:
+                tr_out.remove_response(
+                    inventory=inventory,
+                    output="VEL" if prefer_velocity else "DISP",
+                    water_level=60.0,
+                )
+                info["response_applied"] = True
+                info["units"] = "m/s" if prefer_velocity else "m"
+                return tr_out, info
+        except Exception as e:
+            info["reason"] = f"remove_response failed: {e}"
+
+        # Counts→SI fallback if provided
+        if calib_fallback:
+            fac = calib_fallback.get(tr.id)
+            if fac and np.isfinite(fac) and fac > 0:
+                tr_out.data = tr_out.data * float(fac)
+                info["fallback_applied"] = True
+                info["units"] = "m/s" if prefer_velocity else "m"
+                return tr_out, info
+
+        # No way to calibrate → drop
+        info["status"] = "drop"
+        info["reason"] = info["reason"] or "no response & no fallback"
+        return None, info
+
+    # Looks already calibrated; keep as-is
+    info["units"] = "m/s" if prefer_velocity else "m"
+    return tr_out, info
 
 
 # --------------------------------------------------------------------------------------
@@ -42,7 +190,7 @@ def _infer_station_columns(df: pd.DataFrame) -> list[str]:
     non_numeric = {c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])}
     candidates = [c for c in df.columns if c not in non_numeric]
     # drop common numeric meta columns if present
-    junk = {"num_picks", "year", "event_id"}
+    junk = {"num_picks", "year", "event_id", "dfile"}
     return [c for c in candidates if c not in junk]
 
 
@@ -83,31 +231,43 @@ def estimate_station_gains_from_table(
         If no grouping: Index = station seed_id → gain
         If grouped:     MultiIndex (group, station) → gain
     stats : pd.DataFrame
-        Per-station descriptive stats of the event-wise ratios.
+        Per-station descriptive stats of the event-wise ratios, with n_events.
         If grouped, index is (group, station).
     """
-    df = df.copy()
+    # Identify numeric columns defensively
     if value_cols is None:
-        value_cols = _infer_station_columns(df)
-        if verbose:
-            print(f"[GAINS] Inferred {len(value_cols)} station columns.")
+        meta = {"time", "num_picks", "dfile", "year", "mseed_path", "event_id"}
+        value_cols = [c for c in df.columns
+                      if c not in meta and pd.api.types.is_numeric_dtype(df[c])]
 
-    def _per_block(block: pd.DataFrame) -> Tuple[pd.Series, pd.DataFrame]:
-        med = block[value_cols].median(axis=1, skipna=True)
-        ratios = block[value_cols].div(med.replace(0, np.nan), axis=0)
-        ratios = ratios.where((ratios > 0) & np.isfinite(ratios))
+    # ensure numeric (anything non-numeric → NaN)
+    df_numeric = df.copy()
+    for c in value_cols:
+        df_numeric[c] = pd.to_numeric(df_numeric[c], errors="coerce")
 
-        desc = ratios.describe(percentiles=[.25, .5, .75]).T
-        desc = desc[["mean", "std", "min", "25%", "50%", "75%", "max", "count"]]
+    def _per_block(block):
+        mat = block[value_cols]
+        # event-wise median across stations
+        med = mat.median(axis=1, skipna=True)
+        med = med.where(np.isfinite(med) & (med > 0))  # sanitize
+        ratios = mat.div(med, axis=0)
 
-        agg = (ratios.median(axis=0) if robust else ratios.mean(axis=0))
-        counts = ratios.count(axis=0)
-        agg[counts < min_events_per_station] = np.nan
-        return agg, desc
+        # aggregate across events (robust median by default)
+        if robust:
+            g = ratios.median(axis=0, skipna=True)
+        else:
+            g = ratios.mean(axis=0, skipna=True)
+
+        n_evt = ratios.notna().sum(axis=0).astype(int)
+        # strictly enforce minimum event count
+        g = g.where(n_evt >= int(min_events_per_station))
+        # diagnostics (include central tendency spread if you want)
+        s = pd.DataFrame({"gain": g, "n_events": n_evt})
+        return g, s
 
     if groupby_col:
         gains_blocks, stats_blocks = [], []
-        for key, block in df.groupby(groupby_col):
+        for key, block in df_numeric.groupby(groupby_col):
             if verbose:
                 print(f"[GAINS] Group {groupby_col}={key}: {len(block)} events")
             g, s = _per_block(block)
@@ -122,7 +282,7 @@ def estimate_station_gains_from_table(
         stats = pd.concat(stats_blocks, axis=0)
         stats.set_index([groupby_col, stats.index], inplace=True)
     else:
-        gains, stats = _per_block(df)
+        gains, stats = _per_block(df_numeric)
         gains.name = "gain"
 
     if verbose:
@@ -237,7 +397,7 @@ def gains_series_to_interval_df(
         if stats is None:
             return None
         try:
-            val = stats.loc[idx, "count"]
+            val = stats.loc[idx, "n_events"] if "n_events" in stats.columns else stats.loc[idx, "count"]
             if hasattr(val, "item"):
                 val = val.item()
             return float(val)
@@ -418,10 +578,9 @@ def apply_interval_station_gains(
 
         gain_val = None
         for s in cand:
-            # pick last (latest start_time) matching seed_id row
             rows_s = block[block["seed_id"] == s]
             if not rows_s.empty:
-                gain_val = rows_s.iloc[-1]["gain"]
+                gain_val = rows_s.iloc[-1]["gain"]  # latest
                 break
 
         if gain_val is None or not np.isfinite(gain_val) or float(gain_val) <= 0.0:
@@ -501,12 +660,12 @@ def build_station_gains_from_events(
         if groupby_col:
             gval = meta.get(groupby_col)
             if gval is None:
-                # try derive from stream time (UTC year)
+                # derive from stream start time (UTC year)
                 t0 = _event_start_ts_utc(st)
                 gval = int(t0.year) if pd.notna(t0) else None
             row[groupby_col] = gval
 
-        # per-station amplitude
+        # per-station amplitude via reduce_fn
         for tr in st:
             try:
                 row[tr.id] = float(reduce_fn(tr.id, st, meta))
@@ -537,7 +696,6 @@ def build_station_gains_from_events(
         groupby_col=groupby_col,
         stats=stats,
         tz=tz,
-        # infer [year, year+1) when grouping by year
     )
 
     # 4) Save

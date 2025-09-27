@@ -2,10 +2,10 @@
 set -euo pipefail
 
 PY=/opt/anaconda3/envs/flovopy_plus/bin/python   # or just: python
-SCRIPT="/Users/glennthompson/Developer/flovopy/flovopy/dem/channel_finder.py"
+SCRIPT="$HOME/Developer/flovopy/flovopy/dem/channel_finder.py"
 
 DEM="$HOME/Dropbox/PROFESSIONAL/DATA/WadgeDEMs/conversions/DEM_1999_WGS84_rotated.tif"
-OUTDIR="$HOME/Dropbox/PROFESSIONAL/DATA/WadgeDEMs/channel_finder"
+OUTDIR="$HOME/Dropbox/BRIEFCASE/SSADenver/channel_finder"
 
 $PY "$SCRIPT" \
   --dem "$DEM" \
