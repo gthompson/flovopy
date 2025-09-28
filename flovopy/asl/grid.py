@@ -32,6 +32,7 @@ class GridSignature:
     lonmax: float
     dem_tag: Optional[str] = None  # indicates DEM source/sampler signature
 
+
     def as_tuple(self) -> Tuple:
         return (
             self.centerlat, self.centerlon,
@@ -40,20 +41,6 @@ class GridSignature:
             self.dem_tag,
         )
 
-
-def _meters_per_degree(centerlat_deg: float) -> Tuple[float, float]:
-    """Return (meters_per_deg_lat, meters_per_deg_lon) at the given latitude."""
-    meters_per_deg_lat = 1000.0 * 111.19492664455873  # ~exact degrees2kilometers(1)
-    meters_per_deg_lon = meters_per_deg_lat * math.cos(math.radians(centerlat_deg))
-    return meters_per_deg_lat, meters_per_deg_lon
-
-
-def _safe_to_float(x, default=np.nan) -> float:
-    try:
-        v = float(x)
-        return v if np.isfinite(v) else float(default)
-    except Exception:
-        return float(default)
 
 
 class Grid:
@@ -116,6 +103,10 @@ class Grid:
         # DEM / elevations
         self.dem_info: Optional[Tuple[str, Dict[str, Any]]] = dem
         self.node_elev_m: Optional[np.ndarray] = None  # same shape as grid
+
+        # Optional land mask metadata (True = keep node)
+        self._node_mask: Optional[np.ndarray] = None       # shape like gridlat
+        self._node_mask_idx: Optional[np.ndarray] = None   # flat indices of True
 
         # identity: pure grid (stations can be added to the hash on demand)
         self.id = self.set_id()
@@ -190,6 +181,53 @@ class Grid:
             self.node_elev_m = _dem_sample_callable(self.gridlat, self.gridlon, func)
         else:
             raise ValueError(f"Unknown DEM source: {source}")
+        
+    def apply_land_mask_from_dem(self, *, sea_level: float = 0.0) -> np.ndarray:
+        """
+        Build a boolean mask of 'land' nodes (elevation > sea_level) using
+        Grid.node_elev_m if present; otherwise sample the configured DEM.
+        Stores:
+            - self._node_mask      (bool array, shape = grid)
+            - self._node_mask_idx  (flat int indices of True)
+        Returns the mask.
+        """
+        # Ensure we have elevations
+        if self.node_elev_m is None:
+            if self.dem_info is None:
+                raise ValueError("apply_land_mask_from_dem() requires node_elev_m or a DEM in dem_info.")
+            # lazily sample now
+            self._sample_dem_into_node_elevations()
+
+        elev = np.asarray(self.node_elev_m, float)
+        mask = np.isfinite(elev) & (elev > float(sea_level))
+        self._node_mask = mask
+        self._node_mask_idx = np.flatnonzero(mask.ravel())
+        return mask
+
+    def mask_signature(self) -> Optional[str]:
+        """
+        Short, stable signature of the current node mask, for use in cache keys.
+        Returns None if no mask applied.
+        """
+        idx = self._node_mask_idx
+        if idx is None:
+            return None
+        if idx.size == 0:
+            return "mask:0:-1:-1:0"
+        h = int(np.bitwise_xor.reduce(idx))  # simple fast checksum
+        return f"mask:{idx.size}:{int(idx[0])}:{int(idx[-1])}:{h}"
+
+    def masked_lonlat(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return (lon, lat) flattened arrays honoring the current mask if present.
+        If no mask, returns all nodes.
+        """
+        x = self.gridlon.reshape(-1)
+        y = self.gridlat.reshape(-1)
+        if self._node_mask_idx is not None:
+            sel = self._node_mask_idx
+            return x[sel], y[sel]
+        return x, y
 
     # ---------------------------
     # Plotting
@@ -247,10 +285,11 @@ class Grid:
         size_cm = (self.node_spacing_m / 2000.0) * float(scale)
         stylestr = f"{symbol}{size_cm}c"
 
-        # Plot nodes
+        # Plot nodes (honor land mask if present)
+        x, y = self.masked_lonlat()
         fig.plot(
-            x=self.gridlon.reshape(-1),
-            y=self.gridlat.reshape(-1),
+            x=x,
+            y=y,
             style=stylestr,
             pen=pen,
             fill=fill if symbol not in ("x", "+") else None,
@@ -337,6 +376,599 @@ class Grid:
             raise TypeError(f"Pickle does not contain a {cls.__name__} instance.")
         print(f"[INFO] Grid loaded from {cache_file}")
         return obj
+
+
+    def _slice(self, mask: np.ndarray):
+        """
+        Return a typed sub-grid containing only nodes where mask==True.
+        For arbitrary masks, we return a NodeGrid (sparse) to avoid breaking
+        Grid invariants (nlat/nlon/rectangularity).
+        """
+        mask = np.asarray(mask, bool).ravel()
+        flat_lat = self.gridlat.ravel()
+        flat_lon = self.gridlon.ravel()
+        if mask.size != flat_lat.size:
+            raise ValueError("mask length != number of grid nodes")
+
+        sel_lat = flat_lat[mask]
+        sel_lon = flat_lon[mask]
+
+        # optional elevation carry-over
+        if self.node_elev_m is not None:
+            sel_elev = np.asarray(self.node_elev_m, float).ravel()[mask]
+        else:
+            sel_elev = None
+
+        # propagate DEM tag if available
+        dem_tag = None
+        if self.dem_info is not None:
+            src, params = self.dem_info
+            dem_tag = params.get("tag") or (src if isinstance(src, str) else None)
+
+        approx = float(self.node_spacing_m) if hasattr(self, "node_spacing_m") else None
+        return NodeGrid(
+            node_lon=sel_lon,
+            node_lat=sel_lat,
+            node_elev_m=sel_elev,
+            approx_spacing_m=approx,
+            dem_tag=dem_tag,
+        )
+    
+    # --- Mask API (typed, fluent) ---
+    def apply_mask_indices(self, indices: np.ndarray, *, validate: bool = True) -> "Grid":
+        """
+        Apply a node mask defined by flat indices into the flattened grid (row-major).
+        Stores:
+          - self._node_mask_idx (1-D int array)
+          - self._node_mask     (2-D bool array, same shape as grid)
+        Returns self.
+        """
+        idx = np.asarray(indices, int).ravel()
+        if idx.size == 0:
+            self._node_mask_idx = idx
+            self._node_mask = np.zeros_like(self.gridlat, dtype=bool)
+            return self
+
+        nn = int(self.nlat * self.nlon)
+        if validate:
+            if np.min(idx) < 0 or np.max(idx) >= nn:
+                raise ValueError("apply_mask_indices: index out of bounds for grid size.")
+        idx = np.unique(idx)
+
+        mask_flat = np.zeros(nn, dtype=bool)
+        mask_flat[idx] = True
+        self._node_mask = mask_flat.reshape(self.nlat, self.nlon)
+        self._node_mask_idx = idx
+        return self
+
+    def apply_mask_boolean(self, mask_bool: np.ndarray, *, validate: bool = True) -> "Grid":
+        """
+        Apply a node mask given as a boolean array (shape==grid or flat length==N).
+        """
+        b = np.asarray(mask_bool, bool)
+        if b.ndim == 1:
+            if validate and b.size != self.nlat * self.nlon:
+                raise ValueError("apply_mask_boolean: flat mask length != nlat*nlon")
+            self._node_mask = b.reshape(self.nlat, self.nlon)
+        else:
+            if validate and b.shape != self.gridlat.shape:
+                raise ValueError("apply_mask_boolean: 2-D mask shape mismatch.")
+            self._node_mask = b.copy()
+        self._node_mask_idx = np.flatnonzero(self._node_mask.ravel())
+        return self
+
+    def clear_mask(self) -> "Grid":
+        """Remove any active node mask."""
+        self._node_mask = None
+        self._node_mask_idx = None
+        return self
+
+    def get_mask_indices(self) -> np.ndarray | None:
+        """Return flat indices of True nodes, or None if no mask is set."""
+        return None if self._node_mask_idx is None else np.asarray(self._node_mask_idx, int)
+
+    @property
+    def shape(self) -> tuple[int, int] | None:
+        """(nlat, nlon) for regular grids; NodeGrid will return None."""
+        return (int(self.nlat), int(self.nlon))
+
+def make_grid(
+    center_lat: float = dome_location["lat"],
+    center_lon: float = dome_location["lon"],
+    node_spacing_m: int = 100,
+    grid_size_lat_m: int = 10_000,
+    grid_size_lon_m: int = 8_000,
+    *,
+    dem: Optional[Tuple[str, Dict[str, Any]]] = None,
+) -> Grid:
+    """
+    Create a Grid centered at (center_lat, center_lon) with the given physical extent.
+
+    Examples
+    --------
+    # Flat grid (old behavior)
+    g = make_grid(node_spacing_m=50, grid_size_lat_m=8000, grid_size_lon_m=8000)
+
+    # Drape on PyGMT Earth Relief (01s), cached under ./_dem_cache
+    g = make_grid(
+        node_spacing_m=50,
+        grid_size_lat_m=8000, grid_size_lon_m=8000,
+        dem=("pygmt", {"resolution": "01s", "cache_dir": "./_dem_cache", "tag": "01s"})
+    )
+
+    # Drape using a local GeoTIFF
+    g = make_grid(
+        node_spacing_m=50,
+        grid_size_lat_m=8000, grid_size_lon_m=8000,
+        dem=("geotiff", {"path": "/abs/path/to/dem.tif", "tag": "DEM2020"})
+    )
+
+    # Drape using a custom sampler (callable(lat, lon) -> elevation_m)
+    g = make_grid(
+        dem=("sampler", {"func": my_sampler, "tag": "myDEM"})
+    )
+    """
+    nlat = int(grid_size_lat_m / node_spacing_m) + 1
+    nlon = int(grid_size_lon_m / node_spacing_m) + 1
+    return Grid(center_lat, center_lon, nlat, nlon, node_spacing_m, dem=dem)
+
+
+# === Sparse node grid (NodeGrid) ======================
+@dataclass(frozen=True)
+class NodeGridSignature:
+    """
+    Signature for a sparse set of nodes. We don't store all points in the
+    signature; we use a stable hash of the (lon,lat,optional elev) array.
+    """
+    n_nodes: int
+    approx_spacing_m: float | None
+    bbox_lonmin: float
+    bbox_lonmax: float
+    bbox_latmin: float
+    bbox_latmax: float
+    has_elevation: bool
+    dem_tag: str | None  # e.g., path or short hash of DEM file, if used
+    nodes_sha1: str      # sha1 of float64 packed node array for stability
+
+    def as_tuple(self) -> tuple:
+        return (self.n_nodes, self.approx_spacing_m, self.bbox_lonmin, self.bbox_lonmax,
+                self.bbox_latmin, self.bbox_latmax, self.has_elevation, self.dem_tag, self.nodes_sha1)
+
+
+class NodeGrid:
+    """
+    Sparse 'grid' defined by arbitrary nodes. Compatible with ASL plotting and
+    caching expectations: provides gridlon, gridlat, optional gridelev, signature(), id, plot(), save(), load().
+
+    Attributes
+    ----------
+    node_lon : (N,) float array
+    node_lat : (N,) float array
+    node_elev_m : (N,) float array or None   # elevation above sea level in meters
+    approx_spacing_m : float or None         # optional meta for plotting & label
+    id : str                                 # stable cache key from signature()
+    """
+    def __init__(
+        self,
+        node_lon: np.ndarray,
+        node_lat: np.ndarray,
+        node_elev_m: np.ndarray | None = None,
+        approx_spacing_m: float | None = None,
+        dem_tag: str | None = None,
+    ):
+        node_lon = np.asarray(node_lon, float).reshape(-1)
+        node_lat = np.asarray(node_lat, float).reshape(-1)
+        if node_lon.size != node_lat.size:
+            raise ValueError("node_lon and node_lat must have same length")
+        if node_elev_m is not None:
+            node_elev_m = np.asarray(node_elev_m, float).reshape(-1)
+            if node_elev_m.size != node_lon.size:
+                raise ValueError("node_elev_m must match node_lon size")
+
+        self.node_lon = node_lon
+        self.node_lat = node_lat
+        self.node_elev_m = node_elev_m
+        self.approx_spacing_m = None if approx_spacing_m is None else float(approx_spacing_m)
+        self.dem_tag = dem_tag
+
+        # For compatibility with existing code that expects 2-D fields:
+        self.gridlon = node_lon.copy()
+        self.gridlat = node_lat.copy()
+
+        self.id = self.set_id()
+
+    def get_mask_indices(self) -> np.ndarray | None:
+        # NodeGrid usually doesn’t use a raster mask; return None to indicate “no mask”.
+        return None
+
+    @property
+    def shape(self) -> tuple[int, int] | None:
+        return None
+
+    def _nodes_sha1(self) -> str:
+        """Stable hash of concatenated (lon, lat, elev?) in float64."""
+        arrs = [self.node_lon.astype("float64"), self.node_lat.astype("float64")]
+        if self.node_elev_m is not None:
+            arrs.append(self.node_elev_m.astype("float64"))
+        blob = np.ascontiguousarray(np.column_stack(arrs)).view("uint8")
+        return hashlib.sha1(blob).hexdigest()
+
+    def signature(self) -> NodeGridSignature:
+        lonmin, lonmax = float(np.nanmin(self.node_lon)), float(np.nanmax(self.node_lon))
+        latmin, latmax = float(np.nanmin(self.node_lat)), float(np.nanmax(self.node_lat))
+        return NodeGridSignature(
+            n_nodes=int(self.node_lon.size),
+            approx_spacing_m=self.approx_spacing_m,
+            bbox_lonmin=lonmin, bbox_lonmax=lonmax,
+            bbox_latmin=latmin, bbox_latmax=latmax,
+            has_elevation=self.node_elev_m is not None,
+            dem_tag=self.dem_tag,
+            nodes_sha1=self._nodes_sha1(),
+        )
+
+    def set_id(self) -> str:
+        self.id = make_hash(self.signature().as_tuple())
+        return self.id
+
+    # --- Plot (re-uses topo_map if available) ---
+    def plot(
+        self,
+        fig=None,
+        show: bool = True,
+        symbol: str = "c",
+        scale: float = 1.0,
+        fill: Optional[str] = "blue",
+        pen: Optional[str] = "0.5p,black",
+        topo_map_kwargs: Optional[dict] = None,
+        outfile: Optional[str] = None,
+    ):
+        """
+        Plot sparse nodes on a simple two-color land/sea basemap by default.
+        If this NodeGrid carries a DEM tag from a GeoTIFF build, pass it through.
+        """
+        try:
+            import pygmt  # type: ignore
+        except Exception as e:
+            raise ImportError("PyGMT is required for NodeGrid.plot().") from e
+
+        default_kwargs = {
+            "topo_color": False,
+            "cmap": "land",     # no shading two-color scheme in map.py
+        }
+
+        # If created from channel_finder with a DEM, we stored basename in dem_tag;
+        # when possible, prefer a direct path via topo_map_kwargs['dem_tif'] supplied by caller.
+        # (We can't reliably reconstruct a full path from dem_tag alone.)
+        topo_map_kwargs = {**default_kwargs, **(topo_map_kwargs or {})}
+
+        if fig is None:
+            try:
+                from .map import topo_map
+                fig = topo_map(show=False, **topo_map_kwargs)
+            except Exception:
+                region = [
+                    float(np.nanmin(self.node_lon)), float(np.nanmax(self.node_lon)),
+                    float(np.nanmin(self.node_lat)), float(np.nanmax(self.node_lat)),
+                ]
+                fig = pygmt.Figure()
+                fig.basemap(region=region, projection="M12c", frame=True)
+
+        # Symbol size (cm) – use approx spacing if available
+        if self.approx_spacing_m:
+            size_cm = (self.approx_spacing_m / 2000.0) * float(scale)
+        else:
+            size_cm = 0.12 * float(scale)
+        stylestr = f"{symbol}{size_cm}c"
+
+        fig.plot(
+            x=self.node_lon,
+            y=self.node_lat,
+            style=stylestr,
+            pen=pen,
+            fill=fill if symbol not in ("x", "+") else None,
+        )
+
+        if outfile:
+            fig.savefig(outfile, dpi=300)
+        if show:
+            fig.show()
+        return fig
+
+    # --- Persistence ---
+    def save(self, cache_dir: str, force_overwrite: bool = False) -> str:
+        os.makedirs(cache_dir, exist_ok=True)
+        pklfile = os.path.join(cache_dir, f"NodeGrid_{self.id}.pkl")
+        if os.path.exists(pklfile) and not force_overwrite:
+            print(f"[INFO] File exists: {pklfile} (use force_overwrite=True to overwrite).")
+            return pklfile
+        with open(pklfile, "wb") as f:
+            pickle.dump(self, f)
+        print(f"[INFO] NodeGrid saved to {pklfile}")
+        return pklfile
+
+    @classmethod
+    def load(cls, cache_file: str) -> "NodeGrid":
+        if not os.path.isfile(cache_file):
+            raise FileNotFoundError(f"No such file: {cache_file}")
+        with open(cache_file, "rb") as f:
+            obj = pickle.load(f)
+        if not isinstance(obj, cls):
+            raise TypeError(f"Pickle does not contain a {cls.__name__} instance.")
+        print(f"[INFO] NodeGrid loaded from {cache_file}")
+        return obj
+    
+    def _slice(self, mask: np.ndarray) -> "NodeGrid":
+        """
+        Return a NodeGrid with nodes where mask==True.
+        """
+        mask = np.asarray(mask, bool).ravel()
+        if mask.size != self.node_lon.size:
+            raise ValueError("mask length != number of nodes")
+        lon = self.node_lon[mask]
+        lat = self.node_lat[mask]
+        elev = self.node_elev_m[mask] if self.node_elev_m is not None else None
+        return NodeGrid(
+            node_lon=lon,
+            node_lat=lat,
+            node_elev_m=elev,
+            approx_spacing_m=self.approx_spacing_m,
+            dem_tag=self.dem_tag,
+        )
+    
+    '''
+    replace with snap_to_grid
+    def nodegrid_to_masked_grid(
+        nodegrid: "NodeGrid",
+        template: "Grid",
+        *,
+        tol_cells: float = 0.5,     # max offset allowed between node and snapped cell, in grid-cell units
+        set_on_template: bool = True
+    ) -> tuple["Grid", np.ndarray]:
+        """
+        Snap NodeGrid nodes to a rectangular template Grid and create a mask of used cells.
+
+        Parameters
+        ----------
+        nodegrid : NodeGrid
+            Sparse nodes (lon, lat[, elev]).
+        template : Grid
+            Regular raster to map onto. Must have latrange/lonrange with uniform spacing.
+        tol_cells : float
+            Maximum allowed angular offset between a node and the snapped grid cell,
+            expressed as a fraction of the grid spacing. 0.5 means within half a cell.
+        set_on_template : bool
+            If True, store the flat masked indices on `template._node_mask_idx` for
+            downstream use; otherwise return indices only.
+
+        Returns
+        -------
+        masked_grid : Grid
+            The same template object (for convenience). If `set_on_template=True`,
+            it has an attribute `_node_mask_idx` (1-D array of flat indices).
+        used_idx : np.ndarray
+            Sorted unique flat indices (into template’s flattened grid) that are used.
+
+
+
+        # 1) Build your regular grid (with or without DEM sampling/masking)
+        grid = make_grid(center_lat=..., center_lon=..., node_spacing_m=..., dem=("geotiff", {"path": dem_tif, "tag": "DEM"}))
+        # optionally: grid.apply_land_mask_from_dem(sea_level=0.0)   # if you added this earlier
+
+        # 2) Build/obtain a NodeGrid (e.g., channels/streams)
+        nodegrid = nodegrid_from_channel_csvs(channels_dir=..., step_m=100, dem_tif=dem_tif)
+
+        # 3) Snap NodeGrid to template Grid and carry mask indices
+        grid, used_idx = nodegrid_to_masked_grid(nodegrid, grid, tol_cells=0.5, set_on_template=True)
+
+        # 4) For any sparse result vector R coming from NodeGrid ops, backfill into a raster:
+        R_sparse = np.random.rand(used_idx.size)   # example
+        full = np.full(grid.nlat * grid.nlon, np.nan, float)
+        full[used_idx] = R_sparse
+        R_raster = full.reshape(grid.nlat, grid.nlon)
+
+        # Now you can plot with grdimage / heatmaps against `grid` normally.
+        """
+        # grid spacing (degrees)
+        dlat = float(template.latrange[1] - template.latrange[0]) if template.nlat > 1 else np.nan
+        dlon = float(template.lonrange[1] - template.lonrange[0]) if template.nlon > 1 else np.nan
+        if not np.isfinite(dlat) or not np.isfinite(dlon) or dlat <= 0 or dlon <= 0:
+            raise ValueError("Template grid must have >=2 points per axis with uniform spacing.")
+
+        lat0 = float(template.latrange[0])
+        lon0 = float(template.lonrange[0])
+        nlat, nlon = int(template.nlat), int(template.nlon)
+
+        # snap each node to nearest grid row/col by index
+        lon = np.asarray(nodegrid.node_lon, float).ravel()
+        lat = np.asarray(nodegrid.node_lat, float).ravel()
+
+        j = np.rint((lon - lon0) / dlon).astype(int)  # columns
+        i = np.rint((lat - lat0) / dlat).astype(int)  # rows
+
+        # reject nodes that fall outside the grid bounds
+        inside = (i >= 0) & (i < nlat) & (j >= 0) & (j < nlon)
+
+        # also enforce a tolerance in *angular* offset relative to the snapped centers
+        lat_snapped = lat0 + i * dlat
+        lon_snapped = lon0 + j * dlon
+        d_i = np.abs((lat - lat_snapped) / dlat)   # in cell units
+        d_j = np.abs((lon - lon_snapped) / dlon)   # in cell units
+        close = (d_i <= tol_cells) & (d_j <= tol_cells)
+
+        ok = inside & close
+        if not np.any(ok):
+            raise ValueError("No NodeGrid points fall within the template grid (or tol too small).")
+
+        # flat indices into raster
+        flat_idx = (i[ok] * nlon + j[ok]).astype(int)
+        used_idx = np.unique(flat_idx)  # de-duplicate collisions
+
+        # optionally stash on the grid so raster code can backfill sparse vectors
+        if set_on_template:
+            setattr(template, "_node_mask_idx", used_idx)
+
+        return template, used_idx
+    '''
+
+    def snap_to_grid(
+        self,
+        template: "Grid",
+        *,
+        tol_cells: float = 0.5,
+        set_on_template: bool = True,
+    ) -> np.ndarray:
+        """
+        Snap this NodeGrid onto a rectangular template Grid and compute the
+        flat indices of used raster cells. Optionally stash them on the Grid.
+
+        Returns
+        -------
+        used_idx : np.ndarray
+            Sorted, unique flat indices into template’s flattened grid.
+        """
+        # --- grid spacing (degrees) ---
+        dlat = float(template.latrange[1] - template.latrange[0]) if template.nlat > 1 else np.nan
+        dlon = float(template.lonrange[1] - template.lonrange[0]) if template.nlon > 1 else np.nan
+        if not np.isfinite(dlat) or not np.isfinite(dlon) or dlat <= 0 or dlon <= 0:
+            raise ValueError("Template grid must have >= 2 points per axis with uniform spacing.")
+
+        lat0 = float(template.latrange[0])
+        lon0 = float(template.lonrange[0])
+        nlat, nlon = int(template.nlat), int(template.nlon)
+
+        # --- snap each node to nearest row/col ---
+        lon = np.asarray(self.node_lon, float).ravel()
+        lat = np.asarray(self.node_lat, float).ravel()
+
+        j = np.rint((lon - lon0) / dlon).astype(int)  # columns
+        i = np.rint((lat - lat0) / dlat).astype(int)  # rows
+
+        # inside bounds?
+        inside = (i >= 0) & (i < nlat) & (j >= 0) & (j < nlon)
+
+        # tolerance relative to cell center (in cell units)
+        lat_snapped = lat0 + i * dlat
+        lon_snapped = lon0 + j * dlon
+        d_i = np.abs((lat - lat_snapped) / dlat)
+        d_j = np.abs((lon - lon_snapped) / dlon)
+        close = (d_i <= tol_cells) & (d_j <= tol_cells)
+
+        ok = inside & close
+        if not np.any(ok):
+            raise ValueError("No NodeGrid points fall within the template grid (or tol too small).")
+
+        flat_idx = (i[ok] * nlon + j[ok]).astype(int)
+        used_idx = np.unique(flat_idx)
+
+        if set_on_template:
+            setattr(template, "_node_mask_idx", used_idx)
+
+        return used_idx
+
+
+
+
+
+
+
+
+
+# --- Builders from channel_finder outputs ------------------------------------
+
+def _resample_polyline_lonlat(lon: np.ndarray, lat: np.ndarray, step_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Resample a lon/lat polyline to ~uniform spacing (meters) along track.
+    Uses local meters-per-degree at each segment mid-lat for speed.
+    """
+    lon = np.asarray(lon, float); lat = np.asarray(lat, float)
+    if lon.size < 2:
+        return lon, lat
+
+    # cumulative distance (meters) along polyline
+    meters = [0.0]
+    for i in range(1, lon.size):
+        latm = 0.5 * (lat[i] + lat[i-1])
+        m_per_deg_lat = 111_194.9266
+        m_per_deg_lon = m_per_deg_lat * math.cos(math.radians(latm))
+        dx = (lon[i] - lon[i-1]) * m_per_deg_lon
+        dy = (lat[i] - lat[i-1]) * m_per_deg_lat
+        meters.append(meters[-1] + math.hypot(dx, dy))
+    meters = np.asarray(meters)
+
+    if meters[-1] <= step_m:
+        return lon, lat
+
+    # target distances and interpolation
+    tgt = np.arange(0.0, meters[-1] + step_m, step_m)
+    lon_i = np.interp(tgt, meters, lon)
+    lat_i = np.interp(tgt, meters, lat)
+    return lon_i, lat_i
+
+
+def sample_dem_elevations(dem_tif: str, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    """
+    Sample DEM elevations (meters) at lon/lat points. Returns NaN for nodata/outside.
+    """
+    import rasterio
+    lon = np.asarray(lon, float); lat = np.asarray(lat, float)
+    z = np.full(lon.shape, np.nan, float)
+    with rasterio.open(dem_tif) as src:
+        for i, (x, y) in enumerate(zip(lon, lat)):
+            try:
+                val = list(src.sample([(x, y)], indexes=1))[0][0]
+                nod = src.nodata
+                z[i] = np.nan if (val == nod or not np.isfinite(val)) else float(val)
+            except Exception:
+                z[i] = np.nan
+    return z
+
+
+def nodegrid_from_channel_csvs(
+    channels_dir: str,
+    *,
+    step_m: float | None = 100.0,
+    dem_tif: str | None = None,
+    approx_spacing_m: float | None = None,
+    max_points: int | None = None,
+) -> NodeGrid:
+    """
+    Build a NodeGrid from the CSV polylines written by channel_finder.write_top_n_channels_csv().
+    - Reads all *.csv under channels_dir (columns: lon,lat)
+    - Optionally resamples each polyline to ~step_m spacing
+    - Optionally samples a DEM for elevations (meters)
+
+    Returns NodeGrid (sparse grid).
+    """
+    all_lon, all_lat = [], []
+    for name in sorted(os.listdir(channels_dir)):
+        if not name.lower().endswith(".csv"):
+            continue
+        arr = np.loadtxt(os.path.join(channels_dir, name), delimiter=",", skiprows=1)
+        if arr.ndim != 2 or arr.shape[1] < 2:
+            continue
+        lon, lat = arr[:, 0], arr[:, 1]
+        if step_m and step_m > 0:
+            lon, lat = _resample_polyline_lonlat(lon, lat, step_m)
+        all_lon.append(lon); all_lat.append(lat)
+
+    if not all_lon:
+        raise ValueError(f"No channel CSVs found in {channels_dir}")
+
+    lon = np.concatenate(all_lon); lat = np.concatenate(all_lat)
+
+    if max_points and lon.size > max_points:
+        idx = np.linspace(0, lon.size - 1, num=max_points, dtype=int)
+        lon, lat = lon[idx], lat[idx]
+
+    elev = None
+    dem_tag = None
+    if dem_tif:
+        elev = sample_dem_elevations(dem_tif, lon, lat)
+        dem_tag = os.path.basename(dem_tif)
+
+    # choose a reasonable spacing meta
+    approx = approx_spacing_m if approx_spacing_m is not None else (step_m or None)
+    return NodeGrid(lon, lat, node_elev_m=elev, approx_spacing_m=approx, dem_tag=dem_tag)
 
 
 # ---------------------------------
@@ -488,317 +1120,16 @@ def initial_source(lat: float = dome_location["lat"], lon: float = dome_location
     return {"lat": float(lat), "lon": float(lon)}
 
 
-def make_grid(
-    center_lat: float = dome_location["lat"],
-    center_lon: float = dome_location["lon"],
-    node_spacing_m: int = 100,
-    grid_size_lat_m: int = 10_000,
-    grid_size_lon_m: int = 8_000,
-    *,
-    dem: Optional[Tuple[str, Dict[str, Any]]] = None,
-) -> Grid:
-    """
-    Create a Grid centered at (center_lat, center_lon) with the given physical extent.
-
-    Examples
-    --------
-    # Flat grid (old behavior)
-    g = make_grid(node_spacing_m=50, grid_size_lat_m=8000, grid_size_lon_m=8000)
-
-    # Drape on PyGMT Earth Relief (01s), cached under ./_dem_cache
-    g = make_grid(
-        node_spacing_m=50,
-        grid_size_lat_m=8000, grid_size_lon_m=8000,
-        dem=("pygmt", {"resolution": "01s", "cache_dir": "./_dem_cache", "tag": "01s"})
-    )
-
-    # Drape using a local GeoTIFF
-    g = make_grid(
-        node_spacing_m=50,
-        grid_size_lat_m=8000, grid_size_lon_m=8000,
-        dem=("geotiff", {"path": "/abs/path/to/dem.tif", "tag": "DEM2020"})
-    )
-
-    # Drape using a custom sampler (callable(lat, lon) -> elevation_m)
-    g = make_grid(
-        dem=("sampler", {"func": my_sampler, "tag": "myDEM"})
-    )
-    """
-    nlat = int(grid_size_lat_m / node_spacing_m) + 1
-    nlon = int(grid_size_lon_m / node_spacing_m) + 1
-    return Grid(center_lat, center_lon, nlat, nlon, node_spacing_m, dem=dem)
+def _meters_per_degree(centerlat_deg: float) -> Tuple[float, float]:
+    """Return (meters_per_deg_lat, meters_per_deg_lon) at the given latitude."""
+    meters_per_deg_lat = 1000.0 * 111.19492664455873  # ~exact degrees2kilometers(1)
+    meters_per_deg_lon = meters_per_deg_lat * math.cos(math.radians(centerlat_deg))
+    return meters_per_deg_lat, meters_per_deg_lon
 
 
-# === Sparse node grid (NodeGrid) ======================
-@dataclass(frozen=True)
-class NodeGridSignature:
-    """
-    Signature for a sparse set of nodes. We don't store all points in the
-    signature; we use a stable hash of the (lon,lat,optional elev) array.
-    """
-    n_nodes: int
-    approx_spacing_m: float | None
-    bbox_lonmin: float
-    bbox_lonmax: float
-    bbox_latmin: float
-    bbox_latmax: float
-    has_elevation: bool
-    dem_tag: str | None  # e.g., path or short hash of DEM file, if used
-    nodes_sha1: str      # sha1 of float64 packed node array for stability
-
-    def as_tuple(self) -> tuple:
-        return (self.n_nodes, self.approx_spacing_m, self.bbox_lonmin, self.bbox_lonmax,
-                self.bbox_latmin, self.bbox_latmax, self.has_elevation, self.dem_tag, self.nodes_sha1)
-
-
-class NodeGrid:
-    """
-    Sparse 'grid' defined by arbitrary nodes. Compatible with ASL plotting and
-    caching expectations: provides gridlon, gridlat, optional gridelev, signature(), id, plot(), save(), load().
-
-    Attributes
-    ----------
-    node_lon : (N,) float array
-    node_lat : (N,) float array
-    node_elev_m : (N,) float array or None   # elevation above sea level in meters
-    approx_spacing_m : float or None         # optional meta for plotting & label
-    id : str                                 # stable cache key from signature()
-    """
-    def __init__(
-        self,
-        node_lon: np.ndarray,
-        node_lat: np.ndarray,
-        node_elev_m: np.ndarray | None = None,
-        approx_spacing_m: float | None = None,
-        dem_tag: str | None = None,
-    ):
-        node_lon = np.asarray(node_lon, float).reshape(-1)
-        node_lat = np.asarray(node_lat, float).reshape(-1)
-        if node_lon.size != node_lat.size:
-            raise ValueError("node_lon and node_lat must have same length")
-        if node_elev_m is not None:
-            node_elev_m = np.asarray(node_elev_m, float).reshape(-1)
-            if node_elev_m.size != node_lon.size:
-                raise ValueError("node_elev_m must match node_lon size")
-
-        self.node_lon = node_lon
-        self.node_lat = node_lat
-        self.node_elev_m = node_elev_m
-        self.approx_spacing_m = None if approx_spacing_m is None else float(approx_spacing_m)
-        self.dem_tag = dem_tag
-
-        # For compatibility with existing code that expects 2-D fields:
-        self.gridlon = node_lon.copy()
-        self.gridlat = node_lat.copy()
-
-        self.id = self.set_id()
-
-    def _nodes_sha1(self) -> str:
-        """Stable hash of concatenated (lon, lat, elev?) in float64."""
-        arrs = [self.node_lon.astype("float64"), self.node_lat.astype("float64")]
-        if self.node_elev_m is not None:
-            arrs.append(self.node_elev_m.astype("float64"))
-        blob = np.ascontiguousarray(np.column_stack(arrs)).view("uint8")
-        return hashlib.sha1(blob).hexdigest()
-
-    def signature(self) -> NodeGridSignature:
-        lonmin, lonmax = float(np.nanmin(self.node_lon)), float(np.nanmax(self.node_lon))
-        latmin, latmax = float(np.nanmin(self.node_lat)), float(np.nanmax(self.node_lat))
-        return NodeGridSignature(
-            n_nodes=int(self.node_lon.size),
-            approx_spacing_m=self.approx_spacing_m,
-            bbox_lonmin=lonmin, bbox_lonmax=lonmax,
-            bbox_latmin=latmin, bbox_latmax=latmax,
-            has_elevation=self.node_elev_m is not None,
-            dem_tag=self.dem_tag,
-            nodes_sha1=self._nodes_sha1(),
-        )
-
-    def set_id(self) -> str:
-        self.id = make_hash(self.signature().as_tuple())
-        return self.id
-
-    # --- Plot (re-uses topo_map if available) ---
-    def plot(
-        self,
-        fig=None,
-        show: bool = True,
-        symbol: str = "c",
-        scale: float = 1.0,
-        fill: Optional[str] = "blue",
-        pen: Optional[str] = "0.5p,black",
-        topo_map_kwargs: Optional[dict] = None,
-        outfile: Optional[str] = None,
-    ):
-        """
-        Plot sparse nodes on a simple two-color land/sea basemap by default.
-        If this NodeGrid carries a DEM tag from a GeoTIFF build, pass it through.
-        """
-        try:
-            import pygmt  # type: ignore
-        except Exception as e:
-            raise ImportError("PyGMT is required for NodeGrid.plot().") from e
-
-        default_kwargs = {
-            "topo_color": False,
-            "cmap": "land",     # no shading two-color scheme in map.py
-        }
-
-        # If created from channel_finder with a DEM, we stored basename in dem_tag;
-        # when possible, prefer a direct path via topo_map_kwargs['dem_tif'] supplied by caller.
-        # (We can't reliably reconstruct a full path from dem_tag alone.)
-        topo_map_kwargs = {**default_kwargs, **(topo_map_kwargs or {})}
-
-        if fig is None:
-            try:
-                from .map import topo_map
-                fig = topo_map(show=False, **topo_map_kwargs)
-            except Exception:
-                region = [
-                    float(np.nanmin(self.node_lon)), float(np.nanmax(self.node_lon)),
-                    float(np.nanmin(self.node_lat)), float(np.nanmax(self.node_lat)),
-                ]
-                fig = pygmt.Figure()
-                fig.basemap(region=region, projection="M12c", frame=True)
-
-        # Symbol size (cm) – use approx spacing if available
-        if self.approx_spacing_m:
-            size_cm = (self.approx_spacing_m / 2000.0) * float(scale)
-        else:
-            size_cm = 0.12 * float(scale)
-        stylestr = f"{symbol}{size_cm}c"
-
-        fig.plot(
-            x=self.node_lon,
-            y=self.node_lat,
-            style=stylestr,
-            pen=pen,
-            fill=fill if symbol not in ("x", "+") else None,
-        )
-
-        if outfile:
-            fig.savefig(outfile, dpi=300)
-        if show:
-            fig.show()
-        return fig
-
-    # --- Persistence ---
-    def save(self, cache_dir: str, force_overwrite: bool = False) -> str:
-        os.makedirs(cache_dir, exist_ok=True)
-        pklfile = os.path.join(cache_dir, f"NodeGrid_{self.id}.pkl")
-        if os.path.exists(pklfile) and not force_overwrite:
-            print(f"[INFO] File exists: {pklfile} (use force_overwrite=True to overwrite).")
-            return pklfile
-        with open(pklfile, "wb") as f:
-            pickle.dump(self, f)
-        print(f"[INFO] NodeGrid saved to {pklfile}")
-        return pklfile
-
-    @classmethod
-    def load(cls, cache_file: str) -> "NodeGrid":
-        if not os.path.isfile(cache_file):
-            raise FileNotFoundError(f"No such file: {cache_file}")
-        with open(cache_file, "rb") as f:
-            obj = pickle.load(f)
-        if not isinstance(obj, cls):
-            raise TypeError(f"Pickle does not contain a {cls.__name__} instance.")
-        print(f"[INFO] NodeGrid loaded from {cache_file}")
-        return obj
-
-
-# --- Builders from channel_finder outputs ------------------------------------
-
-def _resample_polyline_lonlat(lon: np.ndarray, lat: np.ndarray, step_m: float) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Resample a lon/lat polyline to ~uniform spacing (meters) along track.
-    Uses local meters-per-degree at each segment mid-lat for speed.
-    """
-    lon = np.asarray(lon, float); lat = np.asarray(lat, float)
-    if lon.size < 2:
-        return lon, lat
-
-    # cumulative distance (meters) along polyline
-    meters = [0.0]
-    for i in range(1, lon.size):
-        latm = 0.5 * (lat[i] + lat[i-1])
-        m_per_deg_lat = 111_194.9266
-        m_per_deg_lon = m_per_deg_lat * math.cos(math.radians(latm))
-        dx = (lon[i] - lon[i-1]) * m_per_deg_lon
-        dy = (lat[i] - lat[i-1]) * m_per_deg_lat
-        meters.append(meters[-1] + math.hypot(dx, dy))
-    meters = np.asarray(meters)
-
-    if meters[-1] <= step_m:
-        return lon, lat
-
-    # target distances and interpolation
-    tgt = np.arange(0.0, meters[-1] + step_m, step_m)
-    lon_i = np.interp(tgt, meters, lon)
-    lat_i = np.interp(tgt, meters, lat)
-    return lon_i, lat_i
-
-
-def sample_dem_elevations(dem_tif: str, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
-    """
-    Sample DEM elevations (meters) at lon/lat points. Returns NaN for nodata/outside.
-    """
-    import rasterio
-    lon = np.asarray(lon, float); lat = np.asarray(lat, float)
-    z = np.full(lon.shape, np.nan, float)
-    with rasterio.open(dem_tif) as src:
-        for i, (x, y) in enumerate(zip(lon, lat)):
-            try:
-                val = list(src.sample([(x, y)], indexes=1))[0][0]
-                nod = src.nodata
-                z[i] = np.nan if (val == nod or not np.isfinite(val)) else float(val)
-            except Exception:
-                z[i] = np.nan
-    return z
-
-
-def nodegrid_from_channel_csvs(
-    channels_dir: str,
-    *,
-    step_m: float | None = 100.0,
-    dem_tif: str | None = None,
-    approx_spacing_m: float | None = None,
-    max_points: int | None = None,
-) -> NodeGrid:
-    """
-    Build a NodeGrid from the CSV polylines written by channel_finder.write_top_n_channels_csv().
-    - Reads all *.csv under channels_dir (columns: lon,lat)
-    - Optionally resamples each polyline to ~step_m spacing
-    - Optionally samples a DEM for elevations (meters)
-
-    Returns NodeGrid (sparse grid).
-    """
-    all_lon, all_lat = [], []
-    for name in sorted(os.listdir(channels_dir)):
-        if not name.lower().endswith(".csv"):
-            continue
-        arr = np.loadtxt(os.path.join(channels_dir, name), delimiter=",", skiprows=1)
-        if arr.ndim != 2 or arr.shape[1] < 2:
-            continue
-        lon, lat = arr[:, 0], arr[:, 1]
-        if step_m and step_m > 0:
-            lon, lat = _resample_polyline_lonlat(lon, lat, step_m)
-        all_lon.append(lon); all_lat.append(lat)
-
-    if not all_lon:
-        raise ValueError(f"No channel CSVs found in {channels_dir}")
-
-    lon = np.concatenate(all_lon); lat = np.concatenate(all_lat)
-
-    if max_points and lon.size > max_points:
-        idx = np.linspace(0, lon.size - 1, num=max_points, dtype=int)
-        lon, lat = lon[idx], lat[idx]
-
-    elev = None
-    dem_tag = None
-    if dem_tif:
-        elev = sample_dem_elevations(dem_tif, lon, lat)
-        dem_tag = os.path.basename(dem_tif)
-
-    # choose a reasonable spacing meta
-    approx = approx_spacing_m if approx_spacing_m is not None else (step_m or None)
-    return NodeGrid(lon, lat, node_elev_m=elev, approx_spacing_m=approx, dem_tag=dem_tag)
+def _safe_to_float(x, default=np.nan) -> float:
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else float(default)
+    except Exception:
+        return float(default)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import os
-from flovopy.analysis.asl import extract_asl_diagnostics
+from obsolete.asl import extract_asl_diagnostics
 from obspy import UTCDateTime
 
 # === Set top-level directory ===

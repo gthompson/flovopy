@@ -1,64 +1,157 @@
-# flovopy/asl/asl.py
+"""
+Amplitude Source Location (ASL) module
+======================================
+
+This module implements the ASL class for locating volcanic sources (e.g.,
+pyroclastic flows, lahars, rockfalls) using amplitude-based inversion of
+seismic network data. It is part of the `flovopy` package.
+
+Overview
+--------
+The ASL workflow combines:
+- Precomputed station–node distances (km) on a regular or masked grid
+- Amplitude correction tables (frequency, attenuation, path effects)
+- VSAM (Volcano Seismic Amplitude Measurement) time series per station
+- Misfit evaluation across candidate nodes
+- Fast search refinements (bounding box or sector masking)
+- Output in QuakeML, CSV, and diagnostic plots
+
+Design
+------
+- Public methods (`locate`, `fast_locate`, `refine_and_relocate`, `plot`, …)
+  are intended for users.
+- Internal/private helpers begin with an underscore (`_`) and encapsulate
+  low-level operations (masking, smoothing, pathfinding, grid utilities).
+- All methods update the object in-place unless explicitly documented.
+"""
+
 from __future__ import annotations
-import os
-from dataclasses import dataclass
+
+# stdlib
+from datetime import datetime
+import warnings
+from typing import Optional, Iterable, Tuple, Dict, Any
+from pprint import pprint
+from contextlib import contextmanager
+
+from obspy.core.event import (
+    Event, Origin, OriginQuality, ResourceIdentifier, Comment,
+    QuantityError, Amplitude, Catalog
+)
+
+# third-party
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.ndimage import uniform_filter1d
 
-from obspy import UTCDateTime, Stream
-from obspy.core.event import Event, Catalog, ResourceIdentifier, Origin, Amplitude, QuantityError, OriginQuality, Comment
-from obspy.geodetics import gps2dist_azimuth
+from obspy import Stream, UTCDateTime
+from obspy.geodetics.base import gps2dist_azimuth
 
+# SciPy (guarded: locate/fast_locate accept None and skip blur;
+#          metric2stream needs uniform_filter1d; we’ll set None if unavailable)
+try:
+    from scipy.ndimage import gaussian_filter as _gauss
+except Exception:
+    _gauss = None
+try:
+    from scipy.ndimage import gaussian_filter, uniform_filter1d
+except Exception:
+    gaussian_filter = None
+    uniform_filter1d = None
+
+# PyGMT (guarded for environments without GMT runtime)
+try:
+    import pygmt
+except Exception:
+    pygmt = None
+
+# flovopy locals
 from flovopy.processing.sam import VSAM
+from flovopy.asl.ampcorr import AmpCorr, AmpCorrParams
+from flovopy.asl.distances import compute_distances, distances_signature, compute_azimuthal_gap #, geo_distance_3d_km
 from flovopy.utils.make_hash import make_hash
-from flovopy.core.mvo import dome_location
-from flovopy.asl.map import topo_map #, plot_heatmap_montserrat_colored
-from flovopy.asl.distances import compute_distances, distances_signature, geo_distance_3d_km
-from flovopy.asl.diagnostics import extract_asl_diagnostics, compare_asl_sources
-from flovopy.asl.grid import make_grid, Grid, NodeGrid
-from flovopy.asl.misfit import plot_misfit_heatmap_for_peak_DR, StdOverMeanMisfit, R2DistanceMisfit
+from flovopy.asl.grid import NodeGrid, Grid
+from flovopy.asl.utils import _grid_mask_indices, compute_spatial_connectedness, _grid_shape_or_none, _median_filter_indices, _viterbi_smooth_indices, _as_regular_view
 
-from scipy.ndimage import gaussian_filter
-# add this import near the top of the module (outside the function)
-from flovopy.asl.station_corrections import apply_interval_station_gains
+# plotting helpers (topo base, diagnostic heatmap)
+from flovopy.asl.map import topo_map
+from flovopy.asl.misfit import plot_misfit_heatmap_for_peak_DR, StdOverMeanMisfit  # , R2DistanceMisfit  # (import when needed)
 
-# ---------- ASL ----------
+# ----------------------------------------------------------------------
+# Main ASL class
+# ----------------------------------------------------------------------
+
 class ASL:
     """
-    Amplitude-based Source Location (ASL) for volcano-seismic data.
+    Amplitude Source Location (ASL) engine.
 
-    Expects:
-      - VSAM object (already computed outside)
-      - metric name
-      - grid object
-      - precomputed node_distances_km, station_coordinates, amplitude_corrections (injected by caller)
+    This class performs amplitude-based source localization on a given
+    stream of preprocessed volcano-seismic data. It combines:
+    - VSAM-derived amplitude metrics
+    - A spatial grid of candidate nodes (Grid or NodeGrid)
+    - Station–node distance matrices
+    - Amplitude correction factors
+
+    Parameters
+    ----------
+    samobject : VSAM
+        Object containing per-station amplitude metrics (already computed).
+    metric : str
+        Which VSAM metric to use (e.g., "RSAM", "VSAM", "DSAM").
+    gridobj : object
+        Grid or NodeGrid defining candidate source node lat/lon arrays.
+        May also carry optional attributes such as node spacing, mask,
+        or dome apex coordinates.
+    window_seconds : float
+        Sliding window length used to compute amplitude metrics.
+
+    Attributes
+    ----------
+    samobject : VSAM
+        Copy of the input VSAM object.
+    metric : str
+        Metric name chosen at initialization.
+    gridobj : Grid or NodeGrid
+        Candidate source nodes (lat/lon arrays).
+    window_seconds : float
+        Time window used for amplitude averaging.
+    node_distances_km : dict[str, np.ndarray]
+        Per-station vector of distances to all nodes (km).
+    amplitude_corrections : dict[str, np.ndarray]
+        Per-station vector of correction factors at each node.
+    station_coordinates : dict[str, dict]
+        Mapping seed_id → {latitude, longitude, elevation}.
+    source : dict
+        Current source track (lat, lon, DR, misfit, …).
+    connectedness : dict
+        Diagnostics of spatial clustering.
+    _node_mask : np.ndarray | None
+        Temporary active mask (indices into the full grid).
     """
-
-    def __init__(self, samobject: VSAM, metric: str, gridobj: Grid | NodeGrid, window_seconds: int):    
+    def __init__(self, samobject: VSAM, metric: str, gridobj: Grid | NodeGrid, window_seconds: float, id: Optional[str] = None):    
         if not isinstance(samobject, VSAM):
             raise TypeError("samobject must be a VSAM instance")
         self.samobject = samobject
         self.metric = metric
         self.gridobj = gridobj
-        self.window_seconds = int(window_seconds)
+        self.window_seconds = window_seconds
 
-        # injected later by caller (precomputed)
+        # Geometry / corrections (must be injected later)
         self.node_distances_km: dict[str, np.ndarray] = {}
-        self.station_coordinates: dict[str, dict] = {}
         self.amplitude_corrections: dict[str, np.ndarray] = {}
+        self.station_coordinates: dict[str, dict] = {}
 
-        # params (for provenance in filenames)
-        self.surfaceWaves = False
-        self.wavespeed_kms = None
-        self.Q = None
-        self.peakf = None
-        self.wavelength_km = None
+        # Outputs
+        self.source: Optional[dict] = None
+        self.connectedness: Optional[dict] = None
 
-        self.located = False
-        self.source = None
-        self.event = None
+        # Provenance parameters (set later by sausage or manually)
+        self.Q: Optional[float] = None
+        self.peakf: Optional[float] = None
+        self.wavespeed_kms: Optional[float] = None
+        self.surfaceWaves: Optional[bool] = None
+
+        # Internal state
+        self._node_mask: Optional[np.ndarray] = None
 
         self.id = self.set_id()
 
@@ -67,61 +160,170 @@ class ASL:
         keys = tuple(sorted(self.amplitude_corrections.keys()))
         return make_hash(self.metric, self.window_seconds, self.gridobj.id, keys)
     
-    def compute_grid_distances(self, *, inventory=None, stream=None, verbose=True):
+    def compute_grid_distances(
+        self,
+        *,
+        inventory=None,
+        stream: Stream | None = None,
+        verbose: bool = True,
+    ) -> tuple[dict[str, np.ndarray], dict[str, dict]]:
         """
-        Convenience wrapper around flovopy.asl.distances.compute_distances.
+        Compute and attach station→node distances for the current grid.
 
-        Fills:
-          - self.node_distances_km : dict[seed_id -> np.ndarray]
-          - self.station_coordinates : dict[seed_id -> {latitude, longitude, elevation}]
+        This is a thin, user-facing wrapper around
+        :func:`flovopy.asl.distances.compute_distances`. It fills
+        ``self.node_distances_km`` and ``self.station_coordinates``
+        and returns both so callers can use the results immediately.
+
+        Parameters
+        ----------
+        inventory : obspy.Inventory or None, optional
+            Station metadata used to discover channel coordinates.
+            If not given, ``stream`` can be used to infer coordinates
+            from trace stats (if present).
+        stream : obspy.Stream or None, optional
+            A stream whose channel ids (NET.STA.LOC.CHA) should be used
+            to select/align stations; may also provide coordinates in
+            ``tr.stats.coordinates`` if no inventory is provided.
+        verbose : bool, default True
+            Print a short progress summary.
+
+        Returns
+        -------
+        (node_distances_km, station_coords) : tuple
+            - node_distances_km : dict[str -> np.ndarray]
+                For each seed id, an array of length ``N_nodes`` of
+                great-circle (or 3-D, depending on implementation)
+                distances in kilometers from *each grid node* to that station.
+            - station_coords : dict[str -> dict]
+                For each seed id, a dict with at least
+                ``{"latitude": float, "longitude": float, "elevation": float}``.
+
+        Side Effects
+        ------------
+        - Sets ``self.node_distances_km`` and ``self.station_coordinates``.
+        - Does **not** modify amplitude corrections. Call
+        :meth:`compute_amplitude_corrections` after this to (re)build them.
+
+        Notes
+        -----
+        The grid is taken from ``self.gridobj``. If the grid carries a persistent
+        node mask (e.g., land-only), the underlying distance engine may compute
+        for the full grid and you can apply masks later; or it may honor the mask
+        internally depending on your ``compute_distances`` implementation.
         """
-        if verbose: print("[ASL] Computing node→station distances…")
+        if verbose:
+            print("[ASL] Computing node→station distances…")
+
         node_distances_km, station_coords = compute_distances(
             self.gridobj, inventory=inventory, stream=stream
         )
+
+        # Basic validation
+        nnodes = np.asarray(self.gridobj.gridlat).size
+        if not node_distances_km:
+            raise RuntimeError("[ASL] No stations found while computing distances.")
+        for sid, v in node_distances_km.items():
+            if np.asarray(v).size != nnodes:
+                raise ValueError(
+                    f"[ASL] Distances length mismatch for {sid}: "
+                    f"{np.asarray(v).size} != {nnodes}"
+                )
+
         self.node_distances_km = node_distances_km
         self.station_coordinates = station_coords
-        if verbose:
-            nchan = len(node_distances_km)
-            nnodes = self.gridobj.gridlat.size
-            print(f"[ASL] Distances ready for {nchan} channels over {nnodes} nodes.")
-        return node_distances_km, station_coords
 
+        if verbose:
+            print(f"[ASL] Distances ready for {len(node_distances_km)} channels "
+                f"over {nnodes} nodes.")
+        return node_distances_km, station_coords       
+    
     def compute_amplitude_corrections(
         self,
         *,
-        surface_waves=True,
+        surface_waves: bool = True,
         wavespeed_kms: float = 2.5,
         Q: float | None = 23,
         peakf: float = 8.0,
         dtype: str = "float32",
         require_all: bool = False,
-        force_recompute: bool = True,   # kept for API parity; here it's always in-memory
+        force_recompute: bool = True,   # retained for API parity; in-memory here
         verbose: bool = True,
-    ):
+    ) -> dict[str, np.ndarray]:
         """
-        Convenience wrapper to build amplitude corrections in memory and attach to self.
+        Build and attach per-station amplitude correction vectors for the grid.
 
-        Uses the currently stored:
-          - self.node_distances_km
-          - self.gridobj
+        This uses :class:`flovopy.asl.ampcorr.AmpCorr` with parameters derived
+        from the current grid signature and the already-computed
+        ``self.node_distances_km``.
 
-        Fills:
-          - self.amplitude_corrections : dict[seed_id -> np.ndarray]
-          - self._ampcorr              : AmpCorr (for metadata; optional)
-          - self.Q, self.peakf, self.wavespeed_kms, self.surfaceWaves
+        Parameters
+        ----------
+        surface_waves : bool, default True
+            If True, apply surface-wave style attenuation in the model;
+            if False, choose body-wave style (your AmpCorr implementation decides).
+        wavespeed_kms : float, default 2.5
+            Assumed (phase/group) wave speed in km/s used in attenuation/Q terms.
+        Q : float or None, default 23
+            Quality factor (attenuation). If None, a pure geometric correction
+            may be used depending on AmpCorr implementation.
+        peakf : float, default 8.0
+            Peak frequency (Hz) to parameterize frequency-dependent terms.
+        dtype : {"float32","float64"}, default "float32"
+            Storage dtype for the correction arrays.
+        require_all : bool, default False
+            If True, raise if any channel cannot be computed (e.g., missing
+            distances); otherwise, channels may be skipped or filled with NaN.
+        force_recompute : bool, default True
+            Kept for compatibility with on-disk cache workflows. In this
+            in-memory path it is ignored—corrections are freshly computed.
+        verbose : bool, default True
+            Print a short progress summary.
+
+        Returns
+        -------
+        corrections : dict[str -> np.ndarray]
+            Per-channel correction vectors of length ``N_nodes`` that scale
+            station amplitudes at each grid node. These are stored into
+            ``self.amplitude_corrections`` and returned.
+
+        Side Effects
+        ------------
+        - Sets:
+            * ``self.amplitude_corrections``
+            * ``self.Q``, ``self.peakf``, ``self.wavespeed_kms``, ``self.surfaceWaves``
+            * ``self._ampcorr`` (the AmpCorr object, for diagnostics/metadata)
+
+        Raises
+        ------
+        RuntimeError
+            If distances have not been computed yet.
+        ValueError
+            If the corrections produced do not match the number of grid nodes.
+
+        Notes
+        -----
+        - The grid identity and distance signatures are baked into the AmpCorr
+        parameter object to ensure consistency and cache correctness if you
+        later decide to use an on-disk cache.
+        - After changing ``peakf`` (or other params), call this method again to
+        regenerate corrections consistent with the new configuration.
         """
         if not self.node_distances_km:
-            raise RuntimeError("node_distances_km is empty; call compute_grid_distances() first.")
+            raise RuntimeError(
+                "[ASL] node_distances_km is empty; call compute_grid_distances() first."
+            )
 
         if verbose:
-            print(f"[ASL] Computing amplitude corrections "
-                  f"(surface_waves={surface_waves}, v={wavespeed_kms} km/s, Q={Q}, peakf={peakf} Hz)…")
+            print("[ASL] Computing amplitude corrections "
+                f"(surface_waves={surface_waves}, v={wavespeed_kms} km/s, "
+                f"Q={Q}, peakf={peakf} Hz)…")
 
+        # Build a parameter block tied to the *current* grid/distances.
         params = AmpCorrParams(
-            surface_waves=surface_waves,
-            wave_speed_kms=wavespeed_kms,
-            Q=Q,
+            surface_waves=bool(surface_waves),
+            wave_speed_kms=float(wavespeed_kms),
+            Q=None if Q is None else float(Q),
             peakf=float(peakf),
             grid_sig=self.gridobj.signature().as_tuple(),
             inv_sig=tuple(sorted(self.node_distances_km.keys())),
@@ -129,49 +331,121 @@ class ASL:
             mask_sig=None,
             code_version="v1",
         )
-        ampcorr = AmpCorr(params)  # in-memory; cache_dir irrelevant here
-        ampcorr.compute(self.node_distances_km, inventory=None, dtype=dtype, require_all=require_all)
-        ampcorr.validate_against_nodes(self.gridobj.gridlat.size)
 
-        # attach
+        # In-memory amplitude corrections
+        ampcorr = AmpCorr(params)
+        ampcorr.compute(
+            self.node_distances_km,
+            inventory=None,        # distances already provided per station
+            dtype=dtype,
+            require_all=require_all,
+        )
+
+        # Validate and attach
+        nnodes = np.asarray(self.gridobj.gridlat).size
+        ampcorr.validate_against_nodes(nnodes)
+
         self.amplitude_corrections = ampcorr.corrections
         self._ampcorr = ampcorr
 
-        # provenance for filenames/plots
+        # Keep key parameters on the ASL object for provenance/filenames
         self.Q = params.Q
         self.peakf = params.peakf
         self.wavespeed_kms = params.wave_speed_kms
         self.surfaceWaves = params.surface_waves
 
         if verbose:
-            print(f"[ASL] Amplitude corrections ready for {len(self.amplitude_corrections)} channels.")
-        return self.amplitude_corrections    
+            print(f"[ASL] Amplitude corrections ready for "
+                f"{len(self.amplitude_corrections)} channels.")
+        return self.amplitude_corrections
 
-    # ---------- data prep ----------
     def metric2stream(self) -> Stream:
-        st = self.samobject.to_stream(metric=self.metric)
+        """
+        Convert the selected VSAM metric into an ObsPy :class:`~obspy.core.stream.Stream`.
 
-        # Determine SAM dt
-        dt = float(getattr(self.samobject, "sampling_interval", 1.0))
+        The returned stream contains one trace per station/channel with the chosen
+        metric as the data array. If ``self.window_seconds`` exceeds the native
+        sampling interval, a **NaN-aware moving average** of length
+        ``round(window_seconds / dt)`` samples is applied trace-by-trace using
+        ``scipy.ndimage.uniform_filter1d`` over a finite mask (so missing values do
+        not depress the average). Sampling rates are preserved.
+
+        Returns
+        -------
+        obspy.Stream
+            Stream with metric data (dtype float32) and corrected/smoothed samples.
+
+        Notes
+        -----
+        - The sampling interval is taken from ``self.samobject.sampling_interval`` when
+        available and valid; otherwise it is inferred from the first trace's
+        ``stats.sampling_rate``.
+        - When smoothing is active, each trace is processed independently with its own
+        local sampling interval, so heterogeneous sampling rates are handled.
+        - The smoothing window length per trace is:
+            ``w_tr = max(2, int(round(window_seconds / dt_tr)))``.
+        If ``window_seconds <= dt_tr`` for a trace, that trace is left untouched.
+        - This method does not change timing metadata (starttime, etc.).
+        """
+        # Build stream from VSAM
+        st = self.samobject.to_stream(metric=self.metric)
+        if not isinstance(st, Stream) or len(st) == 0:
+            raise RuntimeError("[ASL] metric2stream(): VSAM produced an empty or invalid Stream.")
+
+        # Determine a representative dt from VSAM or fall back to the first trace
+        dt = float(getattr(self.samobject, "sampling_interval", np.nan))
         if not np.isfinite(dt) or dt <= 0:
-            fs = float(getattr(st[0].stats, "sampling_rate", 1.0) or 1.0)
-            dt = 1.0 / fs
+            fs0 = float(getattr(st[0].stats, "sampling_rate", 0.0) or 0.0)
+            if fs0 <= 0:
+                raise RuntimeError("[ASL] metric2stream(): cannot infer sampling interval (fs<=0).")
+            dt = 1.0 / fs0
 
         win_sec = float(self.window_seconds or 0.0)
+        if win_sec <= 0:
+            # No smoothing requested; ensure data are float32 for downstream math
+            for tr in st:
+                if tr.data.dtype != np.float32:
+                    tr.data = np.asarray(tr.data, dtype=np.float32)
+            return st
+
+        # Apply NaN-aware moving average if the window exceeds the nominal dt
         if win_sec > dt:
             for tr in st:
-                fs_tr = float(getattr(tr.stats, "sampling_rate", 1.0) or 1.0)
+                # Per-trace sampling
+                fs_tr = float(getattr(tr.stats, "sampling_rate", 0.0) or 0.0)
+                if fs_tr <= 0:
+                    # If a trace lacks a valid fs, skip smoothing for that trace
+                    tr.data = np.asarray(tr.data, dtype=np.float32)
+                    continue
+
                 dt_tr = 1.0 / fs_tr
+                if win_sec <= dt_tr:
+                    # Window shorter than/equal to one sample for this trace → no smoothing
+                    tr.data = np.asarray(tr.data, dtype=np.float32)
+                    continue
+
                 w_tr = max(2, int(round(win_sec / dt_tr)))
 
-                x = tr.data.astype(float)
-                m = np.isfinite(x).astype(float)
-                xf = np.where(np.isfinite(x), x, 0.0)
+                # NaN-aware averaging via finite-mask normalization
+                x = np.asarray(tr.data, dtype=np.float32)
+                finite_mask = np.isfinite(x).astype(np.float32)
+                x_finite = np.where(np.isfinite(x), x, 0.0).astype(np.float32, copy=False)
 
-                num = uniform_filter1d(xf, size=w_tr, mode="nearest")
-                den = uniform_filter1d(m,  size=w_tr, mode="nearest")
-                tr.data = np.divide(num, den, out=np.zeros_like(num), where=den > 0)
+                num = uniform_filter1d(x_finite, size=w_tr, mode="nearest")
+                den = uniform_filter1d(finite_mask, size=w_tr, mode="nearest")
+
+                # Safe division: where den==0, write 0.0 (keeps NaN regions quiet)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    y = np.divide(num, den, out=np.zeros_like(num), where=den > 0)
+
+                tr.data = y  # float32
+                # Preserve the original sampling rate explicitly (in case num/den touched stats)
                 tr.stats.sampling_rate = fs_tr
+        else:
+            # Window not greater than nominal dt → just ensure float32 dtype
+            for tr in st:
+                tr.data = np.asarray(tr.data, dtype=np.float32)
+
         return st
 
     # ---------- locator ----------
@@ -188,26 +462,34 @@ class ASL:
         """
         Slow (loop-based) locator that mirrors fast_locate() outputs/behavior.
 
-        - Scans each time sample and every grid node with Python loops.
+        - Scans each time sample and every (possibly masked) grid node with Python loops.
         - Misfit per node: std(reduced) / (|mean(reduced)| + eps), reduced = y * C[:, j].
         - DR(t): median(reduced) if use_median_for_DR else mean(reduced) at the best node.
-        - Optional spatial smoothing: Gaussian filter applied to the per-time misfit
-        surface before choosing the best node.
+        - Optional spatial smoothing: Gaussian filter applied to the per-time misfit surface
+        with NaN/invalid-aware normalization (same logic as fast_locate).
         - Optional temporal smoothing: moving average on (lat, lon, DR) tracks.
         - Computes azimuthal gap and a spatial connectedness score (same as fast_locate).
-
-        Notes
-        -----
-        This is intended for clarity/debugging and will be much slower than fast_locate().
+        - Records chosen GLOBAL node indices in source["node_index"] (to match fast_locate).
         """
-
         if verbose:
             print("[ASL] locate (slow): preparing data…")
 
-        # Grid vectors
+        # Grid vectors (global space)
         gridlat = self.gridobj.gridlat.reshape(-1)
         gridlon = self.gridobj.gridlon.reshape(-1)
-        nnodes = gridlat.size
+        nnodes  = gridlat.size
+
+        # Optional global→local masking (keep only allowed nodes)
+        node_index = _grid_mask_indices(self.gridobj)  # GLOBAL indices or None
+        if node_index is not None and node_index.size > 0:
+            gridlat_local = gridlat[node_index]
+            gridlon_local = gridlon[node_index]
+            nnodes_local  = int(node_index.size)
+        else:
+            node_index    = None
+            gridlat_local = gridlat
+            gridlon_local = gridlon
+            nnodes_local  = nnodes
 
         # Stream → Y (nsta, ntime)
         st = self.metric2stream()
@@ -216,13 +498,15 @@ class ASL:
         t = st[0].times("utcdatetime")
         nsta, ntime = Y.shape
 
-        # Corrections → C (nsta, nnodes)
-        C = np.empty((nsta, nnodes), dtype=np.float32)
+        # Corrections → C (nsta, nnodes_local) from amplitude_corrections (global→local if masked)
+        C = np.empty((nsta, nnodes_local), dtype=np.float32)
         for k, sid in enumerate(seed_ids):
+            if sid not in self.amplitude_corrections:
+                raise KeyError(f"Missing amplitude corrections for channel '{sid}'")
             vec = np.asarray(self.amplitude_corrections[sid], dtype=np.float32)
             if vec.size != nnodes:
                 raise ValueError(f"Corrections length mismatch for {sid}: {vec.size} != {nnodes}")
-            C[k, :] = vec
+            C[k, :] = vec[node_index] if node_index is not None else vec
 
         # Station coords (for azgap)
         station_coords = []
@@ -238,26 +522,24 @@ class ASL:
         source_misfit = np.empty(ntime, dtype=float)
         source_azgap  = np.empty(ntime, dtype=float)
         source_nsta   = np.empty(ntime, dtype=int)
+        source_node   = np.empty(ntime, dtype=int)  # GLOBAL indices (to match fast_locate)
 
-        # Optional spatial blur setup
-        try:
-            from scipy.ndimage import gaussian_filter as _gauss
-        except Exception:
-            _gauss = None
-
-        # Helper: grid shape if regular (so we can reshape/blur)
+        # If grid has a regular shape, we can reshape for blurring
         def _grid_shape_or_none(grid):
-            # Works for regular lat/lon mesh created by Grid
             try:
                 return int(grid.nlat), int(grid.nlon)
             except Exception:
                 return None
 
+        # If grid has a regular shape, we can reshape for blurring
         grid_shape = _grid_shape_or_none(self.gridobj)
+        # If we applied a mask, the local sub-grid generally won't be reshapeable → skip blur gracefully
         can_blur = (
             spatial_smooth_sigma and spatial_smooth_sigma > 0.0 and
-            (grid_shape is not None) and (_gauss is not None)
+            (grid_shape is not None) and (_gauss is not None) and
+            (nnodes_local == (grid_shape[0] * grid_shape[1]))
         )
+
         if verbose:
             print(f"[ASL] locate (slow): nsta={nsta}, ntime={ntime}, "
                 f"spatial_blur={'on' if can_blur else 'off'}, "
@@ -267,13 +549,13 @@ class ASL:
         for i in range(ntime):
             y = Y[:, i]
 
-            misfit_j = np.full(nnodes, np.inf, dtype=float)
-            dr_j     = np.full(nnodes, np.nan, dtype=float)
-            nused_j  = np.zeros(nnodes, dtype=int)
+            misfit_j = np.full(nnodes_local, np.inf, dtype=float)
+            dr_j     = np.full(nnodes_local, np.nan, dtype=float)
+            nused_j  = np.zeros(nnodes_local, dtype=int)
 
-            # Scan all nodes
-            for j in range(nnodes):
-                reduced = y * C[:, j]          # (nsta,)
+            # Node loop (local indices)
+            for j in range(nnodes_local):
+                reduced = y * C[:, j]              # (nsta,)
                 finite  = np.isfinite(reduced)
                 nfin    = int(finite.sum())
                 nused_j[j] = nfin
@@ -284,38 +566,70 @@ class ASL:
                 if r.size == 0:
                     continue
 
-                # DR summary across stations at this node
-                if use_median_for_DR:
-                    DRj = float(np.median(r))
-                else:
-                    DRj = float(np.mean(r))
+                DRj = float(np.median(r)) if use_median_for_DR else float(np.mean(r))
                 dr_j[j] = DRj
 
                 mu = float(np.mean(r))
                 sg = float(np.std(r, ddof=0))
                 if not np.isfinite(mu) or abs(mu) < eps:
                     continue
-
                 misfit_j[j] = sg / (abs(mu) + eps)
 
-            # Optional spatial smoothing on misfit surface before picking best node
+            # Optional spatial smoothing on the misfit surface (NaN/invalid-aware)
             if can_blur:
                 nlat, nlon = grid_shape
-                m2 = misfit_j.reshape(nlat, nlon)
-                m2 = _gauss(m2, sigma=spatial_smooth_sigma, mode="nearest")
-                misfit_for_pick = m2.reshape(-1)
+                try:
+                    m2 = misfit_j.reshape(nlat, nlon)
+
+                    # Validity mask: finite = True
+                    valid = np.isfinite(m2)
+
+                    if valid.any():
+                        # Replace invalid with a large finite number so the minimum never migrates into invalid areas
+                        LARGE = np.nanmax(m2[valid]) if np.isfinite(m2[valid]).any() else 1.0
+                        LARGE = float(LARGE) if np.isfinite(LARGE) else 1.0
+                        F = np.where(valid, m2, LARGE)
+
+                        # Blur the finite costs and the mask separately, then renormalize
+                        W = _gauss(valid.astype(float), sigma=spatial_smooth_sigma, mode="nearest")
+                        G = _gauss(F,                sigma=spatial_smooth_sigma, mode="nearest")
+
+                        with np.errstate(invalid="ignore", divide="ignore"):
+                            Mblur = np.where(W > 1e-6, G / np.maximum(W, 1e-6), LARGE)
+
+                        # Re-impose invalid cells as LARGE so they can’t be selected
+                        Mblur = np.where(valid, Mblur, LARGE)
+                        misfit_for_pick = Mblur.reshape(-1)
+                    else:
+                        misfit_for_pick = misfit_j
+                except Exception:
+                    # If reshape fails (e.g., masked sub-grid), fall back to unblurred costs
+                    misfit_for_pick = misfit_j
             else:
                 misfit_for_pick = misfit_j
 
-            # Choose best node
-            jstar = int(np.nanargmin(misfit_for_pick))
+            # Choose best node (local → global) with a guard for the "no usable node" edge case
+            if not np.isfinite(misfit_for_pick).any():
+                # No node met min_stations (or all invalid) → write NaNs and continue
+                source_lat[i] = np.nan
+                source_lon[i] = np.nan
+                source_misfit[i] = np.nan
+                source_DR[i] = np.nan
+                source_nsta[i] = 0
+                source_node[i] = -1
+                source_azgap[i] = np.nan
+                continue
+
+            jstar_local  = int(np.nanargmin(misfit_for_pick))
+            jstar_global = int(node_index[jstar_local]) if node_index is not None else jstar_local
 
             # Record outputs at time i
-            source_lat[i]    = gridlat[jstar]
-            source_lon[i]    = gridlon[jstar]
-            source_misfit[i] = float(misfit_j[jstar])  # store the *unblurred* misfit at jstar
-            source_DR[i]     = float(dr_j[jstar])
-            source_nsta[i]   = int(nused_j[jstar])
+            source_lat[i]    = gridlat[jstar_global]
+            source_lon[i]    = gridlon[jstar_global]
+            source_misfit[i] = float(misfit_j[jstar_local])
+            source_DR[i]     = float(dr_j[jstar_local])
+            source_nsta[i]   = int(nused_j[jstar_local])
+            source_node[i]   = jstar_global
 
             azgap, _ = compute_azimuthal_gap(source_lat[i], source_lon[i], station_coords)
             source_azgap[i] = azgap
@@ -336,7 +650,7 @@ class ASL:
             source_lon = _movavg_1d(source_lon, temporal_smooth_win)
             source_DR  = _movavg_1d(source_DR,  temporal_smooth_win)
 
-        # Package source (keep DR scale factor for continuity)
+        # Package source (keep DR scale factor for continuity with fast_locate)
         self.source = {
             "t": t,
             "lat": source_lat,
@@ -345,11 +659,12 @@ class ASL:
             "misfit": source_misfit,
             "azgap": source_azgap,
             "nsta": source_nsta,
+            "node_index": source_node,   # NEW: mirror fast_locate output
         }
 
         # Spatial connectedness (same as fast_locate)
         conn = compute_spatial_connectedness(
-            source_lat, source_lon, dr=source_DR,
+            self.source["lat"], self.source["lon"], dr=source_DR,
             top_frac=0.15, min_points=12, max_points=200,
         )
         self.connectedness = conn
@@ -622,12 +937,13 @@ class ASL:
         asl.fast_locate(temporal_smooth_mode="viterbi", temporal_smooth_win=7,
                         viterbi_lambda_km=8.0, viterbi_max_step_km=30.0)
         """
-
-
         if misfit_backend is None:
             misfit_backend = StdOverMeanMisfit()
 
-        if verbose: print("[ASL] fast_locate: preparing data…")
+        if verbose:
+            print("[ASL] fast_locate: preparing data…")
+
+        # Grid vectors
         gridlat = self.gridobj.gridlat.reshape(-1)
         gridlon = self.gridobj.gridlon.reshape(-1)
 
@@ -638,7 +954,10 @@ class ASL:
         t = st[0].times("utcdatetime")
         nsta, ntime = Y.shape
 
-        # Backend context (honors self._node_mask if present)
+        # Refresh any grid-provided node mask each call
+        self._node_mask = _grid_mask_indices(self.gridobj)
+
+        # Backend context (will honor self._node_mask if present)
         ctx = misfit_backend.prepare(self, seed_ids, dtype=np.float32)
 
         # Station coords (for azgap)
@@ -657,7 +976,7 @@ class ASL:
         source_nsta   = np.empty(ntime, dtype=int)
         source_node   = np.empty(ntime, dtype=int)
 
-        # Spatial blur feasibility
+        # Spatial blur feasibility (full-grid reshape only)
         grid_shape = _grid_shape_or_none(self.gridobj)
         can_blur = (
             spatial_smooth_sigma and spatial_smooth_sigma > 0.0 and
@@ -669,9 +988,15 @@ class ASL:
                 f"spatial_blur={'on' if can_blur else 'off'}, "
                 f"temporal_smooth_win={temporal_smooth_win or 0}")
 
+        # Viterbi collections (filled only if requested)
+        want_viterbi = (temporal_smooth_mode or "none").lower() == "viterbi"
+        misfit_hist = [] if want_viterbi else None
+        mean_hist   = [] if want_viterbi else None
+
         for i0 in range(0, ntime, batch_size):
             i1 = min(i0 + batch_size, ntime)
-            if verbose: print(f"[ASL] fast_locate: [{i0}:{i1})")
+            if verbose:
+                print(f"[ASL] fast_locate: [{i0}:{i1})")
             Yb = Y[:, i0:i1]
 
             for k in range(Yb.shape[1]):
@@ -679,76 +1004,70 @@ class ASL:
                 misfit, extras = misfit_backend.evaluate(y, ctx, min_stations=min_stations, eps=eps)
 
                 # Keep full misfit & mean vectors if we’ll need Viterbi later
-                collect_for_viterbi = (temporal_smooth_mode.lower() == "viterbi")
-                if i0 == 0 and k == 0:
-                    misfit_hist = [] if collect_for_viterbi else None
-                    mean_hist   = [] if collect_for_viterbi else None
-
-                if collect_for_viterbi:
+                if want_viterbi:
                     misfit_hist.append(np.asarray(misfit, float).copy())
-                    # we expect 'mean' (or 'DR') vector to exist; if missing, stash NaNs (we’ll fallback)
-                    mvec = extras.get("mean", None)
+                    mvec = extras.get("mean", extras.get("DR", None))
                     if mvec is None:
                         mvec = np.full_like(misfit, np.nan, dtype=float)
                     mean_hist.append(np.asarray(mvec, float).copy())
 
-                # Optional per-time spatial smoothing (requires full-grid shape)
+                # Optional per-time spatial smoothing (NaN/invalid-aware)
                 if can_blur:
                     nlat, nlon = grid_shape
                     try:
                         m2 = misfit.reshape(nlat, nlon)
 
-                        # Build validity mask: finite = True
+                        # Valid mask and large-fill
                         valid = np.isfinite(m2)
-
                         if valid.any():
-                            # Replace invalid with a very large finite number so the minimum
-                            # never migrates into previously invalid nodes.
                             LARGE = np.nanmax(m2[valid]) if np.isfinite(m2[valid]).any() else 1.0
                             LARGE = float(LARGE) if np.isfinite(LARGE) else 1.0
                             F = np.where(valid, m2, LARGE)
 
-                            # Blur the *finite* costs and the mask separately, then renormalize
+                            # Blur mask and values, then renormalize
                             W = gaussian_filter(valid.astype(float), sigma=spatial_smooth_sigma, mode="nearest")
                             G = gaussian_filter(F,                sigma=spatial_smooth_sigma, mode="nearest")
-
-                            # Avoid division by ~0: where W is tiny (all-invalid neighborhood), keep LARGE
                             with np.errstate(invalid="ignore", divide="ignore"):
                                 Mblur = np.where(W > 1e-6, G / np.maximum(W, 1e-6), LARGE)
-
-                            # Re-impose invalid cells as LARGE so they can’t be selected
                             Mblur = np.where(valid, Mblur, LARGE)
                             misfit = Mblur.reshape(-1)
-                        else:
-                            # everything invalid – leave as is
-                            pass
+                        # else: all invalid, leave as-is
                     except Exception:
-                        # silently fall back if sub-grid shape doesn't match full grid
+                        # Sub-grid / reshape mismatch → skip blur silently
                         pass
 
+                # Guard: if this frame has no usable node (all inf/nan), write NaNs and continue
+                if not np.isfinite(misfit).any():
+                    i = i0 + k
+                    source_lat[i]    = np.nan
+                    source_lon[i]    = np.nan
+                    source_misfit[i] = np.nan
+                    source_node[i]   = -1
+                    # DR and N (station count)
+                    source_DR[i]     = np.nan
+                    y = Yb[:, k]
+                    source_nsta[i]   = int(np.sum(np.isfinite(y)))  # or 0 if you prefer symmetry
+                    source_azgap[i]  = np.nan
+                    continue
+
+                # Pick best node (map local→global if backend subsetted nodes)
                 jstar_local = int(np.nanargmin(misfit))
-                # Map local index to global grid index if backend subsetted the grid
                 jstar_global = jstar_local
                 node_index = ctx.get("node_index", None)
                 if node_index is not None:
                     jstar_global = int(node_index[jstar_local])
 
-                # DR from backend if available (vector)
-                DR_t = extras.get("mean", None)
-                if DR_t is None:
-                    DR_t = extras.get("DR", None)
+                # DR at best node
+                DR_t = extras.get("mean", extras.get("DR", None))
                 if DR_t is not None and np.ndim(DR_t) == 1:
                     DR_t = DR_t[jstar_local]
                 else:
-                    # fallback: compute reduced amplitudes at jstar using C if provided
+                    # Fallback: use reductions at best node if C was provided by backend
                     C = ctx.get("C", None)
                     if C is not None and C.shape[0] == y.shape[0]:
                         rbest = y * C[:, jstar_local]
                         rbest = rbest[np.isfinite(rbest)]
-                        if rbest.size:
-                            DR_t = np.median(rbest) if use_median_for_DR else np.mean(rbest)
-                        else:
-                            DR_t = np.nan
+                        DR_t = (np.median(rbest) if use_median_for_DR else np.mean(rbest)) if rbest.size else np.nan
                     else:
                         DR_t = np.nan
 
@@ -759,21 +1078,22 @@ class ASL:
                 source_misfit[i] = float(misfit[jstar_local])
                 source_node[i]   = jstar_global
 
-                # Station count at best node (if backend reported N as vector)
+                # Station count (vector N or scalar); fallback to finite(y)
                 N = extras.get("N", None)
                 source_nsta[i] = int(N if np.isscalar(N) else (N[jstar_local] if N is not None else np.sum(np.isfinite(y))))
 
                 azgap, _ = compute_azimuthal_gap(source_lat[i], source_lon[i], station_coords)
                 source_azgap[i] = azgap
 
+            # ---- temporal smoothing after each batch (works on the full arrays so far) ----
             flat_lat = self.gridobj.gridlat.ravel()
             flat_lon = self.gridobj.gridlon.ravel()
-
             mode = (temporal_smooth_mode or "none").lower()
+
             if mode == "median" and (temporal_smooth_win and temporal_smooth_win >= 3 and temporal_smooth_win % 2 == 1):
                 sm_node = _median_filter_indices(source_node, temporal_smooth_win)
 
-                # Optional: small jump guard (keeps pathological flips out)
+                # Optional small-jump guard
                 try:
                     def _km(j1, j2):
                         return 0.001 * gps2dist_azimuth(
@@ -781,52 +1101,43 @@ class ASL:
                             float(flat_lat[j2]), float(flat_lon[j2])
                         )[0]
                     JUMP_KM = 5.0
-                    for i in range(len(sm_node)):
-                        if _km(source_node[i], sm_node[i]) > JUMP_KM:
-                            sm_node[i] = source_node[i]
+                    for ii in range(len(sm_node)):
+                        if _km(source_node[ii], sm_node[ii]) > JUMP_KM:
+                            sm_node[ii] = source_node[ii]
                 except Exception:
                     pass
 
-                # Re-derive lat/lon at smoothed nodes; keep DR as (optionally) movavg
                 source_lat = flat_lat[sm_node].astype(float, copy=False)
                 source_lon = flat_lon[sm_node].astype(float, copy=False)
-                # If you still want a gentle DR temporal average:
+                # Gentle DR average to match locate()’s option
                 if temporal_smooth_win and temporal_smooth_win >= 3 and temporal_smooth_win % 2 == 1:
                     source_DR = _movavg_1d(source_DR, temporal_smooth_win)
 
-            elif mode == "viterbi":
-                if misfit_hist is None:
-                    # If we somehow didn’t collect, silently skip to no smoothing
+            elif mode == "viterbi" and want_viterbi and misfit_hist:
+                # Build (T,J_local) misfit matrix in the same local space used by backend
+                M = np.vstack(misfit_hist)
+                # Local lat/lon (respect any node subsetting in ctx)
+                node_index = ctx.get("node_index", None)
+                flat_lat_local = flat_lat if node_index is None else flat_lat[node_index]
+                flat_lon_local = flat_lon if node_index is None else flat_lon[node_index]
+
+                sm_local = _viterbi_smooth_indices(
+                    misfits_TJ=M,
+                    flat_lat=flat_lat_local,
+                    flat_lon=flat_lon_local,
+                    lambda_km=float(viterbi_lambda_km),
+                    max_step_km=(None if viterbi_max_step_km is None else float(viterbi_max_step_km)),
+                )
+                sm_global = sm_local if node_index is None else np.asarray(node_index, int)[sm_local]
+                source_lat = flat_lat[sm_global]
+                source_lon = flat_lon[sm_global]
+                # DR along the Viterbi path, if mean vectors were collected
+                try:
+                    mean_M = np.vstack(mean_hist)
+                    source_DR = np.array([mean_M[t, sm_local[t]] for t in range(mean_M.shape[0])], dtype=float)
+                except Exception:
                     pass
-                else:
-                    M = np.vstack(misfit_hist)  # (T, J_subgrid_or_full)
-                    # If we used a sub-grid during locate, misfit is already in local-node space,
-                    # but the indices we stored in source_node are *global*. That’s OK; the
-                    # Viterbi path is chosen in the same (local) space we evaluated M in.
-                    sm_local = _viterbi_smooth_indices(
-                        misfits_TJ=M,
-                        flat_lat=flat_lat if "node_index" not in ctx else flat_lat[ctx["node_index"]],
-                        flat_lon=flat_lon if "node_index" not in ctx else flat_lon[ctx["node_index"]],
-                        lambda_km=float(viterbi_lambda_km),
-                        max_step_km=(None if viterbi_max_step_km is None else float(viterbi_max_step_km)),
-                    )
-                    # Map local indices back to global if needed
-                    node_index = ctx.get("node_index", None)
-                    sm_global = sm_local if node_index is None else np.asarray(node_index, int)[sm_local]
-
-                    source_lat = flat_lat[sm_global]
-                    source_lon = flat_lon[sm_global]
-                    # Re-pick DR at the smoothed node using stored per-time means (if present)
-                    try:
-                        mean_M = np.vstack(mean_hist)  # (T, J_local)
-                        source_DR = np.array([mean_M[t, sm_local[t]] for t in range(mean_M.shape[0])], dtype=float)
-                    except Exception:
-                        # fallback: keep previously computed DR scalars
-                        pass
-
-            else:
-                # no temporal smoothing; nothing to do
-                pass
+            # else: "none" → do nothing
 
         # Save source
         self.source = {
@@ -842,7 +1153,7 @@ class ASL:
 
         # Connectedness metric
         conn = compute_spatial_connectedness(
-            source_lat, source_lon, dr=source_DR,
+            self.source["lat"], self.source["lon"], dr=source_DR,
             top_frac=0.15, min_points=12, max_points=200,
         )
         self.connectedness = conn
@@ -852,192 +1163,594 @@ class ASL:
 
         self.source["connectedness"] = conn["score"]
 
+        # Package to ObsPy Event and finish
         self.source_to_obspyevent()
         self.located = True
         if hasattr(self, "set_id"):
             self.id = self.set_id()
-        if verbose: print("[ASL] fast_locate: done.")
+        if verbose:
+            print("[ASL] fast_locate: done.")
 
 
-    # ---------- plots ----------
-    def plot(self, zoom_level=1, threshold_DR=0, scale=1, join=False, number=0,
-            add_labels=False, outfile=None, stations=None, title=None, region=None,
-            normalize=True, dem_tif: str | None = None, simple_basemap: bool = True):
-        source = self.source
-        if not source:
-            # even with no source, honor the simple basemap preference
-            fig = topo_map(
-                zoom_level=zoom_level, inv=None, show=True, add_labels=add_labels,
-                topo_color=True, cmap=("land" if simple_basemap else None),
-                region=region, dem_tif=dem_tif
+    def refine_and_relocate(
+            self,
+            *,
+            # How to build the mask
+            mask_method: str = "bbox",            # "bbox" | "sector"
+            # --- common selection controls ---
+            top_frac: float = 0.20,               # fraction of samples (by DR) to define bbox or bearing
+            min_top_points: int = 8,              # lower bound on #points used to make bbox/bearing
+            # --- bbox-specific controls ---
+            margin_km: float = 1.0,               # half-margin added around bbox (converted to deg)
+            # --- sector-specific controls ---
+            apex_lat: float | None = None,
+            apex_lon: float | None = None,
+            length_km: float = 8.0,
+            inner_km: float = 0.0,
+            half_angle_deg: float = 25.0,
+            prefer_misfit: bool = True,           # True: use min-misfit bearing; False: use median of top-DR
+            top_frac_for_bearing: float | None = None,  # fallback to `top_frac` if None
+            # Application mode
+            mode: str = "mask",                   # "mask" (non-destructive) or "slice" (destructive)
+            # fast_locate() passthroughs / aliases
+            misfit_backend=None,
+            spatial_smooth_sigma: float | None = None,
+            spatial_sigma_nodes: float | None = None,   # alias (legacy)
+            temporal_smooth_mode: str | None = None,    # "none" | "median" | "viterbi"
+            temporal_smooth_win: int | None = None,
+            viterbi_lambda_km: float | None = None,
+            viterbi_max_step_km: float | None = None,
+            min_stations: int | None = None,
+            eps: float | None = None,
+            use_median_for_DR: bool | None = None,
+            batch_size: int | None = None,
+            verbose: bool = True,
+        ):
+            """
+            Refine the spatial search domain by building a node mask, then re-run
+            :meth:`fast_locate` on the restricted grid.
+
+            Overview
+            --------
+            This method **does not recompute** distances or amplitude corrections. It only
+            builds a boolean mask over the *existing* grid nodes and then calls
+            :meth:`fast_locate` again so the locator evaluates fewer candidate nodes.
+
+            Two masking strategies are supported via ``mask_method``:
+
+            1) ``mask_method="bbox"`` (default)
+            Build a **bounding box** around the top fraction of samples ranked by DR
+            (reduced displacement) from the **current** source track, expand it by a
+            margin (km → degrees), and keep nodes inside the box.
+
+            2) ``mask_method="sector"``
+            Build a **triangular wedge** (“apex-to-coast” sector) that starts at the
+            dome apex and extends outward along an inferred bearing (either toward the
+            minimum-misfit sample or toward the median location of the top-DR samples).
+            Keep nodes whose (apex→node) distance is within [inner_km, length_km] and
+            whose azimuth is within ±half_angle_deg of the inferred bearing.
+
+            In both cases, the newly built mask is **intersected** with:
+            • any persistent mask carried by the grid object (e.g., land-only mask), and  
+            • any temporary mask currently active in ``self._node_mask``.
+
+            After the intersection, you can either:
+            • apply the mask temporarily and run on the full grid data (``mode="mask"``), or  
+            • **destructively slice** the grid and its per-station vectors
+                (``mode="slice"``), permanently reducing memory/footprint for this ASL object.
+
+            Parameters
+            ----------
+            mask_method : {"bbox", "sector"}, default "bbox"
+                How to build the refinement mask.
+                - "bbox": Use a DR-based bounding box (see ``top_frac`` / ``margin_km``).
+                - "sector": Use an apex-anchored wedge (see sector-specific parameters).
+
+            top_frac : float, default 0.20
+                Fraction (0–1] of valid samples (by DR) used to define the **bbox** or,
+                for the sector method, used (when ``prefer_misfit=False``) to compute the
+                bearing from the median of the top-DR points. A sensible minimum count
+                is enforced via ``min_top_points``.
+
+            min_top_points : int, default 8
+                Lower bound on the number of samples used to define the bbox or the
+                top-DR median (sector bearing fallback).
+
+            margin_km : float, default 1.0
+                **Bbox only.** Half-width expansion added to the min–max lat/lon of the
+                selected top-DR samples, expressed in kilometers. Internally converted to
+                degrees (lat: km/111, lon: km/(111·cos φ)) using the median latitude of
+                the selected points.
+
+            apex_lat, apex_lon : float or None, default None
+                **Sector only.** Geographic coordinates of the wedge apex (e.g., dome
+                summit). If ``None``, the method attempts to read ``gridobj.apex_lat`` and
+                ``gridobj.apex_lon``. Required for the sector method.
+
+            length_km : float, default 8.0
+                **Sector only.** Maximum radial extent of the wedge from the apex.
+
+            inner_km : float, default 0.0
+                **Sector only.** Inner radial exclusion from the apex (useful to skip
+                near-field nodes, e.g., if they sit inside the crater).
+
+            half_angle_deg : float, default 25.0
+                **Sector only.** Half-angle (degrees) of the wedge around the inferred
+                bearing; total wedge aperture is 2×half_angle_deg.
+
+            prefer_misfit : bool, default True
+                **Sector only.** If True, infer the wedge bearing from the **global
+                minimum of misfit** in the current source track. If False (or when the
+                misfit isn’t usable), infer the bearing from the **median location of the
+                top-DR subset** (see ``top_frac_for_bearing``).
+
+            top_frac_for_bearing : float or None, default None
+                **Sector only.** If provided (and ``prefer_misfit=False``), the fraction
+                used specifically for selecting the top-DR subset to infer the bearing.
+                If None, falls back to ``top_frac``.
+
+            mode : {"mask", "slice"}, default "mask"
+                How to apply the resulting mask:
+                - "mask": apply as a temporary mask (non-destructive), run :meth:`fast_locate`,
+                then restore the full grid.
+                - "slice": destructively **subset** the grid and attached vectors
+                (amplitude corrections and distances) to the masked nodes, then run
+                :meth:`fast_locate` on the smaller, permanent grid.
+
+            misfit_backend : object, optional
+                Passed through to :meth:`fast_locate` (see that docstring). If None,
+                :class:`StdOverMeanMisfit` is used.
+
+            spatial_smooth_sigma : float, optional
+                Passed through to :meth:`fast_locate`. If provided, enables Gaussian blur
+                of the misfit per time step (units: grid nodes). ``spatial_sigma_nodes`` is
+                accepted as an alias for backward compatibility.
+
+            temporal_smooth_mode : {"none", "median", "viterbi"}, optional
+                Passed through to :meth:`fast_locate`. If None, current default of
+                :meth:`fast_locate` is used.
+
+            temporal_smooth_win, viterbi_lambda_km, viterbi_max_step_km : optional
+                Passed through to :meth:`fast_locate` (see that docstring).
+
+            min_stations, eps, use_median_for_DR, batch_size : optional
+                Passed through to :meth:`fast_locate` (see that docstring).
+
+            verbose : bool, default True
+                Print diagnostics about mask construction, intersection, and final size.
+
+            Returns
+            -------
+            self : ASL
+                The same object, updated in-place with a new ``self.source`` (and possibly
+                a sliced grid if ``mode="slice"``).
+
+            Side Effects
+            ------------
+            - Updates ``self.source`` with a newly computed track from :meth:`fast_locate`.
+            - Updates ``self.connectedness`` based on the refined track.
+            - If ``mode="slice"``, permanently modifies:
+                * ``self.gridobj`` (lat/lon arrays, shape/metadata)
+                * ``self.amplitude_corrections`` per station (sliced)
+                * ``self.node_distances_km`` per station (sliced)
+
+            Mask Intersection
+            -----------------
+            The constructed mask is AND-ed with:
+            1) any persistent node mask that your grid carries (e.g., ``gridobj.node_mask``,
+                ``gridobj.mask``, …), and
+            2) any temporary mask already active in ``self._node_mask``.
+            This guarantees land-only (or otherwise pre-filtered) grids remain respected.
+
+            Algorithmic Notes
+            -----------------
+            **bbox**:
+            1) Select indices with finite (lat, lon, DR). Rank by DR and take
+                ``max(min_top_points, ceil(top_frac*N))`` samples.
+            2) Compute min/max lat/lon of those samples; expand by ``margin_km`` converted
+                to degrees with a latitude-dependent lon scaling.
+            3) Keep nodes inside the expanded box.
+
+            **sector**:
+            1) Determine bearing from apex:
+                - If ``prefer_misfit=True`` and any finite misfit exists, take the index
+                of the minimum misfit sample and compute apex→that point azimuth.
+                - Else, take the median (lat,lon) of the top-DR subset (size controlled by
+                ``top_frac_for_bearing`` or ``top_frac``) and compute apex→median azimuth.
+            2) For each grid node, compute apex→node great-circle distance and azimuth.
+            3) Keep nodes where distance∈[inner_km, length_km] **and**
+                circular_angle_difference(az, bearing) ≤ half_angle_deg.
+
+            Examples
+            --------
+            # 1) Classic DR-bbox refinement (non-destructive), then re-run fast_locate
+            asl.refine_and_relocate(mask_method="bbox", top_frac=0.25, margin_km=1.0)
+
+            # 2) Sector refinement from dome apex toward inferred direction of propagation
+            #    (Soufrière Hills example coordinates), with Viterbi temporal smoothing
+            asl.refine_and_relocate(
+                mask_method="sector",
+                apex_lat=16.712, apex_lon=-62.181,  # dome/apex
+                length_km=8.0, inner_km=0.0, half_angle_deg=25.0,
+                prefer_misfit=True,                 # use min-misfit bearing
+                temporal_smooth_mode="viterbi", temporal_smooth_win=7,
+                viterbi_lambda_km=8.0, viterbi_max_step_km=30.0,
             )
-            return
 
-        # 1) DR timeseries (matplotlib)
-        t_dt = [this_t.datetime for this_t in source["t"]]
-        plt.figure()
-        plt.plot(t_dt, source["DR"])
-        plt.plot(t_dt, np.ones(source["DR"].size) * threshold_DR)
-        plt.xlabel("Date/Time (UTC)"); plt.ylabel("Reduced Displacement (${cm}^2$)")
-        # do not save here; caller has dedicated functions. This figure is transient.
-        plt.close()
-
-        # 2) Gate by threshold, compute symbol sizes
-        # Keep only finite rows
-        x = np.asarray(x, float)
-        y = np.asarray(y, float)
-        DR = np.asarray(DR, float)
-        symsize = np.asarray(symsize, float)
-
-        m = np.isfinite(x) & np.isfinite(y) & np.isfinite(DR) & np.isfinite(symsize) & (symsize > 0)
-        if not np.any(m):
-            # fall back to a blank basemap
-            fig = topo_map(
-                zoom_level=zoom_level, inv=None,
-                centerlat=float(dome_location["lat"]), centerlon=float(dome_location["lon"]),
-                add_labels=add_labels, topo_color=False, stations=stations, title=title, region=region
+            # 3) Same as (2) but *destructively* slice the grid to the sector for speed
+            asl.refine_and_relocate(
+                mask_method="sector",
+                apex_lat=16.712, apex_lon=-62.181,
+                length_km=8.0, half_angle_deg=25.0,
+                mode="slice"
             )
-            if outfile:
-                fig.savefig(outfile)
+
+            Caveats
+            -------
+            - If the intersection yields **no nodes**, the method falls back to running
+            :meth:`fast_locate` on the **current** domain and returns without error.
+            - For the sector method, you **must** provide an apex (via parameters or
+            grid attributes). If none is available, a ValueError is raised.
+            - Extremely small grids or very narrow wedges can cause over-constrained
+            masks; consider relaxing ``half_angle_deg`` or increasing ``length_km``.
+            """
+
+            if self.source is None:
+                raise RuntimeError("No source yet. Run fast_locate()/locate() first.")
+            
+            # Parameter sanity (non-fatal clamps)
+            top_frac = float(np.clip(top_frac, 0.0, 1.0))
+            if top_frac_for_bearing is not None:
+                top_frac_for_bearing = float(np.clip(top_frac_for_bearing, 0.0, 1.0))
+            margin_km = max(0.0, float(margin_km))
+            length_km = max(0.0, float(length_km))
+            inner_km  = max(0.0, float(inner_km))
+            half_angle_deg = float(np.clip(half_angle_deg, 0.0, 180.0))
+            if inner_km > length_km:
+                inner_km, length_km = length_km, inner_km  # swap so inner<=length
+
+
+            # alias support
+            if spatial_smooth_sigma is None and spatial_sigma_nodes is not None:
+                spatial_smooth_sigma = spatial_sigma_nodes
+            if top_frac_for_bearing is None:
+                top_frac_for_bearing = top_frac
+
+            # -- convenience handles
+            lat = np.asarray(self.source["lat"], float)
+            lon = np.asarray(self.source["lon"], float)
+            dr  = np.asarray(self.source.get("DR", np.full_like(lat, np.nan)), float)
+            mis = np.asarray(self.source.get("misfit", np.full_like(lat, np.nan)), float)
+
+            ok = np.isfinite(lat) & np.isfinite(lon)
+            if not ok.any():
+                if verbose:
+                    print("[ASL] refine_and_relocate: no finite source coords; skipping")
+                return self
+
+            g_lat = np.asarray(self.gridobj.gridlat).reshape(-1)
+            g_lon = np.asarray(self.gridobj.gridlon).reshape(-1)
+            nn = g_lat.size
+
+            def _intersect_with_existing_mask(mask_bool: np.ndarray) -> np.ndarray:
+                # Intersect with persistent mask on the grid, if present
+                base_idx = _grid_mask_indices(self.gridobj)  # None or GLOBAL indices
+                if base_idx is not None and base_idx.size:
+                    base_bool = np.zeros(nn, dtype=bool)
+                    base_bool[base_idx] = True
+                    mask_bool &= base_bool
+                # Intersect with any active temporary mask
+                if getattr(self, "_node_mask", None) is not None and self._node_mask.size:
+                    temp_bool = np.zeros(nn, dtype=bool)
+                    temp_bool[self._node_mask] = True
+                    mask_bool &= temp_bool
+                return mask_bool
+
+            # ---------- mask builders ----------
+            def _mask_bbox() -> np.ndarray:
+                # choose top-fraction by DR with sensible minimum count
+                idx_all = np.flatnonzero(ok & np.isfinite(dr))
+                if idx_all.size == 0:
+                    # fallback: use all finite coords
+                    idx_all = np.flatnonzero(ok)
+
+                k_frac = int(np.ceil(top_frac * idx_all.size))
+                k = max(1, min_top_points, k_frac)
+                k = min(k, idx_all.size)
+                order = np.argsort(dr[idx_all])[::-1] if np.isfinite(dr[idx_all]).any() else np.arange(idx_all.size)
+                idx_top = idx_all[order[:k]]
+
+                lat_top = lat[idx_top]; lon_top = lon[idx_top]
+
+                lat0 = float(np.nanmedian(lat_top))
+                dlat = float(margin_km) / 111.0
+                dlon = float(margin_km) / (111.0 * max(0.1, np.cos(np.deg2rad(lat0))))
+
+                lat_min = float(np.nanmin(lat_top) - dlat)
+                lat_max = float(np.nanmax(lat_top) + dlat)
+                lon_min = float(np.nanmin(lon_top) - dlon)
+                lon_max = float(np.nanmax(lon_top) + dlon)
+
+                mask = (
+                    (g_lat >= lat_min) & (g_lat <= lat_max) &
+                    (g_lon >= lon_min) & (g_lon <= lon_max)
+                )
+                if verbose:
+                    print(f"[ASL] refine_and_relocate[bbox]: bbox lat[{lat_min:.5f},{lat_max:.5f}] "
+                        f"lon[{lon_min:.5f},{lon_max:.5f}] using top {k}/{idx_all.size}")
+                return mask
+
+            def _mask_sector() -> np.ndarray:
+                # apex: explicit or from grid
+                apx_lat = apex_lat if apex_lat is not None else getattr(self.gridobj, "apex_lat", None)
+                apx_lon = apex_lon if apex_lon is not None else getattr(self.gridobj, "apex_lon", None)
+                if apx_lat is None or apx_lon is None:
+                    raise ValueError("sector mask requires apex_lat/apex_lon (or gridobj.apex_lat/apex_lon).")
+
+                def _bearing(aplat, aplon, tlat, tlon) -> float:
+                    _, az, _ = gps2dist_azimuth(float(aplat), float(aplon), float(tlat), float(tlon))
+                    return float(az % 360.0)
+
+                # bearing: min misfit or median of top-DR
+                # bearing: min misfit or median of top-DR (restricted to valid coords)
+                valid_mis = np.isfinite(mis) & ok
+                if prefer_misfit and valid_mis.any():
+                    j_local = np.nanargmin(mis[valid_mis])
+                    j = np.flatnonzero(valid_mis)[j_local]
+                    bearing_deg = _bearing(apx_lat, apx_lon, lat[j], lon[j])
+                    if verbose:
+                        print(f"[ASL] refine_and_relocate[sector]: bearing from min misfit @ idx={j}: {bearing_deg:.1f}°")
+                else:
+                    idx_all = np.flatnonzero(ok & np.isfinite(dr))
+                    if idx_all.size == 0:
+                        tlat = float(np.nanmedian(lat[ok])); tlon = float(np.nanmedian(lon[ok]))
+                    else:
+                        k = max(3, min(int(np.ceil((top_frac_for_bearing or top_frac) * idx_all.size)), idx_all.size))
+                        order = np.argsort(dr[idx_all])[::-1]
+                        idx_top = idx_all[order[:k]]
+                        tlat = float(np.nanmedian(lat[idx_top])); tlon = float(np.nanmedian(lon[idx_top]))
+                    bearing_deg = _bearing(apx_lat, apx_lon, tlat, tlon)
+                    if verbose:
+                        print(f"[ASL] refine_and_relocate[sector]: bearing from top-DR median: {bearing_deg:.1f}°")
+
+                # distances/azimuths apex → nodes
+                dist_km = np.empty(nn, float)
+                az_deg  = np.empty(nn, float)
+                for i in range(nn):
+                    d_m, az, _ = gps2dist_azimuth(float(apx_lat), float(apx_lon), float(g_lat[i]), float(g_lon[i]))
+                    dist_km[i] = 0.001 * float(d_m)
+                    az_deg[i]  = float(az % 360.0)
+
+                # circular angular difference
+                def _angdiff(a, b):
+                    d = (a - b + 180.0) % 360.0 - 180.0
+                    return np.abs(d)
+
+                ang_err = _angdiff(az_deg, bearing_deg)
+                mask = (
+                    (dist_km >= float(inner_km)) &
+                    (dist_km <= float(length_km)) &
+                    (ang_err  <= float(half_angle_deg))
+                )
+                if verbose:
+                    print(f"[ASL] refine_and_relocate[sector]: span=[{inner_km:.2f},{length_km:.2f}] km, "
+                        f"half-angle={half_angle_deg:.1f}°, apex=({apx_lat:.5f},{apx_lon:.5f})")
+                return mask
+
+            # ---------- build mask ----------
+            mm = (mask_method or "bbox").lower()
+            if mm == "bbox":
+                mask_bool = _mask_bbox()
+            elif mm == "sector":
+                mask_bool = _mask_sector()
             else:
-                fig.show()
-            return
+                raise ValueError("mask_method must be one of {'bbox','sector'}")
 
-        x, y, DR, symsize = x[m], y[m], DR[m], symsize[m]
+            # intersect with any existing masks
+            mask_bool = _intersect_with_existing_mask(mask_bool)
+            sub_idx = np.flatnonzero(mask_bool)
 
-        # Map center on the strongest valid point
-        maxi = int(np.nanargmax(DR))
-        fig = topo_map(
-            zoom_level=zoom_level, inv=None,
-            centerlat=float(y[maxi]), centerlon=float(x[maxi]),
-            add_labels=add_labels, topo_color=False,  # <- plain gray land, light-blue sea
-            stations=stations, title=title, region=region
-        )
+            # ---------- run or bail gracefully ----------
+            """
+            kwargs = {}
+            if misfit_backend is not None:        kwargs["misfit_backend"] = misfit_backend
+            if spatial_smooth_sigma is not None:  kwargs["spatial_smooth_sigma"] = spatial_smooth_sigma
+            if temporal_smooth_mode is not None:  kwargs["temporal_smooth_mode"] = temporal_smooth_mode
+            if temporal_smooth_win is not None:   kwargs["temporal_smooth_win"]  = temporal_smooth_win
+            if viterbi_lambda_km is not None:     kwargs["viterbi_lambda_km"]    = viterbi_lambda_km
+            if viterbi_max_step_km is not None:   kwargs["viterbi_max_step_km"]  = viterbi_max_step_km
+            if min_stations is not None:          kwargs["min_stations"] = min_stations
+            if eps is not None:                   kwargs["eps"] = eps
+            if use_median_for_DR is not None:     kwargs["use_median_for_DR"] = use_median_for_DR
+            if batch_size is not None:            kwargs["batch_size"] = batch_size
+            """
 
-        # If user asked for top-N only
-        if number and number < len(x):
-            ind = np.argpartition(DR, -number)[-number:]
-            x, y, DR, symsize = x[ind], y[ind], DR[ind], symsize[ind]
+            kwargs = self._passthrough_locate_kwargs(
+                misfit_backend=misfit_backend,
+                spatial_smooth_sigma=spatial_smooth_sigma,
+                temporal_smooth_mode=temporal_smooth_mode,
+                temporal_smooth_win=temporal_smooth_win,
+                viterbi_lambda_km=viterbi_lambda_km,
+                viterbi_max_step_km=viterbi_max_step_km,
+                min_stations=min_stations,
+                eps=eps,
+                use_median_for_DR=use_median_for_DR,
+                batch_size=batch_size,
+            )
 
-        # Color by time index (simple sequential)
-        pygmt = __import__("pygmt")
-        pygmt.makecpt(cmap="viridis", series=[0, len(x) - 1])
-        timecolor = np.arange(len(x), dtype=float)
+            if sub_idx.size == 0:
+                if verbose:
+                    print("[ASL] refine_and_relocate: sub-grid empty after intersection; keeping current domain.")
+                self.fast_locate(verbose=verbose, **kwargs)
+                return self
 
-        # NOTE: style="c" (not "cc") — sizes are provided via size=
-        fig.plot(x=x, y=y, size=symsize, style="c", pen=None, color=timecolor, cmap=True)
+            if verbose:
+                frac = 100.0 * sub_idx.size / nn
+                print(f"[ASL] refine_and_relocate[{mm}]: {sub_idx.size} nodes (~{frac:.1f}% of grid)")
 
-        fig.colorbar(frame='+l"Sequence"')
+            # ---------- apply mode ----------
+            mode_norm = (mode or "mask").strip().lower()
+            if mode_norm not in {"mask", "slice"}:
+                if verbose:
+                    print(f"[ASL] refine_and_relocate: unknown mode={mode!r}; defaulting to 'mask'")
+                mode_norm = "mask"
 
-        # Optional join
-        if join and len(x) > 1:
-            # Sort by time if you want a line in chronological order
-            order = np.argsort(timecolor)
-            fig.plot(x=x[order], y=y[order], pen="1p,red")
+            if mode_norm == "slice":
+                # Destructive grid reduction
+                self._apply_node_mask(mask_bool)
+                self.fast_locate(verbose=verbose, **kwargs)
+                return self
 
-        if region:
-            fig.basemap(region=region, frame=True)
+            # Non-destructive temporary mask
+            try:
+                self._node_mask = sub_idx
+                self.fast_locate(verbose=verbose, **kwargs)
+            finally:
+                self._node_mask = None
 
-        if outfile:
-            fig.savefig(outfile)
-        else:
-            fig.show()
-
+            return self
+    
 
     # ---------- plots ----------
     def plot(
         self,
-        zoom_level=0,
-        threshold_DR=0,
-        scale=1,
-        join=False,
-        number=0,
-        add_labels=False,
-        outfile=None,
+        zoom_level: int = 0,
+        threshold_DR: float = 0.0,
+        scale: float = 1.0,
+        join: bool = False,
+        number: int = 0,
+        add_labels: bool = False,
+        outfile: str | None = None,
         stations=None,
-        title=None,
+        title: str | None = None,
         region=None,
-        normalize=True,
+        normalize: bool = True,
         dem_tif: str | None = None,
         simple_basemap: bool = True,
+        *,
+        cmap: str = "viridis",
+        color_by: str = "time",      # "time" | "dr"
+        show: bool = True,
+        return_fig: bool = True,
     ):
         """
-        Plot the time-ordered source track on a simple basemap.
-        - Uses lon/lat/DR from self.source (no external symsize input).
-        - If normalize=True: sizes ~ DR / max(DR) * scale
-        else: sizes ~ sqrt(max(DR,0)) * scale   (historic behavior)
-        - Thresholding zeroes DR and masks lon/lat below threshold.
-        - Emits detailed console logs; raises on hard failures.
-        """
-        import numpy as np
-        import matplotlib.pyplot as plt
-        from datetime import datetime
+        Plot the time-ordered ASL source track on a PyGMT basemap.
 
+        Parameters
+        ----------
+        zoom_level : int, default 0
+            Passed to `topo_map()` to control the basemap extent/scale.
+        threshold_DR : float, default 0.0
+            DR values strictly below this threshold are masked from the plot
+            (their lon/lat are set to NaN in a temporary copy).
+        scale : float, default 1.0
+            Overall marker size scale. Interpretation depends on `normalize`.
+        join : bool, default False
+            If True, draw a polyline connecting points in chronological order.
+        number : int, default 0
+            If >0, subselect the top-N points by DR for plotting (applied after
+            thresholding and validity filtering).
+        add_labels : bool, default False
+            Draw station or geographic labels in the basemap (passed to `topo_map`).
+        outfile : str or None, default None
+            If provided, save the figure to this path via `fig.savefig`.
+        stations : any, optional
+            Passed through to `topo_map` for station plotting.
+        title : str or None, default None
+            Plot title. If None, a sensible default is constructed from time span
+            and connectedness (if available).
+        region : any, optional
+            Region override passed to `topo_map`.
+        normalize : bool, default True
+            - True  → marker size ~ DR / max(DR) * scale
+            - False → marker size ~ sqrt(max(DR, 0)) * scale
+        dem_tif : str or None
+            Optional DEM GeoTIFF path forwarded to `topo_map`.
+        simple_basemap : bool, default True
+            If True, request a light ("land") background colormap from `topo_map`.
+        cmap : str, default "viridis"
+            Colormap name for point coloring (PyGMT CPT).
+        color_by : {"time","dr"}, default "time"
+            Color points by chronological index ("time") or by DR ("dr").
+        show : bool, default True
+            If True and `outfile` is None, display interactively with `fig.show()`.
+        return_fig : bool, default True
+            If True, return the PyGMT Figure object.
+
+        Returns
+        -------
+        pygmt.Figure | None
+            Returns the figure if `return_fig=True`, else None.
+
+        Notes
+        -----
+        - Does not mutate `self.source`.
+        - Expects `self.source` to have "lon", "lat", "DR", and "t" keys (set by
+        `locate()` or `fast_locate()`).
+        """
+        # ---------- tiny logger ----------
         def _ts(msg: str) -> None:
             now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{now}] [{now}] [ASL:PLOT] {msg}")
+            print(f"[{now}] [ASL:PLOT] {msg}")
 
-        source = self.source
-        if not source:
+        src = getattr(self, "source", None)
+        if not src:
             _ts(f"no source; drawing simple basemap (dem_tif={dem_tif}, simple_basemap={simple_basemap})")
             fig = topo_map(
                 zoom_level=zoom_level, inv=None, show=True, add_labels=add_labels,
                 topo_color=True, cmap=("land" if simple_basemap else None),
                 region=region, dem_tif=dem_tif
             )
-            return
+            return fig if return_fig else None
 
-        _ts("plot() called with args: "
+        # Log args
+        _ts("plot() args: "
             f"zoom_level={zoom_level}, threshold_DR={float(threshold_DR)}, scale={float(scale)}, "
             f"join={join}, number={number}, add_labels={add_labels}, outfile={outfile}, title={title}, "
-            f"region={region}, normalize={normalize}, dem_tif={dem_tif}, simple_basemap={simple_basemap}")
-        _ts(f"source keys: {sorted(list(source.keys()))}")
+            f"region={region}, normalize={normalize}, dem_tif={dem_tif}, simple_basemap={simple_basemap}, "
+            f"cmap={cmap}, color_by={color_by}")
 
-        # --- DR time series quicklook (non-fatal)
+        # ---------- Extract arrays ----------
         try:
-            t_dt = [tt.datetime for tt in source["t"]]
-            DR_ts = np.asarray(source["DR"], float)
-            _ts(f"timeseries: len(t)={len(t_dt)} len(DR)={DR_ts.size} "
-                f"DR[min,max]=({np.nanmin(DR_ts):.3g},{np.nanmax(DR_ts):.3g})")
-            plt.figure()
-            plt.plot(t_dt, DR_ts)
-            plt.plot(t_dt, np.ones(DR_ts.size) * threshold_DR)
-            plt.xlabel("Date/Time (UTC)"); plt.ylabel("Reduced Displacement (${cm}^2$)")
-            plt.close()
-        except Exception as e:
-            _ts(f"WARNING: timeseries preview failed: {e!r}")
-
-        # --- Core arrays
-        try:
-            x = np.asarray(source["lon"], float)
-            y = np.asarray(source["lat"], float)
-            DR = np.asarray(source["DR"], float)
+            x = np.asarray(src["lon"], float)
+            y = np.asarray(src["lat"], float)
+            DR = np.asarray(src["DR"], float)
+            t  = src.get("t", None)
         except KeyError as e:
             _ts(f"ERROR: required key missing in source: {e!r}")
-            raise
-        except Exception as e:
-            _ts(f"ERROR: failed to coerce lon/lat/DR: {e!r}")
             raise
 
         if not (x.size == y.size == DR.size):
             _ts(f"ERROR: length mismatch: len(lon)={x.size}, len(lat)={y.size}, len(DR)={DR.size}")
             raise ValueError("ASL.plot(): lon, lat, DR must have identical lengths.")
 
-        # --- Thresholding (mirror GitHub semantics, but without mutating self.source)
+        # ---------- DR quicklook (best-effort) ----------
+        try:
+            if t is not None:
+                t_dt = [tt.datetime for tt in t]
+                _ts(f"timeseries len={len(t_dt)}; DR[min,max]=({np.nanmin(DR):.3g},{np.nanmax(DR):.3g})")
+                plt.figure()
+                plt.plot(t_dt, DR)
+                if threshold_DR:
+                    plt.plot(t_dt, np.ones(DR.size) * float(threshold_DR))
+                plt.xlabel("Date/Time (UTC)"); plt.ylabel("Reduced Displacement (${cm}^2$)")
+                plt.close()
+        except Exception as e:
+            _ts(f"WARNING: timeseries preview failed: {e!r}")
+
+        # ---------- thresholding (copy; no mutation) ----------
         if float(threshold_DR) > 0:
             mask = DR < float(threshold_DR)
-            DR = DR.copy(); x = x.copy(); y = y.copy()
-            DR[mask] = 0.0
-            x[mask] = np.nan
-            y[mask] = np.nan
+            x = x.copy(); y = y.copy(); DR = DR.copy()
+            x[mask] = np.nan; y[mask] = np.nan; DR[mask] = 0.0
             _ts(f"threshold applied at {threshold_DR}; masked {int(np.count_nonzero(mask))} points")
 
-        # --- Symbol sizes (what GitHub used, with guards)
+        # ---------- marker sizes ----------
         try:
             if normalize:
                 mx = float(np.nanmax(DR))
                 if not np.isfinite(mx) or mx <= 0:
-                    symsize = scale * np.ones_like(DR, dtype=float)
+                    symsize = float(scale) * np.ones_like(DR, dtype=float)
                     _ts("normalize=True but max(DR)<=0; using constant symsize")
                 else:
                     symsize = (DR / mx) * float(scale)
@@ -1047,26 +1760,24 @@ class ASL:
             _ts(f"ERROR: building symsize failed: {e!r}")
             raise
 
-        # --- Validity mask
+        # ---------- validity filter ----------
         m = np.isfinite(x) & np.isfinite(y) & np.isfinite(DR) & np.isfinite(symsize) & (symsize > 0)
-        n_valid = int(np.count_nonzero(m))
-        _ts(f"valid mask: {n_valid}/{x.size} points valid")
-        if n_valid == 0:
+        if not np.any(m):
             _ts("ERROR: no valid points after filtering.")
             raise RuntimeError("ASL.plot(): no valid points to plot after filtering.")
-
         x, y, DR, symsize = x[m], y[m], DR[m], symsize[m]
-        _ts(f"filtered stats: x[{x.min():.5f},{x.max():.5f}] "
-            f"y[{y.min():.5f},{y.max():.5f}] "
-            f"DR[min,med,max]=({np.nanmin(DR):.3g},{np.nanmedian(DR):.3g},{np.nanmax(DR):.3g}); "
-            f"size[min,med,max]=({np.nanmin(symsize):.3g},{np.nanmedian(symsize):.3g},{np.nanmax(symsize):.3g})")
 
-        # --- Map center on max DR
+        # optional top-N by DR
+        if number and number > 0 and number < len(x):
+            _ts(f"subselecting top-N by DR: N={number}")
+            ind = np.argpartition(DR, -number)[-number:]
+            x, y, DR, symsize = x[ind], y[ind], DR[ind], symsize[ind]
+
+        # center on max DR
         maxi = int(np.nanargmax(DR))
         center_lat, center_lon = float(y[maxi]), float(x[maxi])
-        _ts(f"center on max DR idx={maxi} at (lon,lat)=({center_lon:.5f},{center_lat:.5f})")
 
-        # --- Plain basemap
+        # ---------- basemap ----------
         try:
             fig = topo_map(
                 zoom_level=zoom_level,
@@ -1074,70 +1785,89 @@ class ASL:
                 centerlat=center_lat,
                 centerlon=center_lon,
                 add_labels=add_labels,
-                topo_color=False,                 # <- plain background
+                topo_color=False if simple_basemap else True,
                 stations=stations,
                 title=title,
                 region=region,
                 dem_tif=dem_tif if dem_tif else None,
-                cmap='land',
+                cmap=("land" if simple_basemap else None),
             )
-            _ts("basemap created.")
         except Exception as e:
             _ts(f"ERROR: topo_map() failed: {e!r}")
             raise
 
-        # --- Top-N subselect (by DR) if requested
-        if number and number < len(x):
-            _ts(f"subselecting top-N by DR: N={number}")
-            ind = np.argpartition(DR, -number)[-number:]
-            x, y, DR, symsize = x[ind], y[ind], DR[ind], symsize[ind]
+        # default title if not provided
+        if title is None:
+            try:
+                if t is not None and len(t) > 0:
+                    t0 = t[0].datetime.strftime("%Y-%m-%d %H:%M:%S")
+                    t1 = t[-1].datetime.strftime("%Y-%m-%d %H:%M:%S")
+                    conn = getattr(self, "connectedness", None)
+                    cstr = ""
+                    if isinstance(conn, dict) and "score" in conn and np.isfinite(conn["score"]):
+                        cstr = f"  (connectedness={conn['score']:.2f})"
+                    fig.text(x=0, y=0, text=f"ASL Track: {t0} → {t1}{cstr}", position="TL", offset="0.3c/0.3c")
+            except Exception:
+                pass
 
-        # --- Color by chronological index
-        import pygmt  # type: ignore
+        # ---------- color controls ----------
+        color_by_norm = (color_by or "time").strip().lower()
+        if color_by_norm not in {"time", "dr"}:
+            _ts(f"unknown color_by={color_by!r}; defaulting to 'time'")
+            color_by_norm = "time"
+
         try:
-            pygmt.makecpt(cmap="viridis", series=[0, len(x) - 1])
-            timecolor = np.arange(len(x), dtype=float)
-            _ts("cpt created (viridis).")
+            if color_by_norm == "time":
+                # rank by chronology
+                idx = np.arange(len(x), dtype=float)
+                pygmt.makecpt(cmap=cmap, series=[0, len(x) - 1])
+                cvals = idx
+                cbar_label = "Sequence"
+            else:  # "dr"
+                dmin = float(np.nanmin(DR))
+                dmax = float(np.nanmax(DR))
+                if not np.isfinite(dmin) or not np.isfinite(dmax) or dmax <= dmin:
+                    dmin, dmax = 0.0, 1.0
+                pygmt.makecpt(cmap=cmap, series=[dmin, dmax])
+                cvals = DR.astype(float, copy=False)
+                cbar_label = "Reduced Displacement"
+
         except Exception as e:
             _ts(f"ERROR: makecpt failed: {e!r}")
             raise
 
-        # --- Scatter
+        # ---------- scatter ----------
         try:
-            # NOTE: use style="c" with per-point sizes via `size=symsize`
-            fig.plot(x=x, y=y, size=symsize, style="c", pen=None, fill=timecolor, cmap=True)
-            _ts(f"scatter plotted: n={len(x)}")
+            fig.plot(x=x, y=y, size=symsize, style="c", pen=None, fill=cvals, cmap=True)
         except Exception as e:
             _ts(f"ERROR: scatter plot failed: {e!r}")
             raise
 
-        # --- Colorbar
+        # ---------- colorbar ----------
         try:
-            fig.colorbar(frame='+l"Sequence"')
-            _ts("colorbar added.")
+            fig.colorbar(frame=f'+l"{cbar_label}"')
         except Exception as e:
             _ts(f"ERROR: colorbar failed: {e!r}")
             raise
 
-        # --- Optional line join in chronological order
+        # ---------- optional chronological polyline ----------
         if join and len(x) > 1:
-            order = np.argsort(timecolor)
             try:
-                fig.plot(x=x[order], y=y[order], pen="1p,red")
-                _ts("joined points chronologically with red line.")
+                # chronological order = current x/y order
+                fig.plot(x=x, y=y, pen="1p,red")
             except Exception as e:
                 _ts(f"ERROR: join failed: {e!r}")
                 raise
 
+        # region frame (optional)
         if region:
             try:
                 fig.basemap(region=region, frame=True)
-                _ts("frame drawn for region.")
             except Exception as e:
                 _ts(f"ERROR: frame draw failed: {e!r}")
                 raise
 
-        # --- Output
+        # output
         if outfile:
             try:
                 fig.savefig(outfile)
@@ -1145,103 +1875,290 @@ class ASL:
             except Exception as e:
                 _ts(f"ERROR: savefig failed: {e!r}")
                 raise
-        else:
-            _ts("showing figure (interactive).")
+        elif show:
             fig.show()
 
+        return fig if return_fig else None
 
-    def plot_reduced_displacement(self, threshold_DR=0, outfile=None):
-        if not self.source:
+
+    def plot_reduced_displacement(self, threshold_DR: float = 0.0, outfile: str | None = None, *, show: bool = True):
+        """
+        Plot the time series of reduced displacement (DR).
+
+        Parameters
+        ----------
+        threshold_DR : float, default 0.0
+            Optional horizontal threshold line to draw.
+        outfile : str or None
+            If provided, write the PNG/SVG/etc. to this path.
+        show : bool, default True
+            If True and `outfile` is None, call `plt.show()`.
+
+        Notes
+        -----
+        - Expects `self.source["t"]` (UTCDateTime array) and `self.source["DR"]`.
+        - Units label is kept as cm² to match the convention used by the locator
+        (`DR` stored *already scaled* in cm² by 1e7 factor).
+        """
+        if not getattr(self, "source", None):
             return
-        t_dt = [this_t.datetime for this_t in self.source["t"]]
-        plt.figure(); plt.plot(t_dt, self.source["DR"]); plt.plot(t_dt, np.ones(self.source["DR"].size) * threshold_DR)
-        plt.xlabel("Date/Time (UTC)"); plt.ylabel("Reduced Displacement (${cm}^2$)")
-        (plt.savefig(outfile) if outfile else plt.show())
-
-    def plot_misfit(self, outfile=None):
-        if not self.source:
+        t = self.source.get("t", None)
+        if t is None:
             return
-        t_dt = [this_t.datetime for this_t in self.source["t"]]
-        plt.figure(); plt.plot(t_dt, self.source["misfit"])
-        plt.xlabel("Date/Time (UTC)"); plt.ylabel("Misfit (std/median)")
-        (plt.savefig(outfile) if outfile else plt.show())
 
-    def plot_misfit_heatmap(self, outfile=None):
-        plot_misfit_heatmap_for_peak_DR(self, backend=StdOverMeanMisfit(), cmap="turbo", transparency=40, outfile=outfile)
-        #plot_misfit_heatmap_for_peak_DR(aslobj, backend=R2DistanceMisfit(), cmap="oleron", transparency=45)
+        t_dt = [this_t.datetime for this_t in t]
+        plt.figure()
+        plt.plot(t_dt, self.source["DR"])
+        if threshold_DR:
+            plt.axhline(float(threshold_DR), linestyle="--")
+        plt.xlabel("Date/Time (UTC)")
+        plt.ylabel("Reduced Displacement (${cm}^2$)")
+        if outfile:
+            plt.savefig(outfile)
+            plt.close()
+        elif show:
+            plt.show()
+        else:
+            plt.close()
+
+
+    def plot_misfit(self, outfile: str | None = None, *, show: bool = True):
+        """
+        Plot the misfit time series (value at the chosen node per frame).
+
+        Parameters
+        ----------
+        outfile : str or None
+            If provided, save to file.
+        show : bool, default True
+            If True and `outfile` is None, show interactively.
+        """
+        if not getattr(self, "source", None):
+            return
+        t = self.source.get("t", None)
+        mis = self.source.get("misfit", None)
+        if t is None or mis is None:
+            return
+
+        t_dt = [this_t.datetime for this_t in t]
+        plt.figure()
+        plt.plot(t_dt, mis)
+        plt.xlabel("Date/Time (UTC)")
+        plt.ylabel("Misfit (std/|mean|)")
+        if outfile:
+            plt.savefig(outfile)
+            plt.close()
+        elif show:
+            plt.show()
+        else:
+            plt.close()
+
+
+    def plot_misfit_heatmap(self, outfile: str | None = None, *, backend=None, cmap: str = "turbo", transparency: int = 40, region: List | None = None):
+        """
+        Plot a per-node misfit heatmap for the frame with peak DR (diagnostic).
+
+        Parameters
+        ----------
+        outfile : str or None
+            If provided, save the heatmap to this path.
+        backend : object or None
+            Misfit backend instance. If None, uses `StdOverMeanMisfit()`.
+        cmap : str, default "turbo"
+            CPT colormap to use for the heatmap.
+        transparency : int, default 40
+            Transparency percentage (0–100) for the overlay.
+
+        Notes
+        -----
+        - This is a lightweight wrapper around
+        `plot_misfit_heatmap_for_peak_DR(aslobj, backend=..., cmap=..., transparency=..., outfile=...)`.
+        """
+        if backend is None:
+            backend = StdOverMeanMisfit()
+        plot_misfit_heatmap_for_peak_DR(self, backend=backend, cmap=cmap, transparency=transparency, outfile=outfile, region=region)
+
 
     # ---------- ObsPy event ----------
-    def source_to_obspyevent(self, event_id=None):
-        src = self.source
+    def source_to_obspyevent(self, event_id: str | None = None):
+        """
+        Convert the current ASL source track to an ObsPy :class:`Event`.
+
+        Parameters
+        ----------
+        event_id : str or None
+            Optional event identifier used to build stable resource IDs. If None,
+            a timestamp derived from the first sample time is used.
+
+        Notes
+        -----
+        - Writes the resulting Event to ``self.event``.
+        - Each time sample becomes an :class:`Origin` with quality fields:
+        azimuthal_gap, used_station_count, and standard_error (misfit).
+        - A companion :class:`Amplitude` is added per frame with the DR value.
+        - Distances used for OriginQuality min/median/max are computed in **km**
+        using a simple 3‐D great-circle + elevation difference approximation.
+        - Node elevation (if your grid provides ``node_elev_m``) is associated to
+        each origin by nearest grid node in (lat, lon).
+        """
+        src = getattr(self, "source", None)
         if not src:
             return
-        if not event_id:
-            event_id = src["t"][0].strftime("%Y%m%d%H%M%S")
+
+        # derive event id if needed
+        t0 = src.get("t", None)
+        if event_id is None:
+            if t0 is None or len(t0) == 0:
+                event_id = "asl_unknown"
+            else:
+                tfirst = t0[0] if isinstance(t0[0], UTCDateTime) else UTCDateTime(t0[0])
+                event_id = tfirst.strftime("%Y%m%d%H%M%S")
 
         ev = Event()
         ev.resource_id = ResourceIdentifier(f"smi:example.org/event/{event_id}")
         ev.event_type = "landslide"
         ev.comments.append(Comment(text="Origin.quality distance fields are in kilometers, not degrees."))
 
-        azgap = src.get("azgap", [None] * len(src["t"]))
-        nsta = src.get("nsta", [None] * len(src["t"]))
-        misfits = src.get("misfit", [None] * len(src["t"]))
+        # convenience arrays (len = T)
+        lat_arr = np.asarray(src.get("lat", []), float)
+        lon_arr = np.asarray(src.get("lon", []), float)
+        DR_arr  = np.asarray(src.get("DR", []), float)
+        mis_arr = np.asarray(src.get("misfit", [np.nan] * len(lat_arr)), float)
 
-        for i, (t, lat, lon, DR, misfit_val) in enumerate(zip(src["t"], src["lat"], src["lon"], src["DR"], misfits)):
+        times = src.get("t", [])
+        if len(times) != len(lat_arr):
+            # guard: inconsistent lengths
+            n = min(len(times), len(lat_arr), len(lon_arr), len(DR_arr), len(mis_arr))
+            times  = times[:n]
+            lat_arr = lat_arr[:n]
+            lon_arr = lon_arr[:n]
+            DR_arr  = DR_arr[:n]
+            mis_arr = mis_arr[:n]
+
+        azgap = src.get("azgap", [None] * len(times))
+        nsta  = src.get("nsta",  [None] * len(times))
+
+        # grid elevation (optional)
+        node_z = getattr(self.gridobj, "node_elev_m", None)
+        glat = np.asarray(self.gridobj.gridlat).reshape(-1)
+        glon = np.asarray(self.gridobj.gridlon).reshape(-1)
+        gz   = np.asarray(node_z).reshape(-1) if node_z is not None else None
+
+        # station coordinates
+        sta_coords = list(self.station_coordinates.values())
+
+        # simple local helper (no external import needed)
+        def _geo_distance_3d_km(lat1, lon1, elev_m1, lat2, lon2, elev_m2) -> float:
+            d2d_m, _, _ = gps2dist_azimuth(float(lat1), float(lon1),
+                                        float(lat2), float(lon2))
+            dz_m = float(elev_m2) - float(elev_m1)
+            return 0.001 * float(np.hypot(d2d_m, dz_m))
+
+        for i, (t, lat, lon, DR, misfit_val) in enumerate(zip(times, lat_arr, lon_arr, DR_arr, mis_arr)):
+            if not isinstance(t, UTCDateTime):
+                t = UTCDateTime(t)
+
             origin = Origin()
             origin.resource_id = ResourceIdentifier(f"smi:example.org/origin/{event_id}_{i:03d}")
-            origin.time = UTCDateTime(t) if not isinstance(t, UTCDateTime) else t
-            origin.latitude = lat; origin.longitude = lon; origin.depth = 0
+            origin.time = t
+            origin.latitude = float(lat)
+            origin.longitude = float(lon)
+            origin.depth = 0.0  # set 0 m; grid is 2-D in this implementation
+
             oq = OriginQuality()
-            oq.standard_error = float(misfit_val) if misfit_val is not None else None
-            oq.azimuthal_gap = float(azgap[i]) if azgap[i] is not None else None
-            oq.used_station_count = int(nsta[i]) if nsta[i] is not None else None
 
-            # pick a node elevation near the current origin (works for Grid or NodeGrid)
-            node_z = getattr(self.gridobj, "node_elev_m", None)
+            # attach misfit & azgap / nsta if available
+            oq.standard_error = (float(misfit_val) if np.isfinite(misfit_val) else None)
+            if i < len(azgap) and azgap[i] is not None:
+                val = float(azgap[i])
+                oq.azimuthal_gap = val if np.isfinite(val) else None
+            if i < len(nsta) and nsta[i] is not None:
+                nval = int(nsta[i])
+                oq.used_station_count = nval if nval >= 0 else None
+
+            # nearest grid-node elevation for this origin (if provided)
             elev_node_m = 0.0
-            if node_z is not None and np.isfinite(node_z).any():
-                glat = np.asarray(self.gridobj.gridlat).reshape(-1)
-                glon = np.asarray(self.gridobj.gridlon).reshape(-1)
-                j0 = int(np.nanargmin((glat - lat)**2 + (glon - lon)**2))
-                elev_node_m = float(np.asarray(node_z).reshape(-1)[j0])
+            if gz is not None and np.isfinite(gz).any():
+                j0 = int(np.nanargmin((glat - lat) ** 2 + (glon - lon) ** 2))
+                elev_node_m = float(gz[j0])
 
+            # compute station distance distribution (km)
             distances_km = []
-            for coords in self.station_coordinates.values():
-                stalat = float(coords["latitude"])
-                stalon = float(coords["longitude"])
-                staelev = float(coords.get("elevation", 0.0))  # meters
-                d_km = geo_distance_3d_km(lat, lon, elev_node_m, stalat, stalon, staelev)
+            for sc in sta_coords:
+                stalat = float(sc.get("latitude", np.nan))
+                stalon = float(sc.get("longitude", np.nan))
+                staelev = float(sc.get("elevation", 0.0))
+                if not (np.isfinite(stalat) and np.isfinite(stalon)):
+                    continue
+                d_km = _geo_distance_3d_km(lat, lon, elev_node_m, stalat, stalon, staelev)
                 distances_km.append(d_km)
 
             if distances_km:
-                oq.minimum_distance = min(distances_km)
-                oq.maximum_distance = max(distances_km)
-                oq.median_distance = float(np.median(distances_km))
+                oq.minimum_distance = float(np.min(distances_km))
+                oq.maximum_distance = float(np.max(distances_km))
+                oq.median_distance  = float(np.median(distances_km))
 
             origin.quality = oq
-            origin.time_errors = QuantityError(uncertainty=misfit_val)
+
+            # time uncertainty → we store misfit as a QuantityError for transparency
+            if np.isfinite(misfit_val):
+                origin.time_errors = QuantityError(uncertainty=float(misfit_val))
+
             ev.origins.append(origin)
 
+            # store DR as a generic amplitude (units left generic)
             amp = Amplitude()
             amp.resource_id = ResourceIdentifier(f"smi:example.org/amplitude/{event_id}_{i:03d}")
-            amp.generic_amplitude = DR
+            amp.generic_amplitude = float(DR) if np.isfinite(DR) else None
             amp.unit = "other"
             amp.pick_id = origin.resource_id
             ev.amplitudes.append(amp)
 
         self.event = ev
 
-    def save_event(self, outfile=None):
-        if self.located and outfile:
-            cat = Catalog(events=[self.event])
+
+    def save_event(self, outfile: str | None = None):
+        """
+        Write the current ObsPy :class:`Event` to QuakeML.
+
+        Parameters
+        ----------
+        outfile : str or None
+            Destination file path (e.g., ``"event.xml"``). If None, this is a no-op.
+
+        Notes
+        -----
+        - Requires that :meth:`source_to_obspyevent` has created ``self.event``.
+        - Wraps the single Event in a :class:`Catalog` and saves as QuakeML.
+        """
+        if not outfile:
+            return
+        ev = getattr(self, "event", None)
+        if ev is None:
+            print("[ASL] No Event to save. Did you call source_to_obspyevent()?")
+            return
+
+        try:
+            cat = Catalog(events=[ev])
             cat.write(outfile, format="QUAKEML")
-            print(f"[✓] QuakeML: {outfile}")
+            print(f"[ASL] ✓ QuakeML written: {outfile}")
+        except Exception as e:
+            print(f"[ASL] ERROR writing QuakeML: {e!r}")
+
 
     def print_event(self):
-        if self.located:
-            from pprint import pprint
-            pprint(self.event)
+        """
+        Pretty-print the current ObsPy :class:`Event` (debug/inspection utility).
+        """
+        ev = getattr(self, "event", None)
+        if ev is None:
+            print("[ASL] No Event available. Run source_to_obspyevent() first.")
+            return
+        try:
+            pprint(ev)
+        except Exception:
+            # Fallback string repr
+            print(ev)
 
 
     def source_to_dataframe(self) -> "pd.DataFrame | None":
@@ -1252,13 +2169,21 @@ class ASL:
         -------
         pd.DataFrame or None
             DataFrame of the source information, or None if no source exists.
+
+        Notes
+        -----
+        - This is a shallow conversion (no copies of large arrays are forced).
+        - The DataFrame will include whatever keys exist in ``self.source``.
         """
         if not hasattr(self, "source") or self.source is None:
             print("[ASL] No source data available. Did you run locate() or fast_locate()?")
             return None
 
-        import pandas as pd
-        return pd.DataFrame(self.source)
+        try:
+            return pd.DataFrame(self.source)
+        except Exception as e:
+            print(f"[ASL] Could not convert source to DataFrame: {e!r}")
+            return None
 
 
     def print_source(self, max_rows: int = 100):
@@ -1267,20 +2192,31 @@ class ASL:
 
         Parameters
         ----------
-        max_rows : int, default=20
+        max_rows : int, default 100
             Maximum number of rows to display. Use None to show all.
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            The DataFrame view used for printing, or None if unavailable.
         """
         df = self.source_to_dataframe()
         if df is None:
-            return
+            return None
 
-        if max_rows is not None and len(df) > max_rows:
-            print(f"[ASL] Showing first {max_rows} of {len(df)} rows:")
-            print(df.head(max_rows).to_string(index=False))
-        else:
-            print(df.to_string(index=False))
+        try:
+            if max_rows is not None and len(df) > max_rows:
+                print(f"[ASL] Showing first {max_rows} of {len(df)} rows:")
+                print(df.head(max_rows).to_string(index=False))
+            else:
+                print(df.to_string(index=False))
 
-        print(f'Unique node indices: {np.unique(self.source["node_index"]).size}')
+            if "node_index" in self.source:
+                unique_nodes = np.unique(np.asarray(self.source["node_index"], int))
+                print(f"Unique node indices: {unique_nodes.size}")
+        except Exception as e:
+            print(f"[ASL] Could not print source DataFrame: {e!r}")
+
         return df
 
 
@@ -1292,348 +2228,192 @@ class ASL:
         ----------
         csvfile : str
             Path to output CSV file.
-        index : bool, default=False
+        index : bool, default False
             Whether to include the DataFrame index in the CSV.
+
+        Returns
+        -------
+        str | None
+            The output path on success, else None.
         """
         df = self.source_to_dataframe()
         if df is None:
-            return
+            return None
 
-        df.to_csv(csvfile, index=index)
-        print(f"[ASL] Source written to CSV: {csvfile}")
-        return csvfile
-
+        try:
+            df.to_csv(csvfile, index=index)
+            print(f"[ASL] Source written to CSV: {csvfile}")
+            return csvfile
+        except Exception as e:
+            print(f"[ASL] ERROR writing CSV: {e!r}")
+            return None
+        
 
     def estimate_decay_params(
         self,
         time_index: int | None = None,
         node_index: int | None = None,
         *,
+        use_reduced: bool = False,          # fit on raw amplitudes by default
+        bounded: bool = False,              # enforce N>=0, k>=0 if SciPy available
+        neighborhood_k: int | None = None,  # e.g., 9 → search nearest 9 nodes and pick best R²
         min_stations: int = 5,
         eps_amp: float = 1e-12,
         eps_dist_km: float = 1e-6,
-        freq_hz: float | None = None,      # if None, uses self.peakf (if available)
-        wavespeed_kms: float | None = None, # if None, uses self.wavespeed_kms (if available)
-        use_reduced: bool = True,
+        freq_hz: float | None = None,       # if None, falls back to self.peakf
+        wavespeed_kms: float | None = None, # if None, falls back to self.wavespeed_kms
         verbose: bool = True,
     ) -> dict:
         """
-        Estimate geometric spreading exponent N and attenuation Q from
-        a single time sample and node, by fitting:
+        Estimate geometric spreading exponent N and attenuation factor k from station
+        amplitudes using the log-linear model:
 
-            log A  =  log A0  - N * log R  - k * R,
-
-        where R is distance (km). If `freq_hz` and `wavespeed_kms` are provided
-        (or found on the object), convert k to Q via Q = π f / (k v).
-
-        Parameters
-        ----------
-        time_index : int or None
-            Which time sample to use. If None, chooses the time of max DR
-            if self.source exists; else raises.
-        node_index : int or None
-            Which grid node to use for distances. If None, uses the best node
-            at the chosen time (argmin misfit) if available; else raises.
-        min_stations : int
-            Minimum usable stations required to fit.
-        eps_amp : float
-            Small floor added inside log() for amplitudes (to avoid -inf).
-        eps_dist_km : float
-            Small floor for distances (to avoid log(0)).
-        freq_hz, wavespeed_kms : float or None
-            Needed to convert k→Q. If None, fall back to self.peakf / self.wavespeed_kms.
-        use_reduced : bool
-            If True (default), fit uses *reduced* station amplitudes at the chosen
-            node, i.e., y * C[:, j]. If False, uses raw VSAM metric y.
-            (Reduced is usually more stable.)
-        verbose : bool
-            Print a short summary.
-
-        Returns
-        -------
-        dict with fields:
-        - N : geometric spreading exponent (unitless)
-        - k : attenuation coefficient (1/km)
-        - Q : estimated quality factor (or np.nan if freq/velocity missing or k<=0)
-        - A0_log : intercept (log A0)
-        - r2 : coefficient of determination
-        - nsta : number of stations used
-        - time_index, node_index : indices used
-        - lat, lon : node coordinates
-        """
-        # --- choose time index ---
-        st = self.metric2stream()
-        if time_index is None:
-            if getattr(self, "source", None) and "DR" in self.source:
-                time_index = int(np.nanargmax(self.source["DR"]))
-            else:
-                raise ValueError("time_index=None and no self.source['DR'] available to infer it.")
-        if time_index < 0 or time_index >= len(st[0].data):
-            raise IndexError("time_index out of bounds.")
-
-        # data matrix Y (nsta, ntime)
-        Y = np.vstack([tr.data.astype(np.float64, copy=False) for tr in st])
-        y = Y[:, time_index]  # (nsta,)
-
-        # seed ids order
-        seed_ids = [tr.id for tr in st]
-        nsta = len(seed_ids)
-
-        # --- choose node index ---
-        gridlat = self.gridobj.gridlat.reshape(-1)
-        gridlon = self.gridobj.gridlon.reshape(-1)
-        nnodes = gridlat.size
-
-        if node_index is None:
-            # try to infer from misfit minimum if available
-            if getattr(self, "source", None) and "lat" in self.source and "lon" in self.source:
-                # pick the node nearest to the stored lat/lon at that time
-                lat_t = float(self.source["lat"][time_index])
-                lon_t = float(self.source["lon"][time_index])
-                if np.isfinite(lat_t) and np.isfinite(lon_t):
-                    d2 = (gridlat - lat_t)**2 + (gridlon - lon_t)**2
-                    node_index = int(np.nanargmin(d2))
-                else:
-                    raise ValueError("node_index=None and stored lat/lon are NaN at this time.")
-            else:
-                raise ValueError("node_index=None and no prior location available to infer it.")
-
-        if node_index < 0 or node_index >= nnodes:
-            raise IndexError("node_index out of bounds.")
-
-        # --- distances for that node (km), one per station ---
-        R = np.empty(nsta, dtype=np.float64)
-        for k, sid in enumerate(seed_ids):
-            dk = np.asarray(self.node_distances_km.get(sid), dtype=np.float64)
-            if dk.size != nnodes:
-                raise ValueError(f"Distances for {sid} length {dk.size} != grid nodes {nnodes}")
-            R[k] = dk[node_index]
-
-        # station subset with finite amplitudes and positive distances
-        mask = np.isfinite(y) & np.isfinite(R) & (R > eps_dist_km)
-        if mask.sum() < min_stations:
-            return {
-                "N": np.nan, "k": np.nan, "Q": np.nan, "A0_log": np.nan,
-                "r2": 0.0, "nsta": int(mask.sum()),
-                "time_index": int(time_index), "node_index": int(node_index),
-                "lat": float(gridlat[node_index]), "lon": float(gridlon[node_index]),
-            }
-
-        y_use = y[mask]
-
-        # optionally reduce y using amplitude corrections at this node
-        if use_reduced:
-            C = np.empty(mask.sum(), dtype=np.float64)
-            kk = 0
-            for m, sid in zip(mask, seed_ids):
-                if not m:
-                    continue
-                ck = self.amplitude_corrections.get(sid)
-                if ck is None:
-                    C[kk] = 1.0
-                else:
-                    ck = np.asarray(ck, dtype=np.float64)
-                    C[kk] = ck[node_index] if np.isfinite(ck[node_index]) else 1.0
-                kk += 1
-            A = y_use * C
-        else:
-            A = y_use
-
-        R_use = R[mask].astype(np.float64)
-
-        # --- linear least squares on log(A) = b0 + b1*log(R) + b2*R  ---
-        logA = np.log(np.maximum(A, eps_amp))
-        logR = np.log(np.maximum(R_use, eps_dist_km))
-        X = np.column_stack([np.ones_like(logR), logR, R_use])  # [1, logR, R]
-        # Solve
-        beta, *_ = np.linalg.lstsq(X, logA, rcond=None)
-        b0, b1, b2 = beta
-        # coefficients map to model: logA = logA0 - N*logR - k*R
-        N_hat = -float(b1)
-        k_hat = -float(b2)
-        A0_log = float(b0)
-
-        # R^2
-        yhat = X @ beta
-        ss_res = float(np.sum((logA - yhat)**2))
-        ss_tot = float(np.sum((logA - np.mean(logA))**2))
-        r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-
-        # convert k -> Q if possible
-        f = float(freq_hz if freq_hz is not None else (getattr(self, "peakf", np.nan) or np.nan))
-        v = float(wavespeed_kms if wavespeed_kms is not None else (getattr(self, "wavespeed_kms", np.nan) or np.nan))
-        if np.isfinite(f) and np.isfinite(v) and k_hat > 0:
-            Q_hat = float(np.pi * f / (k_hat * v))
-        else:
-            Q_hat = np.nan
-
-        out = {
-            "N": N_hat,
-            "k": k_hat,             # 1/km
-            "Q": Q_hat,
-            "A0_log": A0_log,
-            "r2": float(r2),
-            "nsta": int(mask.sum()),
-            "time_index": int(time_index),
-            "node_index": int(node_index),
-            "lat": float(gridlat[node_index]),
-            "lon": float(gridlon[node_index]),
-        }
-
-        if verbose:
-            fstr = f if np.isfinite(f) else None
-            vstr = v if np.isfinite(v) else None
-            print(
-                f"[ASL] decay-fit @ t={time_index}, node={node_index} "
-                f"(lat={out['lat']:.5f}, lon={out['lon']:.5f})  "
-                f"N={out['N']:.3f}, k={out['k']:.5g} 1/km, "
-                f"Q={out['Q']:.1f} (f={fstr}, v={vstr})  r2={out['r2']:.3f}  nsta={out['nsta']}"
-            )
-        return out    
-    
-    def estimate_decay_params(
-        self,
-        time_index: int | None = None,
-        node_index: int | None = None,
-        *,
-        use_reduced: bool = False,      # ← default: fit on raw amplitudes
-        bounded: bool = False,          # enforce N>=0, k>=0 if SciPy available
-        neighborhood_k: int | None = None,  # e.g. 9 → search nearest 9 nodes, pick best R²
-        min_stations: int = 3,
-        eps: float = 1e-12,
-        verbose: bool = False,
-    ) -> dict:
-        """
-        Estimate geometric decay exponent N and attenuation factor k in:
             A(R) ≈ A0 * R^{-N} * exp(-k R)
-        where Q ≈ (π f) / (k v). Uses a log-linear model:
+            log A = b0 + b1 * log R + b2 * R,  with  N = -b1,  k = -b2.
 
-            log A = b0 + b1*log R + b2*R,   with  N = -b1,  k = -b2  (so we expect b1<=0, b2<=0)
+        Optionally converts k → Q via  Q = (π f) / (k v)  when f and v are available.
 
-        Parameters
-        ----------
-        time_index : int or None
-            Time sample to use. If None, pick DR maximum from self.source (requires locate()).
-        node_index : int or None
-            Grid node index to use. If None, pick the node at that time from self.source (requires locate()).
-        use_reduced : bool
-            If True, fit on amplitudes already multiplied by amplitude corrections (geometric/attenuation removed).
-            Usually set False to keep physical distance-dependence in the data.
-        bounded : bool
-            If True and SciPy is available, solve with bounds b1<=0, b2<=0 (i.e., N,k >= 0).
-        neighborhood_k : int or None
-            If set, evaluate this many nearest nodes to the starting node and return the fit with the highest R².
-        min_stations : int
-            Require at least this many usable stations.
-        eps : float
-            Numerical guard for logs/divisions.
-        verbose : bool
-            Print a one-line summary.
+        Behavior
+        --------
+        - If (time_index, node_index) are omitted, uses the time of peak DR and the
+        nearest grid node to that (lat, lon) from the current source.
+        - Distances prefer `self.node_distances_km`; otherwise fall back to
+        2-D great-circle via `gps2dist_azimuth`.
+        - If `bounded=True` and SciPy is available, solves with constraints N,k ≥ 0.
+        - If `neighborhood_k` is given, evaluates the nearest `k` nodes to `node_index`
+        and returns the fit with the best R² (also returns the candidate list).
 
         Returns
         -------
-        dict with keys:
-        N, k, Q, A0_log, r2, nsta, time_index, node_index, lat, lon,
-        se_N, se_k, se_A0 (standard errors; NaN if not available),
-        method: "OLS" or "bounded" (if SciPy used),
-        candidates: optional list of (node_index, r2) if neighborhood search was used.
+        dict
+            Keys include: N, k, Q, A0_log, r2, nsta, time_index, node_index, lat, lon,
+            se_N, se_k, se_A0, method; and when `neighborhood_k` is set, `candidates` as
+            a list of (node_index, r2).
         """
-        rspan_min_km = 2.0         # reject if distance span too small
-        logr_span_min = 0.5        # ~e^0.5 ≈ 1.65× spread in distance
-        r2_min = 0.25              # minimum acceptable R^2
-
-
-        # --- pick time/node defaults from located source if needed ---
+        # ---- guards / defaults from located source ----
         if time_index is None or node_index is None:
             if not getattr(self, "source", None):
                 raise ValueError("Provide time_index/node_index or run locate()/fast_locate() first.")
             if time_index is None:
                 time_index = int(np.nanargmax(self.source["DR"]))
             if node_index is None:
-                # nearest grid node to (lat,lon) at this time
                 glat = self.gridobj.gridlat.reshape(-1)
                 glon = self.gridobj.gridlon.reshape(-1)
                 lat0 = float(self.source["lat"][time_index])
                 lon0 = float(self.source["lon"][time_index])
-                node_index = int(np.nanargmin((glat - lat0)**2 + (glon - lon0)**2))
+                node_index = int(np.nanargmin((glat - lat0) ** 2 + (glon - lon0) ** 2))
+
+        # convenience handles
+        glat = self.gridobj.gridlat.reshape(-1)
+        glon = self.gridobj.gridlon.reshape(-1)
+        nnodes = glat.size
+
+        if not (0 <= node_index < nnodes):
+            raise IndexError("node_index out of bounds.")
+
+        # choose frequency/velocity for Q
+        f_hz = float(freq_hz if freq_hz is not None else getattr(self, "peakf", np.nan))
+        v_kms = float(wavespeed_kms if wavespeed_kms is not None else getattr(self, "wavespeed_kms", np.nan))
+
+        # --- helpers ---
+        def _distances_for_node(nj: int, seed_ids: list[str]) -> np.ndarray:
+            """Return distances (km) station→node nj; prefer precomputed vectors."""
+            d_km = np.empty(len(seed_ids), dtype=float)
+            have_all = bool(self.node_distances_km) and all(
+                (sid in self.node_distances_km and
+                np.asarray(self.node_distances_km[sid]).size == nnodes)
+                for sid in seed_ids
+            )
+            if have_all:
+                for k, sid in enumerate(seed_ids):
+                    d_km[k] = float(np.asarray(self.node_distances_km[sid], float)[nj])
+                return d_km
+            # fallback: 2-D distances
+            lat_j, lon_j = float(glat[nj]), float(glon[nj])
+            for k, sid in enumerate(seed_ids):
+                c = self.station_coordinates.get(sid)
+                if c is None or not np.isfinite(c.get("latitude")) or not np.isfinite(c.get("longitude")):
+                    d_km[k] = np.nan
+                else:
+                    dm, _, _ = gps2dist_azimuth(lat_j, lon_j, float(c["latitude"]), float(c["longitude"]))
+                    d_km[k] = dm / 1000.0
+            return d_km
 
         def _fit_once(ti: int, nj: int) -> dict:
-            # Stream → per-station scalar at this time
+            # Stream → station amplitudes at a single time
             st = self.metric2stream()
             seed_ids = [tr.id for tr in st]
-            y = np.vstack([tr.data.astype(np.float64, copy=False) for tr in st])[:, ti]  # (nsta,)
-
-            # distances to this node
-            glat = self.gridobj.gridlat.reshape(-1)
-            glon = self.gridobj.gridlon.reshape(-1)
-            lat_j = float(glat[nj]); lon_j = float(glon[nj])
-
-            # build distances (km) from stored station coordinates
-            d_km = []
-            for sid in seed_ids:
-                c = self.station_coordinates.get(sid)
-                if c is None:
-                    d_km.append(np.nan); continue
-                dm, _, _ = gps2dist_azimuth(lat_j, lon_j, c["latitude"], c["longitude"])
-                d_km.append(dm / 1000.0)
-            d_km = np.asarray(d_km, float)
+            Y = np.vstack([tr.data.astype(np.float64, copy=False) for tr in st])
+            a_raw = Y[:, ti]  # (nsta,)
 
             # choose amplitude vector
             if use_reduced:
-                C = np.vstack([self.amplitude_corrections[sid] for sid in seed_ids])  # (nsta, nnodes)
-                a = y * C[:, nj]
+                # multiply by amplitude corrections at node nj if available
+                C = np.ones_like(a_raw, dtype=np.float64)
+                for k, sid in enumerate(seed_ids):
+                    ck = self.amplitude_corrections.get(sid)
+                    if ck is not None:
+                        val = np.asarray(ck, float)[nj]
+                        C[k] = val if np.isfinite(val) else 1.0
+                A = a_raw * C
             else:
-                a = y
+                A = a_raw
+
+            # distances
+            R = _distances_for_node(nj, seed_ids)
 
             # validity mask
-            m = np.isfinite(a) & np.isfinite(d_km) & (a > 0.0) & (d_km > 0.0)
-            if int(m.sum()) < min_stations:
+            m = np.isfinite(A) & np.isfinite(R) & (A > 0.0) & (R > eps_dist_km)
+            nuse = int(m.sum())
+            lat_j, lon_j = float(glat[nj]), float(glon[nj])
+
+            if nuse < min_stations:
                 return dict(N=np.nan, k=np.nan, Q=np.nan, A0_log=np.nan, r2=0.0,
-                            nsta=int(m.sum()), time_index=ti, node_index=nj,
+                            nsta=nuse, time_index=ti, node_index=nj,
                             lat=lat_j, lon=lon_j, se_N=np.nan, se_k=np.nan, se_A0=np.nan,
                             method="insufficient")
 
-            A = a[m]
-            R = d_km[m]
-            logA = np.log(A + eps)
-            logR = np.log(R + eps)
+            A = A[m]
+            R = R[m]
+            logA = np.log(np.maximum(A, eps_amp))
+            logR = np.log(np.maximum(R, eps_dist_km))
 
             # quick well-posedness checks
+            rspan_min_km = 2.0
+            logr_span_min = 0.5
             if (np.nanmax(R) - np.nanmin(R)) < rspan_min_km or (np.ptp(logR) < logr_span_min):
                 return dict(N=np.nan, k=np.nan, Q=np.nan, A0_log=np.nan, r2=-np.inf,
-                            nsta=int(m.sum()), time_index=ti, node_index=nj,
+                            nsta=nuse, time_index=ti, node_index=nj,
                             lat=lat_j, lon=lon_j, se_N=np.nan, se_k=np.nan, se_A0=np.nan,
                             method="illposed")
 
             # Design matrix: [1, logR, R]
             X = np.column_stack([np.ones_like(logA), logR, R])
 
-            used_method = "OLS"
             b = None
             cov = None
+            used_method = "OLS"
 
             if bounded:
-                # optional bounded fit (requires SciPy)
+                # optional bounded fit (N>=0, k>=0) i.e., b1<=0, b2<=0
                 try:
                     from scipy.optimize import lsq_linear
-                    # center predictors to reduce collinearity
+                    # center predictors to reduce collinearity; solve without intercept then recover it
                     logR_c = logR - logR.mean()
                     R_c = R - R.mean()
-                    Xc = np.column_stack([logR_c, R_c])  # we fit without intercept, then recover it
+                    Xc = np.column_stack([logR_c, R_c])
                     y_c = logA - logA.mean()
                     res = lsq_linear(Xc, y_c, bounds=([-np.inf, -np.inf], [0.0, 0.0]))
                     b1_c, b2_c = res.x
-                    b0 = logA.mean()  # since predictors are centered
+                    b0 = float(logA.mean())
                     b = np.array([b0, b1_c, b2_c], float)
                     used_method = "bounded"
                 except Exception:
-                    # fall back to OLS
-                    pass
+                    pass  # fall back to OLS
 
             if b is None:
-                # ordinary least squares with pseudo-inverse
+                # OLS with covariance
                 b, *_ = np.linalg.lstsq(X, logA, rcond=None)
-                # covariance (X'X)^{-1} * sigma^2
                 try:
                     resid = logA - X @ b
                     dof = max(1, X.shape[0] - X.shape[1])
@@ -1647,24 +2427,17 @@ class ASL:
             N_hat = -b1
             k_hat = -b2
 
-            # Q from k (prefer instance params if present)
-            f_hz = float(getattr(self, "peakf", np.nan))
-            v_kms = float(getattr(self, "wavespeed_kms", np.nan))
-            if np.isfinite(f_hz) and np.isfinite(v_kms) and k_hat >= 0:
-                Q_hat = (np.pi * f_hz) / (k_hat * v_kms) if k_hat > 0 else np.inf
+            # R²
+            yhat = X @ np.array([b0, b1, b2], float)
+            ss_res = float(np.sum((logA - yhat) ** 2))
+            ss_tot = float(np.sum((logA - logA.mean()) ** 2)) + 1e-20
+            r2 = 1.0 - ss_res / ss_tot
+
+            # Q from k
+            if np.isfinite(f_hz) and np.isfinite(v_kms) and k_hat > 0:
+                Q_hat = float(np.pi * f_hz / (k_hat * v_kms))
             else:
                 Q_hat = np.nan
-
-            # R²
-            yhat = X @ b
-            ss_res = float(np.sum((logA - yhat) ** 2))
-            ss_tot = float(np.sum((logA - logA.mean()) ** 2)) + eps
-            r2 = 1.0 - ss_res / ss_tot
-            if not np.isfinite(r2) or r2 < r2_min:
-                return dict(N=np.nan, k=np.nan, Q=np.nan, A0_log=b0, r2=r2,
-                            nsta=int(m.sum()), time_index=ti, node_index=nj,
-                            lat=lat_j, lon=lon_j, se_N=np.nan, se_k=np.nan, se_A0=np.nan,
-                            method=("bounded" if used_method=="bounded" else "OLS_reject"))
 
             # standard errors
             se_A0 = se_N = se_k = np.nan
@@ -1673,59 +2446,82 @@ class ASL:
                 se_N  = float(np.sqrt(max(0.0, cov[1, 1])))
                 se_k  = float(np.sqrt(max(0.0, cov[2, 2])))
 
-            out = dict(N=N_hat, k=k_hat, Q=Q_hat, A0_log=b0, r2=r2,
-                    nsta=int(m.sum()), time_index=ti, node_index=nj,
-                    lat=lat_j, lon=lon_j,
-                    se_N=se_N, se_k=se_k, se_A0=se_A0,
-                    method=used_method)
+            out = dict(
+                N=float(N_hat), k=float(k_hat), Q=float(Q_hat), A0_log=float(b0), r2=float(r2),
+                nsta=int(nuse), time_index=int(ti), node_index=int(nj),
+                lat=lat_j, lon=lon_j,
+                se_N=se_N, se_k=se_k, se_A0=se_A0,
+                method=used_method
+            )
+
             if verbose:
                 print(f"[ASL] decay-fit @ t={ti}, node={nj} (lat={lat_j:.5f}, lon={lon_j:.5f})  "
-                    f"N={N_hat:.3f}, k={k_hat:.5g} 1/km, Q={Q_hat:.1f} (f={getattr(self,'peakf',np.nan)}, "
-                    f"v={getattr(self,'wavespeed_kms',np.nan)})  r2={r2:.3f}  nsta={int(m.sum())}")
+                    f"N={out['N']:.3f}, k={out['k']:.5g} 1/km, Q={out['Q']:.1f} "
+                    f"(f={None if not np.isfinite(f_hz) else f_hz}, "
+                    f"v={None if not np.isfinite(v_kms) else v_kms})  "
+                    f"r2={out['r2']:.3f}  nsta={out['nsta']}  method={used_method}")
             return out
 
         # --- single node or neighborhood search ---
         if neighborhood_k is None or neighborhood_k <= 1:
             return _fit_once(int(time_index), int(node_index))
 
-        # nearest-k nodes to starting node (planar metric is OK for local grid)
-        glat = self.gridobj.gridlat.reshape(-1); glon = self.gridobj.gridlon.reshape(-1)
-        lat0 = float(glat[int(node_index)]); lon0 = float(glon[int(node_index)])
-        d2 = (glat - lat0) ** 2 + (glon - lon0) ** 2
+        # nearest-k nodes to the starting node (planar metric OK for local grids)
+        d2 = (glat - float(glat[int(node_index)])) ** 2 + (glon - float(glon[int(node_index)])) ** 2
         cand = np.argsort(d2)[:int(neighborhood_k)]
 
         fits = [_fit_once(int(time_index), int(j)) for j in cand]
-        best = max(fits, key=lambda p: (np.nan_to_num(p["r2"], nan=-np.inf), -abs(p["N"]) if np.isfinite(p["N"]) else -np.inf))
+        best = max(
+            fits,
+            key=lambda p: (np.nan_to_num(p.get("r2", np.nan), nan=-np.inf),
+                        -abs(p.get("N", np.nan)) if np.isfinite(p.get("N", np.nan)) else -np.inf)
+        )
         best["candidates"] = [(int(f["node_index"]), float(f["r2"])) for f in fits]
         return best
     
+    #####################################################################
+    #### HELPER METHODS ####
+    #####################################################################
 
-    # --- NEW: apply a boolean mask over nodes (no recompute) ---
-    def apply_node_mask(self, mask: np.ndarray, *, inplace: bool = True):
+    # --- PRIVATE: apply a boolean mask over nodes (no recompute) ---
+    def _apply_node_mask(self, mask: np.ndarray):
         """
         Keep only nodes where mask==True by slicing:
-          - grid (lat/lon)
-          - amplitude_corrections per channel
-          - node_distances_km per channel
-        No recomputation is performed.
-
-        Returns self (for chaining).
+        - grid (lat/lon)
+        - amplitude_corrections per channel
+        - node_distances_km per channel
+        No recomputation is performed. Returns self.
         """
         mask = np.asarray(mask, bool).reshape(-1)
-        old = _as_regular_view(self.gridobj)
+        old = _as_regular_view(self.gridobj)  # exposes flat gridlat/gridlon and id/nlat/nlon
+
         if mask.size != old.gridlat.size:
             raise ValueError("mask length != number of grid nodes")
 
-        # Slice grid → a lightweight view
-        sub_lat = old.gridlat[mask]
-        sub_lon = old.gridlon[mask]
-        self.gridobj = SimpleNamespace(
-            id=f"{old.id}-subset-{mask.sum()}",
-            gridlat=sub_lat,
-            gridlon=sub_lon,
-            nlat=None, nlon=None,
-            node_spacing_m=getattr(old, "node_spacing_m", None),
-        )
+        # Prefer a typed slice (Grid/NodeGrid) if available
+        if hasattr(self.gridobj, "_slice") and callable(getattr(self.gridobj, "_slice")):
+            self.gridobj = self.gridobj._slice(mask)
+        else:
+            # Fallback: a minimal, typed-preserving view if you have a constructor; otherwise SimpleNamespace
+            sub_lat = old.gridlat[mask]
+            sub_lon = old.gridlon[mask]
+            try:
+                # If your package exposes a simple NodeGrid constructor, prefer that:
+                from flovopy.grid import NodeGrid  # adjust path if different
+                self.gridobj = NodeGrid(
+                    lat=sub_lat, lon=sub_lon,
+                    node_spacing_m=getattr(old, "node_spacing_m", None),
+                    grid_id=f"{getattr(old, 'id', 'grid')}-subset-{int(mask.sum())}",
+                )
+            except Exception:
+                # Last-resort ultra-light view (works, but not ideal for type checks elsewhere)
+                self.gridobj = SimpleNamespace(
+                    id=f"{getattr(old,'id','grid')}-subset-{int(mask.sum())}",
+                    gridlat=sub_lat,
+                    gridlon=sub_lon,
+                    nlat=None, nlon=None,
+                    node_spacing_m=getattr(old, "node_spacing_m", None),
+                )
 
         # Slice corrections & distances
         if getattr(self, "amplitude_corrections", None):
@@ -1743,652 +2539,61 @@ class ASL:
                 self.node_distances_km[sid] = v[mask]
 
         return self
+    
+    '''
+    # --- PRIVATE: subset by bounding box (lat/lon) ---
+    def _subset_nodes_by_bbox(self, lat_min, lat_max, lon_min, lon_max, *, inplace: bool = True):
+        """
+        Build a node mask from a lat/lon bounding box and apply it (slice).
 
-    # --- NEW: subset by bounding box (lat/lon) ---
-    def subset_nodes_by_bbox(self, lat_min, lat_max, lon_min, lon_max, *, inplace: bool = True):
-        """Convenience wrapper to call apply_node_mask() for a lat/lon bbox."""
+        Returns
+        -------
+        self
+        """
         g = _as_regular_view(self.gridobj)
         mask = (
             (g.gridlat >= min(lat_min, lat_max)) & (g.gridlat <= max(lat_min, lat_max)) &
             (g.gridlon >= min(lon_min, lon_max)) & (g.gridlon <= max(lon_min, lon_max))
         )
-        return self.apply_node_mask(mask, inplace=inplace)
+        return self._apply_node_mask(mask)
+    '''
+    
+    @contextmanager
+    def _temporary_node_mask(aslobj, idx: np.ndarray | None):
+        """Temporarily set `aslobj._node_mask` to idx (array of GLOBAL node indices), then restore."""
+        old = getattr(aslobj, "_node_mask", None)
+        try:
+            aslobj._node_mask = None if idx is None or (hasattr(idx, "size") and idx.size == 0) else np.asarray(idx, int)
+            yield
+        finally:
+            aslobj._node_mask = old
 
-    # --- NEW: coarse→fine without new grid: subset + relocate ---
-    def refine_and_relocate(self, *, top_frac: float = 0.20, margin_km: float = 1.5,
-                            spatial_sigma_nodes: float = 0.0,
-                            temporal_smooth_win: int = 0,
-                            verbose: bool = True):
-        """
-        Take top-fraction DR samples, build a bbox + margin on the current grid,
-        subset nodes (and slice ampcorr/distances), then rerun fast_locate().
-
-        No recomputation of amplitude corrections/distances.
-        """
-        if self.source is None:
-            raise RuntimeError("Run fast_locate()/locate() before refine_and_relocate().")
-
-        lat = np.asarray(self.source["lat"], float)
-        lon = np.asarray(self.source["lon"], float)
-        dr  = np.asarray(self.source["DR"], float)
-        ok = np.isfinite(lat) & np.isfinite(lon) & np.isfinite(dr)
-        if ok.sum() < 4:
-            if verbose: print("[REFINE] Not enough valid points; skipping.")
-            return self
-
-        k = max(8, int(np.ceil(top_frac * ok.sum())))
-        sel = np.argsort(dr[ok])[::-1][:k]
-        la = lat[ok][sel]; lo = lon[ok][sel]
-
-        # bbox + margin
-        km2deg = 1.0 / 111.0
-        ddeg = margin_km * km2deg
-        la0, la1 = np.nanmin(la) - ddeg, np.nanmax(la) + ddeg
-        lo0, lo1 = np.nanmin(lo) - ddeg, np.nanmax(lo) + ddeg
-
-        if verbose:
-            print(f"[REFINE] bbox lat[{la0:.5f},{la1:.5f}] lon[{lo0:.5f},{lo1:.5f}] "
-                  f"from top {k}/{ok.sum()} samples")
-
-        # subset nodes (slices corrections/distances)
-        self.subset_nodes_by_bbox(la0, la1, lo0, lo1, inplace=True)
-
-        # rerun fast_locate with optional smoothing
-        self.fast_locate(
-            verbose=verbose,
-            spatial_smooth_sigma=spatial_sigma_nodes,
-            temporal_smooth_win=temporal_smooth_win,
-        )
-        return self    
-
-    def refine_and_relocate(
+    def _passthrough_locate_kwargs(
         self,
         *,
-        top_frac: float = 0.20,
-        margin_km: float = 1.0,
         misfit_backend=None,
-        spatial_smooth_sigma: float | None = None,
-        temporal_smooth_win: int | None = None,
-        min_stations: int | None = None,
-        eps: float | None = None,
-        use_median_for_DR: bool | None = None,
-        batch_size: int | None = None,
-        verbose: bool = True,
+        spatial_smooth_sigma=None,
+        temporal_smooth_mode=None,
+        temporal_smooth_win=None,
+        viterbi_lambda_km=None,
+        viterbi_max_step_km=None,
+        min_stations=None,
+        eps=None,
+        use_median_for_DR=None,
+        batch_size=None,
     ):
         """
-        Subset the current grid to a tight box around the top-DR samples, then
-        call fast_locate() again. No recomputation of corrections is needed.
-
-        Accepts the same smoothing/locate kwargs as fast_locate() and forwards them.
+        Collect keyword overrides for fast_locate()/locate() without passing None values.
         """
-        if self.source is None:
-            raise RuntimeError("No source yet. Run fast_locate() first.")
-
-        lat = np.asarray(self.source["lat"], float)
-        lon = np.asarray(self.source["lon"], float)
-        dr  = np.asarray(self.source["DR"],  float)
-
-        mask_fin = np.isfinite(lat) & np.isfinite(lon) & np.isfinite(dr)
-        if mask_fin.sum() == 0:
-            if verbose: print("[ASL] refine_and_relocate: no finite samples; skipping")
-            return
-
-        # choose top-fraction by DR
-        idx_all = np.flatnonzero(mask_fin)
-        k = max(1, int(np.ceil(top_frac * idx_all.size)))
-        order = np.argsort(dr[idx_all])[::-1]
-        idx_top = idx_all[order[:k]]
-
-        # bounding box with margin (km → deg)
-        lat_top = lat[idx_top]; lon_top = lon[idx_top]
-        lat0 = float(np.nanmedian(lat_top))
-        dlat = margin_km / 111.0
-        dlon = margin_km / (111.0 * max(0.1, np.cos(np.deg2rad(lat0))))
-        lat_min, lat_max = np.nanmin(lat_top) - dlat, np.nanmax(lat_top) + dlat
-        lon_min, lon_max = np.nanmin(lon_top) - dlon, np.nanmax(lon_top) + dlon
-
-        # build node mask in *global* coordinates
-        g_lat = self.gridobj.gridlat.reshape(-1)
-        g_lon = self.gridobj.gridlon.reshape(-1)
-        node_mask = (g_lat >= lat_min) & (g_lat <= lat_max) & (g_lon >= lon_min) & (g_lon <= lon_max)
-        sub_idx = np.flatnonzero(node_mask)
-        if sub_idx.size == 0:
-            if verbose:
-                print("[ASL] refine_and_relocate: sub-grid empty; keeping full grid")
-            self._node_mask = None
-        else:
-            if verbose:
-                print(f"[ASL] refine_and_relocate: restricting to {sub_idx.size} nodes "
-                    f"(~{100*sub_idx.size/g_lat.size:.1f}% of grid)")
-            self._node_mask = sub_idx  # <-- consumed by misfit backends
-
-        # Forward selected kwargs to fast_locate()
-        kwargs = {}
-        if misfit_backend is not None:     kwargs["misfit_backend"] = misfit_backend
-        if spatial_smooth_sigma is not None: kwargs["spatial_smooth_sigma"] = spatial_smooth_sigma
-        if temporal_smooth_win is not None:  kwargs["temporal_smooth_win"]  = temporal_smooth_win
-        if min_stations is not None:       kwargs["min_stations"] = min_stations
-        if eps is not None:                kwargs["eps"] = eps
-        if use_median_for_DR is not None:  kwargs["use_median_for_DR"] = use_median_for_DR
-        if batch_size is not None:         kwargs["batch_size"] = batch_size
-
-        try:
-            self.fast_locate(verbose=verbose, **kwargs)
-        finally:
-            # always clear the mask so future calls run on full grid unless refined again
-            self._node_mask = None
- 
-# ---------- helpers ----------
-def compute_azimuthal_gap(origin_lat: float, origin_lon: float,
-                          station_coords: Iterable[Tuple[float, float]]) -> tuple[float, int]:
-    """
-    Compute the classical azimuthal gap and station count.
-
-    station_coords: iterable of (lat, lon)
-    Returns: (max_gap_deg, n_stations)
-    """
-    azimuths = []
-    for stalat, stalon in station_coords:
-        _, az, _ = gps2dist_azimuth(origin_lat, origin_lon, stalat, stalon)
-        azimuths.append(float(az))
-
-    n = len(azimuths)
-    if n < 2:
-        return 360.0, n
-
-    azimuths.sort()
-    azimuths.append(azimuths[0] + 360.0)
-    gaps = [azimuths[i+1] - azimuths[i] for i in range(n)]
-    return max(gaps), n
-
-def compute_spatial_connectedness(
-    lat: np.ndarray,
-    lon: np.ndarray,
-    *,
-    dr: np.ndarray | None = None,
-    misfit: np.ndarray | None = None,
-    select_by: str = "dr",         # {"dr", "misfit", "all"}
-    top_frac: float = 0.15,        # used when select_by in {"dr","misfit"}
-    min_points: int = 12,
-    max_points: int = 200,
-    fallback_if_empty: bool = True,
-    eps_km: float = 1e-6,
-) -> dict:
-    """
-    Quantify how tightly clustered the ASL locations are in space.
-
-    Idea: take the strongest subset of points (by DR), compute the mean
-    pairwise great-circle distance (km) among them, and map it to a
-    unitless score in (0, 1] where higher means more compact.
-
-    score = 1 / (1 + mean_pairwise_distance_km)
-
-    Parameters
-    ----------
-    lat, lon : arrays of shape (N,)
-        Per-sample lat/lon from ASL (may contain NaN).
-    dr : array or None
-        Per-sample DR; if provided, selects the top fraction by DR.
-        If None, use all finite lat/lon equally.
-    top_frac : float
-        Fraction (0-1] of samples (by DR) to use. Ignored if dr=None.
-    min_points : int
-        Minimum number of points to include (if available).
-    max_points : int
-        Hard cap for pairwise work (keeps O(K^2) reasonable).
-    eps_km : float
-        Small epsilon to avoid division issues.
-
-    Selection policy
-    ----------------
-    - select_by="dr"     : take the top fraction by DR (largest values)
-    - select_by="misfit" : take the top fraction by *low* misfit (smallest values)
-    - select_by="all"    : use all finite (lat,lon) samples, ignore dr/misfit
-
-    Returns
-    -------
-    dict:
-      score       : float in (0, 1], higher = tighter clustering
-      n_used      : number of points used
-      mean_km     : mean pairwise great-circle distance among selected points
-      median_km   : median pairwise distance
-      p90_km      : 90th percentile distance
-      indices     : indices of selected samples (into the original arrays)
-
-      
-    •	The score increases as the track tightens (mean pairwise distance shrinks).
-	•	score = 1 / (1 + mean_km) → 1.0 for perfectly colocated, ~0 for very spread.
-	•	Using top_frac focuses the metric on the most energetic portion of the track.
-	•	self.connectedness is a dict with rich diagnostics; self.source["connectedness"]
-        is a convenient scalar for tables/CSV (pandas will broadcast the scalar when building a DataFrame).
-	•	If you’d prefer a different mapping (e.g., exp(-mean_km / s0)), it’s a one-liner change.
-  
-    """
-    lat = np.asarray(lat, float)
-    lon = np.asarray(lon, float)
-
-    # base finite mask on coordinates
-    base_mask = np.isfinite(lat) & np.isfinite(lon)
-
-    # optional weights/criteria arrays
-    if dr is not None:
-        dr = np.asarray(dr, float)
-    if misfit is not None:
-        misfit = np.asarray(misfit, float)
-
-    idx_all = np.flatnonzero(base_mask)
-    if idx_all.size == 0:
-        return {"score": 0.0, "n_used": 0, "mean_km": np.nan, "median_km": np.nan,
-                "p90_km": np.nan, "indices": []}
-
-    # ----- choose subset indices -----
-    if select_by == "all":
-        idx = idx_all
-
-    elif select_by == "dr":
-        if dr is None or not np.isfinite(dr[idx_all]).any():
-            # fallback: use all valid coords or a single best point if requested
-            if fallback_if_empty:
-                # single best by whatever we have: try DR, else give up to "all"
-                if dr is not None and np.isfinite(dr).any():
-                    j = int(np.nanargmax(dr))
-                    idx = np.array([j], dtype=int)
-                else:
-                    idx = idx_all
-            else:
-                return {"score": 0.0, "n_used": 0, "mean_km": np.nan, "median_km": np.nan,
-                        "p90_km": np.nan, "indices": []}
-        else:
-            valid = idx_all[np.isfinite(dr[idx_all])]
-            k = max(min_points, int(np.ceil(top_frac * valid.size)))
-            k = min(k, max_points, valid.size)
-            order = np.argsort(dr[valid])[::-1]  # descending DR
-            idx = valid[order[:k]]
-
-    elif select_by == "misfit":
-        if misfit is None or not np.isfinite(misfit[idx_all]).any():
-            if fallback_if_empty:
-                if misfit is not None and np.isfinite(misfit).any():
-                    j = int(np.nanargmin(misfit))
-                    idx = np.array([j], dtype=int)
-                else:
-                    idx = idx_all
-            else:
-                return {"score": 0.0, "n_used": 0, "mean_km": np.nan, "median_km": np.nan,
-                        "p90_km": np.nan, "indices": []}
-        else:
-            valid = idx_all[np.isfinite(misfit[idx_all])]
-            k = max(min_points, int(np.ceil(top_frac * valid.size)))
-            k = min(k, max_points, valid.size)
-            order = np.argsort(misfit[valid])     # ascending misfit
-            idx = valid[order[:k]]
-
-    else:
-        raise ValueError("select_by must be one of {'dr','misfit','all'}")
-
-    # Degenerate 0–1 point cases
-    if idx.size == 0:
-        return {"score": 0.0, "n_used": 0, "mean_km": np.nan, "median_km": np.nan,
-                "p90_km": np.nan, "indices": []}
-    if idx.size == 1:
-        return {"score": 1.0, "n_used": 1, "mean_km": 0.0, "median_km": 0.0, "p90_km": 0.0,
-                "indices": idx.tolist()}
-
-    # ----- pairwise great-circle distances (vectorized haversine) -----
-    R = 6371.0  # km
-    phi = np.radians(lat[idx])
-    lam = np.radians(lon[idx])
-    dphi = phi[:, None] - phi[None, :]
-    dlam = lam[:, None] - lam[None, :]
-    a = np.sin(dphi / 2.0) ** 2 + np.cos(phi)[:, None] * np.cos(phi)[None, :] * np.sin(dlam / 2.0) ** 2
-    d = 2.0 * R * np.arcsin(np.minimum(1.0, np.sqrt(a)))  # (K,K), zeros on diag
-
-    iu = np.triu_indices(idx.size, k=1)
-    pair = d[iu]
-    mean_km = float(np.nanmean(pair))
-    median_km = float(np.nanmedian(pair))
-    p90_km = float(np.nanpercentile(pair, 90))
-
-    score = 1.0 / (1.0 + max(eps_km, mean_km))
-
-    return {
-        "score": float(score),
-        "n_used": int(idx.size),
-        "mean_km": mean_km,
-        "median_km": median_km,
-        "p90_km": p90_km,
-        "indices": idx.tolist(),
-    }
-
-
-# run on each event
-import os
-from typing import Optional
-from obspy import Stream
-from flovopy.processing.sam import VSAM
-from flovopy.asl.ampcorr import AmpCorr, AmpCorrParams
-from flovopy.asl.station_corrections import apply_interval_station_gains
-
-def asl_sausage(
-    stream: Stream,
-    event_dir: str,
-    asl_config: dict,
-    output_dir: str,
-    dry_run: bool = False,
-    peakf_override: Optional[float] = None,
-    station_gains_df: Optional["pd.DataFrame"] = None,  # long/tidy: start_time,end_time,seed_id,gain,…
-    allow_station_fallback: bool = True,
-):
-    """
-    Run ASL on a single (already preprocessed) event stream.
-
-    Required in `asl_config`:
-      - gridobj : Grid
-      - node_distances_km : dict[seed_id -> np.ndarray]
-      - station_coords : dict[seed_id -> {latitude, longitude, ...}]
-      - ampcorr : AmpCorr
-      - vsam_metric, window_seconds, min_stations, interactive, Q, surfaceWaveSpeed_kms
-
-    Optional:
-      - station_gains_df : **long-form** DataFrame with columns:
-            start_time | end_time | seed_id | gain | (optional: method, n_events, …)
-        Behavior:
-          * Picks the row whose [start_time, end_time) contains the event start time.
-          * Divides each trace by the matching gain for its seed_id.
-          * If `allow_station_fallback=True`, tries station-scoped fallbacks:
-              NET.STA.LOC.CHA → NET.STA..CHA → NET.STA.*.CHA → NET.STA.*.* → NET.STA
-          * Traces without a matching gain are left unchanged.
-    """
-
-    print(f"[ASL] Preparing VSAM for event folder: {event_dir}")
-    os.makedirs(event_dir, exist_ok=True)
-
-    # --------------------------
-    # 1) Apply station gains (interval table, long/tidy)
-    # --------------------------
-    if station_gains_df is not None and len(station_gains_df):
-        try:
-            info = apply_interval_station_gains(
-                stream,
-                station_gains_df,
-                allow_station_fallback=allow_station_fallback,
-                verbose=True,
-            )
-            s = info.get("interval_start"); e = info.get("interval_end")
-            used = info.get("used", []); miss = info.get("missing", [])
-            print(f"[GAINS] Interval used: {s} → {e} | corrected {len(used)} traces; missing {len(miss)}")
-        except Exception as e:
-            print(f"[GAINS:WARN] Failed to apply interval gains: {e}")
-    else:
-        print("[GAINS] No station gains DataFrame provided; skipping.")
-
-    # Ensure velocity units for downstream plots (don’t overwrite if already set)
-    for tr in stream:
-        if tr.stats.get("units") in (None, ""):
-            tr.stats["units"] = "m/s"
-
-    # --------------------------
-    # 2) Build VSAM
-    # --------------------------
-    vsamObj = VSAM(stream=stream, sampling_interval=1.0)
-    if len(vsamObj.dataframes) == 0:
-        raise IOError("[ASL:ERR] No dataframes in VSAM object")
-
-    if not dry_run:
-        print("[ASL:PLOT] Writing VSAM preview (VSAM.png)")
-        vsamObj.plot(equal_scale=False, outfile=os.path.join(event_dir, "VSAM.png"))
-        # close any pyplot figs opened by VSAM.plot to avoid figure buildup
-        try:
-            plt.close('all')
-        except Exception:
-            pass
-
-    # --------------------------
-    # 3) Decide event peakf
-    # --------------------------
-    if peakf_override is None:
-        freqs = [df.attrs.get("peakf") for df in vsamObj.dataframes.values() if df.attrs.get("peakf") is not None]
-        if freqs:
-            peakf_event = int(round(sum(freqs) / len(freqs)))
-            print(f"[ASL] Event peak frequency inferred from VSAM: {peakf_event} Hz")
-        else:
-            peakf_event = int(round(asl_config["ampcorr"].params.peakf))
-            print(f"[ASL] Using global/default peak frequency from ampcorr: {peakf_event} Hz")
-    else:
-        peakf_event = int(round(peakf_override))
-        print(f"[ASL] Using peak frequency override: {peakf_event} Hz")
-
-    # --------------------------
-    # 4) Amplitude corrections cache (swap if peakf differs)
-    # --------------------------
-    ampcorr: AmpCorr = asl_config["ampcorr"]
-    if abs(float(ampcorr.params.peakf) - float(peakf_event)) > 1e-6:
-        print(f"[ASL] Switching amplitude corrections to peakf={peakf_event} Hz (from {ampcorr.params.peakf})")
-
-        # Use the grid’s actual signature object and the distance signature you *already* computed
-        grid_sig = asl_config["gridobj"].signature()                # works for Grid or NodeGrid
-        dist_sig = distances_signature(asl_config["node_distances_km"])
-        inv_sig  = tuple(sorted(asl_config["node_distances_km"].keys()))
-
-        params = ampcorr.params
-        new_params = AmpCorrParams(
-            surface_waves=params.surface_waves,
-            wave_speed_kms=params.wave_speed_kms,
-            Q=params.Q,
-            peakf=float(peakf_event),
-            grid_sig=grid_sig,            # ← was wrong before
-            inv_sig=inv_sig,
-            dist_sig=dist_sig,
-            mask_sig=None,
-            code_version=params.code_version,
-        )
-
-        ampcorr = AmpCorr(new_params, cache_dir=ampcorr.cache_dir)
-        ampcorr.compute_or_load(asl_config["node_distances_km"])    # reuse the same (now 3-D) distances
-        asl_config[f"ampcorr_peakf_{peakf_event}"] = ampcorr
-    else:
-        print(f"[ASL] Using existing amplitude corrections (peakf={ampcorr.params.peakf} Hz)")
-
-    # --------------------------
-    # 5) Build ASL object and inject geometry/corrections
-    # --------------------------
-    print("[ASL] Building ASL object…")
-    aslobj = ASL(
-        vsamObj,
-        asl_config["vsam_metric"],
-        asl_config["gridobj"],
-        asl_config["window_seconds"],
-    )
-    aslobj.node_distances_km   = asl_config["node_distances_km"]
-    aslobj.station_coordinates = asl_config["station_coords"]
-    aslobj.amplitude_corrections = ampcorr.corrections
-
-    # Params for provenance / filenames
-    aslobj.Q = ampcorr.params.Q
-    aslobj.peakf = ampcorr.params.peakf
-    aslobj.wavespeed_kms = ampcorr.params.wave_speed_kms
-    aslobj.surfaceWaves = ampcorr.params.surface_waves
-
-    # --------------------------
-    # 6) Locate
-    # --------------------------
-    # Extra sanity check
-    # From asl_config
-    station_coords = asl_config["station_coords"]
-    meta = asl_config.get("dist_meta", {})
-
-    print(f"[DIST] used_3d={meta.get('used_3d')}  "
-        f"has_node_elevations={meta.get('has_node_elevations')}  "
-        f"n_nodes={meta.get('n_nodes')}  n_stations={meta.get('n_stations')}")
-    z_grid = getattr(asl_config["gridobj"], "node_elev_m", None)
-    if z_grid is not None:
-        import numpy as np
-        print(f"[GRID] Node elevations: min={np.nanmin(z_grid):.1f} m  max={np.nanmax(z_grid):.1f} m")
-    ze = [c.get("elevation", 0.0) for c in station_coords.values()]
-    print(f"[DIST] Station elevations: min={min(ze):.1f} m  max={max(ze):.1f} m")
-
-    print("[ASL] Locating source with fast_locate()…")
-    try:
-        aslobj.fast_locate()
-        print("[ASL] Location complete.")
-    except Exception:
-        print("[ASL:ERR] Location failed.")
-        raise
-
-    aslobj.print_event()
-
-    # --------------------------
-    # 7) Outputs
-    # --------------------------
-    if not dry_run:
-        qml_out = os.path.join(event_dir, f"event_Q{int(aslobj.Q)}_F{int(peakf_event)}.qml")
-        print(f"[ASL:OUT] Writing QuakeML: {qml_out}")
-        aslobj.save_event(outfile=qml_out)
-
-        dem_tif_for_bmap = asl_config.get("dem_tif") or asl_config.get("dem_tif_for_bmap")
-
-        try:
-            print("[ASL:PLOT] Writing map and diagnostic plots…")
-            # Simple basemap, no shading, same DEM as channels if provided
-            aslobj.plot(
-                zoom_level=0,
-                threshold_DR=0.0,
-                scale=0.2,
-                join=True,
-                number=0,
-                add_labels=True,
-                stations=[tr.stats.station for tr in stream],
-                outfile=os.path.join(event_dir, f"map_Q{int(aslobj.Q)}_F{int(peakf_event)}.png"),
-                dem_tif=dem_tif_for_bmap,
-                simple_basemap=True,
-            )
-            plt.close('all')
-
-            print("[ASL:SOURCE_TO_CSV] Writing source to a CSV…")
-            aslobj.source_to_csv(os.path.join(event_dir, f"source_Q{int(aslobj.Q)}_F{int(peakf_event)}.csv"))
-
-            print("[ASL:PLOT_REDUCED_DISPLACEMENT]")
-            aslobj.plot_reduced_displacement(
-                outfile=os.path.join(event_dir, f"reduced_disp_Q{int(aslobj.Q)}_F{int(peakf_event)}.png")
-            )
-            plt.close()
-
-            print("[ASL:PLOT_MISFIT]")
-            aslobj.plot_misfit(
-                outfile=os.path.join(event_dir, f"misfit_Q{int(aslobj.Q)}_F{int(peakf_event)}.png")
-            )
-            plt.close()
-
-            print("[ASL:PLOT_MISFIT_HEATMAP]")
-            aslobj.plot_misfit_heatmap(
-                outfile=os.path.join(event_dir, f"misfit_heatmap_Q{int(aslobj.Q)}_F{int(peakf_event)}.png")
-            )
-            # PyGMT figures are managed inside; still good to close pyplot
-            plt.close('all')
-
-        except Exception:
-            print("[ASL:ERR] Plotting failed.")
-            raise
-
-        if asl_config.get("interactive", False):
-            input("[ASL] Press Enter to continue to next event…")
-
-
-from types import SimpleNamespace
-def _as_regular_view(obj):
-    """Small helper to ensure we only use attributes ASL actually touches."""
-    return SimpleNamespace(
-        id=getattr(obj, "id", "gridview"),
-        gridlat=np.asarray(obj.gridlat).reshape(-1),
-        gridlon=np.asarray(obj.gridlon).reshape(-1),
-        # nlat/nlon are optional; most ASL code uses reshape(-1)
-        nlat=getattr(obj, "nlat", None),
-        nlon=getattr(obj, "nlon", None),
-        node_spacing_m=getattr(obj, "node_spacing_m", None),
-    )
-
-def _movavg_1d(x: np.ndarray, w: int) -> np.ndarray:
-    """Simple centered moving average; returns x if w invalid."""
-    x = np.asarray(x, float)
-    if w is None or w < 3 or w % 2 == 0 or x.size < w:
-        return x
-    k = np.ones(w, dtype=float) / w
-    # fill NaNs with median to avoid gaps
-    x_fill = np.where(np.isfinite(x), x, np.nanmedian(x))
-    y = np.convolve(x_fill, k, mode="same")
-    return y
-
-def _grid_shape_or_none(gridobj):
-    """Return (nlat, nlon) if present/consistent; else None."""
-    nlat = getattr(gridobj, "nlat", None)
-    nlon = getattr(gridobj, "nlon", None)
-    glat = np.asarray(gridobj.gridlat).reshape(-1)
-    if nlat and nlon and nlat * nlon == glat.size:
-        return int(nlat), int(nlon)
-    return None
-
-def _median_filter_indices(idx: np.ndarray, win: int) -> np.ndarray:
-    """Centered odd-window median filter on integer indices with simple edge padding."""
-    if win < 3 or win % 2 == 0:
-        return idx
-    n, r = idx.size, win // 2
-    out = idx.copy()
-    # reflect-pad
-    pad_left  = idx[1:r+1][::-1] if n > 1 else idx[:1]
-    pad_right = idx[-r-1:-1][::-1] if n > 1 else idx[-1:]
-    padded = np.concatenate([pad_left, idx, pad_right])
-    for i in range(n):
-        out[i] = int(np.median(padded[i:i+win]))
-    return out
-
-from obspy.geodetics.base import gps2dist_azimuth
-def _grid_pairwise_km(flat_lat: np.ndarray, flat_lon: np.ndarray) -> np.ndarray:
-    """Square matrix D[j,k] = great-circle distance (km) between grid nodes j,k."""
-    
-    J = flat_lat.size
-    D = np.empty((J, J), dtype=float)
-    for j in range(J):
-        latj, lonj = float(flat_lat[j]), float(flat_lon[j])
-        for k in range(J):
-            latk, lonk = float(flat_lat[k]), float(flat_lon[k])
-            D[j, k] = 0.001 * gps2dist_azimuth(latj, lonj, latk, lonk)[0]
-    return D
-
-def _viterbi_smooth_indices(
-    misfits_TJ: np.ndarray,    # shape (T, J)
-    flat_lat: np.ndarray,      # shape (J,)
-    flat_lon: np.ndarray,      # shape (J,)
-    lambda_km: float = 1.0,    # step penalty [cost per km]
-    max_step_km: float | None = None,  # forbid jumps larger than this (None=disabled)
-) -> np.ndarray:
-    """
-    Dynamic programming path: minimize sum_t ( misfit[t, j_t] + lambda_km * dist(j_{t-1}, j_t) ).
-    Returns best indices j_t (shape (T,)).
-    """
-    T, J = misfits_TJ.shape
-    D = _grid_pairwise_km(flat_lat, flat_lon)   # (J, J)
-    if max_step_km is not None:
-        # disallow large jumps by inflating cost to inf
-        mask = D > float(max_step_km)
-        D = np.where(mask, np.inf, D)
-
-    # DP tables
-    dp  = np.full((T, J), np.inf, dtype=float)
-    bp  = np.full((T, J), -1,   dtype=int)
-    dp[0, :] = misfits_TJ[0, :]
-
-    for t in range(1, T):
-        # cost to arrive at node j at time t from all k at t-1
-        # dp[t-1, k] + lambda*D[k,j]  → take min over k
-        trans = dp[t-1, :, None] + lambda_km * D[None, :, :]  # (J, J)
-        kbest = np.nanargmin(trans, axis=0)                   # (J,)
-        dp[t, :] = misfits_TJ[t, np.arange(J)] + trans[kbest, np.arange(J)]
-        bp[t, :] = kbest
-
-    # backtrack
-    jT = int(np.nanargmin(dp[-1, :]))
-    path = np.empty(T, dtype=int)
-    path[-1] = jT
-    for t in range(T-2, -1, -1):
-        path[t] = int(bp[t+1, path[t+1]])
-    return path
+        kw = {}
+        if misfit_backend is not None:       kw["misfit_backend"] = misfit_backend
+        if spatial_smooth_sigma is not None: kw["spatial_smooth_sigma"] = spatial_smooth_sigma
+        if temporal_smooth_mode is not None: kw["temporal_smooth_mode"] = temporal_smooth_mode
+        if temporal_smooth_win is not None:  kw["temporal_smooth_win"] = temporal_smooth_win
+        if viterbi_lambda_km is not None:    kw["viterbi_lambda_km"] = viterbi_lambda_km
+        if viterbi_max_step_km is not None:  kw["viterbi_max_step_km"] = viterbi_max_step_km
+        if min_stations is not None:         kw["min_stations"] = min_stations
+        if eps is not None:                  kw["eps"] = eps
+        if use_median_for_DR is not None:    kw["use_median_for_DR"] = use_median_for_DR
+        if batch_size is not None:           kw["batch_size"] = batch_size
+        return kw

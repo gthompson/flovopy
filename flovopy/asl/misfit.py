@@ -311,7 +311,7 @@ def plot_misfit_heatmap_for_peak_DR(
     import xarray as xr
     import pygmt
     from datetime import datetime
-
+    from flovopy.asl.map import topo_map
     ts = lambda: datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     if aslobj.source is None:
@@ -387,7 +387,6 @@ def plot_misfit_heatmap_for_peak_DR(
             region=region,
             dem_tif=dem_tif,
             title=title or "Misfit heatmap (peak DR time)",
-            simple_basemap=simple_basemap,
         )
         print(f"[{ts()}] [MISFIT] basemap ready (region={region})")
 

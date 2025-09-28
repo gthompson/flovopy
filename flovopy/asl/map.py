@@ -289,7 +289,7 @@ def topo_map(
 # ----------------------------
 # Heatmap
 # ----------------------------
-def plot_heatmap_montserrat_colored(
+def plot_heatmap_colored(
     df: pd.DataFrame,
     lat_col: str = "latitude",
     lon_col: str = "longitude",

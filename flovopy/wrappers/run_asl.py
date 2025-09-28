@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from obspy import Stream, Inventory
 from flovopy.processing.sam import DSAM, DRS, RSAM
-from flovopy.analysis.asl import ASL, initial_source, make_grid, dome_location
+from obsolete.asl import ASL, initial_source, make_grid, dome_location
 from flovopy.processing.detection import run_event_detection, detection_snr, plot_detected_stream, run_monte_carlo, detect_network_event
 #from flovopy.processing.metrics import signal2noise
 

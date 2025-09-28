@@ -282,3 +282,25 @@ def geo_distance_3d_km(lat1: float, lon1: float, elev1_m: float | None,
     d_m, _, _ = gps2dist_azimuth(lat1, lon1, lat2, lon2)
     dz_m = float((elev2_m or 0.0) - (elev1_m or 0.0))
     return math.hypot(d_m / 1000.0, dz_m / 1000.0)
+
+def compute_azimuthal_gap(origin_lat: float, origin_lon: float,
+                          station_coords: Iterable[Tuple[float, float]]) -> tuple[float, int]:
+    """
+    Compute the classical azimuthal gap and station count.
+
+    station_coords: iterable of (lat, lon)
+    Returns: (max_gap_deg, n_stations)
+    """
+    azimuths: list[float] = []
+    for stalat, stalon in station_coords:
+        _, az, _ = gps2dist_azimuth(origin_lat, origin_lon, stalat, stalon)
+        azimuths.append(float(az))
+
+    n = len(azimuths)
+    if n < 2:
+        return 360.0, n
+
+    azimuths.sort()
+    azimuths.append(azimuths[0] + 360.0)
+    gaps = [azimuths[i + 1] - azimuths[i] for i in range(n)]
+    return max(gaps), n
