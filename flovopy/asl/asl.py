@@ -11,7 +11,7 @@ Overview
 The ASL workflow combines:
 - Precomputed station–node distances (km) on a regular or masked grid
 - Amplitude correction tables (frequency, attenuation, path effects)
-- VSAM (Volcano Seismic Amplitude Measurement) time series per station
+- VSAM (Velocity Seismic Amplitude Measurement) time series per station
 - Misfit evaluation across candidate nodes
 - Fast search refinements (bounding box or sector masking)
 - Output in QuakeML, CSV, and diagnostic plots
@@ -29,21 +29,18 @@ from __future__ import annotations
 
 # stdlib
 from datetime import datetime
-import warnings
-from typing import Optional, Iterable, Tuple, Dict, Any
+from typing import Optional
 from pprint import pprint
 from contextlib import contextmanager
 
-from obspy.core.event import (
-    Event, Origin, OriginQuality, ResourceIdentifier, Comment,
-    QuantityError, Amplitude, Catalog
-)
+from obspy.core.event import Catalog
 
 # third-party
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
-from obspy import Stream, UTCDateTime
+from obspy import Stream
 from obspy.geodetics.base import gps2dist_azimuth
 
 # SciPy (guarded: locate/fast_locate accept None and skip blur;
@@ -70,11 +67,12 @@ from flovopy.asl.ampcorr import AmpCorr, AmpCorrParams
 from flovopy.asl.distances import compute_distances, distances_signature, compute_azimuthal_gap #, geo_distance_3d_km
 from flovopy.utils.make_hash import make_hash
 from flovopy.asl.grid import NodeGrid, Grid
-from flovopy.asl.utils import _grid_mask_indices, compute_spatial_connectedness, _grid_shape_or_none, _median_filter_indices, _viterbi_smooth_indices, _as_regular_view
+from flovopy.asl.utils import _grid_mask_indices, compute_spatial_connectedness, _grid_shape_or_none, _median_filter_indices, _viterbi_smooth_indices, _as_regular_view, _movavg_1d, _movmed_1d
 
 # plotting helpers (topo base, diagnostic heatmap)
 from flovopy.asl.map import topo_map
-from flovopy.asl.misfit import plot_misfit_heatmap_for_peak_DR, StdOverMeanMisfit  # , R2DistanceMisfit  # (import when needed)
+from flovopy.asl.misfit import plot_misfit_heatmap_for_peak_DR, StdOverMeanMisfit #,  R2DistanceMisfit  # (import when needed)
+
 
 # ----------------------------------------------------------------------
 # Main ASL class
@@ -147,8 +145,8 @@ class ASL:
         # Provenance parameters (set later by sausage or manually)
         self.Q: Optional[float] = None
         self.peakf: Optional[float] = None
-        self.wavespeed_kms: Optional[float] = None
-        self.surfaceWaves: Optional[bool] = None
+        self.wave_speed_kms: Optional[float] = None
+        self.assume_surface_waves: Optional[bool] = None
 
         # Internal state
         self._node_mask: Optional[np.ndarray] = None
@@ -241,8 +239,8 @@ class ASL:
     def compute_amplitude_corrections(
         self,
         *,
-        surface_waves: bool = True,
-        wavespeed_kms: float = 2.5,
+        assume_surface_waves: bool = True,
+        wave_speed_kms: float = 2.5,
         Q: float | None = 23,
         peakf: float = 8.0,
         dtype: str = "float32",
@@ -259,10 +257,10 @@ class ASL:
 
         Parameters
         ----------
-        surface_waves : bool, default True
+        assume_surface_waves : bool, default True
             If True, apply surface-wave style attenuation in the model;
             if False, choose body-wave style (your AmpCorr implementation decides).
-        wavespeed_kms : float, default 2.5
+        wave_speed_kms : float, default 2.5
             Assumed (phase/group) wave speed in km/s used in attenuation/Q terms.
         Q : float or None, default 23
             Quality factor (attenuation). If None, a pure geometric correction
@@ -291,7 +289,7 @@ class ASL:
         ------------
         - Sets:
             * ``self.amplitude_corrections``
-            * ``self.Q``, ``self.peakf``, ``self.wavespeed_kms``, ``self.surfaceWaves``
+            * ``self.Q``, ``self.peakf``, ``self.wave_speed_kms``, ``self.assume_surface_waves``
             * ``self._ampcorr`` (the AmpCorr object, for diagnostics/metadata)
 
         Raises
@@ -316,13 +314,13 @@ class ASL:
 
         if verbose:
             print("[ASL] Computing amplitude corrections "
-                f"(surface_waves={surface_waves}, v={wavespeed_kms} km/s, "
+                f"(assume_surface_waves={assume_surface_waves}, v={wave_speed_kms} km/s, "
                 f"Q={Q}, peakf={peakf} Hz)…")
 
         # Build a parameter block tied to the *current* grid/distances.
         params = AmpCorrParams(
-            surface_waves=bool(surface_waves),
-            wave_speed_kms=float(wavespeed_kms),
+            assume_surface_waves=bool(assume_surface_waves),
+            wave_speed_kms=float(wave_speed_kms),
             Q=None if Q is None else float(Q),
             peakf=float(peakf),
             grid_sig=self.gridobj.signature().as_tuple(),
@@ -351,8 +349,8 @@ class ASL:
         # Keep key parameters on the ASL object for provenance/filenames
         self.Q = params.Q
         self.peakf = params.peakf
-        self.wavespeed_kms = params.wave_speed_kms
-        self.surfaceWaves = params.surface_waves
+        self.wave_speed_kms = params.wave_speed_kms
+        self.assume_surface_waves = params.assume_surface_waves
 
         if verbose:
             print(f"[ASL] Amplitude corrections ready for "
@@ -634,21 +632,19 @@ class ASL:
             azgap, _ = compute_azimuthal_gap(source_lat[i], source_lon[i], station_coords)
             source_azgap[i] = azgap
 
-        # Optional temporal smoothing on tracks (centered moving average)
-        def _movavg_1d(x, w):
-            x = np.asarray(x, float)
-            if w < 3 or w % 2 == 0:
-                return x
-            k = w // 2
-            pad = np.pad(x, (k, k), mode="edge")
-            ker = np.ones(w, dtype=float) / float(w)
-            y = np.convolve(pad, ker, mode="valid")
-            return y
 
-        if temporal_smooth_win and temporal_smooth_win >= 3 and temporal_smooth_win % 2 == 1:
-            source_lat = _movavg_1d(source_lat, temporal_smooth_win)
-            source_lon = _movavg_1d(source_lon, temporal_smooth_win)
-            source_DR  = _movavg_1d(source_DR,  temporal_smooth_win)
+
+        # --- Temporal smoothing (robust) ---
+        w = int(temporal_smooth_win or 0)
+        if w >= 3:
+            # ensure centered window (odd); if even, bump by one
+            if w % 2 == 0:
+                w += 1
+            # Robust path: median for coordinates (kills outliers),
+            # gentle mean for DR (matches fast_locate's behavior).
+            source_lat = _movmed_1d(source_lat, w)
+            source_lon = _movmed_1d(source_lon, w)
+            source_DR  = _movavg_1d(source_DR,  w)
 
         # Package source (keep DR scale factor for continuity with fast_locate)
         self.source = {
@@ -676,7 +672,7 @@ class ASL:
         self.source["connectedness"] = conn["score"]
 
         # ObsPy event packaging
-        self.source_to_obspyevent()
+        #self.source_to_obspyevent()
         self.located = True
         if hasattr(self, "set_id"):
             self.id = self.set_id()
@@ -1164,7 +1160,7 @@ class ASL:
         self.source["connectedness"] = conn["score"]
 
         # Package to ObsPy Event and finish
-        self.source_to_obspyevent()
+        #self.source_to_obspyevent()
         self.located = True
         if hasattr(self, "set_id"):
             self.id = self.set_id()
@@ -1979,187 +1975,6 @@ class ASL:
         plot_misfit_heatmap_for_peak_DR(self, backend=backend, cmap=cmap, transparency=transparency, outfile=outfile, region=region)
 
 
-    # ---------- ObsPy event ----------
-    def source_to_obspyevent(self, event_id: str | None = None):
-        """
-        Convert the current ASL source track to an ObsPy :class:`Event`.
-
-        Parameters
-        ----------
-        event_id : str or None
-            Optional event identifier used to build stable resource IDs. If None,
-            a timestamp derived from the first sample time is used.
-
-        Notes
-        -----
-        - Writes the resulting Event to ``self.event``.
-        - Each time sample becomes an :class:`Origin` with quality fields:
-        azimuthal_gap, used_station_count, and standard_error (misfit).
-        - A companion :class:`Amplitude` is added per frame with the DR value.
-        - Distances used for OriginQuality min/median/max are computed in **km**
-        using a simple 3‐D great-circle + elevation difference approximation.
-        - Node elevation (if your grid provides ``node_elev_m``) is associated to
-        each origin by nearest grid node in (lat, lon).
-        """
-        src = getattr(self, "source", None)
-        if not src:
-            return
-
-        # derive event id if needed
-        t0 = src.get("t", None)
-        if event_id is None:
-            if t0 is None or len(t0) == 0:
-                event_id = "asl_unknown"
-            else:
-                tfirst = t0[0] if isinstance(t0[0], UTCDateTime) else UTCDateTime(t0[0])
-                event_id = tfirst.strftime("%Y%m%d%H%M%S")
-
-        ev = Event()
-        ev.resource_id = ResourceIdentifier(f"smi:example.org/event/{event_id}")
-        ev.event_type = "landslide"
-        ev.comments.append(Comment(text="Origin.quality distance fields are in kilometers, not degrees."))
-
-        # convenience arrays (len = T)
-        lat_arr = np.asarray(src.get("lat", []), float)
-        lon_arr = np.asarray(src.get("lon", []), float)
-        DR_arr  = np.asarray(src.get("DR", []), float)
-        mis_arr = np.asarray(src.get("misfit", [np.nan] * len(lat_arr)), float)
-
-        times = src.get("t", [])
-        if len(times) != len(lat_arr):
-            # guard: inconsistent lengths
-            n = min(len(times), len(lat_arr), len(lon_arr), len(DR_arr), len(mis_arr))
-            times  = times[:n]
-            lat_arr = lat_arr[:n]
-            lon_arr = lon_arr[:n]
-            DR_arr  = DR_arr[:n]
-            mis_arr = mis_arr[:n]
-
-        azgap = src.get("azgap", [None] * len(times))
-        nsta  = src.get("nsta",  [None] * len(times))
-
-        # grid elevation (optional)
-        node_z = getattr(self.gridobj, "node_elev_m", None)
-        glat = np.asarray(self.gridobj.gridlat).reshape(-1)
-        glon = np.asarray(self.gridobj.gridlon).reshape(-1)
-        gz   = np.asarray(node_z).reshape(-1) if node_z is not None else None
-
-        # station coordinates
-        sta_coords = list(self.station_coordinates.values())
-
-        # simple local helper (no external import needed)
-        def _geo_distance_3d_km(lat1, lon1, elev_m1, lat2, lon2, elev_m2) -> float:
-            d2d_m, _, _ = gps2dist_azimuth(float(lat1), float(lon1),
-                                        float(lat2), float(lon2))
-            dz_m = float(elev_m2) - float(elev_m1)
-            return 0.001 * float(np.hypot(d2d_m, dz_m))
-
-        for i, (t, lat, lon, DR, misfit_val) in enumerate(zip(times, lat_arr, lon_arr, DR_arr, mis_arr)):
-            if not isinstance(t, UTCDateTime):
-                t = UTCDateTime(t)
-
-            origin = Origin()
-            origin.resource_id = ResourceIdentifier(f"smi:example.org/origin/{event_id}_{i:03d}")
-            origin.time = t
-            origin.latitude = float(lat)
-            origin.longitude = float(lon)
-            origin.depth = 0.0  # set 0 m; grid is 2-D in this implementation
-
-            oq = OriginQuality()
-
-            # attach misfit & azgap / nsta if available
-            oq.standard_error = (float(misfit_val) if np.isfinite(misfit_val) else None)
-            if i < len(azgap) and azgap[i] is not None:
-                val = float(azgap[i])
-                oq.azimuthal_gap = val if np.isfinite(val) else None
-            if i < len(nsta) and nsta[i] is not None:
-                nval = int(nsta[i])
-                oq.used_station_count = nval if nval >= 0 else None
-
-            # nearest grid-node elevation for this origin (if provided)
-            elev_node_m = 0.0
-            if gz is not None and np.isfinite(gz).any():
-                j0 = int(np.nanargmin((glat - lat) ** 2 + (glon - lon) ** 2))
-                elev_node_m = float(gz[j0])
-
-            # compute station distance distribution (km)
-            distances_km = []
-            for sc in sta_coords:
-                stalat = float(sc.get("latitude", np.nan))
-                stalon = float(sc.get("longitude", np.nan))
-                staelev = float(sc.get("elevation", 0.0))
-                if not (np.isfinite(stalat) and np.isfinite(stalon)):
-                    continue
-                d_km = _geo_distance_3d_km(lat, lon, elev_node_m, stalat, stalon, staelev)
-                distances_km.append(d_km)
-
-            if distances_km:
-                oq.minimum_distance = float(np.min(distances_km))
-                oq.maximum_distance = float(np.max(distances_km))
-                oq.median_distance  = float(np.median(distances_km))
-
-            origin.quality = oq
-
-            # time uncertainty → we store misfit as a QuantityError for transparency
-            if np.isfinite(misfit_val):
-                origin.time_errors = QuantityError(uncertainty=float(misfit_val))
-
-            ev.origins.append(origin)
-
-            # store DR as a generic amplitude (units left generic)
-            amp = Amplitude()
-            amp.resource_id = ResourceIdentifier(f"smi:example.org/amplitude/{event_id}_{i:03d}")
-            amp.generic_amplitude = float(DR) if np.isfinite(DR) else None
-            amp.unit = "other"
-            amp.pick_id = origin.resource_id
-            ev.amplitudes.append(amp)
-
-        self.event = ev
-
-
-    def save_event(self, outfile: str | None = None):
-        """
-        Write the current ObsPy :class:`Event` to QuakeML.
-
-        Parameters
-        ----------
-        outfile : str or None
-            Destination file path (e.g., ``"event.xml"``). If None, this is a no-op.
-
-        Notes
-        -----
-        - Requires that :meth:`source_to_obspyevent` has created ``self.event``.
-        - Wraps the single Event in a :class:`Catalog` and saves as QuakeML.
-        """
-        if not outfile:
-            return
-        ev = getattr(self, "event", None)
-        if ev is None:
-            print("[ASL] No Event to save. Did you call source_to_obspyevent()?")
-            return
-
-        try:
-            cat = Catalog(events=[ev])
-            cat.write(outfile, format="QUAKEML")
-            print(f"[ASL] ✓ QuakeML written: {outfile}")
-        except Exception as e:
-            print(f"[ASL] ERROR writing QuakeML: {e!r}")
-
-
-    def print_event(self):
-        """
-        Pretty-print the current ObsPy :class:`Event` (debug/inspection utility).
-        """
-        ev = getattr(self, "event", None)
-        if ev is None:
-            print("[ASL] No Event available. Run source_to_obspyevent() first.")
-            return
-        try:
-            pprint(ev)
-        except Exception:
-            # Fallback string repr
-            print(ev)
-
 
     def source_to_dataframe(self) -> "pd.DataFrame | None":
         """
@@ -2261,7 +2076,7 @@ class ASL:
         eps_amp: float = 1e-12,
         eps_dist_km: float = 1e-6,
         freq_hz: float | None = None,       # if None, falls back to self.peakf
-        wavespeed_kms: float | None = None, # if None, falls back to self.wavespeed_kms
+        wave_speed_kms: float | None = None, # if None, falls back to self.wave_speed_kms
         verbose: bool = True,
     ) -> dict:
         """
@@ -2313,7 +2128,7 @@ class ASL:
 
         # choose frequency/velocity for Q
         f_hz = float(freq_hz if freq_hz is not None else getattr(self, "peakf", np.nan))
-        v_kms = float(wavespeed_kms if wavespeed_kms is not None else getattr(self, "wavespeed_kms", np.nan))
+        v_kms = float(wave_speed_kms if wave_speed_kms is not None else getattr(self, "wave_speed_kms", np.nan))
 
         # --- helpers ---
         def _distances_for_node(nj: int, seed_ids: list[str]) -> np.ndarray:

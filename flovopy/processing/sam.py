@@ -1648,7 +1648,7 @@ class VSAM(SAM):
         return corrected_dataframes
     
     def compute_reduced_velocity(self, inventory, source, surfaceWaves=False, Q=None, wavespeed_kms=None, peakf=None):
-        corrected_dataframes = self.reduce(inventory, source, surfaceWaves=surfaceWaves, Q=Q, wavespeed_kms=wavspeed_kms, fixpeakf=peakf)
+        corrected_dataframes = self.reduce(inventory, source, surfaceWaves=surfaceWaves, Q=Q, wavespeed_kms=wavespeed_kms, fixpeakf=peakf)
         if surfaceWaves:
             return VRS(dataframes=corrected_dataframes)
         else:

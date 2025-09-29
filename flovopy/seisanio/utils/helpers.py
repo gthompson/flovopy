@@ -2,6 +2,7 @@ import os
 from glob import glob
 #import datetime as dt
 from obspy import UTCDateTime, Stream
+from flovopy.core.miniseed_io import write_mseed
 
 # need to leave this here to prevent circular imports between Wavfile and Sfile
 def filetime2spath(filetime, mainclass='L', db=None, seisan_top=None, fullpath=True):
@@ -192,5 +193,8 @@ def write_wavfile(
     os.makedirs(out_dir, exist_ok=True)
 
     out_path = os.path.join(out_dir, basename)
-    st.write(out_path, format=fmt)
+    if fmt.lower()=='mseed':
+        write_mseed(st, out_path)
+    else:
+        st.write(out_path, format=fmt)
     return out_path

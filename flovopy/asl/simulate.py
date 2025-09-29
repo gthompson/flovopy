@@ -17,7 +17,7 @@ def synthetic_source_from_grid(grid, sampling_interval: float = 60.0, DR_cm2: fl
     npts = lat.size
     return {"lat": lat, "lon": lon, "DR": np.full(npts, float(DR_cm2)), "t": [t0 + i * sampling_interval for i in range(npts)]}
 
-def simulate_SAM(inv: Inventory, source, units="m/s", surfaceWaves=False, wavespeed_kms=1.5, peakf=8.0, Q=None, noise_level_percent=0.0, verbose=False):
+def simulate_SAM(inv: Inventory, source, units="m/s", assume_surface_waves=False, wave_speed_kms=1.5, peakf=8.0, Q=None, noise_level_percent=0.0, verbose=False):
     sam_class = VSAM if units == "m/s" else DSAM
     if not isinstance(inv, Inventory):
         return None
@@ -29,8 +29,8 @@ def simulate_SAM(inv: Inventory, source, units="m/s", surfaceWaves=False, wavesp
         net, sta, loc, chan = sid.split(".")
         coords = inv.get_coordinates(sid)
         dist_km = degrees2kilometers(locations2degrees(coords["latitude"], coords["longitude"], source["lat"], source["lon"]))
-        gsc = sam_class.compute_geometrical_spreading_correction(dist_km, chan, surfaceWaves=surfaceWaves, wavespeed_kms=wavespeed_kms, peakf=peakf)
-        isc = sam_class.compute_inelastic_attenuation_correction(dist_km, peakf, wavespeed_kms, Q)
+        gsc = sam_class.compute_geometrical_spreading_correction(dist_km, chan, assume_surface_waves=assume_surface_waves, wave_speed_kms=wave_speed_kms, peakf=peakf)
+        isc = sam_class.compute_inelastic_attenuation_correction(dist_km, peakf, wave_speed_kms, Q)
         times = [UTCDateTime().timestamp + i for i in range(npts)]
         amplitude = source["DR"] / (gsc * isc) * 1e-7
         if noise_level_percent > 0.0:

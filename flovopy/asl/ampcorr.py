@@ -17,7 +17,7 @@ from flovopy.utils.make_hash import make_hash
 # ----------------------------------------------------------------------
 @dataclass(frozen=True)
 class AmpCorrParams:
-    surface_waves: bool
+    assume_surface_waves: bool
     wave_speed_kms: float
     Q: Optional[float]
     peakf: float
@@ -30,7 +30,7 @@ class AmpCorrParams:
     def key(self) -> str:
         return make_hash(
             self.code_version,
-            self.surface_waves,
+            self.assume_surface_waves,
             self.wave_speed_kms,
             self.Q,
             self.peakf,
@@ -152,7 +152,7 @@ class AmpCorr:
 
             # Compute multiplicative factors
             g = self.geom_spread_fn(
-                d, chan3, self.params.surface_waves, self.params.wave_speed_kms, self.params.peakf
+                d, chan3, self.params.assume_surface_waves, self.params.wave_speed_kms, self.params.peakf
             )
             a = self.inelastic_att_fn(
                 d, self.params.peakf, self.params.wave_speed_kms, self.params.Q

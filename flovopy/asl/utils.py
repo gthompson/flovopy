@@ -5,6 +5,7 @@ from typing import Iterable, Tuple, Optional
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 from obspy.geodetics import gps2dist_azimuth
 
 __all__ = [
@@ -19,8 +20,6 @@ __all__ = [
 ]
 
 # ---------- helpers ----------
-
-
 
 def compute_spatial_connectedness(
     lat: np.ndarray,
@@ -151,16 +150,54 @@ def _as_regular_view(obj):
     )
 
 
+
 def _movavg_1d(x: np.ndarray, w: int) -> np.ndarray:
-    """Simple centered moving average; returns x if w invalid."""
+    """
+    NaN-aware centered moving average with edge correction.
+    - Coerces even windows to the next odd.
+    - Preserves NaNs where the window has no finite samples.
+    """
     x = np.asarray(x, float)
-    if w is None or w < 3 or w % 2 == 0 or x.size < w:
-        return x
-    k = np.ones(w, dtype=float) / w
-    # fill NaNs with median to avoid gaps
-    x_fill = np.where(np.isfinite(x), x, np.nanmedian(x))
-    y = np.convolve(x_fill, k, mode="same")
-    return y
+    if x.size == 0:
+        return x.copy()
+    if w is None or w <= 1:
+        return x.copy()
+
+    w = int(w)
+    if w % 2 == 0:
+        w += 1  # centered window
+
+    v = np.where(np.isfinite(x), x, 0.0)        # values (NaNs -> 0 for accumulation)
+    m = np.isfinite(x).astype(float)            # mask of finite samples
+    k = np.ones(w, float)                       # unnormalized box kernel
+
+    num = np.convolve(v, k, mode="same")        # sum of values in window
+    den = np.convolve(m, k, mode="same")        # count of finite samples in window
+    out = num / den
+    out[den == 0] = np.nan                      # all-NaN windows stay NaN
+    return out
+
+def _movmed_1d(x: np.ndarray, w: int) -> np.ndarray:
+    x = np.asarray(x, float)
+    if x.size == 0 or w is None or w <= 1:
+        return x.copy()
+    w = int(w)
+    if w % 2 == 0:
+        w += 1
+
+    try:
+        return pd.Series(x).rolling(window=w, center=True, min_periods=1).median().to_numpy()
+    except Exception:
+        # Fallback O(T*w) loop (fine for ~hundreds of samples)
+        T = x.size
+        half = w // 2
+        out = np.empty(T, float)
+        for t in range(T):
+            a, b = max(0, t - half), min(T, t + half + 1)
+            win = x[a:b]
+            win = win[np.isfinite(win)]
+            out[t] = np.median(win) if win.size else np.nan
+        return out
 
 
 def _grid_shape_or_none(gridobj):

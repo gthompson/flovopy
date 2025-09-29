@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Protocol, Any, Tuple, Optional, List
 import numpy as np
 
-
 # ---------------------------------------------------------------------
 # Pluggable misfit interface
 # ---------------------------------------------------------------------
@@ -242,194 +241,7 @@ class R2DistanceMisfit:
         return misfit_out, {"mean": mean, "N": N_used.astype(float)}
 
 
-# ---------------------------------------------------------------------
-# Plot: misfit heatmap (colored layer) at time of maximum DR
-# ---------------------------------------------------------------------
 
-
-
-def compute_node_misfit_for_time(
-    aslobj,
-    time_index: int,
-    *,
-    misfit_backend: Optional[MisfitBackend] = None,
-    min_stations: int = 3,
-    eps: float = 1e-9,
-    dtype=np.float32,
-) -> Tuple[np.ndarray, int, dict]:
-    """
-    Recompute per-node misfit at a single time index using the chosen backend.
-
-    Returns
-    -------
-    misfit_vec : (nnodes_visible,) np.ndarray    (after any node-mask/subgrid)
-    jstar      : int                              index of min-misfit in this view
-    extras     : dict                             backend extras (e.g., mean, N)
-    """
-
-    if misfit_backend is None:
-        misfit_backend = StdOverMeanMisfit()
-
-    # Stream → station-by-time matrix, then pull one time column
-    st = aslobj.metric2stream()
-    seed_ids = [tr.id for tr in st]
-    Y = np.vstack([tr.data.astype(dtype, copy=False) for tr in st])
-    y = Y[:, time_index]  # (nsta,)
-
-    # Prepare backend context (respects ASL._node_mask if backend implements it)
-    ctx = misfit_backend.prepare(aslobj, seed_ids, dtype=dtype)
-
-    # Evaluate misfit for all visible nodes
-    misfit_vec, extras = misfit_backend.evaluate(
-        y, ctx, min_stations=min_stations, eps=eps
-    )
-    jstar = int(np.nanargmin(misfit_vec))
-    return misfit_vec, jstar, extras
-
-
-def plot_misfit_heatmap_for_peak_DR(
-    aslobj,
-    *,
-    backend: Optional[MisfitBackend] = None,
-    min_stations: int = 3,
-    eps: float = 1e-9,
-    dtype=np.float32,
-    cmap: str = "turbo",
-    transparency: int = 35,
-    zoom_level: int = 0,
-    add_labels: bool = True,
-    title: Optional[str] = None,
-    outfile: Optional[str] = None,
-    region: Optional[Tuple[float, float, float, float]] = None,
-    dem_tif: Optional[str] = None,
-    simple_basemap: bool = True,   # passed through to topo_map
-):
-    """
-    Compute per-node misfit at the time of maximum DR and overlay it (semi-transparent)
-    on top of a topo_map() basemap. Marks the best node.
-    """
-    import xarray as xr
-    import pygmt
-    from datetime import datetime
-    from flovopy.asl.map import topo_map
-    ts = lambda: datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-    if aslobj.source is None:
-        print(f"[{ts()}] [MISFIT] No source; run locate()/fast_locate() first.")
-        return None
-
-    try:
-        # ---- pick the time of max DR
-        t_idx = int(np.nanargmax(aslobj.source["DR"]))
-        print(f"[{ts()}] [MISFIT] peak DR index={t_idx}")
-
-        # ---- per-node misfit at that time
-        misfit_vec, jstar_local, meta = compute_node_misfit_for_time(
-            aslobj, t_idx, misfit_backend=backend, min_stations=min_stations, eps=eps, dtype=dtype
-        )
-        print(f"[{ts()}] [MISFIT] misfit_vec shape={misfit_vec.shape} finite={np.isfinite(misfit_vec).sum()}")
-
-        # ---- reconstruct full (nlat, nlon) field (handle optional mask)
-        mask = getattr(aslobj, "_node_mask", None)
-        grid = aslobj.gridobj
-        nlat = getattr(grid, "nlat", grid.gridlat.shape[0])
-        nlon = getattr(grid, "nlon", grid.gridlat.shape[1])
-
-        M_full = np.full((nlat * nlon,), np.nan, dtype=float)
-        if mask is None:
-            M_full[:] = misfit_vec
-            jstar_global = jstar_local
-        else:
-            mask = np.asarray(mask, int)
-            if misfit_vec.shape[0] != mask.shape[0]:
-                raise ValueError(f"Mask length mismatch: misfit_vec={misfit_vec.shape[0]} mask={mask.shape[0]}")
-            M_full[mask] = misfit_vec
-            jstar_global = int(mask[jstar_local])
-
-        M = M_full.reshape((nlat, nlon))
-        print(f"[{ts()}] [MISFIT] grid M shape={M.shape} finite={np.isfinite(M).sum()}/{M.size}")
-
-        # ---- coordinate axes (ensure monotonic latitude for plotting)
-        lat_axis = getattr(grid, "latrange", None)
-        lon_axis = getattr(grid, "lonrange", None)
-        if lat_axis is None or lon_axis is None:
-            lat_axis = np.unique(grid.gridlat.ravel())
-            lon_axis = np.unique(grid.gridlon.ravel())
-
-        flipped = False
-        if lat_axis[0] > lat_axis[-1]:
-            lat_axis = lat_axis[::-1]
-            M = M[::-1, :]
-            flipped = True
-            print(f"[{ts()}] [MISFIT] flipped latitude axis to increasing")
-
-        misfit_da = xr.DataArray(M, coords={"lat": lat_axis, "lon": lon_axis}, dims=["lat", "lon"], name="misfit")
-
-        # ---- region: use caller’s region if given; else tight extents with a little pad
-        if region is None:
-            dlon = max(1e-4, 0.02)
-            dlat = max(1e-4, 0.02)
-            region = [float(lon_axis.min() - dlon), float(lon_axis.max() + dlon),
-                      float(lat_axis.min() - dlat), float(lat_axis.max() + dlat)]
-
-        center_lat = float(aslobj.source["lat"][t_idx])
-        center_lon = float(aslobj.source["lon"][t_idx])
-
-        # ---- basemap via topo_map (this is the user’s requirement)
-        fig = topo_map(
-            show=False,
-            zoom_level=zoom_level,
-            inv=None,
-            add_labels=add_labels,
-            centerlat=center_lat,
-            centerlon=center_lon,
-            topo_color=False,           # keep base subdued so heatmap stands out
-            region=region,
-            dem_tif=dem_tif,
-            title=title or "Misfit heatmap (peak DR time)",
-        )
-        print(f"[{ts()}] [MISFIT] basemap ready (region={region})")
-
-        # ---- color scale from finite values
-        finite = np.isfinite(M)
-        if finite.any():
-            vmin = float(np.nanmin(M[finite])); vmax = float(np.nanmax(M[finite]))
-            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
-                vmin, vmax = 0.0, 1.0
-        else:
-            vmin, vmax = 0.0, 1.0
-        pygmt.makecpt(cmap=cmap, series=[vmin, vmax], continuous=True)
-        print(f"[{ts()}] [MISFIT] CPT: {cmap} [{vmin:.3g}, {vmax:.3g}]")
-
-        # ---- overlay the misfit raster (semi-transparent)
-        fig.grdimage(grid=misfit_da, cmap=True, transparency=int(transparency))
-        fig.colorbar(frame='+l"Misfit"')
-
-        # ---- mark best node
-        lon_flat = grid.gridlon.ravel()
-        lat_flat = grid.gridlat.ravel()
-        best_lon = float(lon_flat[jstar_global])
-        best_lat = float(lat_flat[jstar_global])
-        fig.plot(x=[best_lon], y=[best_lat], style="c0.26c", fill="red", pen="1p,red")
-        print(f"[{ts()}] [MISFIT] best node @ (lon,lat)=({best_lon:.5f},{best_lat:.5f}) idx={jstar_global}")
-
-        if outfile:
-            fig.savefig(outfile)
-            print(f"[{ts()}] [MISFIT] saved: {outfile}")
-        else:
-            fig.show()
-
-        return fig, M
-
-    except Exception as e:
-        import traceback
-        print(f"[{ts()}] [MISFIT:ERR] {type(e).__name__}: {e}")
-        traceback.print_exc()
-        raise
-
-# --- in flovopy/asl/misfit.py ---
-
-import numpy as np
 
 class LinearizedDecayMisfit:
     """
@@ -593,3 +405,238 @@ class LinearizedDecayMisfit:
             "Q_hat": (np.pi * self.f_hz) / (np.where(k_hat > 0, k_hat, np.nan) * self.v_kms)
         }
         return misfit, extras
+    
+# ---------------------------------------------------------------------
+# Plot: misfit heatmap (colored layer) at time of maximum DR
+# ---------------------------------------------------------------------
+
+
+
+def compute_node_misfit_for_time(
+    aslobj,
+    time_index: int,
+    *,
+    misfit_backend: Optional[MisfitBackend] = None,
+    min_stations: int = 3,
+    eps: float = 1e-9,
+    dtype=np.float32,
+) -> Tuple[np.ndarray, int, dict]:
+    """
+    Recompute per-node misfit at a single time index using the chosen backend.
+
+    Returns
+    -------
+    misfit_vec : (nnodes_visible,) np.ndarray    (after any node-mask/subgrid)
+    jstar      : int                              index of min-misfit in this view
+    extras     : dict                             backend extras (e.g., mean, N)
+    """
+
+    if misfit_backend is None:
+        misfit_backend = StdOverMeanMisfit()
+
+    # Stream → station-by-time matrix, then pull one time column
+    st = aslobj.metric2stream()
+    seed_ids = [tr.id for tr in st]
+    Y = np.vstack([tr.data.astype(dtype, copy=False) for tr in st])
+    y = Y[:, time_index]  # (nsta,)
+
+    # Prepare backend context (respects ASL._node_mask if backend implements it)
+    ctx = misfit_backend.prepare(aslobj, seed_ids, dtype=dtype)
+
+    # Evaluate misfit for all visible nodes
+    misfit_vec, extras = misfit_backend.evaluate(
+        y, ctx, min_stations=min_stations, eps=eps
+    )
+    jstar = int(np.nanargmin(misfit_vec))
+    return misfit_vec, jstar, extras
+
+
+def plot_misfit_heatmap_for_peak_DR(
+    aslobj,
+    *,
+    backend: Optional[MisfitBackend] = None,
+    min_stations: int = 3,
+    eps: float = 1e-9,
+    dtype=np.float32,
+    cmap: str = "turbo",
+    transparency: int = 35,
+    zoom_level: int = 0,
+    add_labels: bool = True,
+    title: Optional[str] = None,
+    outfile: Optional[str] = None,
+    region: Optional[Tuple[float, float, float, float]] = None,
+    dem_tif: Optional[str] = None,
+    simple_basemap: bool = True,
+):
+    """
+    Compute per-node misfit at the time of maximum DR and overlay it on a topo_map().
+    Supports both 2D regular grids and 1D "stream grids".
+
+    Parameters
+    ----------
+    aslobj : ASL
+        The ASL object with .source and .gridobj populated.
+    backend : MisfitBackend, optional
+        Misfit backend to use.
+    min_stations : int
+        Minimum stations required for misfit computation.
+    eps : float
+        Small epsilon to avoid divide-by-zero.
+    dtype : np.dtype
+        Numeric dtype for computation.
+    cmap : str
+        Colormap name for PyGMT.
+    transparency : int
+        Transparency level (0 opaque – 100 invisible).
+    zoom_level : int
+        Zoom level for topo_map().
+    add_labels : bool
+        Whether to add station labels.
+    title : str, optional
+        Title string for the plot.
+    outfile : str, optional
+        If provided, save the figure here.
+    region : tuple, optional
+        (lon_min, lon_max, lat_min, lat_max). If None, auto-computed.
+    dem_tif : str, optional
+        Path to DEM for topo_map().
+    simple_basemap : bool
+        Passed through to topo_map().
+    """
+    import xarray as xr
+    import pygmt
+    from datetime import datetime
+    from flovopy.asl.map import topo_map
+
+    ts = lambda: datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    if aslobj.source is None:
+        print(f"[{ts()}] [MISFIT] No source; run locate()/fast_locate() first.")
+        return None
+
+    try:
+        # ---- pick the time of max DR
+        t_idx = int(np.nanargmax(aslobj.source["DR"]))
+        print(f"[{ts()}] [MISFIT] peak DR index={t_idx}")
+
+        # ---- per-node misfit
+        misfit_vec, jstar_local, meta = compute_node_misfit_for_time(
+            aslobj, t_idx, misfit_backend=backend,
+            min_stations=min_stations, eps=eps, dtype=dtype
+        )
+        print(f"[{ts()}] [MISFIT] misfit_vec shape={misfit_vec.shape} finite={np.isfinite(misfit_vec).sum()}")
+
+        mask = getattr(aslobj, "_node_mask", None)
+        grid = aslobj.gridobj
+
+        # --- Detect dimensionality
+        if getattr(grid, "gridlat", None) is not None and grid.gridlat.ndim == 2:
+            # --- 2D grid (DEM-backed)
+            nlat, nlon = grid.gridlat.shape
+            M_full = np.full((nlat * nlon,), np.nan, dtype=float)
+            if mask is None:
+                M_full[:] = misfit_vec
+                jstar_global = jstar_local
+            else:
+                mask = np.asarray(mask, int)
+                M_full[mask] = misfit_vec
+                jstar_global = int(mask[jstar_local])
+            M = M_full.reshape((nlat, nlon))
+
+            lat_axis = np.unique(grid.gridlat.ravel())
+            lon_axis = np.unique(grid.gridlon.ravel())
+
+            # Ensure increasing latitude
+            if lat_axis[0] > lat_axis[-1]:
+                lat_axis = lat_axis[::-1]
+                M = M[::-1, :]
+
+            misfit_da = xr.DataArray(
+                M, coords={"lat": lat_axis, "lon": lon_axis}, dims=["lat", "lon"], name="misfit"
+            )
+
+        else:
+            # --- 1D node grid (e.g. streams)
+            lats = grid.gridlat.ravel()
+            lons = grid.gridlon.ravel()
+            M = misfit_vec.copy()
+            if mask is not None:
+                full = np.full_like(lats, np.nan, dtype=float)
+                full[mask] = misfit_vec
+                M = full
+                jstar_global = int(mask[jstar_local])
+            else:
+                jstar_global = jstar_local
+
+            misfit_da = None  # scatter plot instead of grdimage
+
+        # ---- region
+        if region is None:
+            if misfit_da is not None:
+                dlon = max(1e-4, 0.02)
+                dlat = max(1e-4, 0.02)
+                region = [
+                    float(misfit_da.lon.min() - dlon),
+                    float(misfit_da.lon.max() + dlon),
+                    float(misfit_da.lat.min() - dlat),
+                    float(misfit_da.lat.max() + dlat),
+                ]
+            else:
+                region = [
+                    float(np.nanmin(lons) - 0.02),
+                    float(np.nanmax(lons) + 0.02),
+                    float(np.nanmin(lats) - 0.02),
+                    float(np.nanmax(lats) + 0.02),
+                ]
+
+        center_lat = float(aslobj.source["lat"][t_idx])
+        center_lon = float(aslobj.source["lon"][t_idx])
+
+        fig = topo_map(
+            show=False, zoom_level=zoom_level, inv=None, add_labels=add_labels,
+            centerlat=center_lat, centerlon=center_lon,
+            topo_color=False, region=region, dem_tif=dem_tif,
+            title=title or "Misfit heatmap (peak DR time)",
+        )
+
+        finite = np.isfinite(M)
+        vmin, vmax = (0.0, 1.0)
+        if finite.any():
+            vmin, vmax = float(np.nanmin(M[finite])), float(np.nanmax(M[finite]))
+            if vmin == vmax:
+                vmin, vmax = 0.0, 1.0
+        pygmt.makecpt(cmap=cmap, series=[vmin, vmax], continuous=True)
+
+        if misfit_da is not None:
+            fig.grdimage(grid=misfit_da, cmap=True, transparency=transparency)
+        else:
+            # Build a 3-column table: lon, lat, z (misfit)
+            tbl = np.column_stack([lons[finite], lats[finite], M[finite]])
+            fig.plot(
+                data=tbl,
+                style="c0.15c",
+                cmap=True,                  # use current CPT
+                transparency=transparency,
+            )
+
+        fig.colorbar(frame='+l"Misfit"')
+
+        # Mark best node
+        best_lon = float(grid.gridlon.ravel()[jstar_global])
+        best_lat = float(grid.gridlat.ravel()[jstar_global])
+        fig.plot(x=[best_lon], y=[best_lat], style="c0.26c", fill="red", pen="1p,red")
+
+        if outfile:
+            fig.savefig(outfile)
+            print(f"[{ts()}] [MISFIT] saved: {outfile}")
+        else:
+            fig.show()
+
+        return fig, M
+
+    except Exception as e:
+        import traceback
+        print(f"[{ts()}] [MISFIT:ERR] {type(e).__name__}: {e}")
+        traceback.print_exc()
+        raise
+

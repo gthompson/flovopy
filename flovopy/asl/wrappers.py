@@ -4,10 +4,10 @@ from __future__ import annotations
 import os
 from glob import glob
 from pathlib import Path
-from typing import Dict, Any, Optional,  List, Tuple, Iterable
+from typing import Dict, Any, Optional,  List, Tuple
 import itertools
 from dataclasses import dataclass, asdict
-import time, traceback
+import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -30,6 +30,8 @@ from flovopy.asl.misfit import (
     LinearizedDecayMisfit,
 )
 # from flovopy.asl.misfit import HuberMisfit  # if implemented
+from flovopy.enhanced.event import EnhancedEvent, EnhancedEventMeta
+from flovopy.enhanced.catalog import EnhancedCatalog
 
 # Montserrat defaults (immutable tuple to avoid mutable-default gotchas)
 DEFAULT_REGION = (-62.255, -62.135, 16.66, 16.84)  # (lon_min, lon_max, lat_min, lat_max)
@@ -39,6 +41,102 @@ class VolcanoConfig:
     name: str
     region: tuple[float, float, float, float]
 MONTSERRAT = VolcanoConfig("Montserrat", DEFAULT_REGION)
+
+# helper method for outputting source data after fast_locate() or refine_and_relocate()
+def _asl_output_source_results(
+    aslobj,
+    *,
+    stream,                 # ObsPy Stream used for station labels on plots
+    event_dir: str,
+    asl_config: dict,
+    peakf_event: int,
+    suffix: str = "",       # "" or "_refined"
+) -> dict:
+    """
+    Save QuakeML+JSON (EnhancedEvent), CSV, and all diagnostic plots for the current ASL source.
+    Returns a dict of the produced file paths (some may be None if failures occur).
+    """
+    os.makedirs(event_dir, exist_ok=True)
+
+    # Title / filenames
+    base_title = f"ASL event (Q={int(aslobj.Q)}, F={int(aslobj.peakf)} Hz, v={aslobj.wave_speed_kms:g} km/s)"
+    if suffix:
+        base_title += " refined"
+    base_name = f"event_Q{int(aslobj.Q)}_F{int(peakf_event)}{suffix}"
+
+    # QuakeML + JSON sidecar (EnhancedEvent)
+    ee_meta = EnhancedEventMeta()
+    aslobj.event = EnhancedEvent.from_asl(
+        aslobj,
+        meta=ee_meta,
+        stream=stream,                                  # optional
+        inventory=asl_config.get("inventory"),          # optional
+        title_comment=base_title,
+    )
+    qml_out, json_out = aslobj.event.save(
+        event_dir, base_name,
+        write_quakeml=True,
+        write_obspy_json=asl_config.get("write_event_obspy_json", False),
+        include_trajectory_in_sidecar=asl_config.get("include_trajectory", True),
+    )    
+    print(f"[ASL:OUT] Saved QuakeML: {qml_out}")
+    print(f"[ASL:OUT] Saved JSON sidecar: {json_out}")
+
+    # Common plotting args
+    dem_tif_for_bmap = asl_config.get("dem_tif") or asl_config.get("dem_tif_for_bmap")
+    region = asl_config.get("region", DEFAULT_REGION)
+
+    # Map
+    map_png = os.path.join(event_dir, f"map_Q{int(aslobj.Q)}_F{int(peakf_event)}{suffix}.png")
+    print("[ASL:PLOT] Writing map and diagnostic plots…")
+    aslobj.plot(
+        zoom_level=0,
+        threshold_DR=0.0,
+        scale=0.2,
+        join=True,
+        number=0,
+        add_labels=True,
+        stations = [tr.stats.station for tr in (stream or [])],
+        outfile=map_png,
+        dem_tif=dem_tif_for_bmap,
+        simple_basemap=True,
+        region=region,
+    )
+    plt.close('all')
+
+    # CSV
+    csv_out = os.path.join(event_dir, f"source_Q{int(aslobj.Q)}_F{int(peakf_event)}{suffix}.csv")
+    print("[ASL:SOURCE_TO_CSV] Writing source to a CSV…")
+    aslobj.source_to_csv(csv_out)
+
+    # Reduced displacement
+    rd_png = os.path.join(event_dir, f"reduced_disp_Q{int(aslobj.Q)}_F{int(peakf_event)}{suffix}.png")
+    print("[ASL:PLOT_REDUCED_DISPLACEMENT]")
+    aslobj.plot_reduced_displacement(outfile=rd_png)
+    plt.close()
+
+    # Misfit (line)
+    mis_png = os.path.join(event_dir, f"misfit_Q{int(aslobj.Q)}_F{int(peakf_event)}{suffix}.png")
+    print("[ASL:PLOT_MISFIT]")
+    aslobj.plot_misfit(outfile=mis_png)
+    plt.close()
+
+    # Misfit heatmap
+    mh_png = os.path.join(event_dir, f"misfit_heatmap_Q{int(aslobj.Q)}_F{int(peakf_event)}{suffix}.png")
+    print("[ASL:PLOT_MISFIT_HEATMAP]")
+    aslobj.plot_misfit_heatmap(outfile=mh_png, region=region)
+    plt.close('all')
+
+    return {
+        "qml": qml_out,
+        "json": json_out,
+        "map_png": map_png,
+        "source_csv": csv_out,
+        "reduced_disp_png": rd_png,
+        "misfit_png": mis_png,
+        "misfit_heatmap_png": mh_png,
+    }
+
 
 def asl_sausage(
     stream: Stream,
@@ -61,9 +159,14 @@ def asl_sausage(
       - node_distances_km : dict[seed_id -> np.ndarray]
       - station_coords : dict[seed_id -> {latitude, longitude, elevation}]
       - ampcorr : AmpCorr
-      - vsam_metric : str
+      - sam_metric : str
       - window_seconds : float
     """
+
+    # Information about results from fast_locate() and refine_and_relocate()
+    primary_out = None
+    refined_out = None
+
     print(f"[ASL] Preparing VSAM for event folder: {event_dir}")
     os.makedirs(event_dir, exist_ok=True)
 
@@ -87,18 +190,18 @@ def asl_sausage(
             tr.stats["units"] = "m/s"
 
     # 2) Build VSAM
-    vsamObj = VSAM(stream=stream, sampling_interval=1.0)
-    if len(vsamObj.dataframes) == 0:
+    samObj = VSAM(stream=stream, sampling_interval=1.0)
+    if len(samObj.dataframes) == 0:
         raise IOError("[ASL:ERR] No dataframes in VSAM object")
 
     if not dry_run:
-        print("[ASL:PLOT] Writing VSAM preview (VSAM.png)")
-        vsamObj.plot(equal_scale=False, outfile=os.path.join(event_dir, "VSAM.png"))
+        print("[ASL:PLOT] Writing VSAM preview")
+        samObj.plot(metrics=asl_config['sam_metric'], equal_scale=False, outfile=os.path.join(event_dir, "VSAM.png"))
         plt.close('all')
 
     # 3) Decide event peakf
     if peakf_override is None:
-        freqs = [df.attrs.get("peakf") for df in vsamObj.dataframes.values() if df.attrs.get("peakf") is not None]
+        freqs = [df.attrs.get("peakf") for df in samObj.dataframes.values() if df.attrs.get("peakf") is not None]
         if freqs:
             peakf_event = int(round(sum(freqs) / len(freqs)))
             print(f"[ASL] Event peak frequency inferred from VSAM: {peakf_event} Hz")
@@ -108,6 +211,9 @@ def asl_sausage(
     else:
         peakf_event = int(round(peakf_override))
         print(f"[ASL] Using peak frequency override: {peakf_event} Hz")
+
+    ################### IMPLEMENT THIS FOR CHECKING ################
+    samObj.compute_reduced_velocity(asl_config['inventory'], asl_config['summit'], surfaceWaves=asl_config['assume_surface_waves'], Q=asl_config['Q'], wavespeed_kms=asl_config['wave_speed'], peakf=peakf_event)
 
     # 4) Amplitude corrections cache (swap if peakf differs)
     ampcorr: AmpCorr = asl_config["ampcorr"]
@@ -120,7 +226,7 @@ def asl_sausage(
 
         params = ampcorr.params
         new_params = AmpCorrParams(
-            surface_waves=params.surface_waves,
+            assume_surface_waves=params.assume_surface_waves,
             wave_speed_kms=params.wave_speed_kms,
             Q=params.Q,
             peakf=float(peakf_event),
@@ -140,8 +246,8 @@ def asl_sausage(
     # 5) Build ASL object and inject geometry/corrections
     print("[ASL] Building ASL object…")
     aslobj = ASL(
-        vsamObj,
-        asl_config["vsam_metric"],
+        samObj,
+        asl_config["sam_metric"],
         asl_config["gridobj"],
         asl_config["window_seconds"],
     )
@@ -157,8 +263,8 @@ def asl_sausage(
     # keep parameters on the ASL for provenance/filenames
     aslobj.Q             = ampcorr.params.Q
     aslobj.peakf         = ampcorr.params.peakf
-    aslobj.wavespeed_kms = ampcorr.params.wave_speed_kms
-    aslobj.surfaceWaves  = ampcorr.params.surface_waves
+    aslobj.wave_speed_kms = ampcorr.params.wave_speed_kms
+    aslobj.assume_surface_waves  = ampcorr.params.assume_surface_waves
 
     # 6) Locate
     meta = asl_config.get("dist_meta", {})
@@ -187,53 +293,17 @@ def asl_sausage(
     )
     print("[ASL] Location complete.")
 
-    aslobj.print_event()
 
     # 7) Outputs (baseline)
     if not dry_run:
-        qml_out = os.path.join(event_dir, f"event_Q{int(aslobj.Q)}_F{int(peakf_event)}.qml")
-        print(f"[ASL:OUT] Writing QuakeML: {qml_out}")
-        aslobj.save_event(outfile=qml_out)
-
-        dem_tif_for_bmap = asl_config.get("dem_tif") or asl_config.get("dem_tif_for_bmap")
-
-        print("[ASL:PLOT] Writing map and diagnostic plots…")
-        aslobj.plot(
-            zoom_level=0,
-            threshold_DR=0.0,
-            scale=0.2,
-            join=True,
-            number=0,
-            add_labels=True,
-            stations=[tr.stats.station for tr in stream],
-            outfile=os.path.join(event_dir, f"map_Q{int(aslobj.Q)}_F{int(peakf_event)}.png"),
-            dem_tif=dem_tif_for_bmap,
-            simple_basemap=True,
-            region=asl_config.get("region", DEFAULT_REGION),  # ensure consistent extent
+        primary_out = _asl_output_source_results(
+            aslobj,
+            stream=stream,
+            event_dir=event_dir,
+            asl_config=asl_config,
+            peakf_event=peakf_event,
+            suffix="",
         )
-        plt.close('all')
-
-        print("[ASL:SOURCE_TO_CSV] Writing source to a CSV…")
-        aslobj.source_to_csv(os.path.join(event_dir, f"source_Q{int(aslobj.Q)}_F{int(peakf_event)}.csv"))
-
-        print("[ASL:PLOT_REDUCED_DISPLACEMENT]")
-        aslobj.plot_reduced_displacement(
-            outfile=os.path.join(event_dir, f"reduced_disp_Q{int(aslobj.Q)}_F{int(peakf_event)}.png")
-        )
-        plt.close()
-
-        print("[ASL:PLOT_MISFIT]")
-        aslobj.plot_misfit(
-            outfile=os.path.join(event_dir, f"misfit_Q{int(aslobj.Q)}_F{int(peakf_event)}.png")
-        )
-        plt.close()
-
-        print("[ASL:PLOT_MISFIT_HEATMAP]")
-        aslobj.plot_misfit_heatmap(
-            outfile=os.path.join(event_dir, f"misfit_heatmap_Q{int(aslobj.Q)}_F{int(peakf_event)}.png"),
-            region=asl_config.get("region", DEFAULT_REGION),  # ensure consistent extent
-        )
-        plt.close('all')
 
     # 8) OPTIONAL: sector refinement pass (triangular wedge from dome toward sea)
     if refine_sector:
@@ -249,10 +319,10 @@ def asl_sausage(
                 apex_lat=apex_lat, apex_lon=apex_lon,
                 length_km=8.0, inner_km=0.0, half_angle_deg=25.0,
                 prefer_misfit=True,
-                temporal_smooth_mode="viterbi",
+                temporal_smooth_mode="median", #"viterbi",
                 temporal_smooth_win=7,
-                viterbi_lambda_km=8.0,
-                viterbi_max_step_km=30.0,
+                #viterbi_lambda_km=8.0,
+                #viterbi_max_step_km=30.0,
                 misfit_backend=misfit_backend,            # ← new
                 min_stations=min_sta,                     # ← new
                 verbose=True,
@@ -263,49 +333,20 @@ def asl_sausage(
             raise
 
         if not dry_run:
-            # extra outputs with a `_refined` suffix
-            qml_ref = os.path.join(event_dir, f"event_Q{int(aslobj.Q)}_F{int(peakf_event)}_refined.qml")
-            print(f"[ASL:OUT] Writing refined QuakeML: {qml_ref}")
-            aslobj.save_event(outfile=qml_ref)
-
-            dem_tif_for_bmap = asl_config.get("dem_tif") or asl_config.get("dem_tif_for_bmap")
-
-            print("[ASL:PLOT] Writing refined map and diagnostics…")
-            aslobj.plot(
-                zoom_level=0,
-                threshold_DR=0.0,
-                scale=0.2,
-                join=True,
-                number=0,
-                add_labels=True,
-                stations=[tr.stats.station for tr in stream],
-                outfile=os.path.join(event_dir, f"map_Q{int(aslobj.Q)}_F{int(peakf_event)}_refined.png"),
-                dem_tif=dem_tif_for_bmap,
-                simple_basemap=True,
-                region=asl_config.get("region", DEFAULT_REGION),  # ensure consistent extent
+            refined_out = _asl_output_source_results(
+                aslobj,
+                stream=stream,
+                event_dir=event_dir,
+                asl_config=asl_config,
+                peakf_event=peakf_event,
+                suffix="_refined",
             )
-            plt.close('all')
-
-            aslobj.source_to_csv(os.path.join(event_dir, f"source_Q{int(aslobj.Q)}_F{int(peakf_event)}_refined.csv"))
-
-            aslobj.plot_reduced_displacement(
-                outfile=os.path.join(event_dir, f"reduced_disp_Q{int(aslobj.Q)}_F{int(peakf_event)}_refined.png")
-            )
-            plt.close()
-
-            aslobj.plot_misfit(
-                outfile=os.path.join(event_dir, f"misfit_Q{int(aslobj.Q)}_F{int(peakf_event)}_refined.png")
-            )
-            plt.close()
-
-            aslobj.plot_misfit_heatmap(
-                outfile=os.path.join(event_dir, f"misfit_heatmap_Q{int(aslobj.Q)}_F{int(peakf_event)}_refined.png"),
-                region=asl_config.get("region", DEFAULT_REGION),  # ensure consistent extent
-            )
-            plt.close('all')
 
     if not dry_run and asl_config.get("interactive", False):
         input("[ASL] Press Enter to continue to next event…")
+
+    # Return a structured summary for callers
+    return {"primary": primary_out, "refined": refined_out}
 
 def prepare_asl_context(
     *,
@@ -384,7 +425,7 @@ def prepare_asl_context(
     ampcorr_cache = cache_root / "ampcorr"
     ampcorr_cache.mkdir(parents=True, exist_ok=True)
     params = AmpCorrParams(
-        surface_waves=(sweep_or_cfg.wave_kind == "surface"),
+        assume_surface_waves=(sweep_or_cfg.wave_kind == "surface"),
         wave_speed_kms=sweep_or_cfg.speed,
         Q=sweep_or_cfg.Q,
         peakf=float(peakf),
@@ -402,8 +443,8 @@ def prepare_asl_context(
         "window_seconds": 5,  # caller will override if needed
         "min_stations": 5,    # caller will override if needed
         "Q": sweep_or_cfg.Q,
-        "surfaceWaveSpeed_kms": sweep_or_cfg.speed,
-        "vsam_metric": "VT",  # caller will override if needed
+        "surface_wave_speed_kms": sweep_or_cfg.speed,
+        "sam_metric": "VT",  # caller will override if needed
         "gridobj": gridobj,
         "node_distances_km": node_distances_km,
         "station_coords": station_coords,
@@ -454,12 +495,20 @@ def run_single_event(
     dem_tif_for_bmap: Optional[str] = None,
     simple_basemap: bool = True,
     refine_sector: bool = False,
-    region: tuple[float, float, float, float] = DEFAULT_REGION,   # ← REPLACES ISLAND_REGION
+    region: tuple[float, float, float, float] = DEFAULT_REGION,
     MIN_STATIONS: int = 5,
     GLOBAL_CACHE: str = None,
 ) -> Dict[str, Any]:
-    """Minimal, notebook-friendly runner (delegates prep to prepare_asl_context)."""
+    """
+    Minimal, notebook-friendly runner (delegates prep to prepare_asl_context).
 
+    NOTE: Expects asl_sausage() to return:
+      {"primary": {...}, "refined": {... or None}}
+    Each {...} must include (at least) "qml" and "json" paths.
+    """
+    import time, traceback
+    from pathlib import Path
+    from obspy import read
 
     t0 = time.time()
     outdir = Path(output_base) / cfg.tag()
@@ -479,13 +528,13 @@ def run_single_event(
             channels_dem_tif=channels_dem_tif,
             dem_cache_dir=(GLOBAL_CACHE and os.path.join(GLOBAL_CACHE, "dem")) or None,
             dem_tif_for_bmap=dem_tif_for_bmap,
-            region=region,   # ← pass through
+            region=region,
         )
 
         # Per-run overrides
         asl_config["window_seconds"] = window_seconds
         asl_config["min_stations"]   = MIN_STATIONS
-        asl_config["vsam_metric"]    = metric
+        asl_config["sam_metric"]    = metric
 
         # Read stream and run once
         st = read(mseed_file).select(component="Z")
@@ -496,7 +545,7 @@ def run_single_event(
         event_dir.mkdir(exist_ok=True)
 
         print(f"[ASL] Running single event: {mseed_file}")
-        asl_sausage(
+        outputs = asl_sausage(
             stream=st,
             event_dir=str(event_dir),
             asl_config=asl_config,
@@ -508,20 +557,20 @@ def run_single_event(
             refine_sector=refine_sector,
         )
 
-        # Summary
-        src_csv = next((p for p in event_dir.glob("source_*.csv")), None)
-        qml     = next((p for p in event_dir.glob("event_*.qml")), None)
-        heat    = next((p for p in event_dir.glob("map_Q*_F*.png")), None)
-        misf    = next((p for p in event_dir.glob("*misfit*heatmap*.png")), None)
+        # Validate returned structure; fail fast if missing
+        if not isinstance(outputs, dict) or "primary" not in outputs:
+            raise RuntimeError("asl_sausage() did not return the expected outputs dict.")
 
+        primary = outputs.get("primary")
+        if not isinstance(primary, dict) or not primary.get("qml") or not primary.get("json"):
+            raise RuntimeError("asl_sausage() returned outputs without required 'qml'/'json' paths for the primary solution.")
+
+        # Build summary strictly from returned outputs
         summ = {
             "tag": cfg.tag(),
             "outdir": str(outdir_str),
             "event_dir": str(event_dir),
-            "source_csv": str(src_csv) if src_csv else None,
-            "event_qml": str(qml) if qml else None,
-            "map_png_exists": bool(heat),
-            "misfit_png_exists": bool(misf),
+            "outputs": outputs,                  # {"primary": {...}, "refined": {... or None}}
             "elapsed_s": round(time.time() - t0, 2),
         }
         print(f"[ASL] Single-event summary: {summ}")
@@ -529,6 +578,7 @@ def run_single_event(
 
     except Exception as e:
         traceback.print_exc()
+        # Do not hide failures — return the error so callers can surface it
         return {
             "tag": cfg.tag(),
             "error": f"{type(e).__name__}: {e}",
@@ -620,7 +670,7 @@ def run_all_events(
         # Per-run overrides
         asl_config["window_seconds"] = window_seconds
         asl_config["min_stations"]   = min_stations
-        asl_config["vsam_metric"]    = metric
+        asl_config["sam_metric"]    = metric
 
         # Optional station gains table
         gains_df = load_station_gains_df(station_gains_csv) \
@@ -628,6 +678,7 @@ def run_all_events(
         if gains_df is not None:
             print(f"[GAINS] Loaded station gains: {len(gains_df)} rows")
 
+        all_outputs: list[dict] = []   # collect per-event outputs
         # ---- Event loop
         file_count = 0
         for file_num, mseed_path in enumerate(sorted(find_event_files(input_dir))):
@@ -646,7 +697,7 @@ def run_all_events(
                     except Exception:
                         pass
 
-                asl_sausage(
+                outputs = asl_sausage(
                     stream=st,
                     event_dir=event_dir,
                     asl_config=asl_config,
@@ -657,6 +708,15 @@ def run_all_events(
                     allow_station_fallback=allow_station_fallback,
                     refine_sector=getattr(sweep, "refine_sector", False),  # pass-through
                 )
+                if not isinstance(outputs, dict) or "primary" not in outputs:
+                    raise RuntimeError("asl_sausage() did not return the expected outputs dict.")
+
+                outputs["_meta"] = {
+                    "mseed_path": mseed_path,
+                    "event_dir": event_dir,
+                    "starttime": str(stime),
+                }
+                all_outputs.append(outputs)
                 print(f"[✓] Processed: {mseed_path}")
                 file_count += 1
 
@@ -695,6 +755,28 @@ def run_all_events(
         except Exception as e:
             print("[HEATMAP:WARN] Failed to generate heatmap:", e)
 
+
+        # ---- Optional: assemble EnhancedCatalogs from per-event outputs
+        try:
+            if all_outputs:
+                cat_info = enhanced_catalogs_from_outputs(
+                    all_outputs,
+                    outdir=run_dir,
+                    write_files=True,
+                    load_waveforms=False,         # set True if you want streams in memory
+                    primary_name="catalog_primary",
+                    refined_name="catalog_refined",
+                )
+                if cat_info.get("primary_qml"):
+                    print("[CATALOG] Primary:", cat_info["primary_qml"])
+                if cat_info.get("refined_qml"):
+                    print("[CATALOG] Refined:", cat_info["refined_qml"])
+                if cat_info.get("primary_csv"):
+                    print("[CATALOG] Primary CSV:", cat_info["primary_csv"])
+                if cat_info.get("refined_csv"):
+                    print("[CATALOG] Refined CSV:", cat_info["refined_csv"])
+        except Exception as e:
+            print(f"[CATALOG:WARN] Could not build EnhancedCatalogs: {e}")
         return run_dir
     
 
@@ -713,10 +795,6 @@ def ensure_dir(path: str) -> str:
     return path
 
 def collect_node_results(run_outdir: str) -> pd.DataFrame:
-    """
-    Crawl a run's output directory and collect node-level results with
-    columns at least: latitude, longitude, amplitude.
-    """
     matches: List[str] = []
     for pat in RESULT_PATTERNS:
         matches.extend(glob(os.path.join(run_outdir, pat), recursive=True))
@@ -724,26 +802,25 @@ def collect_node_results(run_outdir: str) -> pd.DataFrame:
     dfs: List[pd.DataFrame] = []
     for f in sorted(set(matches)):
         try:
-            if f.lower().endswith(".parquet"):
-                df = pd.read_parquet(f)
-            else:
-                df = pd.read_csv(f)
+            df = pd.read_parquet(f) if f.lower().endswith(".parquet") else pd.read_csv(f)
         except Exception:
             continue
-        cols = {c.lower(): c for c in df.columns}
-        have = all(k in cols for k in ["latitude", "longitude", "amplitude"])
+
+        # Normalize to lowercase column names for robust downstream usage
+        lower_map = {orig: orig.lower() for orig in df.columns}
+        df = df.rename(columns=lower_map)
+        have = all(k in df.columns for k in ["latitude", "longitude", "amplitude"])
         if not have:
             continue
-        dfs.append(df.rename(columns=cols))  # normalize to canonical names
+
+        dfs.append(df)
 
     if not dfs:
         print(f"[HEATMAP] No node CSVs matched under: {run_outdir}")
         return pd.DataFrame(columns=["latitude", "longitude", "amplitude"])
 
     cat = pd.concat(dfs, ignore_index=True)
-    # keep only required columns, drop NaNs
-    keep = cat[["latitude", "longitude", "amplitude"]].dropna()
-    return keep
+    return cat[["latitude", "longitude", "amplitude"]].dropna()
 
 
 # ----------------------------------------------------------------------
@@ -829,3 +906,99 @@ def _resolve_misfit_backend(name_or_obj, *, peakf_hz: float | None = None, speed
     #     return HuberMisfit()
     print(f"[ASL:MISFIT] Unknown backend '{name_or_obj}', using default StdOverMean.")
     return StdOverMeanMisfit()
+
+def enhanced_catalogs_from_outputs(
+    outputs_list: list[dict],
+    *,
+    outdir: str,
+    write_files: bool = True,
+    load_waveforms: bool = False,
+    primary_name: str = "catalog_primary",
+    refined_name: str = "catalog_refined",
+) -> dict:
+    """
+    Build EnhancedCatalogs (primary, refined) from the per-event outputs dicts
+    returned by `asl_sausage()`.
+
+    Each element in outputs_list is expected to be:
+      {"primary": {"qml": "...", "json": "...", ...},
+       "refined": {"qml": "...", "json": "...", ...} or None,
+       "_meta": {...}}
+
+    Returns:
+      {
+        "primary": EnhancedCatalog,
+        "refined": EnhancedCatalog,
+        "primary_qml": <path or None>,
+        "refined_qml": <path or None>,
+        "primary_csv": <path or None>,
+        "refined_csv": <path or None>,
+      }
+    """
+
+    prim_recs = []
+    ref_recs  = []
+
+    def _append_rec(block: dict, bucket: list):
+        if not block:
+            return
+        qml = block.get("qml")
+        jjs = block.get("json")
+        if not qml or not jjs:
+            return
+        base = os.path.splitext(qml)[0]  # strip .qml
+        # Ensure the JSON next to it matches
+        if not os.path.exists(qml) or not os.path.exists(jjs):
+            return
+        try:
+            enh = EnhancedEvent.load(base)
+            if not load_waveforms:
+                # Clear in-memory waveform to keep object light
+                enh.stream = None
+            bucket.append(enh)
+        except Exception:
+            # Keep going; one bad event shouldn't kill the catalogs
+            pass
+
+    for out in outputs_list:
+        _append_rec((out or {}).get("primary") or {}, prim_recs)
+        _append_rec((out or {}).get("refined") or {}, ref_recs)
+
+    # Build EnhancedCatalogs
+    prim_cat = EnhancedCatalog(
+        events=[r.event for r in prim_recs],
+        records=prim_recs,
+        description="Primary ASL locations"
+    )
+    ref_cat = EnhancedCatalog(
+        events=[r.event for r in ref_recs],
+        records=ref_recs,
+        description="Refined ASL locations"
+    )
+
+    # Optionally write combined QuakeML + CSV summaries
+    primary_qml = None
+    refined_qml = None
+    primary_csv = None
+    refined_csv = None
+
+    if write_files:
+        if len(prim_cat):
+            primary_qml = os.path.join(outdir, f"{primary_name}.qml")
+            prim_cat.write(primary_qml, format="QUAKEML")
+            primary_csv = os.path.join(outdir, f"{primary_name}.csv")
+            prim_cat.export_csv(primary_csv)
+        if len(ref_cat):
+            refined_qml = os.path.join(outdir, f"{refined_name}.qml")
+            ref_cat.write(refined_qml, format="QUAKEML")
+            refined_csv = os.path.join(outdir, f"{refined_name}.csv")
+            ref_cat.export_csv(refined_csv)
+
+    return {
+        "primary": prim_cat,
+        "refined": ref_cat,
+        "primary_qml": primary_qml,
+        "refined_qml": refined_qml,
+        "primary_csv": primary_csv,
+        "refined_csv": refined_csv,
+    }

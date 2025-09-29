@@ -5,22 +5,19 @@ import os
 import json
 import glob
 from collections import defaultdict
-from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
 
 from obspy.core.event import (
-    Catalog, Event, Origin, Magnitude, Comment, CreationInfo, UTCDateTime,
-    Amplitude, StationMagnitude, WaveformStreamID
+    Catalog, Event, Origin, Magnitude, Comment, CreationInfo,
 )
 from obspy.core.event.catalog import read_events
-from obspy import read  # for optional waveform loading
-
-from flovopy.enhanced.event import EnhancedEvent
+from obspy import read, UTCDateTime  # for optional waveform loading
+from flovopy.enhanced.event import EnhancedEvent, EnhancedEventMeta
 from flovopy.enhanced.eventrate import EventRate, EventRateConfig
-from flovopy.core.physics import magnitude2Eseismic, Eseismic2magnitude
+from flovopy.core.physics import magnitude2Eseismic
 
 
 # ---------- Enhanced Catalog ----------
@@ -109,21 +106,20 @@ class EnhancedCatalog(Catalog):
         if not event.creation_info:
             event.creation_info = CreationInfo(author=author, agency_id=agency_id, creation_time=UTCDateTime())
 
-        enh = EnhancedEvent(
-            obspy_event=event,
+        meta = EnhancedEventMeta(
+            sfile_path=sfile_path,
+            wav_paths=wav_paths or ([s.path for s in stream] if stream is not None else []),
+            aef_path=aef_path,
+            trigger_window=trigger_window or (trigger.get("duration") if trigger else None),
+            average_window=average_window or (trigger.get("average_window") if trigger else None),
             metrics=metrics or {
                 "classification": classification,
                 "event_type": event.event_type,
                 "mainclass": mainclass,
                 "subclass": subclass,
             },
-            sfile_path=sfile_path,
-            wav_paths=wav_paths or ([s.path for s in stream] if stream is not None else []),
-            aef_path=aef_path,
-            trigger_window=trigger_window or (trigger.get("duration") if trigger else None),
-            average_window=average_window or (trigger.get("average_window") if trigger else None),
-            stream=stream,
         )
+        enh = EnhancedEvent.wrap(event, meta=meta, stream=stream)
         self.records.append(enh)
         # bust cache
         self._df_cache = None
@@ -168,86 +164,279 @@ class EnhancedCatalog(Catalog):
         print(df["subclass"].value_counts(dropna=False))
 
     # ---------- Dataframe serialization ----------
-    def to_dataframe(self) -> pd.DataFrame:
+    # --- Dataframe view (tiny addition of resource_id) ---
+    def to_dataframe(self, origin_mode: str = "preferred") -> pd.DataFrame:
         """
-        Rows include: datetime, magnitude, lat, lon, depth, energy (if magnitude present),
-        event_type, mainclass, subclass, classification, filename (first wav).
+        Build an event-level summary DataFrame.
+
+        Parameters
+        ----------
+        origin_mode : {"preferred", "first", "all"}, default="preferred"
+            Which origin(s) to export for each event:
+            - "preferred" : one row per event using the preferred_origin
+                            (falls back to the first origin if none set).
+            - "first"     : one row per event using the first origin, if any.
+            - "all"       : one row per *origin* (multi-rows per event).
+
+        Returns
+        -------
+        df : pandas.DataFrame
+            DataFrame with columns: datetime, magnitude, lat, lon, depth,
+            event_type, mainclass, subclass, classification, filename,
+            resource_id, energy (if magnitude is present).
+
+        Examples
+        --------
+        >>> # Event summary using preferred origins
+        >>> df = cat.to_dataframe(origin_mode="preferred")
+        >>> df.head()
+
+        >>> # Event summary using the first origin
+        >>> df = cat.to_dataframe(origin_mode="first")
+
+        >>> # Multi-row per event with all origins
+        >>> df = cat.to_dataframe(origin_mode="all")
         """
         rows = []
         for enh in self.records:
             ev = enh.event
-            row = {
-                "datetime": ev.origins[0].time.datetime if ev.origins else None,
-                "magnitude": ev.magnitudes[0].mag if ev.magnitudes else None,
-                "latitude": ev.origins[0].latitude if ev.origins else None,
-                "longitude": ev.origins[0].longitude if ev.origins else None,
-                "depth": ev.origins[0].depth if ev.origins else None,
-                "event_type": getattr(ev, "event_type", None),
-                "classification": None,
-                "mainclass": None,
-                "subclass": None,
-                "filename": enh.wav_paths[0] if enh.wav_paths else None,
-            }
-            # pull labels from comments if present
-            for c in (ev.comments or []):
-                txt = (c.text or "")
-                if txt.startswith("mainclass:"):
-                    row["mainclass"] = txt.split(":", 1)[-1].strip()
-                elif txt.startswith("subclass:"):
-                    row["subclass"] = txt.split(":", 1)[-1].strip()
-                elif txt.startswith("classification:") and not row["classification"]:
-                    row["classification"] = txt.split(":", 1)[-1].strip()
+            rid = getattr(getattr(ev, "resource_id", None), "id", None)
 
-            if row["magnitude"] is not None:
-                row["energy"] = magnitude2Eseismic(row["magnitude"])
-            rows.append(row)
+            def _row_from_origin(o):
+                row = {
+                    "resource_id": rid,
+                    "datetime": (o.time.datetime if getattr(o, "time", None) else None),
+                    "latitude": getattr(o, "latitude", None),
+                    "longitude": getattr(o, "longitude", None),
+                    "depth": getattr(o, "depth", None),
+                    "event_type": getattr(ev, "event_type", None),
+                    "classification": None,
+                    "mainclass": None,
+                    "subclass": None,
+                    "filename": (enh.meta.wav_paths[0] if getattr(enh.meta, "wav_paths", None) else None),
+                    "magnitude": (ev.magnitudes[0].mag if ev.magnitudes else None),
+                }
+                # pull labels from comments if present
+                for c in (ev.comments or []):
+                    txt = (c.text or "") or ""
+                    if txt.startswith("mainclass:"):
+                        row["mainclass"] = txt.split(":", 1)[-1].strip()
+                    elif txt.startswith("subclass:"):
+                        row["subclass"] = txt.split(":", 1)[-1].strip()
+                    elif txt.startswith("classification:") and not row["classification"]:
+                        row["classification"] = txt.split(":", 1)[-1].strip()
+                if row["magnitude"] is not None:
+                    row["energy"] = magnitude2Eseismic(row["magnitude"])
+                return row
+
+            if origin_mode == "all":
+                for o in (ev.origins or []):
+                    rows.append(_row_from_origin(o))
+            else:
+                origin = None
+                if origin_mode == "preferred":
+                    try:
+                        origin = ev.preferred_origin()  # method
+                    except Exception:
+                        origin = getattr(ev, "preferred_origin", None)  # property fallback
+                if origin is None and ev.origins:
+                    origin = ev.origins[0]
+
+                # If no origin, still emit a row with minimal info
+                rows.append(_row_from_origin(origin or type("O", (), {})()))
 
         df = pd.DataFrame(rows)
-        if not df.empty:
+        if not df.empty and "datetime" in df.columns:
             df["datetime"] = pd.to_datetime(df["datetime"])
         return df
 
-    def export_csv(self, filepath: str) -> None:
-        self.to_dataframe().to_csv(filepath, index=False)
 
-    # ---------- Persistence ----------
-    def save(self, outdir: str, outfile: str, net: str = "MV") -> None:
+    def export_csv(
+        self,
+        filepath: str,
+        *,
+        df: Optional[pd.DataFrame] = None,
+        origin_mode: str = "preferred"
+    ) -> None:
         """
-        Write a catalog-wide QuakeML plus per-event JSON/QuakeML via EnhancedEvent.save.
-        Also writes a small JSON summary with trigger params, description, etc.
+        Export the catalog to CSV.
+
+        Parameters
+        ----------
+        filepath : str
+            Path to output CSV file.
+        df : pandas.DataFrame, optional
+            If provided, write this DataFrame as-is. Otherwise,
+            call `to_dataframe(origin_mode=origin_mode)`.
+        origin_mode : {"preferred", "first", "all"}, default="preferred"
+            Passed to `to_dataframe()` if `df` is not provided.
+
+        Examples
+        --------
+        >>> # Export summary with preferred origins
+        >>> cat.export_csv("events_summary.csv", origin_mode="preferred")
+
+        >>> # Export summary with first origins
+        >>> cat.export_csv("events_first_origin.csv", origin_mode="first")
+
+        >>> # Export summary with all origins
+        >>> cat.export_csv("events_all_origins.csv", origin_mode="all")
+
+        >>> # Export trajectory dataframe instead
+        >>> df_traj = cat.trajectory_dataframe()
+        >>> cat.export_csv("trajectory.csv", df=df_traj)
         """
-        self._write_events(outdir, net=net, xmlfile=outfile + ".xml")
+        (df if df is not None else self.to_dataframe(origin_mode=origin_mode)).to_csv(filepath, index=False)
 
-        summary_json = os.path.join(outdir, outfile + "_meta.json")
-        summary_vars = {
-            "triggerParams": self.triggerParams,
-            "comments": self.comments,
-            "description": self.description,
-            "starttime": self.starttime.strftime("%Y/%m/%d %H:%M:%S") if self.starttime else None,
-            "endtime": self.endtime.strftime("%Y/%m/%d %H:%M:%S") if self.endtime else None,
-        }
-        os.makedirs(outdir, exist_ok=True)
-        with open(summary_json, "w") as f:
-            json.dump(summary_vars, f, indent=2, default=str)
 
-    def _write_events(self, outdir: str, net: str = "MV", xmlfile: Optional[str] = None) -> None:
-        if xmlfile:
-            os.makedirs(outdir, exist_ok=True)
-            self.write(os.path.join(outdir, xmlfile), format="QUAKEML")
+    def trajectory_dataframe(self) -> pd.DataFrame:
+        """
+        Build a long-form DataFrame capturing *all origin trajectories*
+        from ASL-derived events.
 
+        Each row corresponds to a single origin within an event,
+        preserving the full trajectory (time series of positions, DR, misfit, etc.)
+        that `fast_locate()` produces.
+
+        Returns
+        -------
+        df : pandas.DataFrame
+            Columns include:
+            - resource_id : str (event identifier)
+            - datetime    : UTC datetime of origin
+            - latitude    : float
+            - longitude   : float
+            - DR          : float, reduced displacement
+            - misfit      : float, misfit at chosen node
+            - azgap       : float, azimuthal gap
+            - nsta        : int, usable station count
+            - node_index  : int, chosen node index
+            - energy      : float, if magnitude present
+
+        Examples
+        --------
+        >>> # Build full ASL trajectory dataset
+        >>> df_traj = cat.trajectory_dataframe()
+        >>> df_traj.head()
+
+        >>> # Export directly to CSV
+        >>> cat.export_csv("asl_trajectories.csv", df=cat.trajectory_dataframe())
+        """
+        rows = []
         for enh in self.records:
             ev = enh.event
-            if not ev.origins:
+            rid = getattr(getattr(ev, "resource_id", None), "id", None)
+            meta_src = (getattr(enh.meta, "asl_source", None)
+                or (enh.meta.metrics or {}).get("asl_series", {})
+                or {})
+
+            # if the EnhancedEvent saved ASL trajectory arrays
+            t_arr   = np.asarray(meta_src.get("t", []), dtype="datetime64[ns]")
+            lat_arr = np.asarray(meta_src.get("lat", []), dtype=float)
+            lon_arr = np.asarray(meta_src.get("lon", []), dtype=float)
+            DR_arr  = np.asarray(meta_src.get("DR", []), dtype=float)
+            misfit  = np.asarray(meta_src.get("misfit", []), dtype=float)
+            azgap   = np.asarray(meta_src.get("azgap", []), dtype=float)
+            nsta    = np.asarray(meta_src.get("nsta", []), dtype=int)
+            nodes   = np.asarray(meta_src.get("node_index", []), dtype=int)
+
+            for i in range(len(t_arr)):
+                rows.append({
+                    "resource_id": rid,
+                    "datetime": pd.to_datetime(str(t_arr[i])) if t_arr.size else None,
+                    "latitude": lat_arr[i] if i < lat_arr.size else None,
+                    "longitude": lon_arr[i] if i < lon_arr.size else None,
+                    "DR": DR_arr[i] if i < DR_arr.size else None,
+                    "misfit": misfit[i] if i < misfit.size else None,
+                    "azgap": azgap[i] if i < azgap.size else None,
+                    "nsta": int(nsta[i]) if i < nsta.size else None,
+                    "node_index": int(nodes[i]) if i < nodes.size else None,
+                    "energy": magnitude2Eseismic(ev.magnitudes[0].mag)
+                            if ev.magnitudes else None,
+                })
+
+        return pd.DataFrame(rows)
+    
+    def export_trajectory_csv(self, path: str) -> None:
+        self.trajectory_dataframe().to_csv(path, index=False)
+
+    # ---------- Persistence ----------
+    def save(
+        self,
+        outdir: str,
+        outfile: str,
+        *,
+        net: str = "MV",
+        write_catalog_xml: bool = True,
+        write_catalog_json: bool = False,
+        write_individual_events: bool = True,
+        write_summary_json: bool = True,
+        csv_path: Optional[str] = None,
+        # passthrough to per-event writes:
+        write_event_quakeml: bool = True,
+        write_event_obspy_json: bool = False,
+        include_trajectory_in_sidecar: bool = True,
+    ) -> None:
+        os.makedirs(outdir, exist_ok=True)
+
+        if write_catalog_xml:
+            # Includes ALL origins for each event
+            self.write(os.path.join(outdir, outfile + ".xml"), format="QUAKEML")
+
+        if write_catalog_json:
+            self.write(os.path.join(outdir, outfile + ".json"), format="JSON")
+
+        if write_summary_json:
+            summary_json = os.path.join(outdir, outfile + "_meta.json")
+            summary_vars = {
+                "triggerParams": self.triggerParams,
+                "comments": self.comments,
+                "description": self.description,
+                "starttime": self.starttime.strftime("%Y/%m/%d %H:%M:%S") if self.starttime else None,
+                "endtime": self.endtime.strftime("%Y/%m/%d %H:%M:%S") if self.endtime else None,
+            }
+            with open(summary_json, "w") as f:
+                json.dump(summary_vars, f, indent=2, default=str)
+
+        if write_individual_events:
+            self._write_individual_events(
+                outdir,
+                net=net,
+                write_quakeml=write_event_quakeml,
+                write_obspy_json=write_event_obspy_json,
+                include_trajectory_in_sidecar=include_trajectory_in_sidecar,
+            )
+
+        if csv_path:
+            self.export_csv(csv_path)
+
+
+    def _write_individual_events(
+        self,
+        outdir: str,
+        *,
+        net: str = "MV",
+        write_quakeml: bool = True,
+        write_obspy_json: bool = False,
+        include_trajectory_in_sidecar: bool = True,
+    ) -> None:
+        for enh in self.records:
+            ev = enh.event
+            if not ev.origins or not ev.origins[0].time:
                 continue
             t = ev.origins[0].time
-            if not t:
-                continue
-            base_path = os.path.join(
+            base = os.path.join(
                 outdir, "WAV", net, t.strftime("%Y"), t.strftime("%m"),
                 t.strftime("%Y%m%dT%H%M%S")
             )
-            os.makedirs(os.path.dirname(base_path), exist_ok=True)
-            enh.save(os.path.dirname(base_path), os.path.basename(base_path))
+            os.makedirs(os.path.dirname(base), exist_ok=True)
+            enh.save(
+                os.path.dirname(base),
+                os.path.basename(base),
+                write_quakeml=write_quakeml,
+                write_obspy_json=write_obspy_json,
+                include_trajectory_in_sidecar=include_trajectory_in_sidecar,
+            )
 
     # ---------- Filters (return new EnhancedCatalogs) ----------
     def filter_by_event_type(self, event_type: str) -> "EnhancedCatalog":
@@ -325,14 +514,15 @@ class EnhancedCatalog(Catalog):
                 except Exception:
                     stream = None
 
-            records.append(EnhancedEvent(
-                obspy_event=ev,
-                stream=stream,
+            meta = EnhancedEventMeta(
                 wav_paths=wav_paths,
                 metrics={}
-            ))
+            )
+            records.append(EnhancedEvent.wrap(ev, meta=meta, stream=stream))
 
         return cls(events=[r.event for r in records], records=records)
+    
+
 
     @classmethod
     def load_dir(cls, catdir: str, *, load_waveforms: bool = False) -> "EnhancedCatalog":
@@ -364,16 +554,15 @@ class EnhancedCatalog(Catalog):
                 except Exception as e:
                     print(f"[WARN] Could not load waveform {wav_paths[0]}: {e}")
 
-            records.append(EnhancedEvent(
-                obspy_event=ev,
-                metrics=meta.get("metrics", {}),
+            meta_obj = EnhancedEventMeta(
                 sfile_path=meta.get("sfile_path"),
                 wav_paths=wav_paths,
                 aef_path=meta.get("aef_path"),
                 trigger_window=meta.get("trigger_window"),
                 average_window=meta.get("average_window"),
-                stream=stream
-            ))
+                metrics=meta.get("metrics", {}) or {},
+            )
+            records.append(EnhancedEvent.wrap(ev, meta=meta_obj, stream=stream))
 
         return cls(events=[r.event for r in records], records=records)
 
