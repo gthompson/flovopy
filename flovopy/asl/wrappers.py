@@ -22,7 +22,7 @@ from flovopy.asl.station_corrections import apply_interval_station_gains
 from flovopy.asl.utils import _grid_mask_indices
 from flovopy.core.mvo import dome_location  # <-- for sector apex
 from flovopy.asl.distances import distances_signature, compute_or_load_distances
-from flovopy.asl.grid import make_grid, nodegrid_from_channel_csvs
+from flovopy.asl.grid import make_grid, nodegrid_from_channel_csvs, Grid
 from flovopy.asl.station_corrections import load_station_gains_df
 from flovopy.asl.map import plot_heatmap_colored
 # Misfit backends (import directly)
@@ -395,20 +395,18 @@ def asl_sausage(
     # Return a structured summary for callers
     return {"primary": primary_out, "refined": refined_out}
 
-def prepare_asl_context(
+def build_asl_config(
     *,
     sweep_or_cfg,
     inventory_xml: str,
     output_base: str,
-    node_spacing_m: int,
     peakf: float,
     regular_grid_dem: Optional[str],
-    channels_dir: Optional[str],
-    channels_step_m: float,
-    channels_dem_tif: Optional[str],
     dem_cache_dir: Optional[str],
     dem_tif_for_bmap: Optional[str],
     region: tuple[float, float, float, float] = DEFAULT_REGION,   # ← NEW default
+    gridobj: Optional[Grid] = None,
+    node_spacing_m: Optional[int] = None,
 ) -> tuple[dict, "Inventory", str]:
     """
     Build grid, compute/load distances + ampcorr once, return (asl_config, inventory, outdir).
@@ -422,17 +420,7 @@ def prepare_asl_context(
     inv = read_inventory(inventory_xml)
 
     # Grid or NodeGrid
-    if sweep_or_cfg.grid_kind == "streams":
-        if not channels_dir:
-            raise ValueError("grid_kind='streams' requires channels_dir")
-        gridobj = nodegrid_from_channel_csvs(
-            channels_dir=channels_dir,
-            step_m=channels_step_m,
-            dem_tif=channels_dem_tif,
-            approx_spacing_m=channels_step_m,
-            max_points=None,
-        )
-    else:
+    if not isinstance(gridobj, Grid):
         dem_spec = None
         if regular_grid_dem:
             if regular_grid_dem.startswith("pygmt:"):
@@ -536,9 +524,6 @@ def run_single_event(
     metric: str = "VT",
     window_seconds: int = 5,
     peakf: float = 8.0,
-    channels_dir: Optional[str] = None,
-    channels_step_m: float = 100.0,
-    channels_dem_tif: Optional[str] = None,
     regular_grid_dem: Optional[str] = "pygmt:01s",
     dem_tif_for_bmap: Optional[str] = None,
     simple_basemap: bool = True,
@@ -546,9 +531,10 @@ def run_single_event(
     region: tuple[float, float, float, float] = DEFAULT_REGION,
     MIN_STATIONS: int = 5,
     GLOBAL_CACHE: str = None,
+    gridobj: Optional(Grid) = None, 
 ) -> Dict[str, Any]:
     """
-    Minimal, notebook-friendly runner (delegates prep to prepare_asl_context).
+    Minimal, notebook-friendly runner (delegates prep to build_asl_config).
 
     NOTE: Expects asl_sausage() to return:
       {"primary": {...}, "refined": {... or None}}
@@ -564,19 +550,17 @@ def run_single_event(
 
     try:
         # One-shot prep (grid + distances + ampcorr + optional grid preview)
-        asl_config, inv, outdir_str = prepare_asl_context(
+        asl_config, inv, outdir_str = build_asl_config(
             sweep_or_cfg=cfg,
             inventory_xml=inventory_xml,
             output_base=output_base,
             node_spacing_m=node_spacing_m,
             peakf=peakf,
             regular_grid_dem=regular_grid_dem,
-            channels_dir=channels_dir,
-            channels_step_m=channels_step_m,
-            channels_dem_tif=channels_dem_tif,
             dem_cache_dir=(GLOBAL_CACHE and os.path.join(GLOBAL_CACHE, "dem")) or None,
             dem_tif_for_bmap=dem_tif_for_bmap,
             region=region,
+            gridobj=gridobj,
         )
 
         ######################### SCAFFOLD
@@ -686,9 +670,6 @@ def run_all_events(
     peakf: float = 8.0,
     node_spacing_m: int = 50,
     max_events: Optional[int] = None,
-    channels_dir: Optional[str] = None,
-    channels_step_m: float = 100.0,
-    channels_dem_tif: Optional[str] = None,
     regular_grid_dem: Optional[str] = None,
     station_gains_csv: Optional[str] = None,
     allow_station_fallback: bool = True,
@@ -721,7 +702,7 @@ def run_all_events(
         def flush(self):
             self.a.flush(); self.b.flush()
 
-    # Shared cache root (still used by prepare_asl_context for DEM tiles)
+    # Shared cache root (still used by build_asl_config for DEM tiles)
     shared_cache = dem_cache or os.environ.get("FLOVOPY_CACHE") \
                    or os.path.join(os.path.expanduser("~"), ".flovopy_cache")
     os.makedirs(shared_cache, exist_ok=True)
@@ -740,16 +721,13 @@ def run_all_events(
         print(f"[LOG] Capturing output to: {log_path}")
 
         # ---- One-shot run prep (grid, distances, ampcorr, preview, etc.)
-        asl_config, inv, run_dir = prepare_asl_context(
+        asl_config, inv, run_dir = build_asl_config(
             sweep_or_cfg=sweep,
             inventory_xml=inventory_path,
             output_base=base_output_dir,
             node_spacing_m=node_spacing_m,
             peakf=peakf,
             regular_grid_dem=regular_grid_dem,
-            channels_dir=channels_dir,
-            channels_step_m=channels_step_m,
-            channels_dem_tif=channels_dem_tif,
             dem_cache_dir=os.path.join(shared_cache, "dem"),
             dem_tif_for_bmap=dem_tif_for_bmap,
             region=region,   # ← pass through

@@ -2,9 +2,10 @@
 set -euo pipefail
 
 PY=/opt/anaconda3/envs/flovopy_plus/bin/python   # or just: python
-SCRIPT="$HOME/Developer/flovopy/flovopy/dem/channel_finder.py"
+SCRIPT="$HOME/Developer/flovopy/flovopy/dem/channel_finder2.py"
 
-DEM="$HOME/Dropbox/PROFESSIONAL/DATA/WadgeDEMs/conversions/DEM_1999_WGS84_rotated.tif"
+#DEM="$HOME/Dropbox/PROFESSIONAL/DATA/WadgeDEMs/conversions/DEM_1999_WGS84_rotated.tif"
+DEM="$HOME/Dropbox/BRIEFCASE/SSADenver/wgs84_s0.4_3_clean_shifted.tif"
 OUTDIR="$HOME/Dropbox/BRIEFCASE/SSADenver/channel_finder"
 
 $PY "$SCRIPT" \
@@ -15,4 +16,4 @@ $PY "$SCRIPT" \
   --min-cells 700 \
   --top-n 100 \
   --min-len-m 500 \
-  --flip horizontal \
+#  --flip horizontal \

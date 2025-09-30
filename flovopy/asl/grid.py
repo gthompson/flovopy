@@ -7,6 +7,10 @@ import pickle
 import hashlib
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence, Tuple, Dict, Any
+from pathlib import Path
+import copy
+import pandas as pd
+from scipy.spatial import cKDTree
 
 import numpy as np
 from obspy.core.inventory import Inventory
@@ -241,10 +245,11 @@ class Grid:
         symbol: str = "c",
         scale: float = 0.1,
         fill: Optional[str] = "red",
-        pen: Optional[str] = "0.5p,red",
+        pen: Optional[str] = "1.0p,red",
         topo_map_kwargs: Optional[dict] = None,
         outfile: Optional[str] = None,
         min_display_spacing: Optional[float] = 50.0,
+        force_all_nodes = False, # if True, we plot all nodes regardless of how dense the plot is
     ):
         """
         Plot grid nodes on the canonical topo_map() basemap (no fallbacks).
@@ -278,6 +283,7 @@ class Grid:
 
         # Nodes to plot (honor mask)
         # Nodes to plot (honor mask)
+        # Nodes to plot (honor mask)
         x, y = self.masked_lonlat()
         x = np.asarray(x, float).ravel()
         y = np.asarray(y, float).ravel()
@@ -287,25 +293,114 @@ class Grid:
         if x.size == 0:
             raise ValueError("[GRID:PLOT] No nodes to plot after masks (check DEM/CRS or mask radius).")
 
+        # Helper: build an outline polygon from scattered lon/lat
+        def _outline_polygon(xs, ys, alpha_km=0.5):
+            """
+            Returns a shapely Polygon (concave hull if possible, else convex hull).
+            alpha_km controls concavity (smaller => tighter boundary).
+            """
+            try:
+                from shapely.geometry import MultiPoint
+                from shapely.ops import unary_union
+                # Try alpha-shape via SciPy Delaunay, fall back to convex hull
+                try:
+                    from scipy.spatial import Delaunay
+                    import shapely
+                    import numpy as np
 
-        # --- Subsample nodes for plotting if spacing < MIN_DISPLAY_SPACING m ---
-        if self.node_spacing_m < min_display_spacing:
-            step = int(np.ceil(min_display_spacing / self.node_spacing_m))
-            x = x[::step]
-            y = y[::step]
+                    pts = np.column_stack([xs, ys])
+                    if pts.shape[0] < 4:
+                        return MultiPoint(pts).convex_hull
 
-        # --- Symbol size (cm) scaled by actual node spacing, but not too tiny ---
-        size_cm = (max(self.node_spacing_m, min_display_spacing) / 2000.0) * float(scale)
-        stylestr = f"{symbol}{size_cm}c"
+                    # crude lon/lat -> meters scaling near island (OK for hull)
+                    lat0 = float(np.nanmedian(ys))
+                    m_per_deg_lat = 111_132.0
+                    m_per_deg_lon = 111_320.0 * np.cos(np.deg2rad(lat0))
+                    P = np.column_stack([(xs - xs.mean()) * m_per_deg_lon,
+                                         (ys - ys.mean()) * m_per_deg_lat])
 
-        # Plot nodes
-        fig.plot(
-            x=x,
-            y=y,
-            style=stylestr,
-            pen=pen,
-            fill=(None if symbol in ("x", "+") else fill),
-        )
+                    tri = Delaunay(P)
+                    # alpha radius in meters
+                    alpha = float(alpha_km) * 1000.0
+
+                    # collect triangle edges with circumradius < alpha
+                    edges = []
+                    for tri_ix in tri.simplices:
+                        A, B, C = P[tri_ix]
+                        a = np.linalg.norm(B - C)
+                        b = np.linalg.norm(C - A)
+                        c = np.linalg.norm(A - B)
+                        s = 0.5 * (a + b + c)
+                        area = max(s * (s - a) * (s - b) * (s - c), 0.0) ** 0.5
+                        if area == 0:
+                            continue
+                        R = (a * b * c) / (4.0 * area)  # circumradius
+                        if R <= alpha:
+                            i, j, k = tri_ix
+                            edges += [(i, j), (j, k), (k, i)]
+
+                    if not edges:
+                        return MultiPoint(np.column_stack([xs, ys])).convex_hull
+
+                    # dissolve kept triangle edges into a polygon outline
+                    from shapely.geometry import LineString
+                    lines = [LineString([(xs[i], ys[i]), (xs[j], ys[j])]) for i, j in edges]
+                    merged = unary_union(lines)
+                    outline = merged.convex_hull if merged.geom_type != "Polygon" else merged
+                    # If MultiPolygon, take largest
+                    if outline.geom_type == "MultiPolygon":
+                        outline = max(list(outline.geoms), key=lambda g: g.area)
+                    return outline
+
+                except Exception:
+                    # Fallback: convex hull only
+                    return MultiPoint(np.column_stack([xs, ys])).convex_hull
+            except Exception:
+                return None
+
+        # Decide rendering strategy based on density
+        dense = (self.node_spacing_m < (min_display_spacing or 50.0))
+
+        if dense and not force_all_nodes:
+            # 1) Try concave/convex hull outline
+            poly = _outline_polygon(x, y, alpha_km=0.5)
+            if poly is not None and not poly.is_empty:
+                try:
+                    # Plot unfilled red outline (thick enough to be visible)
+                    # Handle Polygon vs MultiPolygon
+                    geoms = [poly] if poly.geom_type != "MultiPolygon" else list(poly.geoms)
+                    for g in geoms:
+                        xs = np.array(g.exterior.coords)[:, 0]
+                        ys = np.array(g.exterior.coords)[:, 1]
+                        fig.plot(x=xs, y=ys, pen="1.25p,red", transparency=10)
+                except Exception as e:
+                    print(f"[GRID:PLOT] Hull plot failed ({e}); falling back to bbox.")
+                    poly = None
+
+            # 2) If hull failed, plot bounding rectangle
+            if (poly is None) or poly.is_empty:
+                xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
+                ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
+                bx = [xmin, xmax, xmax, xmin, xmin]
+                by = [ymin, ymin, ymax, ymax, ymin]
+                fig.plot(x=bx, y=by, pen="1.25p,red", transparency=10)
+
+        else:
+            # Sparse enough → plot nodes as before (with optional thinning)
+            if self.node_spacing_m < (min_display_spacing or 50.0):
+                step = int(np.ceil((min_display_spacing or 50.0) / self.node_spacing_m))
+                x = x[::step]; y = y[::step]
+
+            size_cm = (max(self.node_spacing_m, (min_display_spacing or 50.0)) / 2000.0) * float(scale)
+            stylestr = f"{symbol}{size_cm}c"
+
+            fig.plot(
+                x=x,
+                y=y,
+                style=stylestr,
+                pen=pen,
+                fill=(None if symbol in ("x", "+") else fill),
+            )
 
         # Dome marker
         #try:
@@ -314,6 +409,7 @@ class Grid:
         #    pass
 
         if outfile:
+            print(f'Grid.plot(): saving {outfile}')
             fig.savefig(outfile, dpi=300)
         if show:
             fig.show()
@@ -459,19 +555,50 @@ class Grid:
         self._node_mask_idx = idx
         return self
 
-    def apply_mask_boolean(self, mask_bool: np.ndarray, *, validate: bool = True) -> "Grid":
+    def apply_mask_boolean(
+        self,
+        mask_bool: np.ndarray,
+        *,
+        validate: bool = True,
+        mode: str = "replace",   # "replace" (default), "intersect", or "union"
+    ) -> "Grid":
         """
-        Apply a node mask given as a boolean array (shape==grid or flat length==N).
+        Apply a node mask given as a boolean array.
+
+        Parameters
+        ----------
+        mask_bool : np.ndarray
+            Boolean mask, shape==(nlat,nlon) or flat length==nlat*nlon.
+            True = keep node, False = mask out.
+        validate : bool
+            Check that the shape/size matches grid dimensions.
+        mode : {"replace","intersect","union"}
+            - "replace": overwrite any existing mask with the new one
+            - "intersect": keep only nodes that are True in BOTH
+            - "union": keep nodes that are True in EITHER
         """
         b = np.asarray(mask_bool, bool)
+
+        # normalize shape to 2D
         if b.ndim == 1:
             if validate and b.size != self.nlat * self.nlon:
                 raise ValueError("apply_mask_boolean: flat mask length != nlat*nlon")
-            self._node_mask = b.reshape(self.nlat, self.nlon)
+            b = b.reshape(self.nlat, self.nlon)
         else:
             if validate and b.shape != self.gridlat.shape:
                 raise ValueError("apply_mask_boolean: 2-D mask shape mismatch.")
-            self._node_mask = b.copy()
+
+        if self._node_mask is None or mode == "replace":
+            new_mask = b.copy()
+        else:
+            if mode == "intersect":
+                new_mask = self._node_mask & b
+            elif mode == "union":
+                new_mask = self._node_mask | b
+            else:
+                raise ValueError(f"Unknown mode {mode!r}; must be 'replace','intersect','union'")
+
+        self._node_mask = new_mask
         self._node_mask_idx = np.flatnonzero(self._node_mask.ravel())
         return self
 
@@ -489,6 +616,15 @@ class Grid:
     def shape(self) -> tuple[int, int] | None:
         """(nlat, nlon) for regular grids; NodeGrid will return None."""
         return (int(self.nlat), int(self.nlon))
+
+    def __str__(self):
+        base = f"[GRID] {self.nlat}x{self.nlon} nodes ({self.gridlat.size} total)  spacing={self.node_spacing_m:.1f} m"
+        if self._node_mask is None:
+            return base + "  [no mask]"
+        else:
+            kept = int(np.count_nonzero(self._node_mask))
+            pct  = kept / self._node_mask.size * 100.0
+            return base + f"  [mask: {kept}/{self._node_mask.size} nodes kept ({pct:.1f}%)]"
 
 def make_grid(
     center_lat: float = dome_location["lat"],
@@ -884,7 +1020,165 @@ class NodeGrid:
         return used_idx
 
 
+    def mask_grid_with_nodes(
+        self,
+        grid,
+        *,
+        k: int = 1,
+        max_m: float = 20.0,
+        flatten_copy: bool = True,
+        mask_name: str = "channels_only",   # kept for symmetry; not required by Grid
+        return_matches: bool = False,
+    ):
+        """
+        Horizontally match this NodeGrid's nodes to the nearest Grid nodes and keep ONLY those grid nodes.
 
+        Parameters
+        ----------
+        grid : Grid
+            Target grid (regular lat/lon with one node per (lon,lat)); must expose
+            grid.gridlon (2-D), grid.gridlat (2-D), nlat, nlon, centerlat.
+        k : int
+            Query up to k nearest grid nodes per NodeGrid node.
+        max_m : float
+            Keep neighbors within this horizontal distance (meters).
+        flatten_copy : bool
+            If True, operate on a deepcopy of the grid and zero-out its node_elev_m.
+        mask_name : str
+            Unused here (placeholder for naming); masking is applied directly to Grid.
+        return_matches : bool
+            If True, also return a tidy DataFrame of matches.
+
+        Returns
+        -------
+        grid_out : Grid
+            Masked grid (copy if flatten_copy; otherwise original).
+        mask2d : np.ndarray
+            2D boolean mask (True=kept node).
+        matches : pd.DataFrame   (if return_matches=True)
+        """
+
+        # --- 0) Validate NodeGrid coords ---
+        lon = np.asarray(getattr(self, "node_lon", None), float)
+        lat = np.asarray(getattr(self, "node_lat", None), float)
+        if lon is None or lat is None or lon.size == 0 or lon.shape != lat.shape:
+            raise ValueError("NodeGrid.node_lon/node_lat must exist and have same non-empty shape.")
+
+        # --- 1) Pull grid geometry directly from Grid() as provided ---
+        if not hasattr(grid, "gridlon") or not hasattr(grid, "gridlat"):
+            raise RuntimeError("Grid must expose gridlon/gridlat 2-D arrays.")
+        glon2d = np.asarray(grid.gridlon, float)
+        glat2d = np.asarray(grid.gridlat, float)
+        if glon2d.shape != glat2d.shape:
+            raise RuntimeError("grid.gridlon and grid.gridlat must have the same 2-D shape.")
+        ny, nx = glon2d.shape
+
+        # raveled lon/lat and global flat indices
+        glon = glon2d.ravel()
+        glat = glat2d.ravel()
+        base_flat_idx = np.arange(glon.size, dtype=int)
+
+        # finite only (should be all, but be safe)
+        finite = np.isfinite(glon) & np.isfinite(glat)
+        glon = glon[finite]; glat = glat[finite]; base_flat_idx = base_flat_idx[finite]
+        if glon.size == 0:
+            raise ValueError("Grid has no finite nodes to index.")
+
+        # Deduplicate horizontally (in case of any identical lon/lat)
+        pairs = np.column_stack([glon, glat])
+        uniq_pairs, uniq_idx = np.unique(pairs, axis=0, return_index=True)
+        u_glon = uniq_pairs[:, 0]
+        u_glat = uniq_pairs[:, 1]
+        flat_idx_u = base_flat_idx[uniq_idx]   # KD index -> global flat index (ny*nx)
+
+        # --- 2) Local ENU-like linearization around grid centerlat (or mean) ---
+        try:
+            lat0 = float(getattr(grid, "centerlat", np.nan))
+        except Exception:
+            lat0 = np.nan
+        if not np.isfinite(lat0):
+            lat0 = float(np.nanmean(u_glat))
+        # meters-per-degree at reference latitude
+        m_per_deg_lat, m_per_deg_lon = _meters_per_degree(lat0)
+
+        def _to_xy(lon_deg, lat_deg):
+            x = (np.asarray(lon_deg, float) - float(np.nanmean(u_glon))) * m_per_deg_lon
+            y = (np.asarray(lat_deg, float) - float(np.nanmean(u_glat))) * m_per_deg_lat
+            return x, y
+
+        gx, gy = _to_xy(u_glon, u_glat)
+        tree = cKDTree(np.column_stack([gx, gy]))
+
+        # --- 3) Query for NodeGrid nodes ---
+        px, py = _to_xy(lon, lat)
+        dists, idxs = tree.query(np.column_stack([px, py]), k=k, workers=-1)
+        dists = np.atleast_2d(dists)
+        idxs  = np.atleast_2d(idxs)
+
+        keep_flat = []
+        if return_matches:
+            out_rows = []
+
+        for i in range(lon.size):
+            for rank in range(dists.shape[1]):
+                d = float(dists[i, rank])
+                if not np.isfinite(d) or d > max_m:
+                    continue
+                kd_i   = int(idxs[i, rank])            # index in unique set
+                gi_flat = int(flat_idx_u[kd_i])        # global flat index (ny*nx)
+                keep_flat.append(gi_flat)
+                if return_matches:
+                    out_rows.append({
+                        "ng_idx": i,
+                        "node_lon": float(lon[i]),
+                        "node_lat": float(lat[i]),
+                        "grid_idx": gi_flat,
+                        "grid_lon": float(u_glon[kd_i]),
+                        "grid_lat": float(u_glat[kd_i]),
+                        "dist_m": d,
+                        "rank": rank + 1,
+                    })
+
+        keep_flat = np.unique(np.asarray(keep_flat, dtype=int))
+
+        # --- 4) Build keep-only mask2d (True=keep) ---
+        mask1d = np.zeros(ny * nx, dtype=bool)
+        valid = keep_flat[(keep_flat >= 0) & (keep_flat < mask1d.size)]
+        mask1d[valid] = True
+        mask2d = mask1d.reshape(ny, nx)
+
+        # --- 5) Optionally flatten a copy; then apply the mask ---
+        import copy as _copy
+        grid_out = _copy.deepcopy(grid) if flatten_copy else grid
+        # flatten elevations
+        if hasattr(grid_out, "node_elev_m"):
+            try:
+                # ensure array exists and has correct shape
+                if (getattr(grid_out, "node_elev_m") is None or
+                    np.asarray(grid_out.node_elev_m).shape != (ny, nx)):
+                    grid_out.node_elev_m = np.zeros((ny, nx), dtype=float)
+                else:
+                    grid_out.node_elev_m = np.zeros_like(np.asarray(grid_out.node_elev_m, dtype=float))
+            except Exception:
+                pass  # non-fatal if elevation storage differs
+
+        # Preferred: use Grid.apply_mask_indices if available
+        if hasattr(grid_out, "apply_mask_indices"):
+            grid_out.apply_mask_indices(keep_flat, validate=False)
+        else:
+            # fallback: set internal mask fields if present (True=keep)
+            if hasattr(grid_out, "_node_mask"):
+                grid_out._node_mask = mask2d.copy()
+            if hasattr(grid_out, "_node_mask_idx"):
+                grid_out._node_mask_idx = keep_flat.copy()
+
+        if return_matches:
+            matches = pd.DataFrame(out_rows, columns=[
+                "ng_idx","node_lon","node_lat","grid_idx","grid_lon","grid_lat","dist_m","rank"
+            ])
+            return grid_out, mask2d, matches
+        else:
+            return grid_out, mask2d
 
 
 
@@ -1147,3 +1441,101 @@ def _safe_to_float(x, default=np.nan) -> float:
         return v if np.isfinite(v) else float(default)
     except Exception:
         return float(default)
+    
+
+def _lonlat_to_local_xy(lon, lat, lon0, lat0):
+    """
+    Convert lon/lat (deg) to local ENU-like meters using spherical scale at lat0.
+    Good for ~tens of km. meters_per_degree_fn(lat0) -> (m_per_deg_lat, m_per_deg_lon).
+    """
+    m_per_deg_lat, m_per_deg_lon = _meters_per_degree(lat0)  # already in your module
+    x = (np.asarray(lon, float) - lon0) * m_per_deg_lon
+    y = (np.asarray(lat, float) - lat0) * m_per_deg_lat
+    return x, y
+
+
+def _build_grid_kdtree_2d(grid):
+    """
+    KD-tree over UNIQUE (lon,lat) nodes; returns (tree, meta) where meta includes:
+      ny, nx, lon0, lat0, glon, glat, flat_idx_u (GLOBAL flat indices ny*nx)
+    """
+    if hasattr(grid, "lon2d") and hasattr(grid, "lat2d"):
+        lon2d = np.asarray(grid.lon2d, float)
+        lat2d = np.asarray(grid.lat2d, float)
+        ny, nx = lon2d.shape
+        glon = lon2d.ravel(); glat = lat2d.ravel()
+        base_flat_idx = np.arange(glon.size, dtype=int)  # global flat indices
+    else:
+        glon, glat = grid.masked_lonlat()  # fallback
+        glon = np.asarray(glon, float).ravel()
+        glat = np.asarray(glat, float).ravel()
+        if hasattr(grid, "lon2d"):
+            ny, nx = np.asarray(grid.lon2d).shape
+        else:
+            raise RuntimeError("Cannot infer grid shape; need lon2d/lat2d on Grid.")
+        base_flat_idx = np.arange(glon.size, dtype=int)
+
+    finite = np.isfinite(glon) & np.isfinite(glat)
+    glon, glat, base_flat_idx = glon[finite], glat[finite], base_flat_idx[finite]
+    if glon.size == 0:
+        raise ValueError("Grid has no finite nodes to index.")
+
+    pairs = np.column_stack([glon, glat])
+    uniq_pairs, uniq_idx = np.unique(pairs, axis=0, return_index=True)
+    u_glon = uniq_pairs[:, 0]
+    u_glat = uniq_pairs[:, 1]
+    flat_idx_u = base_flat_idx[uniq_idx]
+
+    lon0, lat0 = float(np.nanmean(u_glon)), float(np.nanmean(u_glat))
+    gx, gy = _lonlat_to_local_xy(u_glon, u_glat, lon0, lat0)
+    tree = cKDTree(np.column_stack([gx, gy]))
+
+    meta = dict(
+        ny=int(ny), nx=int(nx),
+        lon0=lon0, lat0=lat0,
+        glon=u_glon, glat=u_glat,
+        flat_idx_u=flat_idx_u,   # maps KD index -> global flat index
+    )
+    return tree, meta
+
+
+def _apply_keep_mask_2d(grid, keep_flat, mask_name="channels_only"):
+    """Build keep-only 2D mask from flat indices and apply it to grid. Returns (grid_masked, mask2d)."""
+    if hasattr(grid, "lon2d"):
+        ny, nx = np.asarray(grid.lon2d).shape
+    elif hasattr(grid, "shape") and len(grid.shape) >= 2:
+        ny, nx = int(grid.shape[0]), int(grid.shape[1])
+    else:
+        raise RuntimeError("Cannot infer grid 2D shape.")
+
+    keep_flat = np.unique(np.asarray(keep_flat, dtype=int))
+    mask1d = np.zeros(ny * nx, dtype=bool)
+    valid = keep_flat[(keep_flat >= 0) & (keep_flat < mask1d.size)]
+    mask1d[valid] = True
+    mask2d = mask1d.reshape(ny, nx)
+
+    grid_masked = grid
+    applied = False
+    if hasattr(grid, "add_mask"):
+        try:
+            grid.add_mask(mask2d, name=mask_name, mode="keep")
+        except TypeError:
+            grid.add_mask(mask2d, name=mask_name)
+        applied = True
+    if not applied and hasattr(grid, "set_mask"):
+        try:
+            grid.set_mask(mask2d, keep=True)
+        except TypeError:
+            grid.set_mask(mask2d)
+        applied = True
+    if not applied and hasattr(grid, "with_mask"):
+        grid_masked = grid.with_mask(mask2d)
+        applied = True
+    if not applied and hasattr(grid, "mask"):
+        grid.mask = mask2d
+        applied = True
+    if not applied:
+        raise RuntimeError("Could not apply mask: unknown Grid mask API.")
+    return grid_masked, mask2d
+
+

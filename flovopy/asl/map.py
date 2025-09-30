@@ -1,5 +1,4 @@
 # flovopy/asl/map.py
-# flovopy/asl/map.py
 
 from __future__ import annotations
 
@@ -20,25 +19,6 @@ import xarray as xr  # noqa: F401
 
 # Prefer Oceania mirror
 pygmt.config(GMT_DATA_SERVER="https://oceania.generic-mapping-tools.org")
-
-
-# ----------------------------
-# small helpers
-# ----------------------------
-def _finite(v) -> bool:
-    try:
-        return v is not None and np.isfinite(float(v))
-    except Exception:
-        return False
-
-
-def _finite_arrays(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    x = np.asarray(x, float)
-    y = np.asarray(y, float)
-    m = np.isfinite(x) & np.isfinite(y)
-    if not np.any(m):
-        return np.array([]), np.array([])
-    return x[m], y[m]
 
 
 def _validate_region(region: List[float]) -> List[float]:
@@ -65,14 +45,12 @@ def topo_map(
     add_labels: bool = False,
     centerlon: float = -62.177,
     centerlat: float = 16.721,
-    contour_interval: float = 100,
     topo_color: bool = True,
     resolution: str = "01s",
     DEM_DIR: Optional[str] = None,
     stations: Optional[List[str]] = None,
     title: Optional[str] = None,
     region: Optional[List[float]] = None,
-    levels: Optional[List[float]] = None,
     level_interval: Optional[float] = None,
     cmap: Optional[str] = None,           # explicit CPT name or file; if None we choose based on topo_color
     projection: Optional[str] = None,
@@ -89,10 +67,6 @@ def topo_map(
     outfile: Optional[str] = None,
     land_fill: Optional[str] = None,  # NEW: paint land uniformly (e.g. "152/251/152" or "200/200/200")
 ):
-    import os, pickle, numpy as np, pygmt
-    from flovopy.stationmetadata.utils import inventory2traceid
-    # xarray import kept for type compatibility in callers
-    import xarray as xr  # noqa: F401
 
     def _finite(v) -> bool:
         try:
@@ -105,17 +79,6 @@ def topo_map(
         m = np.isfinite(x) & np.isfinite(y)
         return (x[m], y[m]) if np.any(m) else (np.array([]), np.array([]))
 
-    def _validate_region(r):
-        if r is None:
-            return None
-        r = list(map(float, r))
-        if not all(np.isfinite(r)):
-            raise ValueError(f"Region has non-finite values: {r}")
-        if r[0] > r[1]: r[0], r[1] = r[1], r[0]
-        if r[2] > r[3]: r[2], r[3] = r[3], r[2]
-        return r
-
-    # --- Region selection ---
     # --- Region selection (always honor zoom_level unless region is explicit) ---
     if region is not None:
         # Caller explicitly set region: use it as-is.
@@ -205,9 +168,6 @@ def topo_map(
                 shade = None
     else:
         # Earth Relief + small cache
-        cache_root = os.environ.get("FLOVOPY_CACHE")
-        if DEM_DIR is None and cache_root:
-            DEM_DIR = os.path.join(cache_root, "dem")
         pklfile = None
         if DEM_DIR:
             os.makedirs(DEM_DIR, exist_ok=True)
@@ -352,17 +312,16 @@ def topo_map(
         resolution='f',
         frame=(["WSen", "af"] if frame else False),
     )
+    if dem_tif:
+        coast_kwargs['shorelines']=None,
     if paint_water:
         coast_kwargs["water"] = "lightblue"
     fig.coast(**coast_kwargs)
 
     # Contours
     try:
-        if levels is not None:
-            fig.grdcontour(grid=grid_src, levels=levels, pen="0.25p,black", limit=limit)
-        else:
-            step = level_interval if level_interval is not None else contour_interval
-            fig.grdcontour(grid=grid_src, levels=step, pen="0.25p,black", limit=limit)
+        if level_interval:
+            fig.grdcontour(grid=grid_src, levels=level_interval, pen="0.25p,black", limit=limit)
     except Exception:
         pass
 
@@ -426,6 +385,7 @@ def topo_map(
         fig.basemap(region=region, frame=True)
 
     if outfile:
+        print(f'topo_map: Saving to {outfile}')
         fig.savefig(outfile)
     elif show:
         fig.show()

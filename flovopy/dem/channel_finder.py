@@ -17,9 +17,9 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LightSource
 
 # flip with 'labels-only' option (transform_only=True)
-from flovopy.dem.flip_geotiff import flip_geotiff
+#from flovopy.dem.flip_geotiff import flip_geotiff
 
-
+from rasterio.warp import transform as rio_transform
 # ============================= Helpers =============================
 
 def ensure_outdir(path: Path) -> Path:
@@ -500,6 +500,241 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+
+def sample_points_from_geotiff_any_crs(dem_tif: str, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    """
+    Sample elevation (meters) at lon/lat points from a GeoTIFF in ANY CRS.
+    Returns an array of shape (N,) with float elevations and NaN for nodata/outside.
+    """
+    lon = np.asarray(lon, float); lat = np.asarray(lat, float)
+    z = np.full(lon.shape, np.nan, float)
+    with rasterio.open(dem_tif) as src:
+        # Reproject the query points to the DEM's CRS if needed
+        if src.crs and src.crs.to_string() not in ("EPSG:4326", "OGC:CRS84"):
+            xs, ys = rio_transform("EPSG:4326", src.crs, lon.tolist(), lat.tolist())
+        else:
+            xs, ys = lon.tolist(), lat.tolist()
+
+        # rasterio.sample expects iterable of (x, y) in the DEM's CRS
+        samples = src.sample(zip(xs, ys), indexes=1)
+        nod = src.nodata
+        for i, (val,) in enumerate(samples):
+            if val is None or not np.isfinite(val) or (nod is not None and val == nod):
+                z[i] = np.nan
+            else:
+                z[i] = float(val)
+    return z
+
+from pathlib import Path
+
+def add_elevation_to_channel_csvs(
+    channels_dir: Path,
+    sampler: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    outdir: Path | None = None,
+    suffix: str = "_elev",
+    fmt: str = "%.8f",
+) -> None:
+    """
+    Read each channel CSV (lon,lat), sample elevation via `sampler`, write lon,lat,elev_m.
+    """
+    channels_dir = Path(channels_dir)
+    if outdir is not None:
+        outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
+
+    wrote = 0
+    for csv in sorted(channels_dir.glob("*.csv")):
+        if csv.stat().st_size == 0:
+            continue
+        arr = np.loadtxt(csv, delimiter=",", skiprows=1)
+        if arr.ndim != 2 or arr.shape[1] < 2:
+            continue
+        lon, lat = arr[:, 0], arr[:, 1]
+
+        elev = sampler(lon, lat)
+
+        out = np.column_stack([lon, lat, elev])
+        header = "lon,lat,elev_m"
+
+        out_csv = (csv.with_name(csv.stem + suffix + ".csv") if outdir is None
+                   else (outdir / csv.name))
+        np.savetxt(out_csv, out, delimiter=",", header=header, comments="", fmt=(fmt, fmt, "%.3f"))
+        wrote += 1
+
+    print(f"Attached elevation to {wrote} channel CSVs → {(outdir or channels_dir).resolve()}")
+    # --- put near other helpers ---
+from typing import Callable, Optional, Union
+import warnings
+
+RasterSource = Union[str, Path, rasterio.io.DatasetReader]
+
+def make_lonlat_dem_sampler(
+    dem_ll: Optional[RasterSource] = None,
+    *,
+    array: Optional[np.ndarray] = None,
+    transform: Optional[Affine] = None,
+    nodata: Optional[float] = None,
+) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
+    """
+    Build a sampler f(lon, lat) -> elev_m using a *lon/lat* DEM.
+
+    Options:
+    - dem_ll: path or open rasterio DatasetReader with EPSG:4326/CRS84
+    - OR pass `array`, `transform`, `nodata` if you already have the DEM in RAM
+
+    Returns
+    -------
+    sampler(lon, lat) -> np.ndarray of elevations (float, NaN for nodata/outside)
+    """
+    if array is not None:
+        if transform is None:
+            raise ValueError("If passing array, you must also pass its Affine transform")
+        arr = np.array(array, dtype="float32", copy=False)
+        nod = nodata
+        tr = transform
+
+        height, width = arr.shape
+
+        def _sample(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+            lon = np.asarray(lon, float); lat = np.asarray(lat, float)
+            out = np.full(lon.shape, np.nan, float)
+            # Convert lon/lat to raster indices
+            cols, rows = (~tr) * (lon, lat)  # map->pixel
+            cols = np.floor(cols).astype(int); rows = np.floor(rows).astype(int)
+            valid = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+            if not np.any(valid):
+                return out
+            vals = arr[rows[valid], cols[valid]].astype(float)
+            if nod is not None:
+                vals = np.where(vals == nod, np.nan, vals)
+            out[valid] = vals
+            return out
+
+        return _sample
+
+    # Fallback: use raster file/dataset in lon/lat
+    if dem_ll is None:
+        raise ValueError("Provide either (array, transform[, nodata]) or dem_ll")
+    if isinstance(dem_ll, (str, Path)):
+        ds = rasterio.open(dem_ll)
+        close_when_done = True
+    else:
+        ds = dem_ll
+        close_when_done = False
+
+    if ds.crs and ds.crs.to_string() not in ("EPSG:4326", "OGC:CRS84"):
+        warnings.warn(f"DEM is {ds.crs}; expected lon/lat. Elevation sampling may be wrong.", RuntimeWarning)
+
+    nod = ds.nodata
+    tr  = ds.transform
+    height, width = ds.height, ds.width
+
+    def _sample(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+        lon = np.asarray(lon, float); lat = np.asarray(lat, float)
+        out = np.full(lon.shape, np.nan, float)
+        cols, rows = (~tr) * (lon, lat)
+        cols = np.floor(cols).astype(int); rows = np.floor(rows).astype(int)
+        valid = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+        if np.any(valid):
+            vals = ds.read(1, window=rasterio.windows.Window(
+                0, 0, width, height  # full read is fine for small rasters; for huge rasters, sample individually
+            )) if False else None  # placeholder to show pattern if you want to micro-optimize later
+
+        # sample individually to avoid big reads (fast enough for channel CSV sizes)
+        for i in np.where(valid)[0]:
+            r, c = rows[i], cols[i]
+            v = ds.read(1, window=rasterio.windows.Window(c, r, 1, 1))[0, 0]
+            if nod is not None and v == nod:
+                v = np.nan
+            out[i] = float(v)
+        return out
+
+    # If we opened a path, tie a close to the sampler so we don't leak handles.
+    if close_when_done:
+        def _sample_with_close(lon, lat, _inner=_sample, _ds=ds):
+            try:
+                return _inner(lon, lat)
+            finally:
+                _ds.close()
+        return _sample_with_close
+
+    return _sample
+# -------- put near your other helpers --------
+from typing import Callable, Optional, Union
+import rasterio
+from rasterio.transform import Affine
+
+def make_lonlat_dem_sampler_from_dataset(
+    ds: rasterio.io.DatasetReader,
+) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
+    """
+    Build a sampler f(lon, lat) -> elev_m using an *open* lon/lat rasterio dataset.
+    IMPORTANT: ds must stay open for the lifetime of the sampler.
+    """
+    if ds.crs and ds.crs.to_string() not in ("EPSG:4326", "OGC:CRS84"):
+        print(f"[warn] DEM CRS is {ds.crs}; expected lon/lat (EPSG:4326/CRS84).")
+
+    nod = ds.nodata
+    tr  = ds.transform
+    h, w = ds.height, ds.width
+
+    def _sample(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+        lon = np.asarray(lon, float); lat = np.asarray(lat, float)
+        out = np.full(lon.shape, np.nan, float)
+        # map lon/lat -> pixel indices using affine inverse
+        cols, rows = (~tr) * (lon, lat)
+        cols = np.floor(cols).astype(int); rows = np.floor(rows).astype(int)
+        valid = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+        if not np.any(valid):
+            return out
+
+        # Read single pixels. (Channel CSVs are small, this is fast enough and robust.)
+        band1 = ds.read(1)  # one full read is typically faster than many 1x1 windows
+        vals = band1[rows[valid], cols[valid]].astype(float)
+        if nod is not None:
+            vals = np.where(vals == nod, np.nan, vals)
+        out[valid] = vals
+        return out
+
+    return _sample
+
+
+def add_elevation_to_channel_csvs_open_once(
+    channels_dir: Path,
+    dem_ll_path: Path,
+    outdir: Path | None = None,
+    suffix: str = "_elev",
+    fmt: str = "%.8f",
+) -> None:
+    """
+    Open the lon/lat DEM once, build a sampler on it, then augment all channel CSVs.
+    This avoids 'Dataset is closed' errors and is IO-efficient.
+    """
+    channels_dir = Path(channels_dir)
+    if outdir is not None:
+        outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
+
+    with rasterio.open(dem_ll_path) as ds:
+        sampler = make_lonlat_dem_sampler_from_dataset(ds)
+
+        wrote = 0
+        for csv in sorted(channels_dir.glob("*.csv")):
+            if csv.stat().st_size == 0:
+                continue
+            arr = np.loadtxt(csv, delimiter=",", skiprows=1)
+            if arr.ndim != 2 or arr.shape[1] < 2:
+                continue
+            lon, lat = arr[:, 0], arr[:, 1]
+
+            elev = sampler(lon, lat)  # <-- ds stays open for all files
+
+            out = np.column_stack([lon, lat, elev])
+            header = "lon,lat,elev_m"
+            out_csv = (csv.with_name(csv.stem + suffix + ".csv") if outdir is None
+                       else (outdir / csv.name))
+            np.savetxt(out_csv, out, delimiter=",", header=header, comments="", fmt=(fmt, fmt, "%.3f"))
+            wrote += 1
+
+    print(f"Attached elevation to {wrote} channel CSVs → {(outdir or channels_dir).resolve()}")
 # ================================ Main =============================
 
 def main(argv: List[str] | None = None) -> None:
@@ -521,7 +756,7 @@ def main(argv: List[str] | None = None) -> None:
     if args.flip:
         flipped = outdir / f"02_dem_flipped_{args.flip}.tif"
         # IMPORTANT: transform_only=True => flip the "labels", not the pixels
-        flip_geotiff(work_ll, flipped, mode=args.flip, transform_only=True)
+        #flip_geotiff(work_ll, flipped, mode=args.flip, transform_only=True)
         work_ll = flipped
         _print_path(f"DEM (flipped {args.flip})", work_ll)
         quick_raster_png(work_ll, outdir / "02_flipped_dem.png", title="Flipped DEM")
@@ -574,6 +809,14 @@ def main(argv: List[str] | None = None) -> None:
     print("✅ Drainage extraction finished.")
     print("Check outputs in:", outdir.resolve())
 
+    lonlat_sampler = make_lonlat_dem_sampler(work_ll)
+    # NEW (correct: open lon/lat DEM once)
+    add_elevation_to_channel_csvs_open_once(
+        channels_dir=outdir / "channels_csv",
+        dem_ll_path=work_ll,            # <-- this is your lon/lat DEM
+        outdir=None,
+        suffix="_elev",
+    )
 
 if __name__ == "__main__":
     main()
