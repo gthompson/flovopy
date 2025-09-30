@@ -1582,7 +1582,7 @@ class VSAM(SAM):
         return SAM.get_filename(SAM_DIR, id, year, sampling_interval, ext, name=name)
 
     @staticmethod
-    def compute_geometrical_spreading_correction(this_distance_km, chan, surfaceWaves=False, wavespeed_kms=2000, peakf=2.0):
+    def compute_geometrical_spreading_correction(this_distance_km, chan, surfaceWaves=False, wavespeed_kms=2, peakf=2.0):
         #print('peakf =',peakf)
         if surfaceWaves and chan[1]=='H': # make sure seismic channel
             wavelength_km = wavespeed_kms/peakf

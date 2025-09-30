@@ -8,11 +8,13 @@ from typing import Dict, Any, Optional,  List, Tuple
 import itertools
 from dataclasses import dataclass, asdict
 import time
+from pprint import pprint
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from obspy import Stream, read, read_inventory
 
+from flovopy.core.mvo import dome_location
 from flovopy.processing.sam import VSAM
 from flovopy.asl.ampcorr import AmpCorr, AmpCorrParams
 from flovopy.asl.asl import ASL
@@ -91,16 +93,16 @@ def _asl_output_source_results(
     print("[ASL:PLOT] Writing map and diagnostic plots…")
     aslobj.plot(
         zoom_level=0,
-        threshold_DR=0.0,
+        threshold_DR=1.0,
         scale=0.2,
-        join=True,
+        join=False,
         number=0,
         add_labels=True,
         stations = [tr.stats.station for tr in (stream or [])],
         outfile=map_png,
         dem_tif=dem_tif_for_bmap,
         simple_basemap=True,
-        region=region,
+        region=None,#region,
     )
     plt.close('all')
 
@@ -150,6 +152,7 @@ def asl_sausage(
     *,
     # NEW: enable a triangular (apex→sea) sector refinement pass
     refine_sector: bool = False,
+    summit_location: dict = None,
 ):
     """
     Run ASL on a single (already preprocessed) event stream.
@@ -213,8 +216,38 @@ def asl_sausage(
         print(f"[ASL] Using peak frequency override: {peakf_event} Hz")
 
     ################### IMPLEMENT THIS FOR CHECKING ################
-    samObj.compute_reduced_velocity(asl_config['inventory'], asl_config['summit'], surfaceWaves=asl_config['assume_surface_waves'], Q=asl_config['Q'], wavespeed_kms=asl_config['wave_speed'], peakf=peakf_event)
+    print("ASL_CONFIG (keys):", sorted(asl_config.keys()))
+    print("ASL_CONFIG AmpCorr object:")
+    pprint(list(vars(asl_config["ampcorr"]).keys()))
+    #pprint(asl_config, width=100)
+    # Pull wave/atten params from AmpCorr (single source of truth)
+    ampcorr_params = asl_config["ampcorr"].params
 
+    print(f"[ASL:CHECK] Params → surface_waves={ampcorr_params.assume_surface_waves}  "
+        f"v={ampcorr_params.wave_speed_kms} km/s  Q={ampcorr_params.Q}  peakf_event={peakf_event}")
+
+    # Sanity check distances (km)
+    nd = asl_config["node_distances_km"]
+    all_max = [float(np.nanmax(v)) for v in nd.values() if np.size(v)]
+    if all_max:
+        dmin = min(float(np.nanmin(v)) for v in nd.values())
+        dmax = max(all_max)
+        dp95 = np.percentile(np.concatenate([np.ravel(v) for v in nd.values()]), 95)
+        print(f"[ASL:DISTS] node→station distances (km): min={dmin:.3f}  p95={dp95:.3f}  max={dmax:.3f}")
+        if dmax > 100:  # Montserrat scale guardrail
+            print("[ASL:WARN] Distances look like meters! (max > 100 km)")
+
+    # Your diagnostic: compute reduced velocity at the summit
+    if summit_location:
+        samObj.compute_reduced_velocity(
+            asl_config["inventory"],
+            summit_location,
+            surfaceWaves=ampcorr_params.assume_surface_waves,
+            Q=ampcorr_params.Q,
+            wavespeed_kms=ampcorr_params.wave_speed_kms,
+            peakf=peakf_event,
+        )
+            
     # 4) Amplitude corrections cache (swap if peakf differs)
     ampcorr: AmpCorr = asl_config["ampcorr"]
     if abs(float(ampcorr.params.peakf) - float(peakf_event)) > 1e-6:
@@ -304,6 +337,20 @@ def asl_sausage(
             peakf_event=peakf_event,
             suffix="",
         )
+
+    ############## SCAFFOLD
+    src = aslobj.source
+    for k in ("lat","lon","DR","misfit","t","nsta"):
+        v = np.asarray(src.get(k, []))
+        if v.size == 0:
+            finite_pct = 0.0
+        elif np.issubdtype(v.dtype, np.number):
+            finite_pct = 100 * np.isfinite(v).mean()
+        else:
+            finite_pct = float("nan")  # not applicable
+        print(f"[CHECK:SRC] {k}: shape={v.shape} dtype={v.dtype} finite%={finite_pct:.1f}") 
+
+    ################### 
 
     # 8) OPTIONAL: sector refinement pass (triangular wedge from dome toward sea)
     if refine_sector:
@@ -406,6 +453,7 @@ def prepare_asl_context(
             gridobj.apply_land_mask_from_dem(sea_level=1.0)
         except Exception:
             pass
+
 
     # Distances (shared cache per sweep tag + 2D/3D)
     cache_root = Path(output_base) / "_nbcache" / tag
@@ -530,6 +578,46 @@ def run_single_event(
             dem_tif_for_bmap=dem_tif_for_bmap,
             region=region,
         )
+
+        ######################### SCAFFOLD
+        d = asl_config["node_distances_km"]  # dict: seed_id -> (N_nodes,) in KM
+        grid = asl_config["gridobj"]
+        n_nodes = grid.gridlat.size
+
+        print(f"[CHECK:DISTS] stations in distances: {len(d)}")
+
+        bad_shapes = []
+        bad_finite = []
+        mins, meds, maxs = [], [], []
+        some = []
+
+        for sid, arr in d.items():
+            a = np.asarray(arr, float).ravel()
+            if a.size != n_nodes:
+                bad_shapes.append((sid, a.size, n_nodes))
+                continue
+            if not np.isfinite(a).all():
+                bad_finite.append(sid)
+            mins.append(np.nanmin(a))
+            meds.append(np.nanmedian(a))
+            maxs.append(np.nanmax(a))
+            if len(some) < 5:
+                some.append((sid, float(np.nanmin(a)), float(np.nanmedian(a)), float(np.nanmax(a))))
+
+        print("[CHECK:DISTS] example 5 stations (min, med, max km):")
+        for t in some:
+            print("   ", t)
+
+        if bad_shapes:
+            print("[CHECK:DISTS] BAD SHAPES:", bad_shapes[:5], "...")
+
+        if bad_finite:
+            print(f"[CHECK:DISTS] non-finite entries at {len(bad_finite)} stations (first 10):", bad_finite[:10])
+
+        if mins:
+            print(f"[CHECK:DISTS] global: min={np.min(mins):.3f} km  p50={np.median(meds):.3f} km  max={np.max(maxs):.3f} km")
+        #############################
+
 
         # Per-run overrides
         asl_config["window_seconds"] = window_seconds

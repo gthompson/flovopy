@@ -11,10 +11,10 @@ from typing import Callable, Optional, Sequence, Tuple, Dict, Any
 import numpy as np
 from obspy.core.inventory import Inventory
 from obspy import Stream
-
+import pygmt
 from flovopy.utils.make_hash import make_hash
 from flovopy.core.mvo import dome_location
-
+from flovopy.asl.map import topo_map
 
 # ------------------------------
 # Compact grid signature (for IDs)
@@ -173,7 +173,9 @@ class Grid:
             path = params.get("path")
             if not path or not os.path.exists(path):
                 raise ValueError("dem=('geotiff', {'path': '/abs/path/to/dem.tif'}) requires a valid file path.")
-            self.node_elev_m = _dem_sample_geotiff(self.gridlat, self.gridlon, path=path)
+            # fix keyword name (or pass positionally)
+            self.node_elev_m = _dem_sample_geotiff(self.gridlat, self.gridlon, tif_path=path)
+            # or: self.node_elev_m = _dem_sample_geotiff(self.gridlat, self.gridlon, path)
         elif source == "sampler":
             func = params.get("func")
             if not callable(func):
@@ -237,63 +239,79 @@ class Grid:
         fig=None,
         show: bool = True,
         symbol: str = "c",
-        scale: float = 1.0,
-        fill: Optional[str] = "blue",
-        pen: Optional[str] = "0.5p,black",
+        scale: float = 0.1,
+        fill: Optional[str] = "red",
+        pen: Optional[str] = "0.5p,red",
         topo_map_kwargs: Optional[dict] = None,
         outfile: Optional[str] = None,
+        min_display_spacing: Optional[float] = 50.0,
     ):
         """
-        Plot grid nodes using PyGMT on a simple two-color land/sea basemap by default.
-        If this Grid was built from a GeoTIFF DEM, we reuse that DEM for the basemap.
+        Plot grid nodes on the canonical topo_map() basemap (no fallbacks).
         """
-        try:
-            import pygmt  # type: ignore
-        except Exception as e:
-            raise ImportError("PyGMT is required for Grid.plot().") from e
-
-        # Default: plain basemap (no shading), reuse DEM if provided
+        # Base kwargs: default to a simple land/sea scheme unless caller overrides
         default_kwargs = {
-            "topo_color": False,      # keep topography color logic enabled
-            "cmap": "land",          # our map.py uses a 2-color CPT + disables shading
+            "topo_color": False,   # disable colorful topography by default
+            "cmap": "land",        # 2-color sea/land palette defined in topo_map()
+            "show": False,
         }
 
-        # If grid was built from a GeoTIFF, pass the same file to topo_map
-        dem_tif = None
+        # If this Grid was built from a GeoTIFF DEM, reuse the same raster for the basemap
         if self.dem_info and self.dem_info[0] == "geotiff":
-            dem_tif = self.dem_info[1].get("path")
-            if dem_tif:
-                default_kwargs["dem_tif"] = dem_tif
+            path = self.dem_info[1].get("path")
+            if path:
+                default_kwargs["dem_tif"] = path
 
-        topo_map_kwargs = {**default_kwargs, **(topo_map_kwargs or {})}
+        # Merge caller overrides
+        topo_kw = {**default_kwargs, **(topo_map_kwargs or {})}
 
-        # Prefer our topo_map factory; else a bare basemap
+        # Always create/obtain a figure via topo_map()
         if fig is None:
-            try:
-                from .map import topo_map
-                # If caller didn't supply region, let topo_map infer from dem_tif or use its zoom rules
-                fig = topo_map(show=False, **topo_map_kwargs)
-            except Exception:
-                region = [
-                    float(np.nanmin(self.gridlon)), float(np.nanmax(self.gridlon)),
-                    float(np.nanmin(self.gridlat)), float(np.nanmax(self.gridlat)),
-                ]
-                fig = pygmt.Figure()
-                fig.basemap(region=region, projection="M12c", frame=True)
+            fig = topo_map(**topo_kw)
+        # If caller passed (fig, region) because they used return_region=True, keep the fig
+        if isinstance(fig, tuple):
+            fig = fig[0]
 
-        # Symbol size (cm) scaled by spacing
-        size_cm = (self.node_spacing_m / 2000.0) * float(scale)
+        # Symbol size (cm) roughly scaled by physical spacing
+        size_cm = (float(self.node_spacing_m) / 2000.0) * float(scale)
         stylestr = f"{symbol}{size_cm}c"
 
-        # Plot nodes (honor land mask if present)
+        # Nodes to plot (honor mask)
+        # Nodes to plot (honor mask)
         x, y = self.masked_lonlat()
+        x = np.asarray(x, float).ravel()
+        y = np.asarray(y, float).ravel()
+        finite = np.isfinite(x) & np.isfinite(y)
+        x, y = x[finite], y[finite]
+
+        if x.size == 0:
+            raise ValueError("[GRID:PLOT] No nodes to plot after masks (check DEM/CRS or mask radius).")
+
+
+        # --- Subsample nodes for plotting if spacing < MIN_DISPLAY_SPACING m ---
+        if self.node_spacing_m < min_display_spacing:
+            step = int(np.ceil(min_display_spacing / self.node_spacing_m))
+            x = x[::step]
+            y = y[::step]
+
+        # --- Symbol size (cm) scaled by actual node spacing, but not too tiny ---
+        size_cm = (max(self.node_spacing_m, min_display_spacing) / 2000.0) * float(scale)
+        stylestr = f"{symbol}{size_cm}c"
+
+        # Plot nodes
         fig.plot(
             x=x,
             y=y,
             style=stylestr,
             pen=pen,
-            fill=fill if symbol not in ("x", "+") else None,
+            fill=(None if symbol in ("x", "+") else fill),
         )
+
+        # Dome marker
+        #try:
+        #    fig.plot(x=dome_location["lon"], y=dome_location["lat"], style="a0.3c", fill="red", pen="black")
+        #except Exception:
+        #    pass
 
         if outfile:
             fig.savefig(outfile, dpi=300)
@@ -986,10 +1004,6 @@ def _dem_sample_pygmt(
     Sample GMT Earth Relief at given (lat2d, lon2d). Returns elevations (m).
     Caches a small pickled grid subset for speed if cache_dir is given.
     """
-    try:
-        import pygmt  # type: ignore
-    except Exception as e:
-        raise ImportError("PyGMT is required for DEM sampling via 'pygmt'.") from e
 
     latv = np.asarray(lat2d, float); lonv = np.asarray(lon2d, float)
     minlon, maxlon = float(np.nanmin(lonv)), float(np.nanmax(lonv))

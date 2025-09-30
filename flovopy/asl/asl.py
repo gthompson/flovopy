@@ -1855,6 +1855,7 @@ class ASL:
                 _ts(f"ERROR: join failed: {e!r}")
                 raise
 
+        '''
         # region frame (optional)
         if region:
             try:
@@ -1862,6 +1863,7 @@ class ASL:
             except Exception as e:
                 _ts(f"ERROR: frame draw failed: {e!r}")
                 raise
+        '''
 
         # output
         if outfile:
