@@ -243,7 +243,7 @@ class Grid:
         fig=None,
         show: bool = True,
         symbol: str = "c",
-        scale: float = 0.1,
+        scale: float = 2.0,
         fill: Optional[str] = "red",
         pen: Optional[str] = "1.0p,red",
         topo_map_kwargs: Optional[dict] = None,
@@ -256,9 +256,13 @@ class Grid:
         """
         # Base kwargs: default to a simple land/sea scheme unless caller overrides
         default_kwargs = {
-            "topo_color": False,   # disable colorful topography by default
-            "cmap": "land",        # 2-color sea/land palette defined in topo_map()
-            "show": False,
+            "add_labels": True,
+            "cmap": "gray",
+            "title": "Grid",
+            "frame": True,
+        #    "topo_color": False,   # disable colorful topography by default
+        #    "cmap": "land",        # 2-color sea/land palette defined in topo_map()
+        #    "show": False,
         }
 
         # If this Grid was built from a GeoTIFF DEM, reuse the same raster for the basemap
@@ -398,7 +402,7 @@ class Grid:
                 x=x,
                 y=y,
                 style=stylestr,
-                pen=pen,
+                #pen=pen,
                 fill=(None if symbol in ("x", "+") else fill),
             )
 
@@ -1539,3 +1543,171 @@ def _apply_keep_mask_2d(grid, keep_flat, mask_name="channels_only"):
     return grid_masked, mask2d
 
 
+def apply_channel_land_circle_mask(
+    grid: "Grid",
+    nodegrid: "NodeGrid",
+    *,
+    k: int = 4,
+    max_m: float = 20.0,
+    dome_location: dict | None = None,
+    radius_km: float = 1.0,
+) -> "Grid":
+    """
+    Keep nodes: within radius_km of dome  OR  (on land AND along channel).
+
+    - Uses grid.apply_land_mask_from_dem() for land
+    - Uses nodegrid.mask_grid_with_nodes(..., flatten_copy=False) to get channel mask2d
+    - Builds the circle mask in meters
+    - Applies final mask with grid.apply_mask_boolean(...)
+
+    Returns the same grid (mutated) for convenience.
+    """
+    import numpy as np
+
+    # 1) Land mask (True=keep)
+    land_mask = grid.apply_land_mask_from_dem(sea_level=0.0)  # shape (nlat, nlon)
+
+    # 2) Channel mask via NodeGrid → ask for mask2d but DO NOT flatten or write into grid
+    _, channel_mask2d = nodegrid.mask_grid_with_nodes(
+        grid,
+        k=k,
+        max_m=max_m,
+        flatten_copy=False,      # don't zero elevations, don't write a new copy
+        return_matches=False,    # we only need the mask
+    )
+
+    # 3) Circle mask around dome (True inside circle)
+    centerlon = getattr(grid, "centerlon", float(np.nan))
+    centerlat = getattr(grid, "centerlat", float(np.nan))
+    if dome_location and "lon" in dome_location and "lat" in dome_location:
+        centerlon = float(dome_location["lon"])
+        centerlat = float(dome_location["lat"])
+
+    m_per_deg_lat, m_per_deg_lon = _meters_per_degree(grid.centerlat)
+    dlat_m = (grid.gridlat - centerlat) * m_per_deg_lat
+    dlon_m = (grid.gridlon - centerlon) * m_per_deg_lon
+    dist_m = np.hypot(dlat_m, dlon_m)
+    circle_mask = dist_m <= (float(radius_km) * 1000.0)
+
+    # (optional) some quick stats
+    n_all = grid.gridlat.size
+    kept_circle = int(circle_mask.sum())
+    kept_land   = int(land_mask.sum())
+    kept_chan   = int(channel_mask2d.sum())
+    print(f"[CIRCLE] keep {kept_circle}/{n_all} ({100*kept_circle/n_all:.1f}%)")
+    print(f"[LAND  ] keep {kept_land}/{n_all} ({100*kept_land/n_all:.1f}%)")
+    print(f"[CHAN  ] keep {kept_chan}/{n_all} ({100*kept_chan/n_all:.1f}%)")
+
+    # 4) Boolean recipe: within_circle OR (on_land AND on_channel)
+    final_mask = circle_mask | (land_mask & channel_mask2d)
+
+    # 5) Apply once (True = keep)
+    grid.apply_mask_boolean(final_mask, validate=True, mode="replace")
+
+    # Optional: show final mask stats
+    kept_final = int(final_mask.sum())
+    print(f"[FINAL ] keep {kept_final}/{n_all} ({100*kept_final/n_all:.1f}%)")
+
+    return grid
+
+import numpy as np
+import pandas as pd
+from typing import Dict, Optional
+
+def summarize_station_node_distances(
+    node_distances_km: Dict[str, np.ndarray],
+    *,
+    reduce_to_station: bool = False,   # True → aggregate NET.STA across channels
+    include_median: bool = True,       # add p50
+    sort_by: str = "min_km",           # "min_km" | "max_km" | "station"
+    to_csv: Optional[str] = None       # path to save the table (optional)
+) -> pd.DataFrame:
+    """
+    Build a summary table of min/median/max station→node distances (km).
+
+    Parameters
+    ----------
+    node_distances_km : dict[seed_id -> np.ndarray]
+        Each array is length n_nodes (dense), with masked nodes as NaN.
+    reduce_to_station : bool
+        If True, collapse multiple channels to a single NET.STA row by
+        aggregating over all channels of that station.
+    include_median : bool
+        If True, include p50 column.
+    sort_by : str
+        Column to sort by.
+    to_csv : str | None
+        If provided, save the resulting table to this path.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        - station  (seed_id or NET.STA if reduced)
+        - n_total  (total nodes)
+        - n_finite (unmasked nodes per station)
+        - pct_masked
+        - min_km, [median_km], max_km
+    """
+    def _seed_to_station(seed: str) -> str:
+        # seed like NET.STA.LOC.CHA -> NET.STA
+        parts = seed.split(".")
+        return ".".join(parts[:2]) if len(parts) >= 2 else seed
+
+    rows = []
+    n_total = None
+
+    for sid, d in node_distances_km.items():
+        d = np.asarray(d, dtype=float).ravel()
+        if n_total is None:
+            n_total = d.size
+        finite = np.isfinite(d)
+        n_finite = int(finite.sum())
+
+        if n_finite == 0:
+            min_km = np.nan
+            med_km = np.nan
+            max_km = np.nan
+        else:
+            vals = d[finite]
+            min_km = float(np.nanmin(vals))
+            max_km = float(np.nanmax(vals))
+            med_km = float(np.nanmedian(vals)) if include_median else np.nan
+
+        rows.append({
+            "station": sid,
+            "n_total": n_total,
+            "n_finite": n_finite,
+            "pct_masked": 0.0 if n_total == 0 else float(100.0 * (n_total - n_finite) / n_total),
+            "min_km": min_km,
+            **({"median_km": med_km} if include_median else {}),
+            "max_km": max_km,
+        })
+
+    df = pd.DataFrame(rows)
+
+    if reduce_to_station:
+        # Group by NET.STA, aggregate across channels
+        key = df["station"].map(_seed_to_station)
+        agg = {
+            "n_total": "max",                     # same for all rows
+            "n_finite": "sum",                    # sum of finite across channels
+            "pct_masked": "mean",                 # not strictly meaningful; keep for rough sense
+            "min_km": "min",
+            "max_km": "max",
+        }
+        if include_median:
+            # median across channels of their per-station medians (robust enough)
+            agg["median_km"] = "median"
+        df["station"] = key
+        df = df.groupby("station", as_index=False).agg(agg)
+
+    # Sorting
+    if sort_by in df.columns:
+        df = df.sort_values(sort_by).reset_index(drop=True)
+    else:
+        df = df.sort_values("station").reset_index(drop=True)
+
+    if to_csv:
+        df.to_csv(to_csv, index=False)
+
+    return df

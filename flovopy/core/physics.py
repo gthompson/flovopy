@@ -27,10 +27,46 @@ def VASR(Eacoustic: Number, Eseismic: Number) -> Optional[float]:
         return None
 
 
-def Eseismic2magnitude(Eseismic: Union[Number, Iterable[Number]], correction: float = 3.7):
+def Eseismic2magnitude(Eseismic: Union[Number, Iterable[Number]], correction: float = 3.2):
     """
     Energy (J) -> magnitude using Hanks & Kanamori (1979) with joule correction (3.7).
     Accepts scalar or iterable. Returns scalar or list.
+
+    
+    Convert a (vector of) magnitude(s) into a (vector of) equivalent energy(/ies).
+    
+    Conversion is based on the the following formula from Hanks and Kanamori (1979):
+ 
+       mag = 2/3 * log10(energy) - 4.7
+ 
+    That is, energy (Joules) is roughly proportional to the peak amplitude to the power of 1.5.
+    This obviously is based on earthquake waveforms following a characteristic shape.
+    For a waveform of constant amplitude, energy would be proportional to peak amplitude
+    to the power of 2.
+ 
+    For Montserrat data, when calibrating against events in the SRU catalog, a factor of
+    3.7 was preferred to 4.7.
+
+    based on https://github.com/geoscience-community-codes/GISMO/blob/master/core/%2Bmagnitude/eng2mag.m
+    
+    *** Edited 2024/04/17
+
+    Now based on 2024 SSA Presentation:
+
+    ME = 2/3 log10(E) - 3.7
+
+    ME = b * log10(E) + a
+
+    So:
+
+    E = 10^(1.5 * (ME + 3.7))
+
+    E = 10^(1/b * (ME - a))
+
+    *** Edited 2024/04/18
+
+    Now based on Choy & Boatright [1995] who find best value for a=-3.2, so altering default
+
     """
     def _one(E):
         E = float(E)
@@ -40,10 +76,49 @@ def Eseismic2magnitude(Eseismic: Union[Number, Iterable[Number]], correction: fl
     return _one(Eseismic)
 
 
-def magnitude2Eseismic(mag: Union[Number, Iterable[Number]], correction: float = 3.7):
+def magnitude2Eseismic(mag: Union[Number, Iterable[Number]], correction: float = 3.2):
     """
     Magnitude -> energy (J) using Hanks & Kanamori (1979) with joule correction (3.7).
     Accepts scalar or iterable. Returns scalar or list.
+
+    
+    Convert (a vector of) magnitude into (a vector of) equivalent energy(ies).
+   
+    Conversion is based on the equation 7 Hanks and Kanamori (1979):
+ 
+       mag = 2/3 * log10(energy) - 4.7
+ 
+    That is, energy (Joules) is roughly proportional to the peak amplitude to the power of 1.5.
+    This obviously is based on earthquake waveforms following a characteristic shape.
+    For a waveform of constant amplitude, energy would be proportional to peak amplitude
+    to the power of 2.
+ 
+    For Montserrat data, when calibrating against events in the SRU catalog, a factor of
+    a=-3.7 was preferred to a=-4.7.
+    
+    based on https://github.com/geoscience-community-codes/GISMO/blob/master/core/%2Bmagnitude/mag2eng.m
+
+    *** Edited 2024/04/17
+
+    Now based on 2024 SSA Presentation:
+
+    ME = 2/3 log10(E) - 3.7
+
+    ME = b * log10(E) + a
+
+    So:
+
+    E = 10^(1.5 * (ME + 3.7))
+
+    E = 10^(1/b * (ME - a))
+    
+    E = 3 x 10^5 x 10^(1.5 ME)
+    
+    *** Edited 2024/04/18
+
+    Now based on Choy & Boatright [1995] who find best value for a=-3.2, so altering default 
+
+
     """
     def _one(M):
         M = float(M)
@@ -267,3 +342,187 @@ def estimate_local_magnitude(trace: Trace, R_km: Number,
         return ml
     except Exception:
         return None
+    
+#--------------------------------------------------------------------------------
+
+# THESE PHYSICS COME FROM flovopy.processing.sam
+
+
+def _as_dtype(x, out_dtype: str) -> np.ndarray:
+    return np.asarray(x, dtype=np.float32 if out_dtype == "float32" else np.float64)
+
+def _preserve_nan(mask_from: np.ndarray, arr: np.ndarray) -> np.ndarray:
+    # preserve NaNs from mask_from into arr
+    if np.isnan(mask_from).any():
+        arr = np.where(np.isnan(mask_from), np.nan, arr)
+    return arr
+
+# --------------------------
+# Geometrical spreading (amplitude)
+# --------------------------
+def geom_spread_amp(
+    dist_km: np.ndarray,
+    *,
+    chan: str | None,
+    surface_waves: bool,
+    wavespeed_kms: float,
+    peakf_hz: float,
+    out_dtype: str = "float32",
+) -> np.ndarray:
+    """
+    Amplitude geometric-spreading factor g_amp:
+      - Surface waves (on seismic channels '*H*'): g_amp = sqrt( d_km * (v/f) )
+      - Otherwise:                                g_amp = d_km
+    Preserves NaNs (masked nodes).
+    """
+    d = _as_dtype(dist_km, out_dtype)
+    if surface_waves and chan and len(chan) >= 2 and chan[1] == "H" and wavespeed_kms > 0 and peakf_hz > 0:
+        lam_km = wavespeed_kms / float(peakf_hz)
+        out = np.sqrt(np.clip(d, 0.0, None) * lam_km, dtype=d.dtype)
+    else:
+        out = d.copy()
+    return _preserve_nan(d, out)
+
+# --------------------------
+# Geometrical spreading (energy)
+# --------------------------
+def geom_spread_energy_from_amp(g_amp: np.ndarray) -> np.ndarray:
+    """
+    Energy geometric-spreading factor g_energy = (g_amp)^2.
+    """
+    g = np.asarray(g_amp)
+    out = g * g
+    return _preserve_nan(g, out)
+
+def geom_spread_energy(
+    dist_km: np.ndarray,
+    *,
+    chan: str | None,
+    surface_waves: bool,
+    wavespeed_kms: float,
+    peakf_hz: float,
+    out_dtype: str = "float32",
+) -> np.ndarray:
+    """
+    Direct energy form, derived from amplitude rule:
+      - Surface: g_energy = d_km * (v/f)
+      - Body:    g_energy = d_km^2  (NOTE: if you previously used g_energy = d_km,
+                                     switch to square(d_km) for strict amplitude^2 physics.
+                                     If you want legacy behavior, use geom_spread_energy_legacy below.)
+    """
+    d = _as_dtype(dist_km, out_dtype)
+    if surface_waves and chan and len(chan) >= 2 and chan[1] == "H" and wavespeed_kms > 0 and peakf_hz > 0:
+        lam_km = wavespeed_kms / float(peakf_hz)
+        out = np.clip(d, 0.0, None) * lam_km               # (sqrt(d*lam))^2
+    else:
+        out = np.clip(d, 0.0, None) * np.clip(d, 0.0, None)  # (d_km)^2
+    return _preserve_nan(d, out)
+
+def geom_spread_energy_legacy(
+    dist_km: np.ndarray,
+    *,
+    surface_waves: bool,
+    wavespeed_kms: float,
+    peakf_hz: float,
+    out_dtype: str = "float32",
+) -> np.ndarray:
+    """
+    Legacy energy rule to mimic older behavior where energy factor ~ d_km (not d_km^2) for body waves.
+    """
+    d = _as_dtype(dist_km, out_dtype)
+    if surface_waves and wavespeed_kms > 0 and peakf_hz > 0:
+        lam_km = wavespeed_kms / float(peakf_hz)
+        out = np.clip(d, 0.0, None) * lam_km
+    else:
+        out = np.clip(d, 0.0, None)  # legacy
+    return _preserve_nan(d, out)
+
+# --------------------------
+# Inelastic attenuation
+# --------------------------
+def inelastic_amp(
+    dist_km: np.ndarray,
+    *,
+    peakf_hz: float,
+    wavespeed_kms: float,
+    Q: float | None,
+    out_dtype: str = "float32",
+) -> np.ndarray:
+    """
+    Amplitude attenuation factor (vector): exp( (pi*f/(Q*v)) * d_km )
+    - Q<=0 or v<=0 or f<=0 → ones
+    - NaNs preserved
+    - Overflow-safe (clip exponent)
+    """
+    d = _as_dtype(dist_km, out_dtype)
+    if Q is None or Q <= 0 or wavespeed_kms <= 0 or peakf_hz <= 0:
+        out = np.ones_like(d, dtype=d.dtype)
+        return _preserve_nan(d, out)
+
+    const = (np.pi * d.dtype.type(peakf_hz)) / (d.dtype.type(Q) * d.dtype.type(wavespeed_kms))
+    exponent = const * d
+    max_exp = d.dtype.type(88.0) if d.dtype == np.float32 else d.dtype.type(700.0)
+    exponent = np.clip(exponent, -max_exp, max_exp)
+    out = np.exp(exponent, dtype=d.dtype)
+    return _preserve_nan(d, out)
+
+def inelastic_energy(
+    dist_km: np.ndarray,
+    *,
+    peakf_hz: float,
+    wavespeed_kms: float,
+    Q: float | None,
+    out_dtype: str = "float32",
+) -> np.ndarray:
+    """
+    Energy attenuation factor = (inelastic_amp)^2.
+    """
+    a = inelastic_amp(dist_km, peakf_hz=peakf_hz, wavespeed_kms=wavespeed_kms, Q=Q, out_dtype=out_dtype)
+    return a * a
+
+# --------------------------
+# Fused helpers
+# --------------------------
+def total_amp_correction(
+    dist_km: np.ndarray,
+    *,
+    chan: str | None,
+    surface_waves: bool,
+    wavespeed_kms: float,
+    peakf_hz: float,
+    Q: float | None,
+    out_dtype: str = "float32",
+) -> np.ndarray:
+    """
+    corr_amp = geom_amp * inelastic_amp
+    """
+    g = geom_spread_amp(dist_km, chan=chan, surface_waves=surface_waves,
+                        wavespeed_kms=wavespeed_kms, peakf_hz=peakf_hz, out_dtype=out_dtype)
+    a = inelastic_amp(dist_km, peakf_hz=peakf_hz, wavespeed_kms=wavespeed_kms, Q=Q, out_dtype=out_dtype)
+    out = g * a
+    return _preserve_nan(np.asarray(dist_km), out)
+
+def total_energy_correction(
+    dist_km: np.ndarray,
+    *,
+    chan: str | None,
+    surface_waves: bool,
+    wavespeed_kms: float,
+    peakf_hz: float,
+    Q: float | None,
+    out_dtype: str = "float32",
+    legacy_body: bool = False,
+) -> np.ndarray:
+    """
+    corr_energy = geom_energy * inelastic_energy
+      - If legacy_body=True: use legacy geom rule (body: ~d_km).
+    """
+    if legacy_body:
+        gE = geom_spread_energy_legacy(dist_km, surface_waves=surface_waves,
+                                       wavespeed_kms=wavespeed_kms, peakf_hz=peakf_hz, out_dtype=out_dtype)
+    else:
+        gE = geom_spread_energy(dist_km, chan=chan, surface_waves=surface_waves,
+                                wavespeed_kms=wavespeed_kms, peakf_hz=peakf_hz, out_dtype=out_dtype)
+    aE = inelastic_energy(dist_km, peakf_hz=peakf_hz, wavespeed_kms=wavespeed_kms, Q=Q, out_dtype=out_dtype)
+    out = gE * aE
+    return _preserve_nan(np.asarray(dist_km), out)

@@ -114,17 +114,55 @@ def _cache_path(cache_dir: str, grid_sig: Tuple, station_ids: Sequence[str], use
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, f"Distances_{key}.pkl")
 
+'''
+def _meters_per_degree(lat0: float) -> tuple[float, float]:
+    # Simple spherical/ellipsoidal approximation (close enough for local distances)
+    # Latitudinal meters/deg is ~111.132 km; longitudinal scales with cos(lat)
+    m_per_deg_lat = 111132.0
+    m_per_deg_lon = 111320.0 * np.cos(np.deg2rad(lat0))
+    return m_per_deg_lat, m_per_deg_lon
 
 def _compute_horiz_distances_km(
-    nodes_lon: np.ndarray, nodes_lat: np.ndarray,
-    st_lon: float, st_lat: float,
+    nodes_lon: np.ndarray,
+    nodes_lat: np.ndarray,
+    st_lon: float,
+    st_lat: float,
 ) -> np.ndarray:
-    """Horizontal great-circle (km) using gps2dist_azimuth."""
-    out = np.empty(nodes_lon.size, dtype=float)
-    for i, (lo, la) in enumerate(zip(nodes_lon, nodes_lat)):
-        dm, _, _ = gps2dist_azimuth(la, lo, st_lat, st_lon)  # gps2… expects (lat, lon)
-        out[i] = dm / 1000.0
-    return out
+    """
+    Vectorized local-ENU approximation (km). Accurate to ~<0.5% for small areas.
+    """
+    lons = np.asarray(nodes_lon, dtype=float)
+    lats = np.asarray(nodes_lat, dtype=float)
+    m_per_deg_lat, m_per_deg_lon = _meters_per_degree(st_lat)
+    dx = (lons - float(st_lon)) * m_per_deg_lon
+    dy = (lats - float(st_lat)) * m_per_deg_lat
+    return np.hypot(dx, dy) / 1000.0
+'''
+
+'''
+Old functions that ignored masks - though they still work, just with an overhead
+from pyproj import Geod
+
+_GEOD = Geod(ellps="WGS84")  # reuse across calls to avoid reinit cost
+
+def _compute_horiz_distances_km(
+    nodes_lon: np.ndarray,
+    nodes_lat: np.ndarray,
+    st_lon: float,
+    st_lat: float,
+    geod: Geod = _GEOD,
+) -> np.ndarray:
+    """
+    Vectorized great-circle distances (km) on WGS84 using pyproj.Geod.inv.
+    nodes_lon/nodes_lat: 1D arrays of same length.
+    """
+    lons1 = np.asarray(nodes_lon, dtype=float)
+    lats1 = np.asarray(nodes_lat, dtype=float)
+    # Broadcast station coords to node shape
+    lons2 = np.broadcast_to(float(st_lon), lons1.shape)
+    lats2 = np.broadcast_to(float(st_lat), lats1.shape)
+    _, _, dist_m = geod.inv(lons1, lats1, lons2, lats2)  # vectorized
+    return dist_m / 1000.0
 
 # ----------------------------------------------------------------------
 # Public API
@@ -248,6 +286,278 @@ def compute_or_load_distances(
 
     bundle = {"distances": distances, "coords": coords, "meta": meta}
     try:
+        with open(path, "wb") as f:
+            pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as e:
+        print(f"[DIST:WARN] Could not save distances cache: {e}")
+
+    meta = meta | {"from_cache": False, "cache_path": path}
+    return distances, coords, meta
+'''
+
+
+########### NEW MASK AWARE FUNCTIONS #############
+from typing import Dict, Tuple, Optional
+import numpy as np
+from pyproj import Geod
+
+_GEOD = Geod(ellps="WGS84")  # reuse
+
+def _active_indexer(grid) -> Optional[np.ndarray]:
+    """Return flat indices of active nodes, or None if no mask."""
+    return grid._node_mask_idx if grid._node_mask_idx is not None else None
+
+def _flatten_lonlat(grid, idx: Optional[np.ndarray]):
+    """Return flattened lon/lat (optionally subset by idx)."""
+    lon_all = grid.gridlon.ravel()
+    lat_all = grid.gridlat.ravel()
+    if idx is None:
+        return lon_all, lat_all
+    return lon_all[idx], lat_all[idx]
+
+def _flatten_elev(grid, idx: Optional[np.ndarray], use_elevation_3d: bool):
+    """Return flattened node elevations (meters) or zeros; optionally subset by idx."""
+    if (grid.node_elev_m is not None) and use_elevation_3d:
+        z = np.asarray(grid.node_elev_m, float).ravel()
+    else:
+        z = np.zeros(grid.gridlat.size, dtype=float)
+    return z if idx is None else z[idx]
+
+
+def _horiz_dist_km_vectorized(nodes_lon, nodes_lat, st_lon, st_lat, geod=_GEOD) -> np.ndarray:
+    """
+    Vectorized great-circle distances (km) using pyproj.Geod.inv.
+    Robust to empty inputs and NaNs; explicitly broadcasts station coords
+    to match node array length for pyproj builds that don't auto-broadcast.
+    """
+    lon = np.asarray(nodes_lon, float).reshape(-1)
+    lat = np.asarray(nodes_lat, float).reshape(-1)
+
+    n = lon.size
+    if n != lat.size:
+        raise ValueError(
+            f"[dist] lon/lat length mismatch: lon={n}, lat={lat.size} "
+            "(check gridlon/gridlat and any mask indices)"
+        )
+    if n == 0:
+        return np.empty(0, dtype=float)
+
+    valid = np.isfinite(lon) & np.isfinite(lat)
+    out = np.full(n, np.nan, dtype=float)
+    if not valid.any():
+        return out
+
+    # --- EXPLICIT BROADCAST HERE ---
+    st_lon_arr = np.full(valid.sum(), float(st_lon), dtype=float)
+    st_lat_arr = np.full(valid.sum(), float(st_lat), dtype=float)
+
+    # Compute only on valid rows
+    _, _, dist_m = geod.inv(lon[valid], lat[valid], st_lon_arr, st_lat_arr)
+    out[valid] = dist_m / 1000.0
+    return out
+
+def distances_mask_aware(
+    grid,
+    inventory,
+    *,
+    use_elevation_3d: bool = False,
+    dense_output: bool = True,
+    mask_dense_threshold: float = 0.90,  # if active_ratio >= threshold, skip subsetting
+) -> Dict[str, np.ndarray]:
+    """
+    Compute distances (km) from grid nodes to each station/channel, honoring Grid masks.
+    - Fully vectorized across nodes.
+    - If a mask exists and is sufficiently sparse, compute only on active nodes, then scatter.
+    - If dense_output=True, return arrays shaped (grid.nlat * grid.nlon,)
+      with masked nodes set to np.nan; else return compact arrays of length N_active.
+
+    Returns
+    -------
+    dict: seed_id -> distances_km (flat vector; compact or dense as requested)
+    """
+    # Decide whether to subset
+    idx = _active_indexer(grid)
+    n_all = int(np.asarray(grid.gridlat).size)
+
+    # --- EARLY RETURN FOR EMPTY MASK ---
+    if idx is not None and idx.size == 0:
+        # No active nodes: return all-NaN dense vectors or empty compact vectors
+        dists: Dict[str, np.ndarray] = {}
+        if dense_output:
+            nanvec = np.full(n_all, np.nan, dtype=float)
+        for net in inventory:
+            for sta in net:
+                for cha in sta:
+                    sid = f"{net.code}.{sta.code}.{cha.location_code}.{cha.code}"
+                    dists[sid] = (nanvec.copy() if dense_output else np.empty(0, dtype=float))
+        return dists
+
+    # Optionally treat very dense masks as full
+    if idx is not None:
+        active_ratio = idx.size / n_all
+        if active_ratio >= mask_dense_threshold:
+            idx = None
+
+    node_lon, node_lat = _flatten_lonlat(grid, idx)
+    node_z   = _flatten_elev(grid, idx, use_elevation_3d)
+
+    if dense_output and idx is not None:
+        dense_template = np.full(n_all, np.nan, dtype=float)
+
+    dists: Dict[str, np.ndarray] = {}
+
+    for net in inventory:
+        for sta in net:
+            sta_elev = float(sta.elevation or 0.0)
+            for cha in sta:
+                sid   = f"{net.code}.{sta.code}.{cha.location_code}.{cha.code}"
+                slat  = float(cha.latitude  if cha.latitude  is not None else sta.latitude)
+                slon  = float(cha.longitude if cha.longitude is not None else sta.longitude)
+                selev = float(cha.elevation if cha.elevation is not None else sta_elev)
+
+                d_horiz = _horiz_dist_km_vectorized(node_lon, node_lat, slon, slat)
+
+
+                if use_elevation_3d and d_horiz.size:
+                    d_km = np.hypot(d_horiz * 1000.0, (node_z - selev)) / 1000.0
+                else:
+                    d_km = d_horiz
+
+                if dense_output and idx is not None:
+                    out = dense_template.copy()
+                    if d_km.size:
+                        out[idx] = d_km
+                    dists[sid] = out
+                else:
+                    dists[sid] = d_km
+
+    return dists
+
+def compute_or_load_distances(
+    grid,
+    *,
+    inventory: Inventory,
+    stream: Optional[Stream] = None,
+    cache_dir: str = None,
+    force_recompute: bool = False,
+    use_elevation: bool = True,   # default 3-D if grid provides elevations
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, float]], Dict]:
+    """
+    Load node→station distances from cache if available, else compute and cache.
+
+    - Uses vectorized distances_mask_aware() under the hood.
+    - Cache key includes grid signature, station IDs, 3-D flag, and mask signature (if any).
+    - Distances are stored/returned as dense flat vectors (length nlat*nlon), with masked
+      nodes set to NaN when a grid mask is active.
+    """
+
+    # sanity: lon/lat arrays must be same size
+    lonA = np.asarray(grid.gridlon)
+    latA = np.asarray(grid.gridlat)
+    if lonA.size != latA.size:
+        raise ValueError(
+            f"[grid] gridlon/gridlat size mismatch: {lonA.shape} vs {latA.shape}"
+        )
+
+    # --- inputs / intent ---
+    ids = _station_ids(inventory, stream)
+    grid_sig = _grid_signature_tuple(grid)
+    node_lon, node_lat, node_elev = _grid_nodes_lonlat_elev(grid)
+    want_3d = bool(use_elevation and (node_elev is not None))
+
+    # Mask signature (stable short string or None)
+    mask_sig = grid.mask_signature() if hasattr(grid, "mask_signature") else None
+
+    # Base cache path (existing helper), then suffix with mask signature so masked/unmasked don't collide
+    path = _cache_path(cache_dir, grid_sig, ids, want_3d)
+    if mask_sig:
+        root, ext = os.path.splitext(path)
+        path = f"{root}__{mask_sig}.pkl"
+
+    # --- try cache ---
+    if os.path.exists(path) and not force_recompute:
+        try:
+            with open(path, "rb") as f:
+                bundle = pickle.load(f)
+            dists = bundle["distances"]
+            coords = bundle["coords"]
+            meta = bundle.get("meta", {})
+
+            # MIGRATE older coord keys if necessary
+            for sid, sc in list(coords.items()):
+                if "elevation" not in sc:
+                    sc["elevation"] = float(sc.get("elevation_m", 0.0))
+
+            # Sanity: dense vectors must match n_nodes
+            n_nodes = int(node_lon.size)
+            any_vec = next(iter(dists.values()), np.empty(0, float))
+            if int(np.asarray(any_vec).size) != n_nodes:
+                raise ValueError("Cached distances do not match current grid node count.")
+
+            # Optional: ensure mask signature matches (in case file naming changed later)
+            cached_mask_sig = meta.get("mask_signature")
+            if (mask_sig or cached_mask_sig) and (mask_sig != cached_mask_sig):
+                raise ValueError("Cached mask_signature does not match current grid mask.")
+
+            meta.update({
+                "from_cache": True,
+                "cache_path": path,
+                "version": "v3",                # bump cache version
+                "mask_signature": mask_sig,
+                "dense_output": True,
+            })
+
+            # Best-effort write-back of updated meta
+            try:
+                with open(path, "wb") as f:
+                    pickle.dump({"distances": dists, "coords": coords, "meta": meta}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception:
+                pass
+
+            return dists, coords, meta
+        except Exception as e:
+            print(f"[DIST:WARN] Failed to load distances cache ({e}); recomputing…")
+
+    # --- compute fresh (vectorized + mask aware) ---
+    # Build coords map (same as before)
+    coords = _station_coords_from_inventory(inventory)
+
+    # Vectorized distances honoring grid mask; dense_output=True for backward compat
+    try:
+        distances = distances_mask_aware(
+            grid,
+            inventory,
+            use_elevation_3d=want_3d,
+            dense_output=True,          # keep full length nlat*nlon; masked nodes become NaN
+            mask_dense_threshold=0.90,  # skip subsetting if mask is very dense
+        )
+    except Exception as e:
+        idx = _active_indexer(grid)
+        print("mask:", None if idx is None else (idx.size, grid.gridlat.size))
+        print("grid shapes:", grid.gridlon.shape, grid.gridlat.shape)
+        print("finite lon/lat counts:", np.isfinite(grid.gridlon).sum(), np.isfinite(grid.gridlat).sum())
+        raise e
+
+    # --- meta & cache ---
+    n_nodes = int(node_lon.size)
+    node_z = getattr(grid, "node_elev_m", None)
+    meta = {
+        "grid_signature": grid_sig,
+        "n_nodes": n_nodes,
+        "n_stations": len(distances),
+        "station_ids": tuple(sorted(distances.keys())),
+        "used_3d": want_3d,
+        "has_node_elevations": node_z is not None,
+        "station_elev_min_m": float(min(sc.get("elevation", 0.0) for sc in coords.values())) if coords else None,
+        "station_elev_max_m": float(max(sc.get("elevation", 0.0) for sc in coords.values())) if coords else None,
+        "version": "v3",
+        "mask_signature": mask_sig,   # <— mask-awareness recorded
+        "dense_output": True,         # <— callers can rely on fixed length
+    }
+
+    bundle = {"distances": distances, "coords": coords, "meta": meta}
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
     except Exception as e:

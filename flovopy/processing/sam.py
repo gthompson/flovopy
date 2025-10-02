@@ -576,21 +576,81 @@ class SAM:
         # To do. 1/RSAM plots and work out where intersect y-axis.
         pass
 
-    def get_distance_km(self, inventory, source):
-        distance_km = {}
-        coordinates = {}
-        print(f'SCAFFOLD: {inventory}')
+
+
+    def get_distance_km(self, inventory, source, use_elevation: bool = True):
+        """
+        Return per-SEED 3D distances (km) from `source` to each station in self.dataframes.
+
+        source: {'lat': float, 'lon': float, 'elev': float_m}
+        use_elevation: if True, sqrt( R_horiz^2 + dz^2 ); else horizontal distance only.
+        """
+        def _normalize_lon(lon: float) -> float:
+            if lon is None or not np.isfinite(lon):
+                return lon
+            return ((float(lon) + 180.0) % 360.0) - 180.0  # [-180, 180]
+
+        distance_km: dict[str, float] = {}
+        coordinates: dict[str, dict] = {}
+
+        # Source
+        try:
+            src_lat  = float(source.get('lat',  source.get('latitude')))
+            src_lon  = float(source.get('lon',  source.get('longitude')))
+        except Exception:
+            raise ValueError("Source must contain 'lat' and 'lon' (degrees).")
+        src_lon = _normalize_lon(src_lon)
+        src_elev_m = float(source.get('elev', source.get('elevation', 0.0)) or 0.0)
+
         for seed_id in self.dataframes:
-            coordinates[seed_id] = inventory.get_coordinates(seed_id)
-            if seed_id[0:2]=='MV':
-                if coordinates[seed_id]['longitude'] > 0:
-                    coordinates[seed_id]['longitude']  *= -1
-            #print(coordinates[seed_id])
-            #print(source)
-            distance_m, az_source2station, az_station2source = gps2dist_azimuth(source['lat'], source['lon'], coordinates[seed_id]['latitude'], coordinates[seed_id]['longitude'])
-            #print(distance_m/1000)
-            #distance_km[seed_id] = degrees2kilometers(distance_deg)
-            distance_km[seed_id] = distance_m/1000
+            # coordinates from inventory
+            try:
+                coord = inventory.get_coordinates(seed_id)
+            except Exception:
+                continue
+            if not coord:
+                continue
+
+            sta_lat = coord.get('latitude')
+            sta_lon = coord.get('longitude')
+            sta_elev_m = coord.get('elevation', 0.0)
+
+            if sta_lat is None or sta_lon is None:
+                continue
+            if not (np.isfinite(sta_lat) and np.isfinite(sta_lon)):
+                continue
+
+            sta_lat = float(sta_lat)
+            sta_lon = float(sta_lon)
+
+            # --- MV guard: Montserrat stations must be west of Greenwich.
+            # If StationXML accidentally has positive longitudes, flip them.
+            if seed_id.startswith('MV') and sta_lon > 0:
+                sta_lon = -sta_lon
+
+            # Normalize to [-180, 180] regardless
+            sta_lon = _normalize_lon(sta_lon)
+            sta_elev_m = float(sta_elev_m if sta_elev_m is not None else 0.0)
+
+            # Save normalized/cleaned coords
+            coord_norm = dict(coord)
+            coord_norm['latitude']  = sta_lat
+            coord_norm['longitude'] = sta_lon
+            coord_norm['elevation'] = sta_elev_m
+            coordinates[seed_id] = coord_norm
+
+            # Horizontal great-circle distance (meters)
+            horiz_m, _, _ = gps2dist_azimuth(src_lat, src_lon, sta_lat, sta_lon)
+
+            # 3D or 2D
+            if use_elevation:
+                dz = src_elev_m - sta_elev_m  # meters
+                dist_m = float(np.hypot(horiz_m, dz))
+            else:
+                dist_m = float(horiz_m)
+
+            distance_km[seed_id] = dist_m / 1000.0
+
         return distance_km, coordinates
 
     def __len__(self):
@@ -1407,18 +1467,39 @@ class SAM:
         
 
     def __str__(self):
-        contents=""
-        for i, trid in enumerate(self.dataframes):
-            df = self.dataframes[trid]
-            print(df)
-            if i==0:
-                contents += f"Metrics: {','.join(df.columns[1:])}" + '\n'
-                contents += f"Sampling Interval={self.get_sampling_interval(df)} s" + '\n\n'
+        keys = self.get_seed_ids()
+        lines = [f"{self.__class__.__name__} summary:"]
+        lines.append(f"Number of SEED ids: {len(self)} [{keys}]")
+        lines.append(f"Number of rows: {len(self.dataframes[keys[0]])}")
+        first = True
+
+        for trid, df in self.dataframes.items():
+            if df is None or df.empty:
+                lines.append(f"{trid}: <empty dataframe>")
+                continue
+
+            if first:
+                si = self.get_sampling_interval(df)
+                metric_cols = [c for c in df.columns if c != "time"]
+                lines.append(f"Sampling Interval = {si} s")
+                lines.append(f"Metrics: {', '.join(metric_cols)}")
+                lines.append("")
+                first = False
+
+            # Time range
             startt = self.__get_starttime(df)
-            endt = self.__get_endtime(df)        
-            contents += f"{trid}: {startt.isoformat()} to {endt.isoformat()}"
-            contents += "\n"
-        return contents   
+            endt   = self.__get_endtime(df)
+            lines.append(f"{trid}: {startt.isoformat()} to {endt.isoformat()}")
+
+            # Summary stats on numeric columns, excluding 'time'
+            num_df = df.drop(columns=["time"], errors="ignore")
+            if not num_df.empty:
+                desc = num_df.describe().transpose()
+                with pd.option_context("display.float_format", lambda v: f"{v:.3g}"):
+                    lines.append(desc.to_string())
+            lines.append("")
+
+        return "\n".join(lines)  
     
     def __len__(self):
         return len(self.dataframes)
@@ -1562,6 +1643,13 @@ class RSAM(SAM):
 
         raise ValueError("Invalid arguments provided to readRSAMbinary.")
 
+#############################################################################################
+# flovopy/processing/sam.py (inside class VSAM)
+from flovopy.core.physics import (
+    geom_spread_amp, inelastic_amp, total_amp_correction
+)
+
+########################################################################################################################
 
 class VSAM(SAM):
     # Before calling, make sure tr.stats.units is fixed to correct units.
@@ -1582,24 +1670,17 @@ class VSAM(SAM):
         return SAM.get_filename(SAM_DIR, id, year, sampling_interval, ext, name=name)
 
     @staticmethod
-    def compute_geometrical_spreading_correction(this_distance_km, chan, surfaceWaves=False, wavespeed_kms=2, peakf=2.0):
-        #print('peakf =',peakf)
-        if surfaceWaves and chan[1]=='H': # make sure seismic channel
-            wavelength_km = wavespeed_kms/peakf
-            gsc = np.sqrt(np.multiply(this_distance_km, wavelength_km))
-        else: # body waves - infrasound always here at local distances
-            gsc = this_distance_km
-        return gsc
-    
-    
+    def compute_geometrical_spreading_correction(this_distance_km, chan, surfaceWaves=False, wavespeed_kms=3.0, peakf=2.0):
+        return geom_spread_amp(this_distance_km, chan=chan, surface_waves=surfaceWaves,
+                            wavespeed_kms=wavespeed_kms, peakf_hz=peakf, out_dtype="float32")
+
     @staticmethod
     def compute_inelastic_attenuation_correction(this_distance_km, peakf, wavespeed_kms, Q):
-        if Q:
-            t = np.divide(this_distance_km, wavespeed_kms) # s
-            iac = np.exp(math.pi * peakf * t / Q) 
-            return iac
-        else:
-            return 1.0  
+        return inelastic_amp(this_distance_km, peakf_hz=peakf, wavespeed_kms=wavespeed_kms, Q=Q, out_dtype="float32")
+
+    def compute_total_amp_correction(self, dist_km, chan, *, surfaceWaves, wavespeed_kms, peakf, Q, out_dtype="float32"):
+        return total_amp_correction(dist_km, chan=chan, surface_waves=surfaceWaves,
+                                    wavespeed_kms=wavespeed_kms, peakf_hz=peakf, Q=Q, out_dtype=out_dtype)
       
     def reduce(self, inventory, source, surfaceWaves=False, Q=None, wavespeed_kms=None, fixpeakf=None):
         # if the original Trace objects had coordinates attached, add a method in SAM to save those
@@ -1614,7 +1695,7 @@ class VSAM(SAM):
                 wavespeed_kms=3 # km/s
         
         # Need to pass a source too, which should be a dict with name, lat, lon, elev.
-        print(f'SCAFFOLD: {inventory}')
+        #print(f'SCAFFOLD: {inventory}')
         distance_km, coordinates = self.get_distance_km(inventory, source)
 
         corrected_dataframes = {}
@@ -1629,21 +1710,22 @@ class VSAM(SAM):
             else:
                 peakf = np.sqrt(ratio) * 4
             net, sta, loc, chan = seed_id.split('.')    
-            gsc = self.compute_geometrical_spreading_correction(this_distance_km, chan, surfaceWaves=surfaceWaves, \
-                                                           wavespeed_kms=wavespeed_kms, peakf=peakf)
-            if Q:
-                iac = self.compute_inelastic_attenuation_correction(this_distance_km, peakf, wavespeed_kms, Q)
-            else:
-                iac = 1.0
+            g_amp = self.compute_geometrical_spreading_correction(this_distance_km, chan,
+                                                                surfaceWaves=surfaceWaves,
+                                                                wavespeed_kms=wavespeed_kms, peakf=peakf)
+            iac  = self.compute_inelastic_attenuation_correction(this_distance_km, peakf, wavespeed_kms, Q)
+
             for col in df.columns:
-                if col in self.get_metrics(): 
-                    if col=='VLP':
-                        gscvlp = self.compute_geometrical_spreading_correction(this_distance_km, chan, surfaceWaves=surfaceWaves, \
-                                                           wavespeed_kms=wavespeed_kms, peakf=0.06)
-                        iacvlp = self.compute_inelastic_attenuation_correction(this_distance_km, 0.06, wavespeed_kms, Q)
-                        df[col] = df[col] * gscvlp * iacvlp * 1e7 # convert to cm^2/s (or cm^2 for DR)
+                if col in self.get_metrics():
+                    # VLP uses a different peakf:
+                    if col == 'VLP':
+                        g_amp_vlp = self.compute_geometrical_spreading_correction(this_distance_km, chan,
+                                                                                surfaceWaves=surfaceWaves,
+                                                                                wavespeed_kms=wavespeed_kms, peakf=0.06)
+                        iac_vlp   = self.compute_inelastic_attenuation_correction(this_distance_km, 0.06, wavespeed_kms, Q)
+                        df[col] = df[col] * g_amp_vlp * iac_vlp * 1e7
                     else:
-                        df[col] = df[col] * gsc * iac * 1e7                    
+                        df[col] = df[col] * g_amp * iac * 1e7                  
             corrected_dataframes[seed_id] = df
         return corrected_dataframes
     
@@ -1692,6 +1774,11 @@ class DSAM(VSAM):
             return DR(dataframes=corrected_dataframes)
 
 
+
+
+from flovopy.core.physics import (
+    geom_spread_energy, inelastic_energy, total_energy_correction
+)
 class VSEM(VSAM):
 
     def __init__(self, dataframes=None, stream=None, sampling_interval=60.0, filter=[0.5, 18.0], bands = {'VLP': [0.02, 0.2], 'LP':[0.5, 4.0], 'VT':[4.0, 18.0]}, corners=4, verbose=False):
@@ -1825,18 +1912,18 @@ class VSEM(VSAM):
                 peakf = np.sqrt(ratio) * 4
 
             net, sta, loc, chan = seed_id.split('.') 
-            esc = self.Eseismic_correction(this_distance_km*1000) # equivalent of gsc
-            if Q:
-                iac = self.compute_inelastic_attenuation_correction(this_distance_km, peakf, wavespeed_kms, Q)
-            else:
-                iac = 1.0
+            g_E = self.Eseismic_correction(this_distance_km * 1000.0, chan=chan, wavespeed_kms=wavespeed_kms, peakf=peakf)
+            a_E = self.compute_inelastic_attenuation_energy(this_distance_km, peakf, wavespeed_kms, Q)
+
             for col in df.columns:
-                if col in self.get_metrics(): 
-                    if col=='VLP':
-                        iacvlp = self.compute_inelastic_attenuation_correction(this_distance_km, 0.06, wavespeed_kms, Q)
-                        df[col] = df[col] * esc * iacvlp # do i need to multiply by iac**2 since this is energy?
+                if col in self.get_metrics():
+                    if col == 'VLP':
+                        g_E_vlp = self.Eseismic_correction(this_distance_km * 1000.0, chan=chan, 
+                                                        wavespeed_kms=wavespeed_kms, peakf=0.06)
+                        a_E_vlp = self.compute_inelastic_attenuation_energy(this_distance_km, 0.06, wavespeed_kms, Q)
+                        df[col] = df[col] * g_E_vlp * a_E_vlp
                     else:
-                        df[col] = df[col] * esc * iac # do i need to multiply by iac**2 since this is energy?
+                        df[col] = df[col] * g_E * a_E
             corrected_dataframes[seed_id] = df
         return corrected_dataframes
        
@@ -1845,14 +1932,26 @@ class VSEM(VSAM):
         return ER(dataframes=corrected_dataframes)
 
     @staticmethod
-    def Eacoustic_correction(r, c=340, rho=1.2): 
-        Eac = (2 * math.pi * r**2) / (rho * c)
-        return Eac
+    def Eseismic_correction(dist_m, *, chan=None, surfaceWaves=False, wavespeed_kms=3.0, peakf=2.0):
+        # Your code called this with meters; convert to km.
+        return geom_spread_energy(np.asarray(dist_m, float) / 1000.0, chan=chan,
+                                surface_waves=surfaceWaves, wavespeed_kms=wavespeed_kms,
+                                peakf_hz=peakf, out_dtype="float32")
 
     @staticmethod
-    def Eseismic_correction(r, c=3000, rho=2500, S=1, A=1): # a body wave formula
-        Esc = (2 * math.pi * r**2) * rho * c * S**2/A
-        return Esc
+    def Eacoustic_correction(dist_m, c=340, rho=1.2):
+        # If you prefer the simple geometric version for acoustics too, you could alias to geom_spread_energy.
+        # Keeping your original formula would make absolute scaling sensitive to rho/c units.
+        r = np.asarray(dist_m, float)
+        return (2.0 * np.pi * (r ** 2)) / (rho * c)
+
+    @staticmethod
+    def compute_inelastic_attenuation_energy(this_distance_km, peakf, wavespeed_kms, Q):
+        return inelastic_energy(this_distance_km, peakf_hz=peakf, wavespeed_kms=wavespeed_kms, Q=Q, out_dtype="float32")
+
+    def compute_total_energy_correction(self, dist_km, chan, *, surfaceWaves, wavespeed_kms, peakf, Q, legacy_body=False):
+        return total_energy_correction(dist_km, chan=chan, surface_waves=surfaceWaves, wavespeed_kms=wavespeed_kms,
+                                    peakf_hz=peakf, Q=Q, out_dtype="float32", legacy_body=legacy_body)
 
     def downsample(self, new_sampling_interval=3600):
         ''' downsample a VSEM object to a larger sampling interval(e.g. from 1 minute to 1 hour). Returns a new VSEM object.
@@ -2058,14 +2157,15 @@ class DR(SAM):
         It is particularly designed to be used after running examine_spread and apply_station_corrections
         '''
         df = pd.DataFrame()
+        dataframes = self.dataframes
         for metric in self.get_metrics():
             st = self.to_stream(metric)
             df['time'] = self.dataframes[st[0].id]['time']
             all_data_arrays = []
             for tr in st:
                 all_data_arrays.append(tr.data)
-            twoDarray = np.stac
-#import pytzk(all_data_arrays)
+            #twoDarray = np.stac
+
             if average=='mean':
                 df[metric] = pd.Series(np.nanmean(y,axis=1))  
             elif average=='median':
@@ -2136,93 +2236,36 @@ class ER(DR):
     def get_filename(SAM_DIR, id, year, sampling_interval, ext, name='ER'):
 	    return os.path.join(SAM_DIR,'%s_%s_%4d_%ds.%s' % (name, id, year, sampling_interval, ext))	   
 
-def magnitude2energy(ME, a=-3.2, b=2/3):
-    ''' 
-    Convert (a vector of) magnitude into (a vector of) equivalent energy(ies).
-   
-    Conversion is based on the equation 7 Hanks and Kanamori (1979):
- 
-       mag = 2/3 * log10(energy) - 4.7
- 
-    That is, energy (Joules) is roughly proportional to the peak amplitude to the power of 1.5.
-    This obviously is based on earthquake waveforms following a characteristic shape.
-    For a waveform of constant amplitude, energy would be proportional to peak amplitude
-    to the power of 2.
- 
-    For Montserrat data, when calibrating against events in the SRU catalog, a factor of
-    a=-3.7 was preferred to a=-4.7.
-    
-    based on https://github.com/geoscience-community-codes/GISMO/blob/master/core/%2Bmagnitude/mag2eng.m
+from flovopy.core.physics import magnitude2Eseismic, Eseismic2magnitude
 
-    *** Edited 2024/04/17
+def magnitude2energy(ME, a: float = -3.2, b: float = 2/3):
+    """
+    Wrapper that prefers the canonical core implementation when b == 2/3.
+    Vectorized: always returns an ndarray (even for scalar inputs).
+    """
+    ME = np.asarray(ME, dtype=float)
+    if np.isclose(b, 2/3):
+        # core uses: E = 10^(1.5 * ME + correction), where correction = 3.7 (default)
+        # Our 'a' relates as: a = -correction  ⇒ correction = -a
+        return np.asarray(magnitude2Eseismic(ME, correction=-a), dtype=float)
+    # generic (a, b) form
+    return np.power(10.0, (ME - a) / b, dtype=float)
 
-    Now based on 2024 SSA Presentation:
+def energy2magnitude(E, a: float = -3.2, b: float = 2/3):
+    """
+    Wrapper that prefers the canonical core implementation when b == 2/3.
+    Vectorized: always returns an ndarray (even for scalar inputs).
+    """
+    E = np.asarray(E, dtype=float)
+    if np.isclose(b, 2/3):
+        # core uses: ME = (1/1.5) * log10(E) - correction  with correction = 3.7 (default)
+        # Our 'a' relates as: a = -correction
+        return np.asarray(Eseismic2magnitude(E, correction=-a), dtype=float)
 
-    ME = 2/3 log10(E) - 3.7
-
-    ME = b * log10(E) + a
-
-    So:
-
-    E = 10^(1.5 * (ME + 3.7))
-
-    E = 10^(1/b * (ME - a))
-    
-    E = 3 x 10^5 x 10^(1.5 ME)
-    
-    *** Edited 2024/04/18
-
-    Now based on Choy & Boatright [1995] who find best value for a=-3.2, so altering default 
-    '''
-
-    #eng = np.power(10, (1/b * mag - a ))
-    E = np.power(10, (1/b * (ME - a) ))
-    
-    return E 
-    
-    
-def energy2magnitude(E, a=-3.2, b=2/3):
-    '''
-    Convert a (vector of) magnitude(s) into a (vector of) equivalent energy(/ies).
-    
-    Conversion is based on the the following formula from Hanks and Kanamori (1979):
- 
-       mag = 2/3 * log10(energy) - 4.7
- 
-    That is, energy (Joules) is roughly proportional to the peak amplitude to the power of 1.5.
-    This obviously is based on earthquake waveforms following a characteristic shape.
-    For a waveform of constant amplitude, energy would be proportional to peak amplitude
-    to the power of 2.
- 
-    For Montserrat data, when calibrating against events in the SRU catalog, a factor of
-    3.7 was preferred to 4.7.
-
-    based on https://github.com/geoscience-community-codes/GISMO/blob/master/core/%2Bmagnitude/eng2mag.m
-    
-    *** Edited 2024/04/17
-
-    Now based on 2024 SSA Presentation:
-
-    ME = 2/3 log10(E) - 3.7
-
-    ME = b * log10(E) + a
-
-    So:
-
-    E = 10^(1.5 * (ME + 3.7))
-
-    E = 10^(1/b * (ME - a))
-
-    *** Edited 2024/04/18
-
-    Now based on Choy & Boatright [1995] who find best value for a=-3.2, so altering default
-     
-    '''
-    
-    #mag = b * (np.log10(eng) + a) 	
-
-    ME = b * np.log10(E) + a
-    return ME
+    out = np.full_like(E, np.nan, dtype=float)
+    valid = E > 0
+    out[valid] = b * np.log10(E[valid]) + a
+    return out
 
 import argparse
 from obspy.clients.fdsn import Client

@@ -112,36 +112,41 @@ class R2DistanceMisfit:
         self.square  = bool(square)
         self.alpha   = float(alpha)
 
-    def prepare(self, aslobj, seed_ids: List[str], *, dtype=np.float32):
-        # Corrections matrix C (nsta, nnodes)
-        first_corr = aslobj.amplitude_corrections[seed_ids[0]]
-        nnodes = len(first_corr)
-        C = np.empty((len(seed_ids), nnodes), dtype=dtype)
-        for k, sid in enumerate(seed_ids):
-            ck = np.asarray(aslobj.amplitude_corrections[sid], dtype=dtype)
-            if ck.size != nnodes:
-                raise ValueError(f"Corrections mismatch for {sid}: {ck.size} != {nnodes}")
-            C[k, :] = ck
+    def prepare(self, aslobj, seed_ids, dtype=np.float32):
+        # Gather corrections and distances in station order
+        Crows, Drows = [], []
+        for sid in seed_ids:
+            Crows.append(np.asarray(aslobj.amplitude_corrections[sid], dtype=dtype))
+            Drows.append(np.asarray(aslobj.node_distances_km[sid],       dtype=dtype))
+        C = np.vstack(Crows)                      # (S, N_all)
+        D = np.vstack(Drows)                      # (S, N_all)
 
-        # Distances matrix D (nsta, nnodes) from dict seed_id -> (nnodes,)
-        D = np.vstack([np.asarray(aslobj.node_distances_km[sid], dtype=float) for sid in seed_ids]).astype(dtype, copy=False)
+        # Subset to active nodes (mask-aware)
+        idx = _grid_mask_indices(aslobj.gridobj)  # None or 1D int
+        if idx is not None:
+            C = C[:, idx]
+            D = D[:, idx]
+            node_index = idx
+        else:
+            node_index = np.arange(C.shape[1], dtype=int)
 
-        # Standard backend for blending
+        # Precompute distance features (NaN-safe; will re-mask at evaluate)
+        eps_d = np.finfo(C.dtype).tiny
+        Dclamp = np.maximum(D, eps_d)
+        x_log  = np.log(Dclamp)                   # (S, N)
+        x_inv  = 1.0 / Dclamp                     # (S, N)
+        x_lin  = D                                # (S, N)
+
+        # Keep a nested StdOverMean for blending
         std_backend = StdOverMeanMisfit()
         std_ctx = std_backend.prepare(aslobj, seed_ids, dtype=dtype)
 
-        ctx = {"C": C, "D": D, "seed_ids": tuple(seed_ids),
-               "std_backend": std_backend, "std_ctx": std_ctx}
-
-        # Optional sub-grid masking
-        mask = getattr(aslobj, "_node_mask", None)
-        if mask is not None:
-            mask = np.asarray(mask, int)
-            ctx["C"] = C[:, mask]
-            ctx["D"] = D[:, mask]
-            ctx["node_index"] = mask  # local→global for the caller
-
-        return ctx
+        return {
+            "C": C, "D": D, "node_index": node_index,
+            "x_log": x_log, "x_inv": x_inv, "x_lin": x_lin,
+            "std_backend": std_backend, "std_ctx": std_ctx,
+            "dtype": C.dtype,
+        }
 
     @staticmethod
     def _r2_from_zscores(yz: np.ndarray, xz: np.ndarray) -> float:
@@ -159,86 +164,95 @@ class R2DistanceMisfit:
         return float(r2)
 
     def evaluate(self, y, ctx, *, min_stations=3, eps=1e-9):
-        C = ctx["C"]               # (nsta, nnodes)
-        D = ctx["D"]               # (nsta, nnodes)
-        nsta, nnodes = C.shape
+        """
+        Vectorized per-node linear regression: y' = a + b * x
+        where y' = y or log|y|, and x ∈ {log(D), 1/D, D} depending on options.
+        Returns:
+        misfit : (N_active,) float
+        extras : {"N": counts, "mean": DR_proxy}
+        """
+        C      = ctx["C"]     # (S, N)
+        D      = ctx["D"]     # (S, N)
+        x_log  = ctx["x_log"]
+        x_inv  = ctx["x_inv"]
+        x_lin  = ctx["x_lin"]
+        dtype  = ctx["dtype"]
 
-        fin_y = np.isfinite(y)
-        if fin_y.sum() < min_stations:
-            return np.full(nnodes, np.inf, dtype=float), {"N": 0}
+        y = np.asarray(y, dtype=dtype).reshape(-1)        # (S,)
+        S, N = C.shape
 
-        # Amplitude transform (optional log on |y|)
-        y_work = np.where(fin_y, y, 0.0).astype(float, copy=False)
-        if self.use_log:
-            y_work = np.log(np.clip(np.abs(y_work), 1e-12, None))
-
-        # z-score across usable stations
-        ym = np.nanmean(y_work[fin_y])
-        ys = np.nanstd(y_work[fin_y])
-        y_z = (y_work - ym) / (ys if (np.isfinite(ys) and ys > 0) else 1.0)
-
-        # Optional blend with std/|mean|
-        std_misfit = None
-        if self.alpha < 1.0:
-            std_misfit, _ = ctx["std_backend"].evaluate(
-                y, ctx["std_ctx"], min_stations=min_stations, eps=eps
-            )
-            std_misfit = np.where(np.isfinite(std_misfit), std_misfit, np.inf)
-
-        # Node loop (O(nnodes * nsta))
-        Cfin = np.isfinite(C)
-        r2 = np.empty(nnodes, dtype=float)
-        N_used = np.zeros(nnodes, dtype=int)
-
-        for j in range(nnodes):
-            mask = fin_y & Cfin[:, j]
-            nuse = int(mask.sum())
-            N_used[j] = nuse
-            if nuse < min_stations:
-                r2[j] = 0.0
-                continue
-
-            dj = D[:, j].astype(float, copy=False)
-            if self.use_log:
-                x = np.log(np.clip(dj, 1e-6, None))
-            else:
-                x = (1.0 / np.clip(dj, 1e-6, None)) if self.square else dj
-
-            x = x[mask]
-            yz = y_z[mask]
-
-            # z-score x on this subset
-            xm = np.nanmean(x)
-            xs = np.nanstd(x)
-            if not np.isfinite(xs) or xs <= 0:
-                r2[j] = 0.0
-                continue
-            xz = (x - xm) / xs
-
-            r2[j] = self._r2_from_zscores(yz, xz)
-
-        # Cost to minimize
-        r2_cost = 1.0 - r2
-        if self.alpha >= 1.0 or std_misfit is None:
-            misfit_out = r2_cost
-        elif self.alpha <= 0.0:
-            misfit_out = std_misfit
+        # Choose target & feature
+        # self.use_log (bool), self.square (bool): same semantics as your class
+        eps_y = np.finfo(dtype).tiny
+        if getattr(self, "use_log", True):
+            y_t = np.log(np.maximum(np.abs(y), eps_y))    # (S,)
+            x   = x_log                                   # (S, N)
         else:
-            misfit_out = self.alpha * r2_cost + (1.0 - self.alpha) * std_misfit
+            y_t = y
+            x   = (x_inv if getattr(self, "square", False) else x_lin)
 
-        # Enforce min-station rule & finite guard
-        valid_nodes = N_used >= min_stations
-        misfit_out = np.where(valid_nodes, misfit_out, np.inf)
-        misfit_out = np.where(np.isfinite(misfit_out), misfit_out, np.inf)
+        # Valid mask per (station,node): finite y, finite C (use C to gate station availability), finite x
+        fin_y  = np.isfinite(y_t)[:, None]               # (S, 1)
+        fin_C  = np.isfinite(C)                          # (S, N)
+        fin_x  = np.isfinite(x)                          # (S, N)
+        M      = fin_y & fin_C & fin_x                   # (S, N)
+        w      = M.astype(dtype)
 
-        # Extras: per-node mean reduced amplitude (consistent with default backend)
-        Rmask = Cfin
-        y0 = np.where(fin_y, y, 0.0)
-        num = (y0[:, None] * np.where(Rmask, C, 0.0)).sum(axis=0)
-        den = (fin_y[:, None] & Rmask).sum(axis=0)
-        mean = np.divide(num, den, out=np.full_like(num, np.nan, dtype=float), where=den > 0)
+        # Weighted sums (per node)
+        n  = w.sum(axis=0)                                # (N,)
+        sx = (w * x).sum(axis=0)                          # Σ x
+        sy = (w * y_t[:, None]).sum(axis=0)               # Σ y
+        sxx = (w * (x * x)).sum(axis=0)                   # Σ x^2
+        sxy = (w * (x * y_t[:, None])).sum(axis=0)        # Σ x y
+        # Means
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mean_x = sx / np.maximum(n, 1.0)
+            mean_y = sy / np.maximum(n, 1.0)
 
-        return misfit_out, {"mean": mean, "N": N_used.astype(float)}
+        # Covariance/variance
+        cov_xy = sxy - n * mean_x * mean_y               # Σ(xy) − n μx μy
+        var_x  = sxx - n * mean_x * mean_x               # Σ(x^2) − n μx^2
+
+        # Slope & intercept (guard tiny var_x)
+        tiny = np.asarray(eps, dtype=dtype)
+        b = np.where(var_x > tiny, cov_xy / var_x, 0.0)
+        a = mean_y - b * mean_x
+
+        # SSE, SST per node
+        # yhat = a + b*x, computed lazily via expanded formula:
+        # SSE = Σ w * (y - a - b x)^2
+        yhat  = a[None, :] + b[None, :] * x              # (S, N)
+        resid = np.where(M, (y_t[:, None] - yhat), 0.0)
+        SSE   = (resid * resid).sum(axis=0)              # (N,)
+
+        # SST = Σ w * (y - μy)^2
+        dy   = np.where(M, (y_t[:, None] - mean_y[None, :]), 0.0)
+        SST  = (dy * dy).sum(axis=0)
+
+        # R^2 = 1 - SSE/SST  (guard zero SST)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            R2 = 1.0 - (SSE / np.maximum(SST, tiny))
+
+        # Convert to cost = 1 - R^2 and enforce min_stations
+        cost_r2 = 1.0 - R2
+        ok = n >= int(min_stations)
+        cost_r2 = np.where(ok, cost_r2, np.inf)
+
+        # Optional blend with StdOverMean
+        alpha = float(getattr(self, "alpha", 1.0))
+        if alpha < 1.0:
+            # StdOverMean already vectorized; it returns (N_active,) costs
+            som_cost, _extras = self.std_backend.evaluate(y, ctx["std_ctx"], min_stations=min_stations, eps=eps)
+            som_cost = np.asarray(som_cost, dtype=float)
+            misfit = alpha * cost_r2 + (1.0 - alpha) * som_cost
+        else:
+            misfit = cost_r2
+
+        # DR proxy from linear domain reductions at each node (median for robustness)
+        Rlin = y.reshape(S, 1) * C                       # (S, N)
+        DR   = np.nanmedian(np.where(np.isfinite(Rlin), Rlin, np.nan), axis=0)
+
+        return np.asarray(misfit, float), {"N": n.astype(int), "mean": DR}
 
 
 
@@ -259,6 +273,12 @@ class LinearizedDecayMisfit:
     f_hz, v_kms : used only to report the implied Q from k_hat (Q = π f / (k v))
     alpha       : blend with StdOverMean (0..1). alpha=1.0 => pure linearized decay
     clip_R_min  : avoid log(0), 1/R blowups; in km
+
+
+    Model (per node):
+        t = log|y| ≈ β0 + β1 * log R + β2 * R, where physically β0 = A0, β1 = −N, β2 = −k.
+
+     We solve all nodes at once via the normal equations (no loops). We never build a big (S,N,3) matrix; instead we assemble each node’s G = XᵀX and b = Xᵀt from scalar sums.
     """
 
     def __init__(self, f_hz=8.0, v_kms=1.5, alpha=1.0, clip_R_min=1e-3):
@@ -267,144 +287,133 @@ class LinearizedDecayMisfit:
         self.alpha = float(alpha)
         self.clip_R_min = float(clip_R_min)
 
-    def prepare(self, aslobj, seed_ids, *, dtype=np.float32):
-        # Corrections matrix (nsta, nnodes)
-        nnodes = aslobj.gridobj.gridlat.size
-        C = np.empty((len(seed_ids), nnodes), dtype=dtype)
-        for k, sid in enumerate(seed_ids):
-            C[k, :] = np.asarray(aslobj.amplitude_corrections[sid], dtype=dtype)
+    def prepare(self, aslobj, seed_ids, dtype=np.float32):
+        # C and D in station order
+        Crows, Drows = [], []
+        for sid in seed_ids:
+            Crows.append(np.asarray(aslobj.amplitude_corrections[sid], dtype=dtype))
+            Drows.append(np.asarray(aslobj.node_distances_km[sid],       dtype=dtype))
+        C = np.vstack(Crows)  # (S, N)
+        D = np.vstack(Drows)  # (S, N)
 
-        # Distances stacked into D (nsta, nnodes)
-        D = np.vstack([np.asarray(aslobj.node_distances_km[sid], dtype=float) for sid in seed_ids]).astype(dtype, copy=False)
+        idx = _grid_mask_indices(aslobj.gridobj)
+        if idx is not None:
+            C = C[:, idx]; D = D[:, idx]
+            node_index = idx
+        else:
+            node_index = np.arange(C.shape[1], dtype=int)
 
-        # Optional blend backend
-        from .misfit import StdOverMeanMisfit
+        eps_d = np.finfo(dtype).tiny
+        R  = np.maximum(D, eps_d)              # distances (km)
+        L  = np.log(R)                         # log(R)
+        R1 = R                                 # R
+
+        # Blend backend
         std_backend = StdOverMeanMisfit()
-        std_ctx = std_backend.prepare(aslobj, seed_ids, dtype=dtype)
+        std_ctx     = std_backend.prepare(aslobj, seed_ids, dtype=dtype)
 
-        ctx = {
-            "C": C, "D": D, "seed_ids": tuple(seed_ids),
-            "std_backend": std_backend, "std_ctx": std_ctx
+        return {
+            "C": C, "R": R, "L": L, "node_index": node_index,
+            "std_backend": std_backend, "std_ctx": std_ctx,
+            "dtype": C.dtype
         }
-
-        # Honor ASL sub-grid masks (refine_and_relocate)
-        mask = getattr(aslobj, "_node_mask", None)
-        if mask is not None:
-            mask = np.asarray(mask, int)
-            ctx["C"] = C[:, mask]
-            ctx["D"] = D[:, mask]
-            ctx["node_index"] = mask  # local→global mapping
-
-        return ctx
 
     def evaluate(self, y, ctx, *, min_stations=3, eps=1e-9):
-        C = ctx["C"]               # (nsta, nnodes)
-        D = ctx["D"]               # (nsta, nnodes)
-        nsta, nnodes = C.shape
+        """
+        Vectorized multi-linear regression per node:
+            t = log|y| ≈ β0 + β1 * log R + β2 * R
+        Cost = 1 - R² (lower is better), optionally blended with StdOverMean.
+        """
+        C   = ctx["C"]        # (S, N)
+        R   = ctx["R"]        # (S, N)
+        L   = ctx["L"]        # (S, N)
+        dt  = ctx["dtype"]
 
-        fin_y = np.isfinite(y)
-        if fin_y.sum() < min_stations:
-            return np.full(nnodes, np.inf, dtype=float), {"N": 0}
+        y = np.asarray(y, dtype=dt).reshape(-1)          # (S,)
+        S, N = C.shape
 
-        # Reduced amplitudes are NOT needed for the regression itself (we use raw y),
-        # but we still provide per-node 'mean' so ASL can expose DR consistently.
-        # (This mirrors StdOverMean behavior.)
-        y0 = np.where(fin_y, y, 0.0).astype(float, copy=False)
+        eps_y = np.finfo(dt).tiny
+        t = np.log(np.maximum(np.abs(y), eps_y))         # (S,)
 
-        # Build per-node stats
-        r2_vec   = np.zeros(nnodes, dtype=float)
-        N_used   = np.zeros(nnodes, dtype=int)
-        N_hat    = np.full(nnodes, np.nan, dtype=float)
-        k_hat    = np.full(nnodes, np.nan, dtype=float)
-        A0_log   = np.full(nnodes, np.nan, dtype=float)
+        # Valid mask: finite target, finite C and finite features
+        fin_t = np.isfinite(t)[:, None]                  # (S, 1)
+        fin_C = np.isfinite(C)
+        fin_L = np.isfinite(L)
+        fin_R = np.isfinite(R)
+        M     = fin_t & fin_C & fin_L & fin_R           # (S, N)
+        w     = M.astype(dt)
 
-        # We’ll also return mean(R= y*C) like the other backends
-        Cfin = np.isfinite(C)
-        num = (y0[:, None] * np.where(Cfin, C, 0.0)).sum(axis=0)
-        den = (fin_y[:, None] & Cfin).sum(axis=0).astype(float)
-        mean = np.divide(num, den, out=np.full_like(num, np.nan, dtype=float), where=den > 0)
+        # --- Build normal equations from scalar sums (per node) ---
+        # Columns: X = [1, L, R]
+        n   = w.sum(axis=0)                               # Σ 1
+        sL  = (w * L).sum(axis=0)                         # Σ L
+        sR  = (w * R).sum(axis=0)                         # Σ R
 
-        # Prepare y for regression in log-space (|y|, clipped)
-        y_reg = np.where(fin_y, np.log(np.clip(np.abs(y), 1e-12, None)), np.nan)
+        sLL = (w * (L * L)).sum(axis=0)                   # Σ L^2
+        sRR = (w * (R * R)).sum(axis=0)                   # Σ R^2
+        sLR = (w * (L * R)).sum(axis=0)                   # Σ L R
 
-        # Loop nodes
-        for j in range(nnodes):
-            mask = fin_y & Cfin[:, j]
-            nuse = int(mask.sum())
-            N_used[j] = nuse
-            if nuse < min_stations:
-                r2_vec[j] = 0.0
-                continue
+        tcol = t[:, None]
+        sT  = (w * tcol).sum(axis=0)                      # Σ t
+        sLT = (w * (L * tcol)).sum(axis=0)                # Σ L t
+        sRT = (w * (R * tcol)).sum(axis=0)                # Σ R t
 
-            Rj = np.clip(D[:, j].astype(float, copy=False), self.clip_R_min, None)
-            logR = np.log(Rj[mask])
-            Rlin = Rj[mask]
-            yj = y_reg[mask]
+        # Assemble Gram matrix G (N, 3, 3) and RHS b (N, 3)
+        G = np.empty((N, 3, 3), dtype=dt)
+        G[:, 0, 0] = n;   G[:, 0, 1] = sL;  G[:, 0, 2] = sR
+        G[:, 1, 0] = sL;  G[:, 1, 1] = sLL; G[:, 1, 2] = sLR
+        G[:, 2, 0] = sR;  G[:, 2, 1] = sLR; G[:, 2, 2] = sRR
 
-            # X beta ≈ y  with X = [logR, R]
-            # Add column of ones for intercept (A0_log)
-            X = np.column_stack([np.ones_like(logR), logR, Rlin])  # [A0_log, -N, -k]
-            # Least-squares
-            try:
-                beta, _, _, _ = np.linalg.lstsq(X, yj, rcond=None)
-            except np.linalg.LinAlgError:
-                r2_vec[j] = 0.0
-                continue
+        b = np.empty((N, 3), dtype=dt)
+        b[:, 0] = sT
+        b[:, 1] = sLT
+        b[:, 2] = sRT
 
-            A0, b_logR, b_R = beta
-            # Map to parameters (we fit y ≈ A0 + b1*logR + b2*R, expected b1≈-N, b2≈-k)
-            A0_log[j] = float(A0)
-            N_hat[j]  = float(-b_logR)
-            k_hat[j]  = float(-b_R)
-
-            # R^2 on this masked subset
-            yhat = X @ beta
-            ss_res = np.nansum((yj - yhat) ** 2)
-            ss_tot = np.nansum((yj - np.nanmean(yj)) ** 2)
-            r2 = 0.0 if ss_tot <= 0 else 1.0 - ss_res / ss_tot
-            # clip to [0,1] for robustness
-            r2_vec[j] = float(0.0 if r2 < 0 else (1.0 if r2 > 1.0 else r2))
-
-        # Misfit to minimize
-        misfit_r2 = 1.0 - r2_vec
-
-        # Optional blend with StdOverMean (alpha in [0,1])
-        if self.alpha < 1.0:
-            std_misfit, _ = ctx["std_backend"].evaluate(y, ctx["std_ctx"], min_stations=min_stations, eps=eps)
-            std_misfit = np.where(np.isfinite(std_misfit), std_misfit, np.inf)
-            misfit = self.alpha * misfit_r2 + (1.0 - self.alpha) * std_misfit
-        else:
-            misfit = misfit_r2
-
-        # Enforce min-stations
-        valid = N_used >= min_stations
-        misfit = np.where(valid, misfit, np.inf)
-
-        # --- DR proxy in *linear* domain (independent of log-regression) ---
-        Cfin = np.isfinite(C)
-        y_lin = np.where(np.isfinite(y), y, 0.0)
-        num = (y_lin[:, None] * np.where(Cfin, C, 0.0)).sum(axis=0)
-        den = (np.isfinite(y)[:, None] & Cfin).sum(axis=0)
-        mean_linear = np.divide(
-            num, den,
-            out=np.full_like(num, np.nan, dtype=float),
-            where=den > 0
+        # Solve G β = b for each node (batched)
+        # Guard singular systems: mark bad nodes for +inf cost
+        tiny = np.asarray(eps, dtype=dt)
+        # Condition via determinant (cheap proxy)
+        detG = (
+            G[:,0,0]*(G[:,1,1]*G[:,2,2] - G[:,1,2]*G[:,2,1]) -
+            G[:,0,1]*(G[:,1,0]*G[:,2,2] - G[:,1,2]*G[:,2,0]) +
+            G[:,0,2]*(G[:,1,0]*G[:,2,1] - G[:,1,1]*G[:,2,0])
         )
+        nonsing = np.isfinite(detG) & (np.abs(detG) > tiny)
 
+        beta = np.full((N, 3), np.nan, dtype=dt)
+        if nonsing.any():
+            beta[nonsing] = np.linalg.solve(G[nonsing], b[nonsing])
 
-        # Bundle extras
-        extras = {
-            "mean": mean_linear,             # allows DR extraction at best node
-            #"N": N_used.astype(float),
-            "N": den.astype(float),
-            "N_hat": N_hat,
-            "k_hat": k_hat,
-            "A0_log": A0_log,
-            "r2": r2_vec,
-            # convenience: implied Q per node (may be NaN for k≈0)
-            "Q_hat": (np.pi * self.f_hz) / (np.where(k_hat > 0, k_hat, np.nan) * self.v_kms)
-        }
-        return misfit, extras
+        # Predictions and R²
+        # yhat = β0 + β1*L + β2*R
+        yhat  = beta[:, 0][None, :] + beta[:, 1][None, :] * L + beta[:, 2][None, :] * R   # (S, N)
+        resid = np.where(M, (t[:, None] - yhat), 0.0)
+        SSE   = (resid * resid).sum(axis=0)
+
+        mean_t = np.where(n > 0, sT / np.maximum(n, 1.0), np.nan)
+        dy     = np.where(M, (t[:, None] - mean_t[None, :]), 0.0)
+        SST    = (dy * dy).sum(axis=0)
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            R2 = 1.0 - (SSE / np.maximum(SST, tiny))
+
+        # Base cost: 1 - R²; enforce min_stations and nonsingular system
+        cost = 1.0 - R2
+        ok = (n >= int(min_stations)) & nonsing
+        cost = np.where(ok, cost, np.inf)
+
+        # Optional blend with StdOverMean
+        alpha = float(getattr(self, "alpha", 1.0))
+        if alpha < 1.0:
+            som_cost, _extras = self.std_backend.evaluate(y, ctx["std_ctx"], min_stations=min_stations, eps=eps)
+            som_cost = np.asarray(som_cost, dtype=float)
+            cost = alpha * cost + (1.0 - alpha) * som_cost
+
+        # DR proxy from linear reductions (robust)
+        Rlin = y.reshape(S, 1) * C
+        DR   = np.nanmedian(np.where(np.isfinite(Rlin), Rlin, np.nan), axis=0)
+
+        return np.asarray(cost, float), {"N": n.astype(int), "mean": DR}
     
 # ---------------------------------------------------------------------
 # Plot: misfit heatmap (colored layer) at time of maximum DR
@@ -451,6 +460,7 @@ def compute_node_misfit_for_time(
     return misfit_vec, jstar, extras
 
 
+
 def plot_misfit_heatmap_for_peak_DR(
     aslobj,
     *,
@@ -460,183 +470,155 @@ def plot_misfit_heatmap_for_peak_DR(
     dtype=np.float32,
     cmap: str = "turbo",
     transparency: int = 35,
-    zoom_level: int = 0,
-    add_labels: bool = True,
-    title: Optional[str] = None,
+    topo_kw: Optional[dict] = None,   # <-- single source for topo_map kwargs
     outfile: Optional[str] = None,
-    region: Optional[Tuple[float, float, float, float]] = None,
-    dem_tif: Optional[str] = None,
-    simple_basemap: bool = True,
+    show: bool = True,
 ):
     """
-    Compute per-node misfit at the time of maximum DR and overlay it on a topo_map().
-    Supports both 2D regular grids and 1D "stream grids".
+    Compute the per-node misfit at the time of maximum DR and plot it atop a topo_map().
+    - Works with 2D regular grids via grdimage or 1D "stream grids" via scatter.
+    - Honors ASL grid masks (masked nodes show as NaN / not plotted).
+    - Basemap is created *only* from passed topo_kw (no duplicate kwargs here).
 
-    Parameters
-    ----------
-    aslobj : ASL
-        The ASL object with .source and .gridobj populated.
-    backend : MisfitBackend, optional
-        Misfit backend to use.
-    min_stations : int
-        Minimum stations required for misfit computation.
-    eps : float
-        Small epsilon to avoid divide-by-zero.
-    dtype : np.dtype
-        Numeric dtype for computation.
-    cmap : str
-        Colormap name for PyGMT.
-    transparency : int
-        Transparency level (0 opaque – 100 invisible).
-    zoom_level : int
-        Zoom level for topo_map().
-    add_labels : bool
-        Whether to add station labels.
-    title : str, optional
-        Title string for the plot.
-    outfile : str, optional
-        If provided, save the figure here.
-    region : tuple, optional
-        (lon_min, lon_max, lat_min, lat_max). If None, auto-computed.
-    dem_tif : str, optional
-        Path to DEM for topo_map().
-    simple_basemap : bool
-        Passed through to topo_map().
+    Returns
+    -------
+    (fig, misfit_2d_or_1d)
+        fig: PyGMT Figure
+        misfit array: 2D (nlat,nlon) for regular grids; 1D for stream grids
     """
-    import xarray as xr
+
     import pygmt
+    import xarray as xr
     from datetime import datetime
     from flovopy.asl.map import topo_map
 
     ts = lambda: datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    topo_kw = dict(topo_kw or {})  # copy so we don't mutate caller's dict
 
     if aslobj.source is None:
         print(f"[{ts()}] [MISFIT] No source; run locate()/fast_locate() first.")
         return None
 
-    try:
-        # ---- pick the time of max DR
-        t_idx = int(np.nanargmax(aslobj.source["DR"]))
-        print(f"[{ts()}] [MISFIT] peak DR index={t_idx}")
+    # 1) Select time-of-peak DR
+    t_idx = int(np.nanargmax(aslobj.source["DR"]))
+    print(f"[{ts()}] [MISFIT] peak DR index = {t_idx}")
 
-        # ---- per-node misfit
-        misfit_vec, jstar_local, meta = compute_node_misfit_for_time(
-            aslobj, t_idx, misfit_backend=backend,
-            min_stations=min_stations, eps=eps, dtype=dtype
-        )
-        print(f"[{ts()}] [MISFIT] misfit_vec shape={misfit_vec.shape} finite={np.isfinite(misfit_vec).sum()}")
+    # 2) Compute per-node misfit (local space if backend subsets nodes)
+    misfit_vec, jstar_local, meta = compute_node_misfit_for_time(
+        aslobj,
+        t_idx,
+        misfit_backend=backend,
+        min_stations=min_stations,
+        eps=eps,
+        dtype=dtype,
+    )
+    misfit_vec = np.asarray(misfit_vec, float)
+    print(f"[{ts()}] [MISFIT] misfit_vec shape={misfit_vec.shape} finite={np.isfinite(misfit_vec).sum()}")
 
-        mask = getattr(aslobj, "_node_mask", None)
-        grid = aslobj.gridobj
+    # 3) Handle grid/mask; build 2D field when possible
+    grid = aslobj.gridobj
+    mask_idx = getattr(aslobj, "_node_mask", None)  # flat indices of allowed nodes or None
 
-        # --- Detect dimensionality
-        if getattr(grid, "gridlat", None) is not None and grid.gridlat.ndim == 2:
-            # --- 2D grid (DEM-backed)
-            nlat, nlon = grid.gridlat.shape
-            M_full = np.full((nlat * nlon,), np.nan, dtype=float)
-            if mask is None:
-                M_full[:] = misfit_vec
-                jstar_global = jstar_local
-            else:
-                mask = np.asarray(mask, int)
-                M_full[mask] = misfit_vec
-                jstar_global = int(mask[jstar_local])
-            M = M_full.reshape((nlat, nlon))
+    # Mapping from local (backend) index → global grid index if provided
+    node_index = meta.get("node_index") if isinstance(meta, dict) else None
+    if node_index is not None:
+        node_index = np.asarray(node_index, int)
 
-            lat_axis = np.unique(grid.gridlat.ravel())
-            lon_axis = np.unique(grid.gridlon.ravel())
+    # Resolve "global best" index
+    jstar_global = int(jstar_local if node_index is None else node_index[jstar_local])
 
-            # Ensure increasing latitude
-            if lat_axis[0] > lat_axis[-1]:
-                lat_axis = lat_axis[::-1]
-                M = M[::-1, :]
+    # Regular 2D grid?
+    has_2d = getattr(grid, "gridlat", None) is not None and np.ndim(grid.gridlat) == 2
+    gridlat_flat = grid.gridlat.reshape(-1)
+    gridlon_flat = grid.gridlon.reshape(-1)
 
-            misfit_da = xr.DataArray(
-                M, coords={"lat": lat_axis, "lon": lon_axis}, dims=["lat", "lon"], name="misfit"
-            )
+    if has_2d:
+        nlat, nlon = grid.gridlat.shape
+        M_full = np.full(nlat * nlon, np.nan, dtype=float)
 
+        if node_index is None and mask_idx is None:
+            # direct full vectors
+            M_full[:] = misfit_vec
         else:
-            # --- 1D node grid (e.g. streams)
-            lats = grid.gridlat.ravel()
-            lons = grid.gridlon.ravel()
-            M = misfit_vec.copy()
-            if mask is not None:
-                full = np.full_like(lats, np.nan, dtype=float)
-                full[mask] = misfit_vec
-                M = full
-                jstar_global = int(mask[jstar_local])
-            else:
-                jstar_global = jstar_local
+            # scatter local (and/or masked) into dense full-field
+            if node_index is None and mask_idx is not None:
+                # local space == masked subset; scatter via mask indices
+                M_full[np.asarray(mask_idx, int)] = misfit_vec
+            elif node_index is not None:
+                # local space explicitly supplied; scatter via node_index
+                M_full[node_index] = misfit_vec
 
-            misfit_da = None  # scatter plot instead of grdimage
+        M2 = M_full.reshape(nlat, nlon)
 
-        # ---- region
-        if region is None:
-            if misfit_da is not None:
-                dlon = max(1e-4, 0.02)
-                dlat = max(1e-4, 0.02)
-                region = [
-                    float(misfit_da.lon.min() - dlon),
-                    float(misfit_da.lon.max() + dlon),
-                    float(misfit_da.lat.min() - dlat),
-                    float(misfit_da.lat.max() + dlat),
-                ]
-            else:
-                region = [
-                    float(np.nanmin(lons) - 0.02),
-                    float(np.nanmax(lons) + 0.02),
-                    float(np.nanmin(lats) - 0.02),
-                    float(np.nanmax(lats) + 0.02),
-                ]
+        # Ensure increasing lat axis
+        lat_axis = np.unique(grid.gridlat.ravel())
+        lon_axis = np.unique(grid.gridlon.ravel())
+        if lat_axis[0] > lat_axis[-1]:
+            lat_axis = lat_axis[::-1]
+            M2 = M2[::-1, :]
 
-        center_lat = float(aslobj.source["lat"][t_idx])
-        center_lon = float(aslobj.source["lon"][t_idx])
+        misfit_da = xr.DataArray(M2, coords={"lat": lat_axis, "lon": lon_axis}, dims=("lat", "lon"))
+        M_plot = M2
+    else:
+        # 1D node set ("streams" style) → scatter plot
+        if node_index is None and mask_idx is None:
+            M_plot = misfit_vec
+        else:
+            M_full = np.full_like(gridlat_flat, np.nan, dtype=float)
+            if node_index is None and mask_idx is not None:
+                M_full[np.asarray(mask_idx, int)] = misfit_vec
+            elif node_index is not None:
+                M_full[node_index] = misfit_vec
+            M_plot = M_full
+        misfit_da = None  # use scatter
 
-        fig = topo_map(
-            show=False, zoom_level=zoom_level, inv=None, add_labels=add_labels,
-            centerlat=center_lat, centerlon=center_lon,
-            topo_color=False, region=region, dem_tif=dem_tif,
-            title=title or "Misfit heatmap (peak DR time)",
-        )
+    # 4) Create basemap strictly via topo_kw (caller controls everything there)
+    #    If caller didn't supply a title, provide a friendly default.
+    topo_kw.setdefault("title", "Misfit heatmap (peak DR time)")
+    topo_kw.setdefault("show", False)
 
-        finite = np.isfinite(M)
+    # Optionally center on the peak location if not overridden by topo_kw
+    if "centerlat" not in topo_kw or "centerlon" not in topo_kw:
+        topo_kw.setdefault("centerlat", float(aslobj.source["lat"][t_idx]))
+        topo_kw.setdefault("centerlon", float(aslobj.source["lon"][t_idx]))
+
+    fig = topo_map(**topo_kw)
+
+    # 5) Color scale from data range
+    finite = np.isfinite(M_plot)
+    if finite.any():
+        vmin = float(np.nanmin(M_plot[finite]))
+        vmax = float(np.nanmax(M_plot[finite]))
+        if vmin == vmax:
+            vmin, vmax = (0.0, 1.0)
+    else:
         vmin, vmax = (0.0, 1.0)
-        if finite.any():
-            vmin, vmax = float(np.nanmin(M[finite])), float(np.nanmax(M[finite]))
-            if vmin == vmax:
-                vmin, vmax = 0.0, 1.0
-        pygmt.makecpt(cmap=cmap, series=[vmin, vmax], continuous=True)
 
-        if misfit_da is not None:
-            fig.grdimage(grid=misfit_da, cmap=True, transparency=transparency)
-        else:
-            # Build a 3-column table: lon, lat, z (misfit)
-            tbl = np.column_stack([lons[finite], lats[finite], M[finite]])
-            fig.plot(
-                data=tbl,
-                style="c0.15c",
-                cmap=True,                  # use current CPT
-                transparency=transparency,
-            )
+    pygmt.makecpt(cmap=cmap, series=[vmin, vmax], continuous=True)
 
-        fig.colorbar(frame='+l"Misfit"')
+    # 6) Draw heatmap or scatter
+    if misfit_da is not None:
+        fig.grdimage(grid=misfit_da, cmap=True, transparency=transparency)
+    else:
+        # 1D scatter
+        lats = gridlat_flat
+        lons = gridlon_flat
+        tbl = np.column_stack([lons[finite], lats[finite], M_plot[finite]])
+        if tbl.size:
+            fig.plot(data=tbl, style="c0.15c", cmap=True, transparency=transparency)
 
-        # Mark best node
-        best_lon = float(grid.gridlon.ravel()[jstar_global])
-        best_lat = float(grid.gridlat.ravel()[jstar_global])
-        fig.plot(x=[best_lon], y=[best_lat], style="c0.26c", fill="red", pen="1p,red")
+    fig.colorbar(frame='+l"Misfit"')
 
-        if outfile:
-            fig.savefig(outfile)
-            print(f"[{ts()}] [MISFIT] saved: {outfile}")
-        else:
-            fig.show()
+    # 7) Mark best node
+    best_lon = float(gridlon_flat[jstar_global])
+    best_lat = float(gridlat_flat[jstar_global])
+    fig.plot(x=[best_lon], y=[best_lat], style="c0.26c", fill="red", pen="1p,red")
 
-        return fig, M
+    # 8) Output
+    if outfile:
+        fig.savefig(outfile)
+        print(f"[{ts()}] [MISFIT] saved: {outfile}")
+    elif show:
+        fig.show()
 
-    except Exception as e:
-        import traceback
-        print(f"[{ts()}] [MISFIT:ERR] {type(e).__name__}: {e}")
-        traceback.print_exc()
-        raise
-
+    return fig, M_plot

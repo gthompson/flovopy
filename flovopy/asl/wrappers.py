@@ -12,17 +12,16 @@ from pprint import pprint
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from obspy import Stream, read, read_inventory
+import traceback
+from obspy import Stream, read, read_inventory, Inventory
 
-from flovopy.core.mvo import dome_location
-from flovopy.processing.sam import VSAM
-from flovopy.asl.ampcorr import AmpCorr, AmpCorrParams
+from flovopy.processing.sam import SAM, RSAM, VSAM, DSAM
+from flovopy.asl.ampcorr import AmpCorr, AmpCorrParams, summarize_ampcorr_ranges
 from flovopy.asl.asl import ASL
 from flovopy.asl.station_corrections import apply_interval_station_gains
 from flovopy.asl.utils import _grid_mask_indices
-from flovopy.core.mvo import dome_location  # <-- for sector apex
 from flovopy.asl.distances import distances_signature, compute_or_load_distances
-from flovopy.asl.grid import make_grid, nodegrid_from_channel_csvs, Grid
+from flovopy.asl.grid import Grid, summarize_station_node_distances
 from flovopy.asl.station_corrections import load_station_gains_df
 from flovopy.asl.map import plot_heatmap_colored
 # Misfit backends (import directly)
@@ -35,14 +34,121 @@ from flovopy.asl.misfit import (
 from flovopy.enhanced.event import EnhancedEvent, EnhancedEventMeta
 from flovopy.enhanced.catalog import EnhancedCatalog
 
-# Montserrat defaults (immutable tuple to avoid mutable-default gotchas)
-DEFAULT_REGION = (-62.255, -62.135, 16.66, 16.84)  # (lon_min, lon_max, lat_min, lat_max)
-# Later we can create configs like this and modify functions below to use them
-@dataclass(frozen=True)
-class VolcanoConfig:
-    name: str
-    region: tuple[float, float, float, float]
-MONTSERRAT = VolcanoConfig("Montserrat", DEFAULT_REGION)
+
+
+def build_asl_config(
+    *,
+    sweep_or_cfg,
+    inventory_xml: Inventory | str | Path,
+    output_base: str | Path,
+    peakf: float,
+    gridobj,                         # Grid
+    sam_class=None,                  # e.g. VSAM (a class, not an instance)
+    sam_metric: str = "mean",
+    window_seconds: float = 5.0,
+    min_stations: int = 5,
+    global_cache: str | Path | None = None,
+    debug: bool = False,
+) -> Tuple[dict, Inventory, str]:
+    """
+    Compute/load distances + ampcorr once, return (asl_config, inventory, outdir_str).
+
+    Notes
+    -----
+    - Distances use the mask-aware, vectorized pipeline; dense output (masked nodes = NaN).
+    - AmpCorr corrections match full grid length; masked nodes remain NaN.
+    - Input Grid should be unmasked at creation; runtime masks are honored by callers.
+    """
+    # --- tag and output dir ---
+    tag = sweep_or_cfg.tag()
+    output_base = Path(output_base)
+    outdir = output_base / tag
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # --- inventory load/normalize ---
+    if isinstance(inventory_xml, Inventory):
+        inv = inventory_xml
+    else:
+        inv = read_inventory(str(inventory_xml))
+    if debug:
+        print('[build_asl_config] Inventory:', inv)
+
+    # --- cache root ---
+    cache_root = (Path(global_cache) if global_cache else output_base) / tag
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    # --- distances (mask-aware & vectorized; 3D if requested) ---
+    dist_cache_dir = cache_root / "distances" / ("3d" if sweep_or_cfg.dist_mode.lower() == "3d" else "2d")
+    dist_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Uses your new compute_or_load_distances() that calls distances_mask_aware(...)
+    print('[build_asl_config] Computing distances to each node from each station')
+    node_distances_km, station_coords, dist_meta = compute_or_load_distances(
+        gridobj,
+        inventory=inv,
+        stream=None,
+        cache_dir=str(dist_cache_dir),
+        force_recompute=False,
+        use_elevation=(sweep_or_cfg.dist_mode.lower() == "3d"),
+    )
+    if debug:
+        print('[build_asl_config]',summarize_station_node_distances(node_distances_km, reduce_to_station=True))
+
+    # --- ampcorr (vectorized fused correction; mask-aware via NaNs) ---
+    ampcorr_cache = cache_root / "ampcorr"
+    ampcorr_cache.mkdir(parents=True, exist_ok=True)
+
+    # mask signature (valid_count, total) or None
+    mask_idx = getattr(gridobj, "_node_mask_idx", None)
+    total_nodes = int(gridobj.gridlat.size)
+    mask_sig = (int(mask_idx.size), total_nodes) if mask_idx is not None else None
+
+    params = AmpCorrParams(
+        assume_surface_waves=(sweep_or_cfg.wave_kind == "surface"),
+        wave_speed_kms=float(sweep_or_cfg.speed),
+        Q=sweep_or_cfg.Q,
+        peakf=float(peakf),
+        grid_sig=gridobj.signature(),
+        inv_sig=tuple(sorted(node_distances_km.keys())),
+        dist_sig=distances_signature(node_distances_km),
+        mask_sig=mask_sig,
+        code_version="v1",
+    )
+
+    ampcorr = AmpCorr(params, cache_dir=str(ampcorr_cache))
+    print('[build_asl_config] Computing amplitude corrections for each node from each station')
+    ampcorr.compute_or_load(node_distances_km, inventory=inv)
+
+    # Validate length against full grid (we store dense vectors with NaNs on masked nodes)
+    ampcorr.validate_against_nodes(total_nodes)
+
+    # After ampcorr.compute_or_load(...)
+    if debug:
+        print('[build_asl_config]',summarize_ampcorr_ranges(
+            ampcorr.corrections,
+            total_nodes=gridobj.gridlat.size,   # dense grid length (masked nodes are NaN)
+            reduce_to_station=True,             # collapse NET.STA across channels
+            include_percentiles=True,
+            sort_by="min_corr",
+        ))
+   
+
+    return {
+        "tag": tag,
+        "window_seconds": float(window_seconds),
+        "min_stations": int(min_stations),
+        "gridobj": gridobj,
+        "node_distances_km": node_distances_km,
+        "station_coords": station_coords,
+        "ampcorr": ampcorr,
+        "inventory": inv,
+        "dist_meta": dist_meta,
+        "misfit_engine": sweep_or_cfg.misfit_engine,
+        "outdir": str(outdir),
+        "sam_class": (sam_class if sam_class is not None else VSAM),
+        "sam_metric": sam_metric,
+    }
+
 
 # helper method for outputting source data after fast_locate() or refine_and_relocate()
 def _asl_output_source_results(
@@ -53,12 +159,18 @@ def _asl_output_source_results(
     asl_config: dict,
     peakf_event: int,
     suffix: str = "",       # "" or "_refined"
+    topo_kw: dict = None,
+    show: bool = True,
+    debug: bool = False,
 ) -> dict:
     """
     Save QuakeML+JSON (EnhancedEvent), CSV, and all diagnostic plots for the current ASL source.
     Returns a dict of the produced file paths (some may be None if failures occur).
     """
     os.makedirs(event_dir, exist_ok=True)
+
+    if debug:
+        print('source sanity check:\n', aslobj.source_to_dataframe().describe())
 
     # Title / filenames
     base_title = f"ASL event (Q={int(aslobj.Q)}, F={int(aslobj.peakf)} Hz, v={aslobj.wave_speed_kms:g} km/s)"
@@ -84,25 +196,18 @@ def _asl_output_source_results(
     print(f"[ASL:OUT] Saved QuakeML: {qml_out}")
     print(f"[ASL:OUT] Saved JSON sidecar: {json_out}")
 
-    # Common plotting args
-    dem_tif_for_bmap = asl_config.get("dem_tif") or asl_config.get("dem_tif_for_bmap")
-    region = asl_config.get("region", DEFAULT_REGION)
-
     # Map
     map_png = os.path.join(event_dir, f"map_Q{int(aslobj.Q)}_F{int(peakf_event)}{suffix}.png")
     print("[ASL:PLOT] Writing map and diagnostic plots…")
     aslobj.plot(
-        zoom_level=0,
-        threshold_DR=1.0,
+        topo_kw=topo_kw,
+        threshold_DR=0.0,
         scale=0.2,
         join=False,
         number=0,
-        add_labels=True,
         stations = [tr.stats.station for tr in (stream or [])],
         outfile=map_png,
-        dem_tif=dem_tif_for_bmap,
-        simple_basemap=True,
-        region=None,#region,
+        show=show,
     )
     plt.close('all')
 
@@ -114,19 +219,19 @@ def _asl_output_source_results(
     # Reduced displacement
     rd_png = os.path.join(event_dir, f"reduced_disp_Q{int(aslobj.Q)}_F{int(peakf_event)}{suffix}.png")
     print("[ASL:PLOT_REDUCED_DISPLACEMENT]")
-    aslobj.plot_reduced_displacement(outfile=rd_png)
+    aslobj.plot_reduced_displacement(outfile=rd_png, show=show)
     plt.close()
 
     # Misfit (line)
     mis_png = os.path.join(event_dir, f"misfit_Q{int(aslobj.Q)}_F{int(peakf_event)}{suffix}.png")
     print("[ASL:PLOT_MISFIT]")
-    aslobj.plot_misfit(outfile=mis_png)
+    aslobj.plot_misfit(outfile=mis_png, show=show)
     plt.close()
 
     # Misfit heatmap
     mh_png = os.path.join(event_dir, f"misfit_heatmap_Q{int(aslobj.Q)}_F{int(peakf_event)}{suffix}.png")
     print("[ASL:PLOT_MISFIT_HEATMAP]")
-    aslobj.plot_misfit_heatmap(outfile=mh_png, region=region)
+    aslobj.plot_misfit_heatmap(outfile=mh_png, topo_kw=topo_kw, show=show)
     plt.close('all')
 
     return {
@@ -144,7 +249,6 @@ def asl_sausage(
     stream: Stream,
     event_dir: str,
     asl_config: dict,
-    output_dir: str,  # kept for parity (not used here)
     dry_run: bool = False,
     peakf_override: Optional[float] = None,
     station_gains_df: Optional["pd.DataFrame"] = None,
@@ -152,7 +256,10 @@ def asl_sausage(
     *,
     # NEW: enable a triangular (apex→sea) sector refinement pass
     refine_sector: bool = False,
-    summit_location: dict = None,
+    vertical_only: bool = True,
+    topo_kw: dict = None,
+    show: bool=True,
+    debug: bool=False,
 ):
     """
     Run ASL on a single (already preprocessed) event stream.
@@ -188,18 +295,44 @@ def asl_sausage(
         print("[GAINS] No station gains DataFrame provided; skipping.")
 
     # Ensure velocity units for downstream plots (don’t overwrite if already set)
-    for tr in stream:
-        if tr.stats.get("units") in (None, ""):
-            tr.stats["units"] = "m/s"
+    if vertical_only:
+        stream = stream.select(component='Z')
 
-    # 2) Build VSAM
-    samObj = VSAM(stream=stream, sampling_interval=1.0)
+    units_by_class  = {DSAM: "m",   VSAM: "m/s"}
+    output_by_class = {DSAM: "DISP", VSAM: "VEL"}
+    output = output_by_class.get(asl_config["sam_class"])
+
+    for tr in stream:
+        # Default units
+        units = tr.stats.get("units") or "Counts"
+        tr.stats["units"] = units
+
+        # Only reason about response if still in counts
+        if units == "Counts":
+            median_abs = float(np.nanmedian(np.abs(tr.data))) if tr.data is not None else np.inf
+
+            if median_abs < 1.0:
+                # Looks already corrected but units not set; fix units based on SAM class
+                new_units = units_by_class.get(asl_config["sam_class"])
+                if new_units:
+                    tr.stats["units"] = new_units
+            else:
+                # Still in counts at a plausible scale -> we should correct later
+                print('Removing instrument response from {tr.id}')
+                tr.remove_response(inventory=asl_config["inventory"], output=output)
+    
+    if debug:
+        stream.plot(equal_scale=False, outfile=os.path.join(event_dir, 'stream.png'))
+
+
+    # 2) Build SAM object
+    samObj = asl_config['sam_class'](stream=stream, sampling_interval=1.0)
     if len(samObj.dataframes) == 0:
         raise IOError("[ASL:ERR] No dataframes in VSAM object")
 
     if not dry_run:
         print("[ASL:PLOT] Writing VSAM preview")
-        samObj.plot(metrics=asl_config['sam_metric'], equal_scale=False, outfile=os.path.join(event_dir, "VSAM.png"))
+        samObj.plot(metrics=asl_config['sam_metric'], equal_scale=False, outfile=os.path.join(event_dir, "SAM.png"))
         plt.close('all')
 
     # 3) Decide event peakf
@@ -216,37 +349,53 @@ def asl_sausage(
         print(f"[ASL] Using peak frequency override: {peakf_event} Hz")
 
     ################### IMPLEMENT THIS FOR CHECKING ################
-    print("ASL_CONFIG (keys):", sorted(asl_config.keys()))
-    print("ASL_CONFIG AmpCorr object:")
-    pprint(list(vars(asl_config["ampcorr"]).keys()))
-    #pprint(asl_config, width=100)
-    # Pull wave/atten params from AmpCorr (single source of truth)
     ampcorr_params = asl_config["ampcorr"].params
 
-    print(f"[ASL:CHECK] Params → surface_waves={ampcorr_params.assume_surface_waves}  "
-        f"v={ampcorr_params.wave_speed_kms} km/s  Q={ampcorr_params.Q}  peakf_event={peakf_event}")
+    if debug:
+        print("ASL_CONFIG (keys):", sorted(asl_config.keys()))
+        print("ASL_CONFIG AmpCorr object:")
+        pprint(list(vars(asl_config["ampcorr"]).keys()))
+        print(f"[ASL:CHECK] Params → surface_waves={ampcorr_params.assume_surface_waves}  "
+            f"v={ampcorr_params.wave_speed_kms} km/s  Q={ampcorr_params.Q}  peakf_event={peakf_event}")
 
-    # Sanity check distances (km)
-    nd = asl_config["node_distances_km"]
-    all_max = [float(np.nanmax(v)) for v in nd.values() if np.size(v)]
-    if all_max:
-        dmin = min(float(np.nanmin(v)) for v in nd.values())
-        dmax = max(all_max)
-        dp95 = np.percentile(np.concatenate([np.ravel(v) for v in nd.values()]), 95)
-        print(f"[ASL:DISTS] node→station distances (km): min={dmin:.3f}  p95={dp95:.3f}  max={dmax:.3f}")
-        if dmax > 100:  # Montserrat scale guardrail
-            print("[ASL:WARN] Distances look like meters! (max > 100 km)")
+        # Sanity check distances (km)
+        nd = asl_config["node_distances_km"]
+        all_max = [float(np.nanmax(v)) for v in nd.values() if np.size(v)]
+        if all_max:
+            dmin = min(float(np.nanmin(v)) for v in nd.values())
+            dmax = max(all_max)
+            dp95 = np.percentile(np.concatenate([np.ravel(v) for v in nd.values()]), 95)
+            print(f"[ASL:DISTS] node→station distances (km): min={dmin:.3f}  p95={dp95:.3f}  max={dmax:.3f}")
+            if dmax > 100:  # Montserrat scale guardrail
+                print("[ASL:WARN] Distances look like meters! (max > 100 km)")
 
-    # Your diagnostic: compute reduced velocity at the summit
-    if summit_location:
-        samObj.compute_reduced_velocity(
-            asl_config["inventory"],
-            summit_location,
-            surfaceWaves=ampcorr_params.assume_surface_waves,
-            Q=ampcorr_params.Q,
-            wavespeed_kms=ampcorr_params.wave_speed_kms,
-            peakf=peakf_event,
-        )
+        # compute reduced velocity at the summit
+        if topo_kw['dome_location']:
+            if asl_config['sam_class']==VSAM:
+                print('[ASL_SAUSAGE]: Sanity check: VSAM data reduced to VR/VRS')
+                VR = samObj.compute_reduced_velocity(
+                    asl_config["inventory"],
+                    topo_kw['dome_location'],
+                    surfaceWaves=ampcorr_params.assume_surface_waves,
+                    Q=ampcorr_params.Q,
+                    wavespeed_kms=ampcorr_params.wave_speed_kms,
+                    peakf=peakf_event,
+                )
+                print(VR)
+                VR.plot(outfile=os.path.join(event_dir, "VR_at_dome.png"))
+
+            elif asl_config['sam_class']==DSAM:
+                print('[ASL_SAUSAGE]: Sanity check: DSAM data reduced to DR/DRS')
+                DR = samObj.compute_reduced_displacement(
+                    asl_config["inventory"],
+                    topo_kw['dome_location'],
+                    surfaceWaves=ampcorr_params.assume_surface_waves,
+                    Q=ampcorr_params.Q,
+                    wavespeed_kms=ampcorr_params.wave_speed_kms,
+                    peakf=peakf_event,
+                )
+                print(DR)
+                DR.plot(outfile=os.path.join(event_dir, "DR_at_dome.png"))
             
     # 4) Amplitude corrections cache (swap if peakf differs)
     ampcorr: AmpCorr = asl_config["ampcorr"]
@@ -272,7 +421,8 @@ def asl_sausage(
 
         ampcorr = AmpCorr(new_params, cache_dir=ampcorr.cache_dir)
         ampcorr.compute_or_load(asl_config["node_distances_km"])
-        asl_config[f"ampcorr_peakf_{peakf_event}"] = ampcorr
+        asl_config['ampcorr'] = ampcorr
+
     else:
         print(f"[ASL] Using existing amplitude corrections (peakf={ampcorr.params.peakf} Hz)")
 
@@ -280,45 +430,32 @@ def asl_sausage(
     print("[ASL] Building ASL object…")
     aslobj = ASL(
         samObj,
-        asl_config["sam_metric"],
-        asl_config["gridobj"],
-        asl_config["window_seconds"],
+        config=asl_config,
     )
 
     idx = _grid_mask_indices(asl_config["gridobj"])
     if idx is not None and idx.size:
         aslobj._node_mask = idx
 
-    aslobj.node_distances_km     = asl_config["node_distances_km"]
-    aslobj.station_coordinates   = asl_config["station_coords"]
-    aslobj.amplitude_corrections = ampcorr.corrections
-
-    # keep parameters on the ASL for provenance/filenames
-    aslobj.Q             = ampcorr.params.Q
-    aslobj.peakf         = ampcorr.params.peakf
-    aslobj.wave_speed_kms = ampcorr.params.wave_speed_kms
-    aslobj.assume_surface_waves  = ampcorr.params.assume_surface_waves
-
     # 6) Locate
     meta = asl_config.get("dist_meta", {})
-    station_coords = asl_config["station_coords"]
-
-    print(f"[DIST] used_3d={meta.get('used_3d')}  "
-          f"has_node_elevations={meta.get('has_node_elevations')}  "
-          f"n_nodes={meta.get('n_nodes')}  n_stations={meta.get('n_stations')}")
-    z_grid = getattr(asl_config["gridobj"], "node_elev_m", None)
-    if z_grid is not None:
-        print(f"[GRID] Node elevations: min={np.nanmin(z_grid):.1f} m  max={np.nanmax(z_grid):.1f} m")
-    ze = [c.get("elevation", 0.0) for c in station_coords.values()]
-    print(f"[DIST] Station elevations: min={min(ze):.1f} m  max={max(ze):.1f} m")
+    if debug:
+        print(f"[DIST] used_3d={meta.get('used_3d')}  "
+            f"has_node_elevations={meta.get('has_node_elevations')}  "
+            f"n_nodes={meta.get('n_nodes')}  n_stations={meta.get('n_stations')}")
+        z_grid = getattr(asl_config["gridobj"], "node_elev_m", None)
+        if z_grid is not None:
+            print(f"[GRID] Node elevations: min={np.nanmin(z_grid):.1f} m  max={np.nanmax(z_grid):.1f} m")
+        ze = [c.get("elevation", 0.0) for c in aslobj.station_coordinates.values()]
+        print(f"[DIST] Station elevations: min={min(ze):.1f} m  max={max(ze):.1f} m")
 
     print("[ASL] Locating source with fast_locate()…")
     # Pull optional settings from config if present
     min_sta = int(asl_config.get("min_stations", 3))
     misfit_backend = _resolve_misfit_backend(
         asl_config.get("misfit_engine", None),
-        peakf_hz=float(asl_config.get("ampcorr", ampcorr).params.peakf),
-        speed_kms=float(asl_config.get("ampcorr", ampcorr).params.wave_speed_kms),
+        peakf_hz=float(ampcorr.params.peakf),
+        speed_kms=float(ampcorr.params.wave_speed_kms),
     )
     aslobj.fast_locate(
         min_stations=min_sta,
@@ -335,7 +472,10 @@ def asl_sausage(
             event_dir=event_dir,
             asl_config=asl_config,
             peakf_event=peakf_event,
+            topo_kw=topo_kw,
             suffix="",
+            show=show,
+            debug=debug,
         )
 
     ############## SCAFFOLD
@@ -353,12 +493,12 @@ def asl_sausage(
     ################### 
 
     # 8) OPTIONAL: sector refinement pass (triangular wedge from dome toward sea)
-    if refine_sector:
+    if refine_sector and topo_kw['dome_location']:
         print("[ASL] Refinement pass: sector wedge from dome apex…")
         try:
             # Use dome apex as the sector origin
-            apex_lat = float(dome_location["lat"])
-            apex_lon = float(dome_location["lon"])
+            apex_lat = float(topo_kw['dome_location']["lat"])
+            apex_lon = float(topo_kw['dome_location']["lon"])
 
             # call refine_and_relocate() with sector mask + Viterbi smoothing defaults
             aslobj.refine_and_relocate(
@@ -386,152 +526,23 @@ def asl_sausage(
                 event_dir=event_dir,
                 asl_config=asl_config,
                 peakf_event=peakf_event,
+                topo_kw=topo_kw,
                 suffix="_refined",
+                show=False,
+                debug=debug,                
             )
-
-    if not dry_run and asl_config.get("interactive", False):
-        input("[ASL] Press Enter to continue to next event…")
 
     # Return a structured summary for callers
     return {"primary": primary_out, "refined": refined_out}
 
-def build_asl_config(
-    *,
-    sweep_or_cfg,
-    inventory_xml: str,
-    output_base: str,
-    peakf: float,
-    regular_grid_dem: Optional[str],
-    dem_cache_dir: Optional[str],
-    dem_tif_for_bmap: Optional[str],
-    region: tuple[float, float, float, float] = DEFAULT_REGION,   # ← NEW default
-    gridobj: Optional[Grid] = None,
-    node_spacing_m: Optional[int] = None,
-) -> tuple[dict, "Inventory", str]:
-    """
-    Build grid, compute/load distances + ampcorr once, return (asl_config, inventory, outdir).
-    """
-
-
-    tag = sweep_or_cfg.tag()
-    outdir = Path(output_base) / tag
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    inv = read_inventory(inventory_xml)
-
-    # Grid or NodeGrid
-    if not isinstance(gridobj, Grid):
-        dem_spec = None
-        if regular_grid_dem:
-            if regular_grid_dem.startswith("pygmt:"):
-                res = regular_grid_dem.split(":", 1)[1] or "01s"
-                dem_spec = ("pygmt", {"resolution": res, "cache_dir": dem_cache_dir, "tag": res})
-            elif regular_grid_dem.startswith("geotiff:"):
-                path = regular_grid_dem.split(":", 1)[1]
-                dem_spec = ("geotiff", {"path": path, "tag": Path(path).name})
-        gridobj = make_grid(
-            center_lat=dome_location["lat"],
-            center_lon=dome_location["lon"],
-            node_spacing_m=node_spacing_m,
-            grid_size_lat_m=10_000,
-            grid_size_lon_m=14_000,
-            dem=dem_spec,
-        )
-        try:
-            gridobj.apply_land_mask_from_dem(sea_level=1.0)
-        except Exception:
-            pass
-
-
-    # Distances (shared cache per sweep tag + 2D/3D)
-    cache_root = Path(output_base) / "_nbcache" / tag
-    dist_cache_dir = cache_root / "distances" / ("3d" if sweep_or_cfg.dist_mode.lower() == "3d" else "2d")
-    dist_cache_dir.mkdir(parents=True, exist_ok=True)
-
-    node_distances_km, station_coords, dist_meta = compute_or_load_distances(
-        gridobj,
-        inventory=inv,
-        stream=None,
-        cache_dir=str(dist_cache_dir),
-        force_recompute=False,
-        use_elevation=(sweep_or_cfg.dist_mode.lower() == "3d"),
-    )
-
-    # AmpCorr (shared cache)
-    ampcorr_cache = cache_root / "ampcorr"
-    ampcorr_cache.mkdir(parents=True, exist_ok=True)
-    params = AmpCorrParams(
-        assume_surface_waves=(sweep_or_cfg.wave_kind == "surface"),
-        wave_speed_kms=sweep_or_cfg.speed,
-        Q=sweep_or_cfg.Q,
-        peakf=float(peakf),
-        grid_sig=gridobj.signature(),
-        inv_sig=tuple(sorted(node_distances_km.keys())),
-        dist_sig=distances_signature(node_distances_km),
-        mask_sig=None,
-        code_version="v1",
-    )
-    ampcorr = AmpCorr(params, cache_dir=str(ampcorr_cache))
-    ampcorr.compute_or_load(node_distances_km, inventory=inv)
-    ampcorr.validate_against_nodes(gridobj.gridlat.size)
-
-    asl_config = {
-        "window_seconds": 5,  # caller will override if needed
-        "min_stations": 5,    # caller will override if needed
-        "Q": sweep_or_cfg.Q,
-        "surface_wave_speed_kms": sweep_or_cfg.speed,
-        "sam_metric": "VT",  # caller will override if needed
-        "gridobj": gridobj,
-        "node_distances_km": node_distances_km,
-        "station_coords": station_coords,
-        "ampcorr": ampcorr,
-        "inventory": inv,
-        "interactive": False,
-        "numtrials": 200,
-        "dist_meta": dist_meta,
-        "misfit_engine": sweep_or_cfg.misfit_engine,
-        "dem_tif_for_bmap": dem_tif_for_bmap,
-    }
-
-    # Optional grid preview (was hard-coded)
-    try:
-        preview_png = outdir / f"grid_preview_{getattr(gridobj, 'id', 'grid')[:8]}.png"
-        topo_kw = {
-            "inv": inv,
-            "add_labels": False,
-            "topo_color": True,
-            "region": region,                 # ← uses parameter
-            "DEM_DIR": dem_cache_dir,
-        }
-        if dem_tif_for_bmap:
-            topo_kw["dem_tif"] = dem_tif_for_bmap
-        gridobj.plot(show=False, topo_map_kwargs=topo_kw, outfile=str(preview_png))
-    except Exception:
-        pass
-
-    # stash region for downstream plotting if you want
-    asl_config["region"] = region
-    return asl_config, inv, str(outdir)
-
 
 def run_single_event(
-    cfg: "MiniConfig",
-    *,
     mseed_file: str,
-    inventory_xml: str,
-    output_base: str,
-    node_spacing_m: int = 50,
-    metric: str = "VT",
-    window_seconds: int = 5,
-    peakf: float = 8.0,
-    regular_grid_dem: Optional[str] = "pygmt:01s",
-    dem_tif_for_bmap: Optional[str] = None,
-    simple_basemap: bool = True,
+    asl_config: dict = None,
     refine_sector: bool = False,
-    region: tuple[float, float, float, float] = DEFAULT_REGION,
-    MIN_STATIONS: int = 5,
-    GLOBAL_CACHE: str = None,
-    gridobj: Optional(Grid) = None, 
+    station_gains_df: Optional[pd.DataFrame] = None,
+    topo_kw: dict = None,
+    debug: bool = True,
 ) -> Dict[str, Any]:
     """
     Minimal, notebook-friendly runner (delegates prep to build_asl_config).
@@ -540,94 +551,43 @@ def run_single_event(
       {"primary": {...}, "refined": {... or None}}
     Each {...} must include (at least) "qml" and "json" paths.
     """
-    import time, traceback
-    from pathlib import Path
-    from obspy import read
 
     t0 = time.time()
-    outdir = Path(output_base) / cfg.tag()
-    outdir.mkdir(parents=True, exist_ok=True)
+    Path(asl_config['outdir']).mkdir(parents=True, exist_ok=True)
 
     try:
-        # One-shot prep (grid + distances + ampcorr + optional grid preview)
-        asl_config, inv, outdir_str = build_asl_config(
-            sweep_or_cfg=cfg,
-            inventory_xml=inventory_xml,
-            output_base=output_base,
-            node_spacing_m=node_spacing_m,
-            peakf=peakf,
-            regular_grid_dem=regular_grid_dem,
-            dem_cache_dir=(GLOBAL_CACHE and os.path.join(GLOBAL_CACHE, "dem")) or None,
-            dem_tif_for_bmap=dem_tif_for_bmap,
-            region=region,
-            gridobj=gridobj,
-        )
-
-        ######################### SCAFFOLD
-        d = asl_config["node_distances_km"]  # dict: seed_id -> (N_nodes,) in KM
-        grid = asl_config["gridobj"]
-        n_nodes = grid.gridlat.size
-
-        print(f"[CHECK:DISTS] stations in distances: {len(d)}")
-
-        bad_shapes = []
-        bad_finite = []
-        mins, meds, maxs = [], [], []
-        some = []
-
-        for sid, arr in d.items():
-            a = np.asarray(arr, float).ravel()
-            if a.size != n_nodes:
-                bad_shapes.append((sid, a.size, n_nodes))
-                continue
-            if not np.isfinite(a).all():
-                bad_finite.append(sid)
-            mins.append(np.nanmin(a))
-            meds.append(np.nanmedian(a))
-            maxs.append(np.nanmax(a))
-            if len(some) < 5:
-                some.append((sid, float(np.nanmin(a)), float(np.nanmedian(a)), float(np.nanmax(a))))
-
-        print("[CHECK:DISTS] example 5 stations (min, med, max km):")
-        for t in some:
-            print("   ", t)
-
-        if bad_shapes:
-            print("[CHECK:DISTS] BAD SHAPES:", bad_shapes[:5], "...")
-
-        if bad_finite:
-            print(f"[CHECK:DISTS] non-finite entries at {len(bad_finite)} stations (first 10):", bad_finite[:10])
-
-        if mins:
-            print(f"[CHECK:DISTS] global: min={np.min(mins):.3f} km  p50={np.median(meds):.3f} km  max={np.max(maxs):.3f} km")
-        #############################
-
-
-        # Per-run overrides
-        asl_config["window_seconds"] = window_seconds
-        asl_config["min_stations"]   = MIN_STATIONS
-        asl_config["sam_metric"]    = metric
 
         # Read stream and run once
         st = read(mseed_file).select(component="Z")
-        if len(st) < MIN_STATIONS:
-            raise RuntimeError(f"Not enough stations: {len(st)} < {MIN_STATIONS}")
+        if len(st) < asl_config['min_stations']:
+            raise RuntimeError(f"Not enough stations: {len(st)} < {asl_config['min_stations']}")
 
-        event_dir = Path(outdir_str) / Path(mseed_file).stem
+        event_dir = Path(asl_config['outdir']) / Path(mseed_file).stem
         event_dir.mkdir(exist_ok=True)
+
+
+        # show the grid
+        if debug:
+            print('You are using this Grid:')
+            print(asl_config['gridobj'])
+            gridpng = os.path.join(asl_config['outdir'], f"grid.png")
+            if not os.path.isfile(gridpng):
+                asl_config['gridobj'].plot(show=True, topo_map_kwargs=topo_kw, force_all_nodes=True, outfile=gridpng)
 
         print(f"[ASL] Running single event: {mseed_file}")
         outputs = asl_sausage(
             stream=st,
             event_dir=str(event_dir),
             asl_config=asl_config,
-            output_dir=outdir_str,
             dry_run=False,
             peakf_override=None,
-            station_gains_df=None,
+            station_gains_df=station_gains_df,
             allow_station_fallback=True,
             refine_sector=refine_sector,
-        )
+            vertical_only=True,
+            topo_kw=topo_kw,   
+            debug=debug,         
+        )   
 
         # Validate returned structure; fail fast if missing
         if not isinstance(outputs, dict) or "primary" not in outputs:
@@ -639,8 +599,8 @@ def run_single_event(
 
         # Build summary strictly from returned outputs
         summ = {
-            "tag": cfg.tag(),
-            "outdir": str(outdir_str),
+            "tag": asl_config['tag'],
+            "outdir": asl_config['outdir'],
             "event_dir": str(event_dir),
             "outputs": outputs,                  # {"primary": {...}, "refined": {... or None}}
             "elapsed_s": round(time.time() - t0, 2),
@@ -652,241 +612,187 @@ def run_single_event(
         traceback.print_exc()
         # Do not hide failures — return the error so callers can surface it
         return {
-            "tag": cfg.tag(),
+            "tag": asl_config['tag'],
             "error": f"{type(e).__name__}: {e}",
-            "outdir": str(outdir),
+            "outdir": str(asl_config['outdir']),
         }
     
 
+import os
+import json
+import time
+import traceback
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import pandas as pd  # only if you pass a DataFrame for gains
+
+
 def run_all_events(
-    *,
-    sweep: SweepPoint,
     input_dir: str,
-    base_output_dir: str,
-    inventory_path: str,
-    min_stations: int = 5,
-    metric: str = "VT",
-    window_seconds: int = 5,
-    peakf: float = 8.0,
-    node_spacing_m: int = 50,
+    *,
+    asl_config: dict,
+    topo_kw: Optional[dict] = None,
+    station_gains_df: Optional[pd.DataFrame] = None,
+    refine_sector: bool = False,
     max_events: Optional[int] = None,
-    regular_grid_dem: Optional[str] = None,
-    station_gains_csv: Optional[str] = None,
-    allow_station_fallback: bool = True,
-    dem_tif_for_bmap: Optional[str] = None,
-    dry_run: bool = False,
-    dem_cache: Optional[str] = None,
-    region: tuple[float, float, float, float] = DEFAULT_REGION,    # ← NEW default
+    use_multiprocessing: bool = True,
+    workers: Optional[int] = None,
+    debug: bool = True,
 ) -> str:
     """
-    Execute one configuration and return the run directory.
-
-    Mirrors all stdout/stderr to <run_dir>/run.log with timestamps.
+    Process all miniSEED files under input_dir with the same configuration.
+    - Parallel by default using N-2 workers (never less than 1).
+    - Writes a JSONL summary of per-event results.
+    - After the loop, generates heatmap and builds EnhancedCatalogs (if any events succeeded).
+    Returns the run directory (asl_config['outdir']).
     """
-    import sys, io
-    from contextlib import redirect_stdout, redirect_stderr
 
-    class _Tee(io.TextIOBase):
-        """Write to two text streams; line-buffered timestamp prefix."""
-        def __init__(self, a, b):
-            self.a = a; self.b = b; self._buf = ""
-        def write(self, s):
-            if not isinstance(s, str): s = str(s)
-            self._buf += s
-            lines = self._buf.splitlines(keepends=True)
-            self._buf = "" if (not lines or lines[-1].endswith("\n")) else lines.pop()
-            for ln in lines:
-                ts = time.strftime("[%Y-%m-%d %H:%M:%S] ")
-                self.a.write(ts + ln); self.b.write(ts + ln)
-            return len(s)
-        def flush(self):
-            self.a.flush(); self.b.flush()
+    run_dir = Path(asl_config["outdir"])
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Shared cache root (still used by build_asl_config for DEM tiles)
-    shared_cache = dem_cache or os.environ.get("FLOVOPY_CACHE") \
-                   or os.path.join(os.path.expanduser("~"), ".flovopy_cache")
-    os.makedirs(shared_cache, exist_ok=True)
+    files = sorted(set(map(str, find_event_files(input_dir))))
+    if max_events:
+        files = files[: int(max_events)]
+    if not files:
+        print("[RUN] No event files found.")
+        return str(run_dir)
 
-    run_dir = ensure_dir(os.path.join(base_output_dir, sweep.tag()))
-    log_path = os.path.join(run_dir, "run.log")
+    # worker count
+    if use_multiprocessing:
+        if workers is None:
+            cpu = os.cpu_count() or 2
+            workers = max(1, cpu - 2)
+        print(f"[RUN] multiprocessing ON  workers={workers}")
+    else:
+        workers = 1
+        print("[RUN] multiprocessing OFF")
 
-    with open(log_path, "a", buffering=1, encoding="utf-8") as _log, \
-         redirect_stdout(_Tee(sys.stdout, _log)), \
-         redirect_stderr(_Tee(sys.stderr, _log)):
+    t0 = time.time()
+    processed = 0
+    all_outputs: List[Dict[str, Any]] = []
+    summary_path = run_dir / "summary.jsonl"
 
-        print("\n" + "=" * 100)
-        print("[RUN] ", sweep.tag())
-        print("      ", asdict(sweep))
-        print("=" * 100)
-        print(f"[LOG] Capturing output to: {log_path}")
+    # Helper to serialize each result to summary file
+    def _append_summary(rec: Dict[str, Any]):
+        with open(summary_path, "a", encoding="utf-8") as sfo:
+            sfo.write(json.dumps(rec) + "\n")
 
-        # ---- One-shot run prep (grid, distances, ampcorr, preview, etc.)
-        asl_config, inv, run_dir = build_asl_config(
-            sweep_or_cfg=sweep,
-            inventory_xml=inventory_path,
-            output_base=base_output_dir,
-            node_spacing_m=node_spacing_m,
-            peakf=peakf,
-            regular_grid_dem=regular_grid_dem,
-            dem_cache_dir=os.path.join(shared_cache, "dem"),
-            dem_tif_for_bmap=dem_tif_for_bmap,
-            region=region,   # ← pass through
-        )
-
-        # Per-run overrides
-        asl_config["window_seconds"] = window_seconds
-        asl_config["min_stations"]   = min_stations
-        asl_config["sam_metric"]    = metric
-
-        # Optional station gains table
-        gains_df = load_station_gains_df(station_gains_csv) \
-            if (getattr(sweep, "station_corr", False) and station_gains_csv) else None
-        if gains_df is not None:
-            print(f"[GAINS] Loaded station gains: {len(gains_df)} rows")
-
-        all_outputs: list[dict] = []   # collect per-event outputs
-        # ---- Event loop
-        file_count = 0
-        for file_num, mseed_path in enumerate(sorted(find_event_files(input_dir))):
+    # Serial path (easier for debugging)
+    if workers == 1:
+        for f in files:
             try:
-                st = read(mseed_path).select(component="Z")
-                if len(st) < min_stations:
-                    print(f"[SKIP] Not enough stations ({len(st)}): {mseed_path}")
-                    continue
-
-                stime = min(tr.stats.starttime for tr in st)
-                event_dir = ensure_dir(os.path.join(run_dir, stime.strftime("%Y%m%dT%H%M%S")))
-
-                if not dry_run:
-                    try:
-                        st.plot(equal_scale=False, outfile=os.path.join(event_dir, "raw.png"))
-                    except Exception:
-                        pass
-
-                outputs = asl_sausage(
-                    stream=st,
-                    event_dir=event_dir,
+                res = run_single_event(
+                    mseed_file=f,
                     asl_config=asl_config,
-                    output_dir=run_dir,
-                    dry_run=dry_run,
-                    peakf_override=None,
-                    station_gains_df=gains_df,
-                    allow_station_fallback=allow_station_fallback,
-                    refine_sector=getattr(sweep, "refine_sector", False),  # pass-through
+                    refine_sector=refine_sector,
+                    station_gains_df=station_gains_df,
+                    topo_kw=topo_kw,
+                    debug=debug,
                 )
-                if not isinstance(outputs, dict) or "primary" not in outputs:
-                    raise RuntimeError("asl_sausage() did not return the expected outputs dict.")
-
-                outputs["_meta"] = {
-                    "mseed_path": mseed_path,
-                    "event_dir": event_dir,
-                    "starttime": str(stime),
-                }
-                all_outputs.append(outputs)
-                print(f"[✓] Processed: {mseed_path}")
-                file_count += 1
-
             except Exception as e:
-                print(f"[ERR] Failed on {mseed_path}: {e}")
+                res = {
+                    "tag": asl_config.get("tag", "<unknown>"),
+                    "error": f"{type(e).__name__}: {e}",
+                    "traceback": traceback.format_exc(),
+                    "mseed_file": f,
+                }
+            _append_summary(res)
+            all_outputs.append(res)
+            processed += 1
+            print("[OK]" if "error" not in res else "[ERR]", f)
 
-            if max_events and (file_num + 1) >= max_events:
-                print(f"[STOP] Reached max-events limit: {max_events}")
-                break
+    # Parallel path
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            fut2file = {
+                ex.submit(
+                    run_single_event,
+                    mseed_file=f,
+                    asl_config=asl_config,
+                    refine_sector=refine_sector,
+                    station_gains_df=station_gains_df,
+                    topo_kw=topo_kw,
+                    debug=debug,
+                ): f
+                for f in files
+            }
+            for fut in as_completed(fut2file):
+                f = fut2file[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {
+                        "tag": asl_config.get("tag", "<unknown>"),
+                        "error": f"{type(e).__name__}: {e}",
+                        "traceback": traceback.format_exc(),
+                        "mseed_file": f,
+                    }
+                _append_summary(res)
+                all_outputs.append(res)
+                processed += 1
+                print("[OK]" if "error" not in res else "[ERR]", f)
 
-        print(f"[DONE] Run complete. Events processed: {file_count}")
+    dt = time.time() - t0
+    print(f"[DONE] Processed {processed}/{len(files)} events in {dt:.1f}s")
 
-        # ---- Heatmap aggregation & plot
-        try:
-            df = collect_node_results(run_dir)
-            if not df.empty:
-                heat_png = os.path.join(run_dir, "heatmap_energy.png")
-                print("[HEATMAP] Generating overall heatmap…")
-                plot_heatmap_colored(
-                    df,
-                    lat_col="latitude",
-                    lon_col="longitude",
-                    amp_col="amplitude",
-                    zoom_level=0,
-                    inventory=inv,
-                    log_scale=True,
-                    node_spacing_m=node_spacing_m,
-                    outfile=heat_png,
-                    dem_tif=dem_tif_for_bmap,
-                    title=f"Energy Heatmap — {sweep.tag()}",
-                    region=region,  # ← ensure same extent
-                )
-                print("[HEATMAP] Wrote:", heat_png)
-            else:
-                print("[HEATMAP] No data found to plot.")
-        except Exception as e:
-            print("[HEATMAP:WARN] Failed to generate heatmap:", e)
+    # ---- Heatmap aggregation & plot
+    try:
+        df = collect_node_results(str(run_dir))
+        if not df.empty:
+            heat_png = os.path.join(run_dir, "heatmap_energy.png")
+            print("[HEATMAP] Generating overall heatmap…")
+            plot_heatmap_colored(
+                df,
+                lat_col="latitude",
+                lon_col="longitude",
+                amp_col="amplitude",
+                log_scale=True,
+                node_spacing_m=asl_config["gridobj"].node_spacing_m,
+                outfile=heat_png,
+                title=f"Energy Heatmap — {asl_config.get('tag','')}",
+                topo_kw=topo_kw,
+            )
+            print("[HEATMAP] Wrote:", heat_png)
+        else:
+            print("[HEATMAP] No data found to plot.")
+    except Exception as e:
+        print("[HEATMAP:WARN] Failed to generate heatmap:", e)
 
+    # ---- Optional: assemble EnhancedCatalogs from per-event outputs
+    try:
+        # Keep only successful runs that carry the expected structure
+        good = []
+        for rec in all_outputs:
+            if isinstance(rec, dict) and "outputs" in rec and isinstance(rec["outputs"], dict):
+                good.append(rec["outputs"])
+        if good:
+            cat_info = enhanced_catalogs_from_outputs(
+                good,
+                outdir=str(run_dir),
+                write_files=True,
+                load_waveforms=False,  # set True if you want streams in memory
+                primary_name="catalog_primary",
+                refined_name="catalog_refined",
+            )
+            if cat_info.get("primary_qml"):
+                print("[CATALOG] Primary:", cat_info["primary_qml"])
+            if cat_info.get("refined_qml"):
+                print("[CATALOG] Refined:", cat_info["refined_qml"])
+            if cat_info.get("primary_csv"):
+                print("[CATALOG] Primary CSV:", cat_info["primary_csv"])
+            if cat_info.get("refined_csv"):
+                print("[CATALOG] Refined CSV:", cat_info["refined_csv"])
+        else:
+            print("[CATALOG] No successful event outputs to assemble.")
+    except Exception as e:
+        print(f"[CATALOG:WARN] Could not build EnhancedCatalogs: {e}")
 
-        # ---- Optional: assemble EnhancedCatalogs from per-event outputs
-        try:
-            if all_outputs:
-                cat_info = enhanced_catalogs_from_outputs(
-                    all_outputs,
-                    outdir=run_dir,
-                    write_files=True,
-                    load_waveforms=False,         # set True if you want streams in memory
-                    primary_name="catalog_primary",
-                    refined_name="catalog_refined",
-                )
-                if cat_info.get("primary_qml"):
-                    print("[CATALOG] Primary:", cat_info["primary_qml"])
-                if cat_info.get("refined_qml"):
-                    print("[CATALOG] Refined:", cat_info["refined_qml"])
-                if cat_info.get("primary_csv"):
-                    print("[CATALOG] Primary CSV:", cat_info["primary_csv"])
-                if cat_info.get("refined_csv"):
-                    print("[CATALOG] Refined CSV:", cat_info["refined_csv"])
-        except Exception as e:
-            print(f"[CATALOG:WARN] Could not build EnhancedCatalogs: {e}")
-        return run_dir
+    return str(run_dir)
     
 
 
-# From 13_run_sweep.py
-
-RESULT_PATTERNS = (
-    # add/modify to match what asl_sausage writes
-    "**/*node_results.csv",
-    "**/*node_metrics.csv",
-    "**/*vsam_nodes.csv",
-)
-
-def ensure_dir(path: str) -> str:
-    os.makedirs(path, exist_ok=True)
-    return path
-
-def collect_node_results(run_outdir: str) -> pd.DataFrame:
-    matches: List[str] = []
-    for pat in RESULT_PATTERNS:
-        matches.extend(glob(os.path.join(run_outdir, pat), recursive=True))
-
-    dfs: List[pd.DataFrame] = []
-    for f in sorted(set(matches)):
-        try:
-            df = pd.read_parquet(f) if f.lower().endswith(".parquet") else pd.read_csv(f)
-        except Exception:
-            continue
-
-        # Normalize to lowercase column names for robust downstream usage
-        lower_map = {orig: orig.lower() for orig in df.columns}
-        df = df.rename(columns=lower_map)
-        have = all(k in df.columns for k in ["latitude", "longitude", "amplitude"])
-        if not have:
-            continue
-
-        dfs.append(df)
-
-    if not dfs:
-        print(f"[HEATMAP] No node CSVs matched under: {run_outdir}")
-        return pd.DataFrame(columns=["latitude", "longitude", "amplitude"])
-
-    cat = pd.concat(dfs, ignore_index=True)
-    return cat[["latitude", "longitude", "amplitude"]].dropna()
 
 
 # ----------------------------------------------------------------------
@@ -1068,3 +974,45 @@ def enhanced_catalogs_from_outputs(
         "primary_csv": primary_csv,
         "refined_csv": refined_csv,
     }
+
+
+# From 13_run_sweep.py
+
+RESULT_PATTERNS = (
+    # add/modify to match what asl_sausage writes
+    "**/*node_results.csv",
+    "**/*node_metrics.csv",
+    "**/*vsam_nodes.csv",
+)
+
+def ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def collect_node_results(run_outdir: str) -> pd.DataFrame:
+    matches: List[str] = []
+    for pat in RESULT_PATTERNS:
+        matches.extend(glob(os.path.join(run_outdir, pat), recursive=True))
+
+    dfs: List[pd.DataFrame] = []
+    for f in sorted(set(matches)):
+        try:
+            df = pd.read_parquet(f) if f.lower().endswith(".parquet") else pd.read_csv(f)
+        except Exception:
+            continue
+
+        # Normalize to lowercase column names for robust downstream usage
+        lower_map = {orig: orig.lower() for orig in df.columns}
+        df = df.rename(columns=lower_map)
+        have = all(k in df.columns for k in ["latitude", "longitude", "amplitude"])
+        if not have:
+            continue
+
+        dfs.append(df)
+
+    if not dfs:
+        print(f"[HEATMAP] No node CSVs matched under: {run_outdir}")
+        return pd.DataFrame(columns=["latitude", "longitude", "amplitude"])
+
+    cat = pd.concat(dfs, ignore_index=True)
+    return cat[["latitude", "longitude", "amplitude"]].dropna()

@@ -7,7 +7,7 @@ import os
 import pickle
 import numpy as np
 from obspy.core.inventory import Inventory
-from flovopy.processing.sam import VSAM
+from flovopy.core.physics import total_amp_correction
 from flovopy.utils.make_hash import make_hash
 #from flovopy.asl.distances import distances_signature
 
@@ -51,8 +51,8 @@ class AmpCorr:
     cache_dir: str = "asl_cache"
 
     # Optional backends (dependency injection)
-    geom_spread_fn: Optional[Callable[[np.ndarray, str, bool, float, float], np.ndarray]] = None
-    inelastic_att_fn: Optional[Callable[[np.ndarray, float, float, Optional[float]], np.ndarray]] = None
+    #geom_spread_fn: Optional[Callable[[np.ndarray, str, bool, float, float], np.ndarray]] = None
+    #inelastic_att_fn: Optional[Callable[[np.ndarray, float, float, Optional[float]], np.ndarray]] = None
 
     # ------------- Cache -------------
     def cache_path(self) -> str:
@@ -109,10 +109,6 @@ class AmpCorr:
         dtype : {"float32","float64"}
             dtype for saved corrections (float32 reduces cache size).
         """
-        # Late import backends if not injected
-        if self.geom_spread_fn is None or self.inelastic_att_fn is None:
-            self.geom_spread_fn = self.geom_spread_fn or VSAM.compute_geometrical_spreading_correction
-            self.inelastic_att_fn = self.inelastic_att_fn or VSAM.compute_inelastic_attenuation_correction
 
         # Decide channel iteration list
         if seed_ids is not None:
@@ -132,6 +128,13 @@ class AmpCorr:
             return
         n_nodes = int(np.asarray(_first_vec).size)
 
+        # Precompute stable params and dtype
+        assume_sw = bool(self.params.assume_surface_waves)
+        v_kms     = float(self.params.wave_speed_kms)
+        Q         = None if self.params.Q is None else float(self.params.Q)
+        peakf     = float(self.params.peakf)
+        out_dtype = np.float32 if dtype == "float32" else np.float64
+
         out: Dict[str, np.ndarray] = {}
         missing: list[str] = []
 
@@ -143,29 +146,39 @@ class AmpCorr:
                     raise KeyError(f"Missing distances for {sid}")
                 continue
 
-            d = np.asarray(d, dtype=float)
+            d = np.asarray(d, dtype=out_dtype, order="C")
             if d.size != n_nodes:
                 raise ValueError(f"Distance vector length mismatch for {sid}: {d.size} != {n_nodes}")
 
-            # Channel code suffix (e.g., SHZ/BHZ)
+            # Fast skip: all masked
+            if not np.isfinite(d).any():
+                out[sid] = np.full_like(d, np.nan, dtype=out_dtype)
+                continue
+
             chan3 = sid.split(".")[-1][-3:]
 
-            # Compute multiplicative factors
-            g = self.geom_spread_fn(
-                d, chan3, self.params.assume_surface_waves, self.params.wave_speed_kms, self.params.peakf
-            )
-            a = self.inelastic_att_fn(
-                d, self.params.peakf, self.params.wave_speed_kms, self.params.Q
+            # Fused (vectorized) correction: single pass over d
+            # If you defined it as a VSAM method:
+            corr = total_amp_correction(
+                d,
+                chan=chan3,
+                surface_waves=assume_sw,
+                wavespeed_kms=v_kms,
+                peakf_hz=peakf,
+                Q=Q,
+                out_dtype=("float32" if out_dtype == np.float32 else "float64"),
             )
 
-            # Numerical guards & dtype
-            g = np.asarray(g, dtype=float)
-            a = np.asarray(a, dtype=float)
-            corr = (g * a).astype(dtype, copy=False)
+            # Preserve NaNs (masked nodes remain NaN), but kill +/-inf
+            if not np.all(np.isfinite(corr) | np.isnan(corr)):
+                corr = np.where(np.isinf(corr), 0.0, corr)
 
-            # Replace non-finite with zeros to avoid NaNs propagating into misfit ratios
-            if not np.all(np.isfinite(corr)):
-                corr = np.where(np.isfinite(corr), corr, 0.0).astype(dtype, copy=False)
+            # Ensure final dtype
+            corr = np.asarray(corr, dtype=out_dtype, order="C")
+
+            # Preserve NaNs (masked nodes remain NaN), but kill +/-inf
+            if not np.all(np.isfinite(corr) | np.isnan(corr)):
+                corr = np.where(np.isinf(corr), 0.0, corr)
 
             out[sid] = corr
 
@@ -201,10 +214,9 @@ class AmpCorr:
     def apply_to_station_array(self, seed_ids: Sequence[str], y_vec: np.ndarray, node_index: int) -> np.ndarray:
         """Return array of corrected amplitudes for all stations at a node index."""
         y_vec = np.asarray(y_vec, dtype=float)
-        return np.array(
-            [y_vec[k] * self.corrections[seed_ids[k]][node_index] for k in range(len(seed_ids))],
-            dtype=float,
-        )
+        # gather corrections into an array in one shot
+        corr = np.array([self.corrections[sid][node_index] for sid in seed_ids], dtype=float)
+        return y_vec * corr
 
     def validate_against_nodes(self, expected_nodes: int) -> None:
         """Ensure each correction vector matches the expected node count."""
@@ -243,3 +255,89 @@ def inv_signature(inventory: Inventory) -> tuple:
         for net in inventory for sta in net for cha in sta
     ))
 
+import numpy as np
+import pandas as pd
+from typing import Dict, Optional
+
+def summarize_ampcorr_ranges(
+    corrections: Dict[str, np.ndarray],   # e.g., ampcorr.corrections
+    *,
+    total_nodes: Optional[int] = None,    # len of dense grid (for pct_masked); if None, infer per-row
+    reduce_to_station: bool = False,      # True → aggregate NET.STA across channels
+    include_percentiles: bool = True,     # add p10/p50/p90
+    sort_by: str = "min_corr",            # "min_corr" | "max_corr" | "station"
+    to_csv: Optional[str] = None,         # optional path to save CSV
+) -> pd.DataFrame:
+    """
+    Build a summary table of per-station/channel amplitude-correction ranges.
+
+    Notes
+    -----
+    - Ignores NaNs (masked nodes).
+    - 'pct_masked' is computed vs total_nodes if provided; otherwise from each vector length.
+    - If reduce_to_station=True, rows are collapsed by NET.STA with robust aggregations.
+    """
+
+    def _seed_to_station(seed: str) -> str:
+        parts = seed.split(".")
+        return ".".join(parts[:2]) if len(parts) >= 2 else seed
+
+    rows = []
+    for sid, c in corrections.items():
+        c = np.asarray(c, dtype=float).ravel()
+        n_vec = c.size
+        n_tot = int(total_nodes) if total_nodes is not None else n_vec
+
+        finite = np.isfinite(c)
+        n_finite = int(finite.sum())
+
+        if n_finite == 0:
+            minc = maxc = medc = p10 = p90 = np.nan
+        else:
+            vals = c[finite]
+            minc = float(np.min(vals))
+            maxc = float(np.max(vals))
+            medc = float(np.median(vals))
+            if include_percentiles:
+                p10 = float(np.percentile(vals, 10))
+                p90 = float(np.percentile(vals, 90))
+            else:
+                p10 = p90 = np.nan
+
+        rows.append({
+            "station": sid,
+            "n_total": n_tot,
+            "n_finite": n_finite,
+            "pct_masked": 0.0 if n_tot == 0 else float(100.0 * (n_tot - n_finite) / n_tot),
+            "min_corr": minc,
+            **({"p10_corr": p10, "median_corr": medc, "p90_corr": p90} if include_percentiles else {"median_corr": medc}),
+            "max_corr": maxc,
+        })
+
+    df = pd.DataFrame(rows)
+
+    if reduce_to_station:
+        key = df["station"].map(_seed_to_station)
+        agg = {
+            "n_total": "max",
+            "n_finite": "sum",
+            "pct_masked": "mean",       # indicative only if channels differ
+            "min_corr": "min",
+            "max_corr": "max",
+            "median_corr": "median",
+        }
+        if include_percentiles:
+            agg["p10_corr"] = "median"  # robust across channels
+            agg["p90_corr"] = "median"
+        df["station"] = key
+        df = df.groupby("station", as_index=False).agg(agg)
+
+    if sort_by in df.columns:
+        df = df.sort_values(sort_by).reset_index(drop=True)
+    else:
+        df = df.sort_values("station").reset_index(drop=True)
+
+    if to_csv:
+        df.to_csv(to_csv, index=False)
+
+    return df

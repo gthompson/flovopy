@@ -6,7 +6,18 @@ from obspy.core.inventory import read_inventory
 
 from flovopy.core.trace_utils import remove_empty_traces, fix_trace_mvo
 
-dome_location = {'lat':16.71111, 'lon':-62.17722}
+dome_location = {'lat':16.71111, 'lon':-62.17722, 'elev': 1000.0}
+# Montserrat defaults (immutable tuple to avoid mutable-default gotchas)
+REGION_DEFAULT = (-62.255, -62.135, 16.66, 16.84)  # (lon_min, lon_max, lat_min, lat_max)
+
+'''
+# Later we can create configs like this and modify functions below to use them
+@dataclass(frozen=True)
+class VolcanoConfig:
+    name: str
+    region: tuple[float, float, float, float]
+MONTSERRAT = VolcanoConfig("Montserrat", DEFAULT_REGION)
+'''
 
 ##########################################################################
 ####                    Montserrat Trace tools                        ####

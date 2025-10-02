@@ -30,7 +30,6 @@ from __future__ import annotations
 # stdlib
 from datetime import datetime
 from typing import Optional
-from pprint import pprint
 from contextlib import contextmanager
 
 from obspy.core.event import Catalog
@@ -62,9 +61,9 @@ except Exception:
     pygmt = None
 
 # flovopy locals
-from flovopy.processing.sam import VSAM
-from flovopy.asl.ampcorr import AmpCorr, AmpCorrParams
-from flovopy.asl.distances import compute_distances, distances_signature, compute_azimuthal_gap #, geo_distance_3d_km
+#from flovopy.processing.sam import VSAM
+#from flovopy.asl.ampcorr import AmpCorr, AmpCorrParams
+from flovopy.asl.distances import compute_azimuthal_gap #, geo_distance_3d_km, compute_distances, distances_signature, 
 from flovopy.utils.make_hash import make_hash
 from flovopy.asl.grid import NodeGrid, Grid
 from flovopy.asl.utils import _grid_mask_indices, compute_spatial_connectedness, _grid_shape_or_none, _median_filter_indices, _viterbi_smooth_indices, _as_regular_view, _movavg_1d, _movmed_1d
@@ -125,31 +124,40 @@ class ASL:
     _node_mask : np.ndarray | None
         Temporary active mask (indices into the full grid).
     """
-    def __init__(self, samobject: VSAM, metric: str, gridobj: Grid | NodeGrid, window_seconds: float, id: Optional[str] = None):    
-        if not isinstance(samobject, VSAM):
-            raise TypeError("samobject must be a VSAM instance")
+    def __init__(self, samobject, config: dict):    
+        if not isinstance(samobject, config['sam_class']):
+            raise TypeError(f"samobject must be a {config['sam_class']} instance")
         self.samobject = samobject
-        self.metric = metric
-        self.gridobj = gridobj
-        self.window_seconds = window_seconds
-
-        # Geometry / corrections (must be injected later)
-        self.node_distances_km: dict[str, np.ndarray] = {}
-        self.amplitude_corrections: dict[str, np.ndarray] = {}
-        self.station_coordinates: dict[str, dict] = {}
+        self._node_mask: Optional[np.ndarray] = None
+        try:
+            self.metric = config['sam_metric']
+            self.gridobj = config['gridobj']
+            self._idx_active = getattr(self.gridobj, "_node_mask_idx", None)
+            self._n_all = int(self.gridobj.gridlat.size)
+            self.window_seconds = config['window_seconds']           
+            self.node_distances_km = config['node_distances_km']
+            print('ASL: node_distances_km set')
+            self.amplitude_corrections = config['ampcorr'].corrections
+            print('ASL: amplitude_corrections set')     
+            self.station_coordinates = config['station_coords']
+            print('ASL: station coordinates set')    
+            self.Q = config['ampcorr'].params.Q
+            self.peakf = config['ampcorr'].params.peakf
+            self.wave_speed_kms = config['ampcorr'].params.wave_speed_kms
+            self.assume_surface_waves = config['ampcorr'].params.assume_surface_waves
+            print('ASL: got Q, peakf, wave_speed_kms from AmpCorr params')
+            if self.assume_surface_waves:
+                print('Assuming surface waves')
+            else:
+                print('Assuming body waves')
+        except Exception as e:
+            print(e)
+            raise e
+            
 
         # Outputs
         self.source: Optional[dict] = None
         self.connectedness: Optional[dict] = None
-
-        # Provenance parameters (set later by sausage or manually)
-        self.Q: Optional[float] = None
-        self.peakf: Optional[float] = None
-        self.wave_speed_kms: Optional[float] = None
-        self.assume_surface_waves: Optional[bool] = None
-
-        # Internal state
-        self._node_mask: Optional[np.ndarray] = None
 
         self.id = self.set_id()
 
@@ -158,6 +166,13 @@ class ASL:
         keys = tuple(sorted(self.amplitude_corrections.keys()))
         return make_hash(self.metric, self.window_seconds, self.gridobj.id, keys)
     
+    def _active_indexer(self):
+        return self._idx_active if self._idx_active is not None else slice(None)
+    '''
+    
+    SCAFFOLD:
+    We no longer need to build distances or amplitude corrections because the build_asl_config function does this
+
     def compute_grid_distances(
         self,
         *,
@@ -357,6 +372,7 @@ class ASL:
                 f"{len(self.amplitude_corrections)} channels.")
         return self.amplitude_corrections
 
+    '''
     def metric2stream(self) -> Stream:
         """
         Convert the selected VSAM metric into an ObsPy :class:`~obspy.core.stream.Stream`.
@@ -1610,22 +1626,18 @@ class ASL:
     # ---------- plots ----------
     def plot(
         self,
-        zoom_level: int = 0,
         threshold_DR: float = 0.0,
         scale: float = 1.0,
         join: bool = False,
         number: int = 0,
-        add_labels: bool = False,
         outfile: str | None = None,
         stations=None,
         title: str | None = None,
-        region=None,
         normalize: bool = True,
-        dem_tif: str | None = None,
         simple_basemap: bool = True,
         *,
-        cmap: str = "viridis",
         color_by: str = "time",      # "time" | "dr"
+        topo_kw: dict = None, 
         show: bool = True,
         return_fig: bool = True,
     ):
@@ -1691,20 +1703,8 @@ class ASL:
 
         src = getattr(self, "source", None)
         if not src:
-            _ts(f"no source; drawing simple basemap (dem_tif={dem_tif}, simple_basemap={simple_basemap})")
-            fig = topo_map(
-                zoom_level=zoom_level, inv=None, show=True, add_labels=add_labels,
-                topo_color=True, cmap=("land" if simple_basemap else None),
-                region=region, dem_tif=dem_tif
-            )
+            fig = topo_map(**topo_kw)
             return fig if return_fig else None
-
-        # Log args
-        _ts("plot() args: "
-            f"zoom_level={zoom_level}, threshold_DR={float(threshold_DR)}, scale={float(scale)}, "
-            f"join={join}, number={number}, add_labels={add_labels}, outfile={outfile}, title={title}, "
-            f"region={region}, normalize={normalize}, dem_tif={dem_tif}, simple_basemap={simple_basemap}, "
-            f"cmap={cmap}, color_by={color_by}")
 
         # ---------- Extract arrays ----------
         try:
@@ -1720,6 +1720,7 @@ class ASL:
             _ts(f"ERROR: length mismatch: len(lon)={x.size}, len(lat)={y.size}, len(DR)={DR.size}")
             raise ValueError("ASL.plot(): lon, lat, DR must have identical lengths.")
 
+        '''
         # ---------- DR quicklook (best-effort) ----------
         try:
             if t is not None:
@@ -1733,6 +1734,7 @@ class ASL:
                 plt.close()
         except Exception as e:
             _ts(f"WARNING: timeseries preview failed: {e!r}")
+        '''
 
         # ---------- thresholding (copy; no mutation) ----------
         if float(threshold_DR) > 0:
@@ -1742,19 +1744,23 @@ class ASL:
             _ts(f"threshold applied at {threshold_DR}; masked {int(np.count_nonzero(mask))} points")
 
         # ---------- marker sizes ----------
+        normalize=True
         try:
+            symsize = np.sqrt(np.maximum(DR, 0.0))
             if normalize:
                 mx = float(np.nanmax(DR))
+                '''
                 if not np.isfinite(mx) or mx <= 0:
                     symsize = float(scale) * np.ones_like(DR, dtype=float)
                     _ts("normalize=True but max(DR)<=0; using constant symsize")
                 else:
-                    symsize = (DR / mx) * float(scale)
-            else:
-                symsize = float(scale) * np.sqrt(np.maximum(DR, 0.0))
+                    symsize = np(DR / mx) np.sqrt(np.maximum(DR, 0.0)/mx)
+                '''
+                symsize = symsize / np.sqrt(mx)
         except Exception as e:
             _ts(f"ERROR: building symsize failed: {e!r}")
             raise
+        symsize = symsize * float(scale)  
 
         # ---------- validity filter ----------
         m = np.isfinite(x) & np.isfinite(y) & np.isfinite(DR) & np.isfinite(symsize) & (symsize > 0)
@@ -1769,30 +1775,8 @@ class ASL:
             ind = np.argpartition(DR, -number)[-number:]
             x, y, DR, symsize = x[ind], y[ind], DR[ind], symsize[ind]
 
-        # center on max DR
-        maxi = int(np.nanargmax(DR))
-        center_lat, center_lon = float(y[maxi]), float(x[maxi])
 
-        # ---------- basemap ----------
-        try:
-            fig = topo_map(
-                zoom_level=zoom_level,
-                inv=None,
-                centerlat=center_lat,
-                centerlon=center_lon,
-                add_labels=add_labels,
-                topo_color=False if simple_basemap else True,
-                stations=stations,
-                title=title,
-                region=region,
-                dem_tif=dem_tif if dem_tif else None,
-                cmap=("land" if simple_basemap else None),
-            )
-        except Exception as e:
-            _ts(f"ERROR: topo_map() failed: {e!r}")
-            raise
-
-        # default title if not provided
+         # default title if not provided
         if title is None:
             try:
                 if t is not None and len(t) > 0:
@@ -1802,9 +1786,27 @@ class ASL:
                     cstr = ""
                     if isinstance(conn, dict) and "score" in conn and np.isfinite(conn["score"]):
                         cstr = f"  (connectedness={conn['score']:.2f})"
-                    fig.text(x=0, y=0, text=f"ASL Track: {t0} → {t1}{cstr}", position="TL", offset="0.3c/0.3c")
+                    title = f"ASL Track: {t0} → {t1}{cstr}"
+                    #fig.text(x=0, y=0, text=title, position="TL", offset="0.3c/0.3c")
+                    topo_kw['title']=title,
             except Exception:
-                pass
+                pass           
+
+        # center on max DR
+        #maxi = int(np.nanargmax(DR))
+        #center_lat, center_lon = float(y[maxi]), float(x[maxi])
+
+        # ---------- basemap ----------
+        try:
+            fig = topo_map(
+                stations=stations,
+                **topo_kw,
+            )
+        except Exception as e:
+            _ts(f"ERROR: topo_map() failed: {e!r}")
+            raise
+
+
 
         # ---------- color controls ----------
         color_by_norm = (color_by or "time").strip().lower()
@@ -1816,7 +1818,7 @@ class ASL:
             if color_by_norm == "time":
                 # rank by chronology
                 idx = np.arange(len(x), dtype=float)
-                pygmt.makecpt(cmap=cmap, series=[0, len(x) - 1])
+                pygmt.makecpt(cmap='viridis', series=[0, len(x) - 1])
                 cvals = idx
                 cbar_label = "Sequence"
             else:  # "dr"
@@ -1952,7 +1954,7 @@ class ASL:
             plt.close()
 
 
-    def plot_misfit_heatmap(self, outfile: str | None = None, *, backend=None, cmap: str = "turbo", transparency: int = 40, region: List | None = None):
+    def plot_misfit_heatmap(self, outfile: str | None = None, *, backend=None, cmap: str = "turbo", transparency: int = 40, topo_kw: dict=None, show: bool = True):
         """
         Plot a per-node misfit heatmap for the frame with peak DR (diagnostic).
 
@@ -1974,7 +1976,7 @@ class ASL:
         """
         if backend is None:
             backend = StdOverMeanMisfit()
-        plot_misfit_heatmap_for_peak_DR(self, backend=backend, cmap=cmap, transparency=transparency, outfile=outfile, region=region)
+        plot_misfit_heatmap_for_peak_DR(self, backend=backend, cmap=cmap, transparency=transparency, outfile=outfile, topo_kw=topo_kw, show=show)
 
 
 
