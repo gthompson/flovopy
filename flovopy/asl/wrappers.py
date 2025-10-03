@@ -801,7 +801,6 @@ def run_all_events(
 
 @dataclass(frozen=True)
 class SweepPoint:
-    grid_kind: str           # 'streams' or 'regular'
     wave_kind: str           # 'surface' or 'body'
     station_corr: bool       # True/False
     speed: float             # km/s
@@ -812,29 +811,31 @@ class SweepPoint:
     def tag(self) -> str:
         """Short, filesystem-safe label for this combination."""
         parts = [
-            f"G_{self.grid_kind}",
-            f"W_{self.wave_kind}",
-            f"SC_{'on' if self.station_corr else 'off'}",
-            f"V_{self.speed:g}",
-            f"Q_{self.Q}",
-            f"D_{self.dist_mode}",
-            f"M_{self.misfit_engine}",
+            f"{self.sam_class__class__.__name__}",        
+            f"{self.sam_metric}",
+            f"{int(self.windows_seconds)}",  
+            f"{self.wave_kind}",
+            f"{self.speed:g}",
+            f"{self.Q}",
+            f"{self.peakf}",
+            f"{self.dist_mode}",
+            f"{self.misfit_engine}",
         ]
-        return "__".join(parts)
+        taglabel = "_".join(parts) + f"{'_with_station_corrections' if self.station_corr else ''}"
+        return taglabel
 
 def generate_sweep(
     *,
     speeds: Tuple[float, float] = (1.5, 3.2),
     Qs: Tuple[int, int] = (50, 200),
-    grid_kinds: Tuple[str, str] = ("streams", "regular"),
     wave_kinds: Tuple[str, str] = ("surface", "body"),
     station_corr_opts: Tuple[bool, bool] = (True, False),
     dist_modes: Tuple[str, str] = ("2d", "3d"),
     misfit_engines: Tuple[str, str] = ("l2", "huber"),
 ) -> List[SweepPoint]:
     pts = []
-    for g, w, sc, v, q, d, m in itertools.product(
-        grid_kinds, wave_kinds, station_corr_opts, speeds, Qs, dist_modes, misfit_engines
+    for w, sc, v, q, d, m in itertools.product(
+        wave_kinds, station_corr_opts, speeds, Qs, dist_modes, misfit_engines
     ):
         pts.append(SweepPoint(g, w, sc, float(v), int(q), d, m))
     return pts
