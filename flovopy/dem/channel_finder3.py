@@ -533,6 +533,63 @@ def print_dem_resolution_stats(dem_ll: Path | None, utm_dem: Path | None):
             dx_m = abs(tr.a); dy_m = abs(tr.e)
         print(f"[DEM] UTM DEM pixel   = {dx_m:.2f} m × {dy_m:.2f} m")
 
+
+from shapely.geometry import LineString, MultiLineString
+import numpy as np
+import geopandas as gpd
+
+def _resample_lines_to_points(gdf_ll: gpd.GeoDataFrame, spacing_m: float = 20.0) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Resample each LineString/MultiLineString to points every `spacing_m` meters.
+    gdf_ll must be in lon/lat; we reproject to UTM 20N to measure in meters,
+    then bring the resampled points back to lon/lat.
+    """
+    # work in meters for uniform spacing
+    gdf_m = gdf_ll.to_crs(32620)
+
+    lon_all, lat_all = [], []
+    for geom in gdf_m.geometry:
+        if geom is None:
+            continue
+
+        if isinstance(geom, LineString):
+            parts = [geom]
+        elif isinstance(geom, MultiLineString):
+            parts = list(geom.geoms)
+        else:
+            continue
+
+        for ls in parts:
+            L = ls.length
+            if L <= 0:
+                continue
+            # distances along the line at fixed spacing (include end)
+            d = np.arange(0.0, L, spacing_m)
+            if d.size == 0 or d[-1] < L:
+                d = np.append(d, L)
+
+            # interpolate points in meters
+            pts_m = [ls.interpolate(float(di)) for di in d]
+            # back to lon/lat
+            pts_ll = gpd.GeoSeries(pts_m, crs=32620).to_crs(4326)
+
+            # collect coords
+            xy = np.array([(p.x, p.y) for p in pts_ll.geometry], dtype=float)
+            if xy.size:
+                lon_all.append(xy[:, 0])
+                lat_all.append(xy[:, 1])
+
+    if lon_all:
+        lon = np.concatenate(lon_all)
+        lat = np.concatenate(lat_all)
+        # drop exact duplicates
+        keep = ~(np.isnan(lon) | np.isnan(lat))
+        lon, lat = lon[keep], lat[keep]
+        uniq = np.unique(np.round(np.column_stack([lon, lat]), 8), axis=0)
+        return uniq[:, 0], uniq[:, 1]
+    else:
+        return np.array([]), np.array([])
+
 # ================================ CLI ==============================
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
@@ -626,40 +683,43 @@ def main(argv: List[str] | None = None) -> None:
         min_len_m=args.min_len_m,
     )
 
-    # Optional NodeGrid
     if _HAVE_ASL and not args.no_nodegrid:
         try:
-            gdf = gpd.read_file(streams_gpkg).to_crs(4326)
-            all_lon, all_lat = [], []
-            for geom in gdf.geometry:
-                if geom is None:
-                    continue
-                if isinstance(geom, LineString):
-                    parts = [geom]
-                elif isinstance(geom, MultiLineString):
-                    parts = list(geom.geoms)
-                else:
-                    continue
-                for ls in parts:
-                    arr = np.asarray(ls.coords, float)
-                    if arr.shape[0] >= 2:
-                        all_lon.append(arr[:, 0])
-                        all_lat.append(arr[:, 1])
-            if all_lon:
-                lon = np.concatenate(all_lon); lat = np.concatenate(all_lat)
+            gdf_ll = gpd.read_file(streams_gpkg)
+            # ensure lon/lat
+            if gdf_ll.crs is None or gdf_ll.crs.to_epsg() != 4326:
+                gdf_ll = gdf_ll.to_crs(4326)
+
+            # RESAMPLE: pick your spacing (in meters)
+            spacing_m = 20.0
+            lon, lat = _resample_lines_to_points(gdf_ll, spacing_m=spacing_m)
+
+            if lon.size:
+                # sample elevations on the lon/lat DEM
                 sampler, close_dem = _make_lonlat_nearest_sampler(work_ll)
                 try:
                     elev = sampler(lon, lat)
                 finally:
                     close_dem()
-                nodegrid = NodeGrid(lon, lat, node_elev_m=elev, approx_spacing_m=None, dem_tag=os.path.basename(work_ll))
+
+                # build & save NodeGrid
+                nodegrid = NodeGrid(
+                    lon,
+                    lat,
+                    node_elev_m=elev,
+                    approx_spacing_m=spacing_m,
+                    dem_tag=os.path.basename(work_ll),
+                )
                 nodegrid.save(outdir)
-                print(f"[NG] NodeGrid ID: {nodegrid.id}  nodes: {lon.size}  elev: yes")
+                print(f"[NG] NodeGrid ID: {nodegrid.id}  nodes={lon.size}  spacing≈{spacing_m} m")
+            else:
+                print("[NG] No resampled points produced; NodeGrid not written.")
+
         except Exception as e:
             print(f"[warn] NodeGrid build skipped: {e}")
 
-    print("✅ Drainage extraction finished.")
-    print("Check outputs in:", outdir.resolve())
+        print("✅ Drainage extraction finished.")
+        print("Check outputs in:", outdir.resolve())
 
 if __name__ == "__main__":
     main()

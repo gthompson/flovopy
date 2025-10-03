@@ -30,6 +30,8 @@ Other packages to consider installing, e.g. for DEMs:
 ```
 conda install rasterio
 conda install whitebox
+conda install gdal
+conda install geopandas
 ```
 ---
 

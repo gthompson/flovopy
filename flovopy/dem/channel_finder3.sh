@@ -2,7 +2,7 @@ PY=/opt/anaconda3/envs/flovopy_plus/bin/python
 SCRIPT="$HOME/Developer/flovopy/flovopy/dem/channel_finder3.py"
 
 DEM="$HOME/Dropbox/MONTSERRAT_DEM_WGS84_MASTER.tif"
-OUTDIR="$HOME/Dropbox/BRIEFCASE/SSADenver/channel_finder5"
+OUTDIR="$HOME/Dropbox/BRIEFCASE/SSADenver/channel_finder6"
 
 $PY "$SCRIPT" \
   --dem "$DEM" \
