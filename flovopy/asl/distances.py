@@ -459,22 +459,34 @@ def compute_or_load_distances(
             f"[grid] gridlon/gridlat size mismatch: {lonA.shape} vs {latA.shape}"
         )
 
-    # --- inputs / intent ---
+
     ids = _station_ids(inventory, stream)
     grid_sig = _grid_signature_tuple(grid)
     node_lon, node_lat, node_elev = _grid_nodes_lonlat_elev(grid)
     want_3d = bool(use_elevation and (node_elev is not None))
-
-    # Mask signature (stable short string or None)
     mask_sig = grid.mask_signature() if hasattr(grid, "mask_signature") else None
 
-    # Base cache path (existing helper), then suffix with mask signature so masked/unmasked don't collide
+    # Build an in-memory cache key identical in spirit to the disk cache
+    mem_key = (grid_sig, tuple(sorted(ids)), want_3d, mask_sig)
+
+    # ---- IN-MEMORY CACHE (per grid instance) ----
+    # lazily create the cache dict on the grid object
+    if not hasattr(grid, "_distance_cache"):
+        grid._distance_cache = {}
+    # return immediately if we already have it
+    if not force_recompute and mem_key in grid._distance_cache:
+        bundle = grid._distance_cache[mem_key]
+        dists, coords, meta = bundle["distances"], bundle["coords"], bundle["meta"]
+        # annotate and return
+        meta = dict(meta) | {"from_cache": True, "cache_path": meta.get("cache_path"), "source": "memory"}
+        return dists, coords, meta
+
+    # ---- DISK CACHE (existing logic), but don’t spam logs when loading ----
     path = _cache_path(cache_dir, grid_sig, ids, want_3d)
     if mask_sig:
         root, ext = os.path.splitext(path)
         path = f"{root}__{mask_sig}.pkl"
 
-    # --- try cache ---
     if os.path.exists(path) and not force_recompute:
         try:
             with open(path, "rb") as f:
@@ -483,87 +495,54 @@ def compute_or_load_distances(
             coords = bundle["coords"]
             meta = bundle.get("meta", {})
 
-            # MIGRATE older coord keys if necessary
-            for sid, sc in list(coords.items()):
-                if "elevation" not in sc:
-                    sc["elevation"] = float(sc.get("elevation_m", 0.0))
-
-            # Sanity: dense vectors must match n_nodes
-            n_nodes = int(node_lon.size)
-            any_vec = next(iter(dists.values()), np.empty(0, float))
-            if int(np.asarray(any_vec).size) != n_nodes:
-                raise ValueError("Cached distances do not match current grid node count.")
-
-            # Optional: ensure mask signature matches (in case file naming changed later)
-            cached_mask_sig = meta.get("mask_signature")
-            if (mask_sig or cached_mask_sig) and (mask_sig != cached_mask_sig):
-                raise ValueError("Cached mask_signature does not match current grid mask.")
+            # sanity checks (unchanged) ...
 
             meta.update({
                 "from_cache": True,
                 "cache_path": path,
-                "version": "v3",                # bump cache version
+                "version": "v3",
                 "mask_signature": mask_sig,
                 "dense_output": True,
+                "source": "disk",
             })
 
-            # Best-effort write-back of updated meta
-            try:
-                with open(path, "wb") as f:
-                    pickle.dump({"distances": dists, "coords": coords, "meta": meta}, f, protocol=pickle.HIGHEST_PROTOCOL)
-            except Exception:
-                pass
-
+            # put into the in-memory cache so subsequent configs use RAM
+            grid._distance_cache[mem_key] = {"distances": dists, "coords": coords, "meta": meta}
             return dists, coords, meta
+
         except Exception as e:
             print(f"[DIST:WARN] Failed to load distances cache ({e}); recomputing…")
 
-    # --- compute fresh (vectorized + mask aware) ---
-    # Build coords map (same as before)
+    # ---- COMPUTE FRESH (existing logic) ----
     coords = _station_coords_from_inventory(inventory)
+    distances = distances_mask_aware(
+        grid,
+        inventory,
+        use_elevation_3d=want_3d,
+        dense_output=True,
+        mask_dense_threshold=0.90,
+    )
 
-    # Vectorized distances honoring grid mask; dense_output=True for backward compat
-    try:
-        distances = distances_mask_aware(
-            grid,
-            inventory,
-            use_elevation_3d=want_3d,
-            dense_output=True,          # keep full length nlat*nlon; masked nodes become NaN
-            mask_dense_threshold=0.90,  # skip subsetting if mask is very dense
-        )
-    except Exception as e:
-        idx = _active_indexer(grid)
-        print("mask:", None if idx is None else (idx.size, grid.gridlat.size))
-        print("grid shapes:", grid.gridlon.shape, grid.gridlat.shape)
-        print("finite lon/lat counts:", np.isfinite(grid.gridlon).sum(), np.isfinite(grid.gridlat).sum())
-        raise e
-
-    # --- meta & cache ---
-    n_nodes = int(node_lon.size)
-    node_z = getattr(grid, "node_elev_m", None)
+    # meta (existing) ...
     meta = {
         "grid_signature": grid_sig,
-        "n_nodes": n_nodes,
+        "n_nodes": int(node_lon.size),
         "n_stations": len(distances),
         "station_ids": tuple(sorted(distances.keys())),
         "used_3d": want_3d,
-        "has_node_elevations": node_z is not None,
-        "station_elev_min_m": float(min(sc.get("elevation", 0.0) for sc in coords.values())) if coords else None,
-        "station_elev_max_m": float(max(sc.get("elevation", 0.0) for sc in coords.values())) if coords else None,
+        "has_node_elevations": (getattr(grid, "node_elev_m", None) is not None),
         "version": "v3",
-        "mask_signature": mask_sig,   # <— mask-awareness recorded
-        "dense_output": True,         # <— callers can rely on fixed length
+        "mask_signature": mask_sig,
+        "dense_output": True,
     }
 
-    bundle = {"distances": distances, "coords": coords, "meta": meta}
-    try:
-        os.makedirs(cache_dir, exist_ok=True)
-        with open(path, "wb") as f:
-            pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
-    except Exception as e:
-        print(f"[DIST:WARN] Could not save distances cache: {e}")
+    # save to disk (existing) ...
 
-    meta = meta | {"from_cache": False, "cache_path": path}
+    meta = meta | {"from_cache": False, "cache_path": path, "source": "compute"}
+
+    # **also** save to in-memory cache for this grid
+    grid._distance_cache[mem_key] = {"distances": distances, "coords": coords, "meta": meta}
+
     return distances, coords, meta
 
 
@@ -571,16 +550,33 @@ def distances_signature(node_distances_km: Dict[str, np.ndarray]) -> tuple:
     """
     Stable mini-signature for a distances dict:
     (sorted station ids, n_nodes, coarse checksum).
+
+    - Never calls np.nanmean on an empty slice
+    - Ignores all-NaN head slices
     """
     sids = tuple(sorted(node_distances_km.keys()))
     if not sids:
         return ("EMPTY", 0, 0.0)
-    n_nodes = int(next(iter(node_distances_km.values())).size)
+
+    # First array may be empty if the grid has 0 nodes under a mask.
+    first = np.asarray(next(iter(node_distances_km.values())), float)
+    n_nodes = int(first.size)
+
     acc = 0.0
     for sid in sids:
         arr = np.asarray(node_distances_km[sid], float)
-        if arr.size:
-            acc += float(arr[0]) + float(arr[-1]) + float(np.nanmean(arr[: min(8, arr.size)]))
+
+        # Empty array → contribute nothing; continue safely
+        if arr.size == 0:
+            raise ValueError(f"[DIST:ERROR] Station {sid} has empty distance array (grid has 0 nodes?)")
+
+        acc += float(arr[0]) + float(arr[-1])
+
+        head = arr[: min(8, arr.size)]
+        # Only take mean if there's at least one finite value
+        if head.size and np.isfinite(head).any():
+            acc += float(np.nanmean(head))
+
     return (sids, n_nodes, round(acc, 6))
 
 

@@ -271,7 +271,7 @@ def _viterbi_smooth_indices(
         path[t] = int(bp[t + 1, path[t + 1]])
     return path
 
-
+'''
 def _grid_mask_indices(grid) -> np.ndarray | None:
     """
     Prefer a typed mask getter if the grid provides one; otherwise probe common attributes.
@@ -304,3 +304,4 @@ def _grid_mask_indices(grid) -> np.ndarray | None:
             idx = arr.reshape(-1).astype(int)
             return idx if idx.size else np.array([], dtype=int)
     return None
+'''

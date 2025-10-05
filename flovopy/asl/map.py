@@ -475,6 +475,9 @@ def topo_map(
     # Title, frame, output
     # --------------------
     if title and frame:
+        print(f"[MAP] Adding title {title}")
+        draw_multiline_title(fig, region, title)
+        '''
         fig.text(
             text=title,
             x=region[0] + 0.50 * (region[1] - region[0]),
@@ -482,6 +485,7 @@ def topo_map(
             justify="TC",
             font="11p,Helvetica-Bold,black",
         )
+        '''
 
     if frame:
         fig.basemap(region=region, frame=True)
@@ -502,7 +506,37 @@ def topo_map(
     return (fig, region) if return_region else fig
 
 
+def draw_multiline_title(
+    fig,
+    region,                    # [xmin, xmax, ymin, ymax]
+    title,                     # str with \n OR list/tuple of lines
+    *,
+    font="12p,Helvetica-Bold,black",
+    pad_rel=0.05,              # gap above top frame as a fraction of map height
+    line_rel=0.02,             # line spacing as a fraction of map height
+    justify="TC",
+):
+    # Normalize title → list of lines
+    if isinstance(title, (list, tuple)):
+        lines = [str(x) for x in title]
+    else:
+        lines = str(title).splitlines()
 
+    xmin, xmax, ymin, ymax = map(float, region)
+    xmid = xmin + 0.5 * (xmax - xmin)
+    H    = (ymax - ymin)
+    y0   = ymax + pad_rel * H
+    dy   = line_rel * H
+
+    for i, line in enumerate(lines):
+        fig.text(
+            text=line,
+            x=xmid,
+            y=y0 - i * dy,
+            justify=justify,
+            font=font,
+            no_clip=True,
+        )
 
 def _resolve_dem_to_grid_and_bounds(
     dem_src: Union[str, Path, "xr.DataArray", np.ndarray, Tuple[np.ndarray, Tuple[float, float, float, float]]],

@@ -106,11 +106,19 @@ class EventRate:
             rows.append(row)
 
         df = pd.DataFrame(rows)
-        if df.empty:
-            return cls(pd.DataFrame(columns=["time", "event_count"]), groupby=cfg.groupby)
 
         # -------- clean & convert --------
         df["time"] = pd.to_datetime(df["time"])
+        if df.empty:
+            cols = [
+                "time","event_count","minimum_magnitude","average_magnitude","maximum_magnitude",
+                "cumulative_energy","cumulative_magnitude",
+                "thresholded_count","thresholded_energy","thresholded_magnitude",
+            ]
+            if cfg.groupby:
+                cols.insert(1, cfg.groupby)  # after 'time'
+            return cls(pd.DataFrame(columns=cols), groupby=cfg.groupby)
+
         # sanitize magnitudes
         df["imputed"] = df["magnitude"] < cfg.lowest_magnitude
         valid = df["magnitude"] >= cfg.lowest_magnitude
@@ -151,6 +159,9 @@ class EventRate:
             thresholded_count=("magnitude", "count"),
             thresholded_energy=("energy", "sum"),
         ).reset_index()
+
+        on_keys = ["time"] + ([cfg.groupby] if cfg.groupby and cfg.groupby in grouped.columns else [])
+        grouped = grouped.merge(thr, on=on_keys, how="left")
 
         grouped = grouped.merge(thr, on=[c for c in grouped.columns if c in thr.columns], how="left")
         grouped["thresholded_count"] = grouped["thresholded_count"].fillna(0)

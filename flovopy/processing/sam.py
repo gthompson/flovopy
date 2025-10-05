@@ -1504,6 +1504,32 @@ class SAM:
     def __len__(self):
         return len(self.dataframes)
     
+    @property
+    def starttime(self):
+        """Return the start time of the first non-empty dataframe (ObsPy UTCDateTime)."""
+        for df in self.dataframes.values():
+            if not df.empty:
+                return UTCDateTime(df.iloc[0]["time"])
+        return None
+
+    @property
+    def endtime(self):
+        """Return the end time of the first non-empty dataframe (ObsPy UTCDateTime)."""
+        for df in self.dataframes.values():
+            if not df.empty:
+                return UTCDateTime(df.iloc[-1]["time"])
+        return None
+
+    @property
+    def duration(self):
+        """Return the duration of the first non-empty dataframe in seconds."""
+        for df in self.dataframes.values():
+            if not df.empty:
+                start = UTCDateTime(df.iloc[0]["time"])
+                end   = UTCDateTime(df.iloc[-1]["time"])
+                return end - start
+        return None   # <- keep consistent with starttime/endtime
+    
 class RSAM(SAM):
         
     @staticmethod

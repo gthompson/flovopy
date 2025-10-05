@@ -426,10 +426,16 @@ class EnhancedStream(Stream):
         Q: float = 50.0,
         c_earth: float = 2500.0,
         correction: float = 3.7,
-        a: float = 1.6, b: float = -0.15, g: float = 0.0,
+        a: float = 1.6, 
+        b: float = -0.15, 
+        g: float = 0.0,
         use_boatwright: bool = True,
-        rho_earth: float = 2000.0, S: float = 1.0, A: float = 1.0,
-        rho_atmos: float = 1.2, c_atmos: float = 340.0, z: float = 100000.0,
+        rho_earth: float = 2000.0, 
+        S: float = 1.0, 
+        A: float = 1.0,
+        rho_atmos: float = 1.2, 
+        c_atmos: float = 340.0, 
+        z: float = 100000.0,
         attach_coords: bool = True,
         compute_distances: bool = True,
     ) -> None:
@@ -453,6 +459,7 @@ class EnhancedStream(Stream):
                         E0 = Eseismic_Boatwright(tr, R, rho_earth=rho_earth, c_earth=c_earth, S=S, A=A)
 
                         # optional Q correction using spectral peak if present
+                        '''
                         spec = getattr(tr.stats, "spectral", {})
                         freqs = spec.get("freqs"); amps = spec.get("amplitudes")
                         if E0 is not None and freqs is not None and amps is not None:
@@ -462,6 +469,7 @@ class EnhancedStream(Stream):
                                 A_att = np.exp(-np.pi * f_peak * R / (Q * c_earth))
                                 if np.isfinite(A_att) and A_att > 0:
                                     E0 = float(E0) / float(A_att)
+                        '''
                 else:
                     E0 = estimate_source_energy(tr, R, model=model, Q=Q, c_earth=c_earth)
 

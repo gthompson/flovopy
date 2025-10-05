@@ -554,6 +554,12 @@ def apply_interval_station_gains(
       3) If allow_station_fallback=True, try station-scope forms:
          NET.STA..CHA, NET.STA.*.CHA, NET.STA.*.*, NET.STA
 
+    Special case
+    ------------
+    If `start_time` and `end_time` are present but **empty for all rows**, the
+    table is treated as **time-agnostic** (global gains). If no interval matches
+    are found, we fall back to using the entire table for matching.
+
     Returns
     -------
     dict with interval info and which traces were updated.
@@ -561,16 +567,59 @@ def apply_interval_station_gains(
     if len(st) == 0:
         return {"interval_start": None, "interval_end": None, "used": [], "missing": []}
 
-    t0 = _event_start_ts_utc(st)
-    block = _pick_interval_rows_for_time(station_gains_df, t0)
+    # --- basic schema checks (seed_id & gain required) ---
+    for req in ("seed_id", "gain"):
+        if req not in station_gains_df.columns:
+            raise ValueError(f"gains_df must include '{req}'")
+
+    df = station_gains_df.copy()
+
+    # --- coerce time columns if present ---
+    has_start = "start_time" in df.columns
+    has_end = "end_time" in df.columns
+    if has_start:
+        df["start_time"] = pd.to_datetime(df["start_time"], errors="coerce", utc=True)
+    if has_end:
+        df["end_time"] = pd.to_datetime(df["end_time"], errors="coerce", utc=True)
+
+    # Are both time columns present and empty (all NaT)?
+    time_agnostic = False
+    if has_start and has_end:
+        all_empty_start = df["start_time"].isna().all()
+        all_empty_end = df["end_time"].isna().all()
+        time_agnostic = bool(all_empty_start and all_empty_end)
+
+    # --- try interval-based matching first (unless time-agnostic by design) ---
+    if not time_agnostic:
+        t0 = _event_start_ts_utc(st)
+        block = _pick_interval_rows_for_time(df, t0)
+    else:
+        block = pd.DataFrame()  # force the fallback below if needed
+
+    # --- fallback: if no interval match AND table is time-agnostic, use entire table ---
+    if block.empty and time_agnostic:
+        if verbose:
+            print("[GAINS] No interval filtering (time-agnostic gains table). Applying global gains.")
+        block = df.copy()
+        interval_start = pd.NaT
+        interval_end = pd.NaT
+    else:
+        # choose the latest starting interval row for each seed_id scope
+        # (safe even if one of the time cols is missing)
+        sort_cols = [c for c in ("start_time", "end_time") if c in block.columns]
+        if sort_cols:
+            block = block.sort_values(sort_cols, na_position="last")
+        interval_start = block["start_time"].min() if "start_time" in block.columns else pd.NaT
+        interval_end = (block["end_time"].max()
+                        if "end_time" in block.columns and block["end_time"].notna().any()
+                        else pd.NaT)
+
     if block.empty:
         if verbose:
             print("[GAINS] No matching interval; no station gains applied.")
         return {"interval_start": None, "interval_end": None, "used": [], "missing": [tr.id for tr in st]}
 
-    # choose the latest starting interval row for each seed_id scope
-    block = block.sort_values(["start_time", "end_time"], na_position="last")
-
+    # --- apply per-trace ---
     used, missing = [], []
     for tr in st:
         sid = tr.id
@@ -580,7 +629,8 @@ def apply_interval_station_gains(
         for s in cand:
             rows_s = block[block["seed_id"] == s]
             if not rows_s.empty:
-                gain_val = rows_s.iloc[-1]["gain"]  # latest
+                # latest wins (after sort); otherwise just take last
+                gain_val = rows_s.iloc[-1]["gain"]
                 break
 
         if gain_val is None or not np.isfinite(gain_val) or float(gain_val) <= 0.0:
@@ -595,10 +645,6 @@ def apply_interval_station_gains(
             print(f"[GAINS] Applied gains to {len(used)} traces.")
         if missing:
             print(f"[GAINS] No gain for {len(missing)} traces (left unchanged).")
-
-    # interval coverage for reporting: use the *broadest* covering interval in block
-    interval_start = block["start_time"].min()
-    interval_end   = block["end_time"].max() if block["end_time"].notna().any() else pd.NaT
 
     return {
         "interval_start": interval_start,

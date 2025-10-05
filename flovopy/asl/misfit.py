@@ -122,7 +122,7 @@ class R2DistanceMisfit:
         D = np.vstack(Drows)                      # (S, N_all)
 
         # Subset to active nodes (mask-aware)
-        idx = _grid_mask_indices(aslobj.gridobj)  # None or 1D int
+        idx = aslobj.gridobj.get_mask_indices()  # None or 1D int
         if idx is not None:
             C = C[:, idx]
             D = D[:, idx]
@@ -241,8 +241,9 @@ class R2DistanceMisfit:
         # Optional blend with StdOverMean
         alpha = float(getattr(self, "alpha", 1.0))
         if alpha < 1.0:
-            # StdOverMean already vectorized; it returns (N_active,) costs
-            som_cost, _extras = self.std_backend.evaluate(y, ctx["std_ctx"], min_stations=min_stations, eps=eps)
+            som_cost, _extras = ctx["std_backend"].evaluate(
+                y, ctx["std_ctx"], min_stations=min_stations, eps=eps
+            )
             som_cost = np.asarray(som_cost, dtype=float)
             misfit = alpha * cost_r2 + (1.0 - alpha) * som_cost
         else:
@@ -296,7 +297,7 @@ class LinearizedDecayMisfit:
         C = np.vstack(Crows)  # (S, N)
         D = np.vstack(Drows)  # (S, N)
 
-        idx = _grid_mask_indices(aslobj.gridobj)
+        idx = aslobj.gridobj.get_mask_indices()
         if idx is not None:
             C = C[:, idx]; D = D[:, idx]
             node_index = idx
@@ -371,8 +372,8 @@ class LinearizedDecayMisfit:
 
         # Solve G β = b for each node (batched)
         # Guard singular systems: mark bad nodes for +inf cost
+        # Solve G β = b for each node (batched)
         tiny = np.asarray(eps, dtype=dt)
-        # Condition via determinant (cheap proxy)
         detG = (
             G[:,0,0]*(G[:,1,1]*G[:,2,2] - G[:,1,2]*G[:,2,1]) -
             G[:,0,1]*(G[:,1,0]*G[:,2,2] - G[:,1,2]*G[:,2,0]) +
@@ -382,7 +383,10 @@ class LinearizedDecayMisfit:
 
         beta = np.full((N, 3), np.nan, dtype=dt)
         if nonsing.any():
-            beta[nonsing] = np.linalg.solve(G[nonsing], b[nonsing])
+            A = G[nonsing]                 # (K, 3, 3)
+            B = b[nonsing][..., None]      # (K, 3, 1)
+            sol = np.linalg.solve(A, B)    # (K, 3, 1)
+            beta[nonsing] = sol[..., 0]    # (K, 3)
 
         # Predictions and R²
         # yhat = β0 + β1*L + β2*R
@@ -405,7 +409,9 @@ class LinearizedDecayMisfit:
         # Optional blend with StdOverMean
         alpha = float(getattr(self, "alpha", 1.0))
         if alpha < 1.0:
-            som_cost, _extras = self.std_backend.evaluate(y, ctx["std_ctx"], min_stations=min_stations, eps=eps)
+            som_cost, _extras = ctx["std_backend"].evaluate(
+                y, ctx["std_ctx"], min_stations=min_stations, eps=eps
+            )
             som_cost = np.asarray(som_cost, dtype=float)
             cost = alpha * cost + (1.0 - alpha) * som_cost
 
@@ -515,17 +521,25 @@ def plot_misfit_heatmap_for_peak_DR(
     misfit_vec = np.asarray(misfit_vec, float)
     print(f"[{ts()}] [MISFIT] misfit_vec shape={misfit_vec.shape} finite={np.isfinite(misfit_vec).sum()}")
 
+
+
     # 3) Handle grid/mask; build 2D field when possible
     grid = aslobj.gridobj
-    mask_idx = getattr(aslobj, "_node_mask", None)  # flat indices of allowed nodes or None
+    grid_mask_idx = getattr(aslobj.gridobj, "_node_mask_idx", None)  # persistent mask on Grid
 
     # Mapping from local (backend) index → global grid index if provided
     node_index = meta.get("node_index") if isinstance(meta, dict) else None
     if node_index is not None:
         node_index = np.asarray(node_index, int)
 
-    # Resolve "global best" index
-    jstar_global = int(jstar_local if node_index is None else node_index[jstar_local])
+    def _local_to_global(ix_local: int) -> int:
+        if node_index is not None:
+            return int(node_index[ix_local])
+        if grid_mask_idx is not None:
+            return int(np.asarray(grid_mask_idx, int)[ix_local])
+        return int(ix_local)
+
+    jstar_global = _local_to_global(jstar_local)
 
     # Regular 2D grid?
     has_2d = getattr(grid, "gridlat", None) is not None and np.ndim(grid.gridlat) == 2
@@ -536,17 +550,19 @@ def plot_misfit_heatmap_for_peak_DR(
         nlat, nlon = grid.gridlat.shape
         M_full = np.full(nlat * nlon, np.nan, dtype=float)
 
-        if node_index is None and mask_idx is None:
-            # direct full vectors
-            M_full[:] = misfit_vec
+        if (node_index is None) and (grid_mask_idx is None):
+            # misfit_vec already corresponds to full grid in order
+            if misfit_vec.size == M_full.size:
+                M_full[:] = misfit_vec
+            else:
+                # defensive fallback: place what we can at the start
+                M_full[:misfit_vec.size] = misfit_vec
         else:
-            # scatter local (and/or masked) into dense full-field
-            if node_index is None and mask_idx is not None:
-                # local space == masked subset; scatter via mask indices
-                M_full[np.asarray(mask_idx, int)] = misfit_vec
-            elif node_index is not None:
-                # local space explicitly supplied; scatter via node_index
+            # scatter from local space into the full field
+            if node_index is not None:
                 M_full[node_index] = misfit_vec
+            else:  # use grid persistent mask indices
+                M_full[np.asarray(grid_mask_idx, int)] = misfit_vec
 
         M2 = M_full.reshape(nlat, nlon)
 
@@ -561,14 +577,14 @@ def plot_misfit_heatmap_for_peak_DR(
         M_plot = M2
     else:
         # 1D node set ("streams" style) → scatter plot
-        if node_index is None and mask_idx is None:
+        if (node_index is None) and (grid_mask_idx is None):
             M_plot = misfit_vec
         else:
             M_full = np.full_like(gridlat_flat, np.nan, dtype=float)
-            if node_index is None and mask_idx is not None:
-                M_full[np.asarray(mask_idx, int)] = misfit_vec
-            elif node_index is not None:
+            if node_index is not None:
                 M_full[node_index] = misfit_vec
+            else:
+                M_full[np.asarray(grid_mask_idx, int)] = misfit_vec
             M_plot = M_full
         misfit_da = None  # use scatter
 
@@ -612,6 +628,16 @@ def plot_misfit_heatmap_for_peak_DR(
     # 7) Mark best node
     best_lon = float(gridlon_flat[jstar_global])
     best_lat = float(gridlat_flat[jstar_global])
+
+    try:
+        region = topo_kw.get("region", None)
+        if region is not None:
+            xmin, xmax, ymin, ymax = region
+            if not (xmin <= best_lon <= xmax and ymin <= best_lat <= ymax):
+                print(f"[MISFIT] Best node ({best_lat:.5f},{best_lon:.5f}) is outside region {region}")
+    except Exception:
+        pass
+
     fig.plot(x=[best_lon], y=[best_lat], style="c0.26c", fill="red", pen="1p,red")
 
     # 8) Output

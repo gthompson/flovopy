@@ -91,8 +91,6 @@ class EnhancedCatalog(Catalog):
         """
         Add an ObsPy Event with optional extras and create an EnhancedEvent record.
         """
-        self.append(event)
-
         # Decorate event with simple QuakeML metadata
         if event_type:
             event.event_type = event_type
@@ -119,8 +117,12 @@ class EnhancedCatalog(Catalog):
                 "subclass": subclass,
             },
         )
+
+        # Wrap and use the SAME object for both Catalog events and records
         enh = EnhancedEvent.wrap(event, meta=meta, stream=stream)
+        self.append(enh)
         self.records.append(enh)
+
         # bust cache
         self._df_cache = None
 
@@ -144,10 +146,10 @@ class EnhancedCatalog(Catalog):
     def merge(self, other: "EnhancedCatalog") -> None:
         existing = {e.resource_id.id for e in self if e.resource_id}
         for enh in other.records:
-            rid = enh.event.resource_id.id if enh.event.resource_id else None
+            rid = enh.resource_id.id if enh.resource_id else None
             if rid not in existing:
-                self.append(enh.event)
-                self.records.append(enh)
+                self.append(enh)          # enh is an Event
+                self.records.append(enh)  # keep the same object in records
         self._df_cache = None
 
     # ---------- Summaries ----------
@@ -164,7 +166,6 @@ class EnhancedCatalog(Catalog):
         print(df["subclass"].value_counts(dropna=False))
 
     # ---------- Dataframe serialization ----------
-    # --- Dataframe view (tiny addition of resource_id) ---
     def to_dataframe(self, origin_mode: str = "preferred") -> pd.DataFrame:
         """
         Build an event-level summary DataFrame.
@@ -181,28 +182,54 @@ class EnhancedCatalog(Catalog):
         Returns
         -------
         df : pandas.DataFrame
-            DataFrame with columns: datetime, magnitude, lat, lon, depth,
-            event_type, mainclass, subclass, classification, filename,
-            resource_id, energy (if magnitude is present).
-
-        Examples
-        --------
-        >>> # Event summary using preferred origins
-        >>> df = cat.to_dataframe(origin_mode="preferred")
-        >>> df.head()
-
-        >>> # Event summary using the first origin
-        >>> df = cat.to_dataframe(origin_mode="first")
-
-        >>> # Multi-row per event with all origins
-        >>> df = cat.to_dataframe(origin_mode="all")
+            Columns: resource_id, datetime, latitude, longitude, depth, event_type,
+            classification, mainclass, subclass, filename, magnitude, energy,
+            DR, misfit, azgap, nsta, node_index, connectedness, connectedness_score,
+            best_time_index, best_DR.
         """
         rows = []
-        for enh in self.records:
-            ev = enh.event
+
+        for ev in self.records:  # EnhancedEvent (subclass of ObsPy Event)
             rid = getattr(getattr(ev, "resource_id", None), "id", None)
 
-            def _row_from_origin(o):
+            # Pull ASL series (if present) + summary metrics
+            meta_src = (getattr(ev.meta, "asl_source", None)
+                        or (ev.meta.metrics or {}).get("asl_series", {})
+                        or {})
+            best_idx = (ev.meta.metrics or {}).get("best_time_index")
+            best_DR  = (ev.meta.metrics or {}).get("best_DR")
+            connectedness = (ev.meta.metrics or {}).get("connectedness")
+            conn_score = None
+            try:
+                if isinstance(connectedness, dict):
+                    conn_score = connectedness.get("score", None)
+            except Exception:
+                pass
+
+            # Helper to get per-time ASL values safely
+            def asl_at(idx: int | None) -> dict:
+                try:
+                    if idx is None:
+                        return {"DR": None, "misfit": None, "azgap": None, "nsta": None, "node_index": None}
+                    DRv     = meta_src.get("DR", [])
+                    misfitv = meta_src.get("misfit", [])
+                    azgv    = meta_src.get("azgap", [])
+                    nstav   = meta_src.get("nsta", [])
+                    nodev   = meta_src.get("node_index", [])
+                    # Bounds check
+                    def pick(v):
+                        return v[idx] if (hasattr(v, "__len__") and idx < len(v)) else None
+                    return {
+                        "DR": pick(DRv),
+                        "misfit": pick(misfitv),
+                        "azgap": pick(azgv),
+                        "nsta": pick(nstav),
+                        "node_index": pick(nodev),
+                    }
+                except Exception:
+                    return {"DR": None, "misfit": None, "azgap": None, "nsta": None, "node_index": None}
+
+            def _row_from_origin(o, idx_for_asl: int | None):
                 row = {
                     "resource_id": rid,
                     "datetime": (o.time.datetime if getattr(o, "time", None) else None),
@@ -213,43 +240,56 @@ class EnhancedCatalog(Catalog):
                     "classification": None,
                     "mainclass": None,
                     "subclass": None,
-                    "filename": (enh.meta.wav_paths[0] if getattr(enh.meta, "wav_paths", None) else None),
+                    "filename": (ev.meta.wav_paths[0] if getattr(ev.meta, "wav_paths", None) else None),
                     "magnitude": (ev.magnitudes[0].mag if ev.magnitudes else None),
+                    "connectedness": connectedness,
+                    "connectedness_score": conn_score,
+                    "best_time_index": best_idx,
+                    "best_DR": best_DR,
                 }
-                # pull labels from comments if present
+                # labels from comments
                 for c in (ev.comments or []):
-                    txt = (c.text or "") or ""
+                    txt = (c.text or "")
                     if txt.startswith("mainclass:"):
                         row["mainclass"] = txt.split(":", 1)[-1].strip()
                     elif txt.startswith("subclass:"):
                         row["subclass"] = txt.split(":", 1)[-1].strip()
                     elif txt.startswith("classification:") and not row["classification"]:
                         row["classification"] = txt.split(":", 1)[-1].strip()
+
                 if row["magnitude"] is not None:
                     row["energy"] = magnitude2Eseismic(row["magnitude"])
+
+                # attach ASL time-aligned values
+                row.update(asl_at(idx_for_asl))
                 return row
 
             if origin_mode == "all":
-                for o in (ev.origins or []):
-                    rows.append(_row_from_origin(o))
+                # map each origin to its index; bounds checks handled in asl_at()
+                for i, o in enumerate(ev.origins or []):
+                    rows.append(_row_from_origin(o, i))
             else:
                 origin = None
+                idx_for_asl = None
                 if origin_mode == "preferred":
                     try:
-                        origin = ev.preferred_origin()  # method
+                        origin = ev.preferred_origin()
                     except Exception:
-                        origin = getattr(ev, "preferred_origin", None)  # property fallback
+                        origin = getattr(ev, "preferred_origin", None)
+                    # guard best_idx to be int and non-negative
+                    if isinstance(best_idx, (int, np.integer)) and best_idx >= 0:
+                        idx_for_asl = int(best_idx)
                 if origin is None and ev.origins:
                     origin = ev.origins[0]
+                    if idx_for_asl is None:
+                        idx_for_asl = 0
 
-                # If no origin, still emit a row with minimal info
-                rows.append(_row_from_origin(origin or type("O", (), {})()))
+                rows.append(_row_from_origin(origin or type("O", (), {})(), idx_for_asl))
 
         df = pd.DataFrame(rows)
         if not df.empty and "datetime" in df.columns:
             df["datetime"] = pd.to_datetime(df["datetime"])
         return df
-
 
     def export_csv(
         self,
@@ -312,25 +352,17 @@ class EnhancedCatalog(Catalog):
             - nsta        : int, usable station count
             - node_index  : int, chosen node index
             - energy      : float, if magnitude present
-
-        Examples
-        --------
-        >>> # Build full ASL trajectory dataset
-        >>> df_traj = cat.trajectory_dataframe()
-        >>> df_traj.head()
-
-        >>> # Export directly to CSV
-        >>> cat.export_csv("asl_trajectories.csv", df=cat.trajectory_dataframe())
         """
         rows = []
-        for enh in self.records:
-            ev = enh.event
-            rid = getattr(getattr(ev, "resource_id", None), "id", None)
-            meta_src = (getattr(enh.meta, "asl_source", None)
+        for enh in self.records:  # enh is an EnhancedEvent (subclass of Event)
+            rid = getattr(getattr(enh, "resource_id", None), "id", None)
+            meta_src = (
+                getattr(enh.meta, "asl_source", None)
                 or (enh.meta.metrics or {}).get("asl_series", {})
-                or {})
+                or {}
+            )
 
-            # if the EnhancedEvent saved ASL trajectory arrays
+            # ASL trajectory arrays
             t_arr   = np.asarray(meta_src.get("t", []), dtype="datetime64[ns]")
             lat_arr = np.asarray(meta_src.get("lat", []), dtype=float)
             lon_arr = np.asarray(meta_src.get("lon", []), dtype=float)
@@ -351,8 +383,8 @@ class EnhancedCatalog(Catalog):
                     "azgap": azgap[i] if i < azgap.size else None,
                     "nsta": int(nsta[i]) if i < nsta.size else None,
                     "node_index": int(nodes[i]) if i < nodes.size else None,
-                    "energy": magnitude2Eseismic(ev.magnitudes[0].mag)
-                            if ev.magnitudes else None,
+                    "energy": magnitude2Eseismic(enh.magnitudes[0].mag)
+                            if enh.magnitudes else None,
                 })
 
         return pd.DataFrame(rows)
@@ -420,9 +452,8 @@ class EnhancedCatalog(Catalog):
         write_obspy_json: bool = False,
         include_trajectory_in_sidecar: bool = True,
     ) -> None:
-        for enh in self.records:
-            ev = enh.event
-            if not ev.origins or not ev.origins[0].time:
+        for ev in self.records:  # ev is an EnhancedEvent (subclass of Event)
+            if not ev.origins or not getattr(ev.origins[0], "time", None):
                 continue
             t = ev.origins[0].time
             base = os.path.join(
@@ -430,7 +461,7 @@ class EnhancedCatalog(Catalog):
                 t.strftime("%Y%m%dT%H%M%S")
             )
             os.makedirs(os.path.dirname(base), exist_ok=True)
-            enh.save(
+            ev.save(  # call EnhancedEvent.save()
                 os.path.dirname(base),
                 os.path.basename(base),
                 write_quakeml=write_quakeml,
@@ -440,20 +471,25 @@ class EnhancedCatalog(Catalog):
 
     # ---------- Filters (return new EnhancedCatalogs) ----------
     def filter_by_event_type(self, event_type: str) -> "EnhancedCatalog":
-        recs = [r for r in self.records if getattr(r.event, "event_type", None) == event_type]
-        return EnhancedCatalog(events=[r.event for r in recs], records=recs)
+        recs = [r for r in self.records if getattr(r, "event_type", None) == event_type]
+        return EnhancedCatalog(events=[r for r in recs], records=recs)
+
 
     def filter_by_mainclass(self, mainclass: str) -> "EnhancedCatalog":
         def has_mc(ev: Event) -> bool:
-            return any((c.text or "").startswith("mainclass:") and mainclass in c.text for c in (ev.comments or []))
-        recs = [r for r in self.records if has_mc(r.event)]
-        return EnhancedCatalog(events=[r.event for r in recs], records=recs)
+            return any((c.text or "").startswith("mainclass:") and mainclass in (c.text or "")
+                    for c in (ev.comments or []))
+        recs = [r for r in self.records if has_mc(r)]
+        return EnhancedCatalog(events=[r for r in recs], records=recs)
+
 
     def filter_by_subclass(self, subclass: str) -> "EnhancedCatalog":
         def has_sc(ev: Event) -> bool:
-            return any((c.text or "").startswith("subclass:") and subclass in c.text for c in (ev.comments or []))
-        recs = [r for r in self.records if has_sc(r.event)]
-        return EnhancedCatalog(events=[r.event for r in recs], records=recs)
+            return any((c.text or "").startswith("subclass:") and subclass in (c.text or "")
+                    for c in (ev.comments or []))
+        recs = [r for r in self.records if has_sc(r)]
+        return EnhancedCatalog(events=[r for r in recs], records=recs)
+
 
     def group_by(self, field: str) -> Dict[Any, "EnhancedCatalog"]:
         """
@@ -463,9 +499,9 @@ class EnhancedCatalog(Catalog):
         for r in self.records:
             val = None
             if field == "event_type":
-                val = getattr(r.event, "event_type", None)
+                val = getattr(r, "event_type", None)
             else:
-                for c in (r.event.comments or []):
+                for c in (r.comments or []):
                     txt = (c.text or "")
                     if txt.startswith(f"{field}:"):
                         val = txt.split(":", 1)[-1].strip()
@@ -473,7 +509,7 @@ class EnhancedCatalog(Catalog):
             grouped[val].append(r)
 
         return {
-            key: EnhancedCatalog(events=[rr.event for rr in recs], records=recs)
+            key: EnhancedCatalog(events=[rr for rr in recs], records=recs)
             for key, recs in grouped.items()
         }
 
@@ -489,7 +525,8 @@ class EnhancedCatalog(Catalog):
             if not pd.isna(row.get("datetime")) and not pd.isna(row.get("latitude")):
                 ev.origins = [Origin(
                     time=UTCDateTime(pd.to_datetime(row["datetime"])),
-                    latitude=row["latitude"], longitude=row.get("longitude"),
+                    latitude=row["latitude"],
+                    longitude=row.get("longitude"),
                     depth=row.get("depth")
                 )]
 
@@ -520,7 +557,8 @@ class EnhancedCatalog(Catalog):
             )
             records.append(EnhancedEvent.wrap(ev, meta=meta, stream=stream))
 
-        return cls(events=[r.event for r in records], records=records)
+        # EnhancedEvent IS an Event, so return the same objects for both lists.
+        return cls(events=[r for r in records], records=records)
     
 
 
@@ -528,6 +566,13 @@ class EnhancedCatalog(Catalog):
     def load_dir(cls, catdir: str, *, load_waveforms: bool = False) -> "EnhancedCatalog":
         """
         Build EnhancedCatalog from per-event .qml + .json pairs created by EnhancedEvent.save().
+
+        Notes
+        -----
+        - Uses EnhancedEvent.load(base_path) so that the sidecar (including `asl_source`)
+        and all meta fields are reconstructed faithfully.
+        - If `load_waveforms=True` and the sidecar contains `wav_paths`, the first path
+        is read (if it exists) and attached as `enh.stream`.
         """
         qml_files = sorted(glob.glob(os.path.join(catdir, "**", "*.qml"), recursive=True))
         records: List[EnhancedEvent] = []
@@ -539,32 +584,24 @@ class EnhancedCatalog(Catalog):
                 continue
 
             try:
-                ev = read_events(qml_file)[0]
-                with open(json_file, "r") as f:
-                    meta = json.load(f)
+                enh = EnhancedEvent.load(base)  # brings back meta.asl_source, metrics, etc.
             except Exception as e:
                 print(f"[WARN] Skipping {base}: {e}")
                 continue
 
-            wav_paths = meta.get("wav_paths", [])
-            stream = None
-            if load_waveforms and wav_paths and os.path.exists(wav_paths[0]):
-                try:
-                    stream = read(wav_paths[0])
-                except Exception as e:
-                    print(f"[WARN] Could not load waveform {wav_paths[0]}: {e}")
+            # Optionally attach the first waveform listed in the sidecar
+            if load_waveforms and enh.meta.wav_paths:
+                fn = enh.meta.wav_paths[0]
+                if isinstance(fn, str) and os.path.exists(fn):
+                    try:
+                        enh.stream = read(fn)
+                    except Exception as e:
+                        print(f"[WARN] Could not load waveform {fn}: {e}")
 
-            meta_obj = EnhancedEventMeta(
-                sfile_path=meta.get("sfile_path"),
-                wav_paths=wav_paths,
-                aef_path=meta.get("aef_path"),
-                trigger_window=meta.get("trigger_window"),
-                average_window=meta.get("average_window"),
-                metrics=meta.get("metrics", {}) or {},
-            )
-            records.append(EnhancedEvent.wrap(ev, meta=meta_obj, stream=stream))
+            records.append(enh)
 
-        return cls(events=[r.event for r in records], records=records)
+        # EnhancedEvent is an Event, so use the same objects for both lists
+        return cls(events=[r for r in records], records=records)
 
     # ---------- EventRate bridge ----------
     def to_event_rate(self, config: Optional[EventRateConfig] = None) -> EventRate:

@@ -19,6 +19,46 @@ from obspy import read_events
 # -------------------------
 @dataclass
 class EnhancedEventMeta:
+
+    """
+    Sidecar metadata container for :class:`EnhancedEvent`.
+
+    Stores provenance, processing parameters, per-trace summaries,
+    and arbitrary ASL-derived metadata in a JSON-serializable structure.
+    This sidecar is kept separate from QuakeML so that the ObsPy
+    :class:`Event` remains standards-compliant.
+
+    Attributes
+    ----------
+    sfile_path : str or None
+        Path to the original Seisan S-file, if available.
+    wav_paths : list of str
+        Paths to waveform files associated with this event.
+    aef_path : str or None
+        Path to a corresponding AEF (Amplitude–Energy–Frequency) summary file.
+    trigger_window : float or None
+        Window length (s) used for event triggering.
+    average_window : float or None
+        Window length (s) used for moving averages or noise estimation.
+    metrics : dict
+        Arbitrary flat metrics or classifications (JSON-serializable).
+        Often includes scalar event-level features or user-defined tags.
+    traces : list of dict
+        Per-trace summaries, each entry being a flat dictionary
+        (id, net, sta, loc, cha, starttime, distance_m, metrics{...},
+        spectral{...}, etc.).
+    asl_source : dict
+        Canonical storage for ASL trajectory output. Keys typically include
+        ``t`` (timestamps), ``lat``, ``lon``, ``DR``, ``misfit``, ``azgap``,
+        ``nsta``, and ``node_index``. This is the authoritative copy of the
+        ASL track for JSON sidecars.
+        .. note::
+           A legacy mirror may also be stored in
+           ``meta.metrics["asl_series"]`` for backward compatibility, but
+           ``asl_source`` should be preferred going forward.
+    """
+
+
     # File provenance
     sfile_path: Optional[str] = None
     wav_paths: List[str] = field(default_factory=list)
@@ -87,6 +127,7 @@ class EnhancedEvent(Event):
         # Ensure the event always has a ResourceIdentifier (useful for DB keys)
         self.resource_id = self.resource_id or ResourceIdentifier()
         return self.resource_id.id or str(self.resource_id)
+
 
     @classmethod
     def wrap(cls, obspy_event: Event, *, meta: Optional[EnhancedEventMeta] = None, stream=None) -> "EnhancedEvent":
@@ -270,10 +311,65 @@ class EnhancedEvent(Event):
         *,
         event_id: Optional[str] = None,
         meta: Optional[EnhancedEventMeta] = None,
-        inventory=None,
         stream=None,
         title_comment: Optional[str] = None,
     ) -> "EnhancedEvent":
+       
+        """
+        Construct an :class:`EnhancedEvent` from an :class:`ASL` run.
+
+        This adapter converts the output of an :class:`ASL` object (after
+        :meth:`ASL.fast_locate` or :meth:`ASL.locate`) into a standards-compliant
+        ObsPy :class:`Event` enriched with extra ASL-specific metadata and
+        trajectory information.
+
+        Behavior
+        --------
+        - Builds an ObsPy :class:`Origin` for each time/space sample in
+        ``aslobj.source`` (lat/lon/time/quality).
+        - Sets ``preferred_origin_id`` to the origin corresponding to the time
+        of maximum reduced displacement (DR).
+        - Attaches ASL pipeline parameters (Q, peak frequency, wave speed,
+        etc.) into the sidecar ``meta.metrics``.
+        - Stores the full time–trajectory series into ``meta.asl_source``
+        (and also into ``meta.metrics["asl_series"]`` for backward
+        compatibility).
+        - If a waveform stream is provided, attempts to harvest trace
+        ``.stats.path`` attributes into ``meta.wav_paths``.
+        - Stamps ``creation_info`` with ``author="flovopy.asl"`` and
+        ``version`` set to the producing config’s ``tag_str`` (if present).
+
+        Parameters
+        ----------
+        aslobj : ASL
+            A configured and executed ASL object with a populated
+            ``source`` dictionary.
+        event_id : str, optional
+            Explicit resource identifier to assign to the new event.
+        meta : EnhancedEventMeta, optional
+            Sidecar metadata container to attach. If not provided, a fresh one
+            is created.
+        stream : Stream, optional
+            If provided, waveform traces may be inspected for ``.stats.path``
+            to populate ``meta.wav_paths``.
+        title_comment : str, optional
+            A free-form comment added to the ObsPy Event.
+
+        Returns
+        -------
+        EnhancedEvent
+            A subclass of ObsPy :class:`Event` containing both QuakeML-safe
+            elements (origins, comments, resource_id) and a JSON-serializable
+            sidecar of ASL metadata.
+
+        Raises
+        ------
+        ValueError
+            If ``aslobj`` has no source or if no finite origins can be
+            constructed.
+        """
+
+
         if aslobj.source is None:
             raise ValueError("ASL object has no source – run locate()/fast_locate() first.")
 
@@ -339,7 +435,6 @@ class EnhancedEvent(Event):
 
         ev.origins = origins
         # preferred origin aligned to argmax(DR) index among the kept origins
-        # map global index -> kept list index
         kept_mask = np.isfinite(lat) & np.isfinite(lon)
         try:
             kept_indices = np.flatnonzero(kept_mask)
@@ -350,6 +445,7 @@ class EnhancedEvent(Event):
             pass
 
         # ---- sidecar metrics (pipeline params + series, keyed exactly like fast_locate())
+        # These properties are exposed on ASL and delegate to cfg internally.
         ev.meta.metrics.update({
             "Q": getattr(aslobj, "Q", None),
             "peakf": getattr(aslobj, "peakf", None),
@@ -359,6 +455,8 @@ class EnhancedEvent(Event):
             "best_time_index": t_idx,
             "best_DR": float(DR[t_idx]) if (DR.size and np.isfinite(DR[t_idx])) else None,
             "connectedness": conn,
+            # Optional breadcrumb: which config/tag produced this result
+            "asl_config_tag": getattr(getattr(aslobj, "cfg", None), "tag_str", None),
         })
 
         def _tolist(x):
@@ -377,8 +475,10 @@ class EnhancedEvent(Event):
             "nsta":   _tolist(nsta),
             "node_index": _tolist(node),
         }
-        ev.meta.asl_source = series                  # canonical location
-        ev.meta.metrics["asl_series"] = series       # optional legacy mirror
+        # Canonical home:
+        ev.meta.asl_source = series
+        # Backward-compat mirror:
+        ev.meta.metrics["asl_series"] = series
 
         # Optional waveform paths → meta.wav_paths (if available)
         if stream is not None:
@@ -388,21 +488,27 @@ class EnhancedEvent(Event):
             except Exception:
                 pass
 
+        # Stamp creation info with the producing config tag (fallback to "1")
         try:
-            ev.creation_info = CreationInfo(author="flovopy.asl", version="1")
+            tag_ver = getattr(getattr(aslobj, "cfg", None), "tag_str", None) or "1"
+            ev.creation_info = CreationInfo(author="flovopy.asl", version=str(tag_ver))
         except Exception:
             pass
 
         return ev
-    
+        
 
     def trajectory_dataframe(self) -> pd.DataFrame:
         """
         One row per time step from fast_locate():
         columns: event_id, time_index, datetime, lat, lon, DR, misfit, azgap, nsta, node_index, is_preferred_time
+        Prefers the canonical sidecar `meta.asl_source`, falls back to legacy `meta.metrics["asl_series"]`,
+        and finally to Origins if neither is present.
         """
-        series = (self.meta.metrics or {}).get("asl_series", {})
-        # fall back to origins-only if series missing
+        # Prefer canonical series location
+        series = self.meta.asl_source or (self.meta.metrics or {}).get("asl_series", {})
+
+        # Fall back to origins-only if series missing
         if not series:
             rows = []
             for i, o in enumerate(self.origins or []):
@@ -417,9 +523,10 @@ class EnhancedEvent(Event):
                 })
             return pd.DataFrame(rows)
 
-        def _aslist(k): 
+        def _aslist(k):
             v = series.get(k)
             return v if isinstance(v, list) else []
+
         t  = _aslist("t")
         la = _aslist("lat")
         lo = _aslist("lon")
