@@ -629,6 +629,44 @@ class Grid:
             kept = int(np.count_nonzero(self._node_mask))
             pct  = kept / self._node_mask.size * 100.0
             return base + f"  [mask: {kept}/{self._node_mask.size} nodes kept ({pct:.1f}%)]"
+        
+    # inside your Grid class
+    def node_lonlat(self, g: int):
+        """
+        Return (lon, lat, elev_m|nan) for flat node index g.
+        Works whether gridlon/gridlat/node_elev_m are 2-D or 1-D.
+        """
+        import numpy as np
+        glon = np.asarray(self.gridlon)
+        glat = np.asarray(self.gridlat)
+        if glon.shape != glat.shape:
+            raise ValueError("gridlon/gridlat shape mismatch")
+        # Accept both (nlat, nlon) and (N,)
+        nlat, nlon = (glon.shape if glon.ndim == 2 else (1, glon.size))
+        if glon.ndim == 2:
+            i, j = np.unravel_index(int(g), (nlat, nlon))
+            lon = float(glon[i, j]); lat = float(glat[i, j])
+            elev = np.asarray(getattr(self, "node_elev_m", None))
+            if elev is not None and elev.size == glon.size:
+                elev = float(elev.reshape(nlat, nlon)[i, j])
+            else:
+                elev = float("nan")
+        else:
+            lon = float(glon.ravel()[int(g)])
+            lat = float(glat.ravel()[int(g)])
+            elev_arr = np.asarray(getattr(self, "node_elev_m", None))
+            elev = float(elev_arr.ravel()[int(g)]) if elev_arr is not None else float("nan")
+        return lon, lat, elev
+
+    def nearest_node(self, lon: float, lat: float) -> int:
+        """
+        Return flat node index of the grid node nearest (lon, lat).
+        """
+        import numpy as np
+        glon = np.asarray(self.gridlon).ravel()
+        glat = np.asarray(self.gridlat).ravel()
+        k = int(np.argmin((glon - lon) ** 2 + (glat - lat) ** 2))
+        return k    
 
 def make_grid(
     center_lat: float = dome_location["lat"],

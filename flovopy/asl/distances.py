@@ -110,6 +110,9 @@ def _station_coords_from_inventory(inv: Inventory) -> Dict[str, Dict[str, float]
 
 
 def _cache_path(cache_dir: str, grid_sig: Tuple, station_ids: Sequence[str], use_3d: bool) -> str:
+    if cache_dir is None:
+        return
+
     key = _hash16(("Distances", grid_sig), tuple(sorted(station_ids)), bool(use_3d))
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, f"Distances_{key}.pkl")
@@ -435,10 +438,10 @@ def distances_mask_aware(
 
 def compute_or_load_distances(
     grid,
+    cache_dir,
     *,
     inventory: Inventory,
     stream: Optional[Stream] = None,
-    cache_dir: str = None,
     force_recompute: bool = False,
     use_elevation: bool = True,   # default 3-D if grid provides elevations
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, float]], Dict]:
@@ -482,38 +485,43 @@ def compute_or_load_distances(
         return dists, coords, meta
 
     # ---- DISK CACHE (existing logic), but don’t spam logs when loading ----
-    path = _cache_path(cache_dir, grid_sig, ids, want_3d)
-    if mask_sig:
-        root, ext = os.path.splitext(path)
-        path = f"{root}__{mask_sig}.pkl"
+    if cache_dir is None:
+        print("[COMPUTE OR LOAD DISTANCES] No cache_dir provided; skipping disk cache.")
+    else:
+        path = _cache_path(cache_dir, grid_sig, ids, want_3d)
+        if mask_sig:
+            root, ext = os.path.splitext(path)
+            path = f"{root}__{mask_sig}.pkl"
 
-    if os.path.exists(path) and not force_recompute:
-        try:
-            with open(path, "rb") as f:
-                bundle = pickle.load(f)
-            dists = bundle["distances"]
-            coords = bundle["coords"]
-            meta = bundle.get("meta", {})
+        if os.path.exists(path) and not force_recompute:
+            try:
+                with open(path, "rb") as f:
+                    bundle = pickle.load(f)
+                dists = bundle["distances"]
+                coords = bundle["coords"]
+                meta = bundle.get("meta", {})
 
-            # sanity checks (unchanged) ...
+                # sanity checks (unchanged) ...
 
-            meta.update({
-                "from_cache": True,
-                "cache_path": path,
-                "version": "v3",
-                "mask_signature": mask_sig,
-                "dense_output": True,
-                "source": "disk",
-            })
+                meta.update({
+                    "from_cache": True,
+                    "cache_path": path,
+                    "version": "v3",
+                    "mask_signature": mask_sig,
+                    "dense_output": True,
+                    "source": "disk",
+                })
 
-            # put into the in-memory cache so subsequent configs use RAM
-            grid._distance_cache[mem_key] = {"distances": dists, "coords": coords, "meta": meta}
-            return dists, coords, meta
+                # put into the in-memory cache so subsequent configs use RAM
+                grid._distance_cache[mem_key] = {"distances": dists, "coords": coords, "meta": meta}
+                print(f"[COMPUTE OR LOAD DISTANCES] Distances loaded from {path}.")
+                return dists, coords, meta
 
-        except Exception as e:
-            print(f"[DIST:WARN] Failed to load distances cache ({e}); recomputing…")
+            except Exception as e:
+                print(f"[COMPUTE OR LOAD DISTANCES]:WARN] Failed to load distances cache ({e}); recomputing…")
 
     # ---- COMPUTE FRESH (existing logic) ----
+    print("[COMPUTE OR LOAD DISTANCES] Computing fresh distances…")
     coords = _station_coords_from_inventory(inventory)
     distances = distances_mask_aware(
         grid,

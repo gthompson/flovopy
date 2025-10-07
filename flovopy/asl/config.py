@@ -194,7 +194,7 @@ class ASLConfig:
         tag = self.tag()
         object.__setattr__(self, "tag_str", tag)
         outdir = Path(self.output_base) / tag
-        outdir.mkdir(parents=True, exist_ok=True)
+        #outdir.mkdir(parents=True, exist_ok=True)
         object.__setattr__(self, "outdir", str(outdir))
 
         # 2) inventory load
