@@ -224,6 +224,19 @@ def attenuation(trace: Trace, R: Number, Q: float = 50.0, c_earth: float = 2500.
 # Source energy estimators
 # ---------------------------------------------------------------------------
 
+def _check_units(trace2: Trace, units_needed="m/s"):
+    if units_needed == "m/s":
+        if trace2.stats.get('units', None).lower() == "m":
+            trace = trace2.copy().differentiate()
+        else:
+            trace = trace2
+    elif units_needed == "m":
+        if trace2.stats.get('units', None).lower() == "m/s":
+            trace = trace2.copy().integrate().detrend('linear')
+        else:
+            trace = trace2       
+    return trace 
+
 def _geom_spreading(model: str, R: Number, f_peak: float, c_earth: float) -> Optional[float]:
     """
     Geometric spreading undo factor for energy back-projection.
@@ -245,7 +258,7 @@ def _geom_spreading(model: str, R: Number, f_peak: float, c_earth: float) -> Opt
         return None
 
 
-def estimate_source_energy(trace: Trace, R: Number, *, model: str = "body",
+def estimate_source_energy(trace2: Trace, R: Number, *, model: str = "body",
                            Q: float = 50.0, c_earth: float = 2500.0) -> Optional[float]:
     """
     Estimate source energy E0 (J) from observed station energy:
@@ -253,6 +266,7 @@ def estimate_source_energy(trace: Trace, R: Number, *, model: str = "body",
     Uses time-domain energy in trace.stats.metrics['energy'] and a representative f_peak.
     Returns None on missing data.
     """
+    trace = _check_units(trace2, units_needed="m/s")
     try:
         E_obs = getattr(trace.stats, "metrics", {}).get("energy")
         if E_obs is None or not np.isfinite(E_obs):
@@ -286,7 +300,8 @@ def Eseismic_Boatwright(val: Union[Trace, Number], R: Number,
     """
     try:
         if isinstance(val, Trace):
-            E_station = getattr(val.stats, "metrics", {}).get("energy")
+            val2 = _check_units(val, units_needed="m/s")
+            E_station = getattr(val2.stats, "metrics", {}).get("energy")
         else:
             E_station = float(val)
         R = float(R)
@@ -334,8 +349,10 @@ def estimate_local_magnitude(trace: Trace, R_km: Number,
     Convenience wrapper: reads `trace.stats.metrics['peakamp']` and computes ML.
     Stores result in `trace.stats.metrics['local_magnitude']` if successful.
     """
+    trace2 = _check_units(trace, units_needed="m")
     try:
-        peakamp = getattr(trace.stats, "metrics", {}).get("peakamp")
+        #peakamp = getattr(trace2.stats, "metrics", {}).get("peakamp")
+        peakamp = max(abs(trace2.data))
         ml = Mlrichter(peakamp, R_km, a=a, b=b, g=g) if peakamp is not None else None
         if ml is not None:
             trace.stats.metrics["local_magnitude"] = ml

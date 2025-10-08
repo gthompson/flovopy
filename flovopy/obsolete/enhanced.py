@@ -1,0 +1,2321 @@
+import os
+import json
+import pickle
+import numpy as np
+import pandas as pd
+from math import pi
+
+from scipy.signal import savgol_filter
+from scipy.stats import skew, kurtosis #. describe
+from collections import defaultdict
+
+import matplotlib.pyplot as plt
+
+from obspy import Stream, Trace, read, UTCDateTime, read_events
+from obspy.core.event import (
+    Event, Origin, Magnitude, ResourceIdentifier, Comment,
+    CreationInfo, StationMagnitude, StationMagnitudeContribution,
+    WaveformStreamID, Amplitude, Catalog
+)
+from obspy.core.util.attribdict import AttribDict
+from obspy.geodetics.base import gps2dist_azimuth
+
+from obsolete.core.trace_qc import estimate_snr
+from obsolete.core.spectra import compute_amplitude_spectra
+
+
+class EnhancedStream(Stream):
+    def __init__(self, stream=None, traces=None):
+        if traces is not None:
+            # Allow ObsPy internal logic to pass 'traces='
+            super().__init__(traces=traces)
+        elif stream is not None:
+            # Fallback for manual use with stream=...
+            super().__init__(traces=stream.traces)
+        else:
+            # Empty stream
+            super().__init__()
+
+
+
+
+    def legacy_ampengfft(self, filepath, freq_bins=None, amp_avg_window=2.0,
+                                trigger_window=None, average_window=None):
+        compute_ampengfft_stream(self, freq_bins=freq_bins, amp_avg_window=amp_avg_window)
+        write_aef_file(self, filepath, trigger_window=trigger_window, average_window=average_window)
+
+
+    def ampengfft(
+        self,
+        *,
+        # time-domain stays on by default (cheap)
+        differentiate: bool = False,          # True: input disp -> vel for energy/PGM
+        compute_spectral: bool = False,       # False = skip all FFT-based metrics
+        compute_ssam: bool = False,           # depends on spectral
+        compute_bandratios: bool = False,     # depends on spectral
+        # spectral params
+        threshold: float = 0.707,
+        window_length: int = 9,
+        polyorder: int = 2,
+    ) -> None:
+        """
+        Compute metrics per trace. Time-domain metrics are always computed.
+        Spectral metrics are optional (compute_spectral=False by default).
+
+        differentiate:
+        If True, treat input as DISPLACEMENT, derive VEL (and ACC) for energy/PGM.
+        If False, treat input as already VEL, derive DISP (and ACC).
+        """
+        if len(self) == 0:
+            return
+
+        for tr in self:
+            # Ensure containers
+            if not hasattr(tr.stats, "metrics") or tr.stats.metrics is None:
+                tr.stats.metrics = {}
+
+            # Choose working series (float64 for stability)
+            dt = float(tr.stats.delta)
+            y0 = np.asarray(tr.data, dtype=np.float64)
+
+            tr.detrend("linear").taper(0.01)
+
+            if differentiate:
+                # input assumed DIS -> VEL,ACC
+                disp = tr.copy()
+                vel  = tr.copy().differentiate()
+                acc  = vel.copy().differentiate()
+            else:
+                # input assumed VEL -> DISP,ACC
+                vel  = tr
+                disp = tr.copy().integrate()
+                acc  = tr.copy().differentiate()
+
+            y = np.asarray(vel.data, dtype=np.float64)
+
+            # ---------- TIME-DOMAIN METRICS (cheap) ----------
+            m = tr.stats.metrics
+            if y.size:
+                m["sample_min"]     = float(np.nanmin(y))
+                m["sample_max"]     = float(np.nanmax(y))
+                m["sample_mean"]    = float(np.nanmean(y))
+                m["sample_median"]  = float(np.nanmedian(y))
+                m["sample_rms"]     = float(np.sqrt(np.nanmean(y * y)))
+                m["sample_stdev"]   = float(np.nanstd(y))
+                from scipy.stats import skew, kurtosis
+                m["skewness"]       = float(skew(y, nan_policy="omit"))
+                m["kurtosis"]       = float(kurtosis(y, nan_policy="omit"))
+            else:
+                for k in ("sample_min","sample_max","sample_mean","sample_median",
+                        "sample_rms","sample_stdev","skewness","kurtosis"):
+                    m[k] = np.nan
+
+            # Peak amplitude/time on |VEL| (consistent with typical PGM use)
+            absy = np.abs(y)
+            if absy.size:
+                m["peakamp"] = float(np.nanmax(absy))
+                m["peaktime"] = tr.stats.starttime + (int(np.nanargmax(absy)) * dt)
+            else:
+                m["peakamp"] = np.nan
+                m["peaktime"] = None
+
+            # Energy on working series (VEL unless you changed via differentiate)
+            m["energy"] = float(np.nansum(y * y) * dt) if y.size else np.nan
+
+            # PGD / PGV / PGA
+            try:
+                m["pgv"] = float(np.nanmax(np.abs(vel.data))) if vel.stats.npts else np.nan
+                m["pgd"] = float(np.nanmax(np.abs(disp.data))) if disp.stats.npts else np.nan
+                m["pga"] = float(np.nanmax(np.abs(acc.data))) if acc.stats.npts else np.nan
+            except Exception:
+                m.setdefault("pgv", np.nan)
+                m.setdefault("pgd", np.nan)
+                m.setdefault("pga", np.nan)
+
+            # Dominant frequency (time-domain ratio)
+            try:
+                num = np.abs(vel.data).astype(np.float64)
+                den = 2.0 * np.pi * np.abs(disp.data).astype(np.float64) + 1e-20
+                fdom_series = num / den
+                m["fdom"] = float(np.nanmedian(fdom_series)) if fdom_series.size else np.nan
+            except Exception:
+                m["fdom"] = np.nan
+
+            # (Optional) You can add RSAM/bandratio *without* FFT using time-domain filters
+            # if you want cheap band features here.
+
+            # ---------- SPECTRAL METRICS (optional; more expensive) ----------
+            if not compute_spectral:
+                # Cheap band features (no FFT):
+                # choose your default bands & statistic once
+                _band_pairs = [ (0.5, 2.0, 2.0, 8.0),  # LF vs HF
+                                (1.0, 3.0, 3.0, 12.0) ]  # alt split; optional
+
+                for (l1, l2, h1, h2) in _band_pairs[:1]:  # [:1] keeps just the first pair for speed
+                    br = _td_band_ratio(tr, low=(l1,l2), high=(h1,h2), stat="mean_abs", log2=True)
+                    # Persist RSAM scalars so they’re directly usable downstream
+                    tr.stats.metrics[f"rsam_{l1}_{l2}"] = br["RSAM_low"]
+                    tr.stats.metrics[f"rsam_{h1}_{h2}"] = br["RSAM_high"]
+                    tr.stats.metrics[ br["ratio_key"] ] = br["ratio"]
+                continue
+
+            # Use rFFT (one-sided) for efficiency
+            from numpy.fft import rfft, rfftfreq
+
+            N = tr.stats.npts
+            if N < 2:
+                continue
+
+            Y = np.abs(rfft(y0))  # choose raw series or vel; y0 is raw input
+            F = rfftfreq(N, d=dt)
+
+            if not hasattr(tr.stats, "spectral") or tr.stats.spectral is None:
+                tr.stats.spectral = {}
+            tr.stats.spectral["freqs"] = F
+            tr.stats.spectral["amplitudes"] = Y
+
+            # Bandwidth / cutoffs (uses your helper; stores into metrics)
+            try:
+                get_bandwidth(F, Y, threshold=threshold, window_length=window_length,
+                            polyorder=polyorder, trace=tr)
+            except Exception as e:
+                print(f"[{tr.id}] Skipping bandwidth metrics: {e}")
+
+            # SSAM (optional)
+            if compute_ssam:
+                try:
+                    _ssam(tr)
+                except Exception as e:
+                    print(f"[{tr.id}] SSAM computation failed: {e}")
+
+            # Band ratios (optional)
+            if compute_bandratios:
+                try:
+                    _band_ratio(tr, freqlims=[1.0, 6.0, 11.0])
+                    _band_ratio(tr, freqlims=[0.5, 3.0, 18.0])
+                except Exception as e:
+                    print(f"[{tr.id}] Band ratio computation failed: {e}")
+
+            # Spectral peak/means (store both camel/snake variants for compatibility)
+            try:
+                A = tr.stats.spectral["amplitudes"]
+                if A.size and np.any(A > 0):
+                    peak_idx = int(np.nanargmax(A))
+                    peakf = float(F[peak_idx])
+                    meanf = float(np.nansum(F * A) / np.nansum(A))
+                else:
+                    peakf = meanf = np.nan
+                m["peakf"]   = peakf
+                m["meanf"]   = meanf
+                m["medianf"] = float(np.nanmedian(F[A > 0])) if np.any(A > 0) else np.nan
+
+                # Back-compat into s.stats.spectrum keys some code expects
+                s = getattr(tr.stats, "spectrum", {})
+                s["peakF"]   = peakf
+                s["medianF"] = m["medianf"]
+                s["peakA"]   = float(np.nanmax(A)) if A.size else np.nan
+                tr.stats.spectrum = s
+            except Exception as e:
+                print(f"[{tr.id}] Spectral summary failed: {e}")
+
+
+    def save(self, basepath, save_pickle=False):
+        """
+        Save enhanced stream to .mseed, .csv, and optionally .pickle.
+
+        Parameters
+        ----------
+        basepath : str
+            Base path (without extension) to save files.
+        save_pickle : bool
+            If True, also save the stream as a .pickle file.
+        """
+        if basepath.endswith('.mseed'):
+            basepath = basepath[:-6]
+
+        parentdir = os.path.dirname(basepath)
+        if not os.path.exists(parentdir):
+            os.makedirs(parentdir)
+
+        self.write(basepath + '.mseed', format='MSEED')
+
+
+        rows = []
+
+        for tr in self:
+            s = tr.stats
+            row = {}
+
+            #if include_id:
+            row['id'] = tr.id
+            #if include_starttime:
+            row['starttime'] = s.starttime
+
+            row['Fs'] = s.sampling_rate
+            row['calib'] = getattr(s, 'calib', None)
+            row['units'] = getattr(s, 'units', None)
+            row['quality'] = getattr(s, 'quality_factor', None)
+
+            if hasattr(s, 'spectrum'):
+                for item in ['medianF', 'peakF', 'peakA', 'bw_min', 'bw_max']:
+                    row[item] = s.spectrum.get(item, None)
+
+            if hasattr(s, 'metrics'):
+                m = s.metrics
+                for item in [
+                    'snr', 'signal_level', 'noise_level', 'twin',
+                    'peakamp', 'peaktime', 'energy', 'RSAM_high', 'RSAM_low',
+                    'sample_min', 'sample_max', 'sample_mean', 'sample_median',
+                    'sample_lower_quartile', 'sample_upper_quartile', 'sample_rms',
+                    'sample_stdev', 'percent_availability', 'num_gaps', 'skewness', 'kurtosis'
+                ]:
+                    row[item] = m.get(item, None)
+                for key, value in m.items():
+                    if isinstance(value, dict):
+                        for subkey, subval in value.items():
+                            row[f"{key}_{subkey}"] = subval
+
+            if 'bandratio' in s:
+                for dictitem in s['bandratio']:
+                    label = 'bandratio_' + "".join(str(dictitem['freqlims'])).replace(', ', '_')
+                    row[label] = dictitem['RSAM_ratio']
+
+            if 'lon' in s:
+                row['lon'] = s['lon']
+                row['lat'] = s['lat']
+                row['elev'] = s['elev']
+
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        df = df.round({
+            'Fs': 2, 'secs': 2, 'quality': 2, 'medianF': 1, 'peakF': 1,
+            'bw_max': 1, 'bw_min': 1, 'peaktime': 2, 'twin': 2,
+            'skewness': 2, 'kurtosis': 2
+        })
+
+
+        df.to_csv(basepath + '.csv', index=False)
+
+        if save_pickle:
+            self.write(basepath + '.pickle', format='PICKLE')
+
+    @classmethod
+    def read(cls, basepath, match_on='id'):
+        """
+        Load EnhancedStream from .mseed and .csv file.
+
+        Parameters
+        ----------
+        basepath : str
+            Path without extension (e.g. '/path/to/event')
+
+        Returns
+        -------
+        EnhancedStream
+        """
+        basepath = basepath.replace('.mseed', '')
+        st = read(basepath + '.mseed', format='MSEED')
+        df = pd.read_csv(basepath + '.csv', index_col=False)
+
+        # Load metrics from a DataFrame into each trace.stats.metrics.
+        for tr in st:
+            key = tr.id if match_on == 'id' else tr.stats.starttime
+            row = df[df[match_on] == key]
+            if row.empty:
+                continue
+
+            tr.stats.metrics = {}
+
+            for col in row.columns:
+                if col in ['id', 'starttime']:
+                    continue
+                val = row.iloc[0][col]
+
+                # Optional: split compound keys like 'ssam_A' back into nested dicts
+                if '_' in col:
+                    main_key, sub_key = col.split('_', 1)
+                    if main_key not in tr.stats.metrics:
+                        tr.stats.metrics[main_key] = {}
+                    tr.stats.metrics[main_key][sub_key] = val
+                else:
+                    tr.stats.metrics[col] = val
+
+        return cls(stream=st)
+
+    def attach_station_coordinates_from_inventory(self, inventory):
+        """ attach_station_coordinates_from_inventory """
+        
+        for tr in self:
+            for netw in inventory.networks:
+                for sta in netw.stations:
+                    if tr.stats.station == sta.code and netw.code == tr.stats.network:
+                        for cha in sta.channels:
+                            if tr.stats.location == cha.location_code:
+                                tr.stats.coordinates = AttribDict({
+                                    'latitude':cha.latitude,
+                                    'longitude':cha.longitude,
+                                    'elevation':cha.elevation})
+                                
+    def compute_station_magnitudes(self, inventory, source_coords,
+                                    model='body', Q=50, c_earth=2500, correction=3.7,
+                                    a=1.6, b=-0.15, g=0,
+                                    use_boatwright=True,
+                                    rho_earth=2000, S=1.0, A=1.0,
+                                    rho_atmos=1.2, c_atmos=340, z=100000,
+                                    attach_coords=True, compute_distances=True):
+        """
+        Attach coordinates and estimate energy-based and local magnitudes for all traces.
+
+        Parameters
+        ----------
+        inventory : obspy.Inventory
+            Station metadata
+        source_coords : dict
+            {'latitude': ..., 'longitude': ..., 'depth': ...}
+        model : str
+            'body' or 'surface' wave geometric spreading
+        Q : float
+            Attenuation quality factor
+        c_earth : float
+            Seismic wave speed (m/s)
+        correction : float
+            Correction factor in Hanks & Kanamori formula
+        a, b, g : float
+            ML Richter coefficients and station correction
+        use_boatwright : bool
+            If True, use Boatwright formulation for energy estimation
+        rho_earth, S, A : float
+            Parameters for seismic Boatwright energy model
+        rho_atmos, c_atmos, z : float
+            Parameters for infrasound Boatwright energy model
+        attach_coords : bool
+            Whether to attach station coordinates from inventory
+        compute_distances : bool
+            Whether to compute and store distance (in meters)
+
+        Returns
+        -------
+        stream : obspy.Stream
+            Updated stream with .stats.metrics['energy_magnitude'] and ['local_magnitude']
+        """
+        if attach_coords:
+            self.attach_station_coordinates_from_inventory(inventory)
+
+        for tr in self:
+            try:
+                R = estimate_distance(tr, source_coords)
+
+                if compute_distances:
+                    tr.stats['distance'] = R
+
+                if not hasattr(tr.stats, 'metrics'):
+                    tr.stats.metrics = {}
+
+                # Choose energy model based on data type and user preference
+                if use_boatwright:
+                    if tr.stats.channel[1].upper() == 'D':  # Infrasound
+                        E0 = Eacoustic_Boatwright(tr, R, rho_atmos=rho_atmos, c_atmos=c_atmos, z=z)
+                    else:  # Seismic
+                        E0 = Eseismic_Boatwright(tr, R, rho_earth=rho_earth, c_earth=c_earth, S=S, A=A)
+
+                        # Apply Q correction using spectral peak frequency if available
+                        if 'spectral' in tr.stats and 'freqs' in tr.stats.spectral and 'amplitudes' in tr.stats.spectral:
+                            freqs = tr.stats.spectral['freqs']
+                            amps = tr.stats.spectral['amplitudes']
+                            if np.any(amps > 0):
+                                f_peak = freqs[np.argmax(amps)]
+                                A_att = np.exp(-np.pi * f_peak * R / (Q * c_earth))
+                                E0 /= A_att
+                else:
+                    E0 = estimate_source_energy(tr, R, model=model, Q=Q, c_earth=c_earth)
+
+                ME = Eseismic2magnitude(E0, correction=correction)
+
+                tr.stats.metrics['source_energy'] = E0
+                tr.stats.metrics['energy_magnitude'] = ME
+
+                if tr.stats.channel[1].upper() in ('H', 'L'):
+                    R_km = R / 1000
+                    ML = estimate_local_magnitude(tr, R_km, a=a, b=b, g=g)
+                    tr.stats.metrics['local_magnitude'] = ML
+
+            except Exception as e:
+                print(f"[{tr.id}] Magnitude estimation failed: {e}")
+
+    def magnitudes2dataframe(self):
+        """
+        Summarize trace-level and network-averaged magnitude values.
+
+        Returns
+        -------
+        df : pandas.DataFrame
+            Columns: id, starttime, distance, local_magnitude (ML), energy_magnitude (ME),
+        """
+        rows = []
+
+        for tr in self:
+            row = {
+                'id': tr.id,
+                'starttime': tr.stats.starttime
+            }
+
+            row['distance_m'] = tr.stats.get('distance', np.nan)
+            metrics = tr.stats.get('metrics', {})
+
+            row['ML'] = metrics.get('local_magnitude', np.nan)
+            row['ME'] = metrics.get('energy_magnitude', np.nan)
+            row['source_energy'] = metrics.get('source_energy', np.nan)
+            row['peakamp'] = metrics.get('peakamp', np.nan)
+            row['energy'] = metrics.get('energy', np.nan)
+
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+
+        return df
+
+    def estimate_network_magnitude(self, key='local_magnitude'):
+        """
+        Compute network-average magnitude with uncertainty.
+
+        Parameters
+        ----------
+        key : str
+            Metric to average (e.g., 'local_magnitude', 'energy_magnitude')
+
+        Returns
+        -------
+        tuple of (mean_mag, std_dev, n)
+        """
+        mags = []
+        for tr in self:
+            mag = tr.stats.metrics.get(key)
+            if mag is not None:
+                mags.append(mag)
+
+        if len(mags) == 0:
+            return None, None, 0
+
+        return np.mean(mags), np.std(mags), len(mags)
+    
+    def ampengfftmag(self, inventory, source_coords,
+                     model='body', Q=50, c_earth=2500, correction=3.7,
+                     a=1.6, b=-0.15, g=0,
+                     threshold=0.707, window_length=9, polyorder=2,
+                     differentiate=True, verbose=True, snr_method='std',
+                     snr_split_time=None, snr_window_length=1.0,
+                     snr_min=None):
+        """
+        Compute amplitude, spectral metrics, SNR, and magnitudes for the EnhancedStream.
+
+        Returns
+        -------
+        stream : EnhancedStream
+        df : pandas.DataFrame
+        """
+
+
+        if verbose:
+            print("[2] Estimating SNR values...")
+        for tr in self:
+            if not hasattr(tr.stats, 'metrics'):
+                tr.stats['metrics'] = {}
+            if not 'snr' in tr.stats.metrics:
+                try:
+                    snr, signal_val, noise_val = estimate_snr(
+                        tr, method=snr_method, window_length=snr_window_length,
+                        split_time=snr_split_time, verbose=False
+                    )
+                    tr.stats.metrics['snr'] = snr
+                    tr.stats.metrics['signal'] = signal_val
+                    tr.stats.metrics['noise'] = noise_val
+                except Exception as e:
+                    if verbose:
+                        print(f"[{tr.id}] SNR estimation failed: {e}")
+            
+
+        if snr_min: #is not None:
+            if verbose:
+                print(f"[3] Filtering traces with SNR < {snr_min:.1f}...")
+            filtered = [tr for tr in self if tr.stats.metrics.get('snr', 0) >= snr_min]
+            self._traces = filtered
+            for tr in self:
+                if tr.stats.metrics.snr < snr_min:
+                    self.remove(tr)
+
+        if verbose:
+            print("[1] Computing amplitude and spectral metrics...")
+        self.ampengfft(threshold=threshold, window_length=window_length,
+                  polyorder=polyorder, differentiate=differentiate)
+
+        if verbose:
+            print("[4] Estimating station magnitudes...")
+        self.compute_station_magnitudes(inventory, source_coords,
+                                   model=model, Q=Q, c_earth=c_earth, correction=correction,
+                                   a=a, b=b, g=g,
+                                   attach_coords=True, compute_distances=True)
+
+        if verbose:
+            print("[5] Summarizing network magnitude statistics...")
+        df = self.magnitudes2dataframe()
+        #print(df.describe())
+
+        '''
+        if verbose and not df.empty:
+            net_ml = df.iloc[-1].get('network_mean_ML', np.nan)
+            net_me = df.iloc[-1].get('network_mean_ME', np.nan)
+            print(f"    → Network ML: {net_ml:.2f} | Network ME: {net_me:.2f}")
+        '''
+
+        return self, df
+
+
+    def to_pickle(self, outdir, remove_data=True, mseed_path=None):
+        """
+        Save EnhancedStream to a pickle file with optional data removal.
+
+        Parameters
+        ----------
+        outdir : str
+            Directory to write .pkl file to.
+        remove_data : bool
+            If True, remove trace.data to reduce file size.
+        mseed_path : str
+            Path to the original MiniSEED file (for reference).
+        """
+        os.makedirs(outdir, exist_ok=True)
+        stream_copy = self.copy()
+
+        for tr in stream_copy:
+            if remove_data:
+                tr.data = []
+            tr.stats['mseed_path'] = mseed_path
+
+        # Compose filename
+        filename = os.path.basename(mseed_path or "stream") + ".pkl"
+        outfile = os.path.join(outdir, filename)
+
+        with open(outfile, "wb") as f:
+            pickle.dump(stream_copy, f)
+        
+        print(f"[✓] Saved pickle: {outfile}")
+
+
+    def to_obspyevent(self, source_coords, event_id=None, creation_time=None,
+                    event_type='volcanic eruption', mainclass='LV', subclass=None):
+        """
+        Convert EnhancedStream and source metadata into ObsPy Event object.
+
+        Parameters
+        ----------
+        source_coords : dict
+            {'latitude': ..., 'longitude': ..., 'depth': ...} in meters
+        event_id : str, optional
+            Resource ID for the Event
+        creation_time : str or UTCDateTime, optional
+            Event creation time
+        event_type : str, optional
+            QuakeML-compatible event type
+        mainclass : str, optional
+            High-level classification (e.g., "LV")
+        subclass : str, optional
+            Detailed classification (e.g., "hybrid")
+
+        Returns
+        -------
+        event : obspy.core.event.Event
+        """
+        event = Event()
+
+        # Resource ID and creation time
+        if event_id:
+            event.resource_id = ResourceIdentifier(id=event_id)
+        if creation_time:
+            event.creation_info = {'creation_time': UTCDateTime(creation_time)}
+
+        # Event type and origin
+        if event_type:
+            event.event_type = event_type
+        origin = Origin(
+            latitude=source_coords['latitude'],
+            longitude=source_coords['longitude'],
+            depth=source_coords.get('depth', 0)
+        )
+        event.origins.append(origin)
+
+        # Add network magnitudes
+        df = self.magnitudes2dataframe()
+        if df is not None and not df.empty:
+            net_ml = df.iloc[-1].get('network_mean_ML')
+            net_me = df.iloc[-1].get('network_mean_ME')
+            if pd.notnull(net_ml):
+                event.magnitudes.append(Magnitude(
+                    mag=net_ml, magnitude_type="ML", origin_id=origin.resource_id))
+            if pd.notnull(net_me):
+                event.magnitudes.append(Magnitude(
+                    mag=net_me, magnitude_type="Me", origin_id=origin.resource_id))
+
+        # Add station magnitudes
+        for tr in self:
+            ml = tr.stats.metrics.get('local_magnitude')
+            if ml is None:
+                continue
+            wid = WaveformStreamID(
+                network_code=tr.stats.network,
+                station_code=tr.stats.station,
+                location_code=tr.stats.location,
+                channel_code=tr.stats.channel
+            )
+            smag = StationMagnitude(
+                mag=ml,
+                magnitude_type="ML",
+                station_magnitude_type="ML",
+                waveform_id=wid
+            )
+            event.station_magnitudes.append(smag)
+            if event.magnitudes:
+                event.magnitudes[0].station_magnitude_contributions.append(
+                    StationMagnitudeContribution(
+                        station_magnitude_id=smag.resource_id, weight=1.0))
+
+        # Add trace-level metrics as a comment
+        try:
+            metrics_dict = {tr.id: tr.stats.metrics for tr in self if hasattr(tr.stats, 'metrics')}
+            event.comments.append(Comment(
+                text=json.dumps(metrics_dict, indent=2), force_resource_id=False))
+        except Exception:
+            pass
+
+        # Add classification
+        if mainclass or subclass:
+            class_comment = {"mainclass": mainclass, "subclass": subclass}
+            event.comments.append(Comment(
+                text=json.dumps(class_comment, indent=2), force_resource_id=False))
+
+        return event
+
+
+    def to_enhancedevent(self, event_id=None, dfile=None, origin_time=None):
+        """
+        Convert EnhancedStream to an EnhancedEvent object.
+
+        Parameters
+        ----------
+        event_id : str
+            Event ID this stream belongs to.
+        dfile : str
+            Filename of associated waveform file.
+        origin_time : UTCDateTime
+            Time of event origin (optional).
+
+        Returns
+        -------
+        EnhancedEvent
+        """
+        event = EnhancedEvent()
+        event.event = self.to_obspyevent()
+        event.event_id = event_id
+        event.dfile = dfile
+        event.origin_time = origin_time
+        event.traces = []
+
+        for tr in self:
+            trace_info = {
+                'id': tr.id,
+                'network': tr.stats.network,
+                'station': tr.stats.station,
+                'location': tr.stats.location,
+                'channel': tr.stats.channel,
+                'starttime': str(tr.stats.starttime),
+                'sampling_rate': tr.stats.sampling_rate,
+                'distance_m': tr.stats.get('distance'),
+                'metrics': tr.stats.get('metrics', {}),
+                'spectral': tr.stats.get('spectral', {}),
+            }
+            event.traces.append(trace_info)
+
+        return event
+
+
+########################## METRICS FUNCTIONS FOLLOW ######################
+
+from collections import defaultdict
+import numpy as np
+from numpy.fft import rfft, rfftfreq
+
+_COMPONENT_SETS = [
+    ("Z","N","E"),
+    ("Z","1","2"),
+    ("Z","R","T"),
+]
+
+def _trim_to_overlap(traces):
+    if not traces:
+        return []
+    t0 = max(tr.stats.starttime for tr in traces)
+    t1 = min(tr.stats.endtime   for tr in traces)
+    if t1 <= t0:
+        return []
+    out = []
+    for tr in traces:
+        trc = tr.copy().trim(t0, t1, pad=False)
+        if trc.stats.npts <= 1:
+            return []
+        out.append(trc)
+    return out
+
+def _vector_max_3c(trZ, trN, trE, *, kind="vel"):
+    def as_kind(tr):
+        if kind == "vel":  return tr.copy()
+        if kind == "disp": return tr.copy().integrate()
+        if kind == "acc":  return tr.copy().differentiate()
+        raise ValueError("kind must be vel|disp|acc")
+    trs = _trim_to_overlap([as_kind(trZ), as_kind(trN), as_kind(trE)])
+    if len(trs) != 3:
+        return np.nan
+    z, n, e = (np.asarray(t.data, dtype=np.float64) for t in trs)
+    vec = np.sqrt(z*z + n*n + e*e)
+    return float(np.nanmax(np.abs(vec))) if vec.size else np.nan
+
+def _group_by_station_band(stream):
+    groups = defaultdict(lambda: defaultdict(list))
+    for tr in stream:
+        net, sta, loc, cha = tr.stats.network, tr.stats.station, tr.stats.location, tr.stats.channel
+        if not cha or len(cha) < 3:
+            continue
+        band2 = cha[:2].upper()   # e.g., 'HH','BH','HD','BD'
+        comp  = cha[-1].upper()
+        key = (net, sta, loc, band2)
+        groups[key][comp].append(tr)
+    return groups
+
+# ---------- time-domain "SSAM-lite" ----------
+def _td_rsam(tr, f1, f2, *, stat="mean_abs", corners=2, zerophase=True):
+    try:
+        trf = tr.copy().filter("bandpass", freqmin=float(f1), freqmax=float(f2),
+                               corners=int(corners), zerophase=bool(zerophase))
+        y = trf.data.astype(np.float64)
+        if not y.size:
+            return np.nan
+        if stat == "median_abs":
+            return float(np.nanmedian(np.abs(y)))
+        if stat == "rms":
+            return float(np.sqrt(np.nanmean(y*y)))
+        return float(np.nanmean(np.abs(y)))
+    except Exception:
+        return np.nan
+
+def _td_band_ratio(tr, low=(0.5,2.0), high=(2.0,8.0), *, stat="mean_abs", log2=True):
+    a1,b1 = low; a2,b2 = high
+    r_low  = _td_rsam(tr, a1, b1, stat=stat)
+    r_high = _td_rsam(tr, a2, b2, stat=stat)
+    if not np.isfinite(r_low) or not np.isfinite(r_high) or r_low <= 0:
+        ratio = np.nan
+    else:
+        ratio = r_high / r_low
+        if log2 and ratio > 0:
+            ratio = float(np.log2(ratio))
+    return {
+        "RSAM_low":  r_low,
+        "RSAM_high": r_high,
+        "ratio":     ratio,
+        "ratio_key": f"bandratio_{a1}_{b1}__{a2}_{b2}" + ("_log2" if log2 else ""),
+    }
+
+# ---------- spectral block (optional) ----------
+def _spectral_block(tr, y, dt, threshold, window_length, polyorder, compute_ssam, compute_bandratios):
+    if tr.stats.npts < 2:
+        return
+    Y = np.abs(rfft(y))
+    F = rfftfreq(tr.stats.npts, d=dt)
+    if not hasattr(tr.stats, "spectral") or tr.stats.spectral is None:
+        tr.stats.spectral = {}
+    tr.stats.spectral["freqs"] = F
+    tr.stats.spectral["amplitudes"] = Y
+    try:
+        get_bandwidth(F, Y, threshold=threshold, window_length=window_length,
+                      polyorder=polyorder, trace=tr)
+    except Exception as e:
+        print(f"[{tr.id}] Skipping bandwidth metrics: {e}")
+    if compute_ssam:
+        try:
+            _ssam(tr)
+        except Exception as e:
+            print(f"[{tr.id}] SSAM computation failed: {e}")
+    if compute_bandratios:
+        try:
+            _band_ratio(tr, freqlims=[1.0, 6.0, 11.0])
+            _band_ratio(tr, freqlims=[0.5, 3.0, 18.0])
+        except Exception as e:
+            print(f"[{tr.id}] Band ratio computation failed: {e}")
+    try:
+        A = tr.stats.spectral["amplitudes"]
+        if A.size and np.any(A > 0):
+            peak_idx = int(np.nanargmax(A))
+            peakf = float(F[peak_idx])
+            meanf = float(np.nansum(F * A) / np.nansum(A))
+        else:
+            peakf = meanf = np.nan
+        m = tr.stats.metrics
+        m["peakf"]   = peakf
+        m["meanf"]   = meanf
+        m["medianf"] = float(np.nanmedian(F[A > 0])) if np.any(A > 0) else np.nan
+        s = getattr(tr.stats, "spectrum", {})
+        s["peakF"]   = peakf
+        s["medianF"] = m["medianf"]
+        s["peakA"]   = float(np.nanmax(A)) if A.size else np.nan
+        tr.stats.spectrum = s
+    except Exception as e:
+        print(f"[{tr.id}] Spectral summary failed: {e}")
+
+# ---------- pressure metrics ----------
+def _pressure_metrics(tr, band=(1.0, 20.0)):
+    y = np.asarray(tr.data, dtype=np.float64)
+    pap = float(np.nanmax(np.abs(y))) if y.size else np.nan
+    try:
+        trf = tr.copy().filter("bandpass", freqmin=band[0], freqmax=band[1],
+                               corners=2, zerophase=True)
+        yf = np.asarray(trf.data, dtype=np.float64)
+        pap_band = float(np.nanmax(np.abs(yf))) if yf.size else np.nan
+    except Exception:
+        pap_band = np.nan
+    return pap, pap_band
+
+
+class EventContainer:
+    """
+    A container for storing information about a single volcano-seismic event,
+    including the ObsPy Event object, waveform Stream, trigger dictionary,
+    classification label, and associated miniSEED file path.
+    """
+    def __init__(self, event, stream=None, trigger=None, classification=None, miniseedfile=None):
+        self.event = event
+        self.stream = stream
+        self.trigger = trigger
+        self.classification = classification
+        self.miniseedfile = miniseedfile
+
+    def to_enhancedevent(self):
+        return EnhancedEvent(
+            event=self.event,
+            stream=self.stream,
+            sfile_path=None,  # Optional
+            wav_paths=[self.miniseedfile] if self.miniseedfile else [],
+            trigger_window=self.trigger['trigger_window'] if self.trigger else None,
+            average_window=self.trigger['average_window'] if self.trigger else None,
+            metrics={}  # or extract from stream.stats.metrics
+        )
+
+
+class EnhancedCatalog(Catalog):
+    """
+    Extended ObsPy Catalog class for volcano-seismic workflows.
+
+    Stores:
+    - Event metadata (ObsPy Event objects)
+    - Associated waveform streams
+    - Trigger metadata and parameters
+    - Classifications, QuakeML extras (event_type, mainclass, subclass)
+    - Save/load routines and plotting utilities
+    """
+    def __init__(self, events=None, records=None, triggerParams=None, starttime=None, endtime=None,
+                 comments=None, description=None, resource_id=None, creation_info=None):
+        super().__init__(events=events or [])
+        self.records = records or []
+        self.triggerParams = triggerParams or {}
+        self.starttime = starttime
+        self.endtime = endtime
+        self.comments = comments or []
+        self.description = description or ""
+        self._df_cache = None  # Internal cache for DataFrame representation
+        self._set_resource_id(resource_id)
+        self._set_creation_info(creation_info)
+
+    @property
+    def dataframe(self):
+        """
+        Cached pandas.DataFrame of catalog event metadata.
+        Use `update_dataframe()` to refresh after modifying the catalog.
+        """
+        if self._df_cache is None:
+            self.update_dataframe()
+        return self._df_cache
+
+    def update_dataframe(self, force=False):
+        """
+        Refresh internal DataFrame representation of catalog events.
+
+        Parameters
+        ----------
+        force : bool, optional
+            If True, update even if cache already exists.
+
+        Returns
+        -------
+        None
+            Updates self._df_cache.
+        """
+        if force or self._df_cache is None:
+            self._df_cache = self.to_dataframe()
+
+
+    def addEvent(self, event, stream=None, trigger=None, classification=None,
+                 event_type=None, mainclass=None, subclass=None,
+                 author="EnhancedCatalog", agency_id="MVO"):
+        """
+        Add an ObsPy Event to the catalog with optional metadata and waveform stream.
+        """
+        self.append(event)
+        if event_type:
+            event.event_type = event_type
+            event.event_type_certainty = "suspected"
+        if mainclass:
+            event.comments.append(Comment(text=f"mainclass: {mainclass}"))
+        if subclass:
+            event.comments.append(Comment(text=f"subclass: {subclass}"))
+        if classification:
+            event.comments.append(Comment(text=f"classification: {classification}"))
+        if not event.creation_info:
+            event.creation_info = CreationInfo(
+                author=author, agency_id=agency_id, creation_time=UTCDateTime()
+            )
+        #self.records.append(EventContainer(event, stream, trigger, classification))
+        self.records.append(EnhancedEvent(
+            obspy_event=event,
+            stream=stream,
+            sfile_path=None,  # or pass it if available
+            wav_paths=[s.path for s in stream] if stream else [],
+            aef_path=None,
+            trigger_window=trigger.get('duration') if trigger else None,
+            average_window=trigger.get('average_window') if trigger else None,
+            metrics={
+                "classification": classification,
+                "event_type": event.event_type,
+                "mainclass": mainclass,
+                "subclass": subclass,
+            }
+        ))
+
+
+
+    def get_times(self):
+        """Return a list of origin times for events that have origins."""
+        return [ev.origins[0].time for ev in self if ev.origins]
+
+    def plot_streams(self):
+        """Plot all waveform streams associated with the catalog."""
+        for i, rec in enumerate(self.records):
+            if rec.stream:
+                print(f"\nEVENT NUMBER: {i+1}  time: {rec.stream[0].stats.starttime}\n")
+                rec.stream.plot(equal_scale=False)
+
+    def concat(self, other):
+        """Merge another EnhancedCatalog into this one."""
+        for ev in other:
+            self.append(ev)
+        self.records.extend(other.records)
+
+    def merge(self, other):
+        """
+        Merge another EnhancedCatalog into this one, avoiding duplicate events.
+        """
+        existing_ids = {e.resource_id.id for e in self}
+        for rec in other.records:
+            if rec.event.resource_id.id not in existing_ids:
+                self.append(rec.event)
+                self.records.append(rec)
+
+    def summary(self):
+        """
+        Print a summary of event counts grouped by event_type, mainclass, and subclass.
+        """
+        df = self.to_dataframe()
+        print("\nEvent Type Summary:")
+        print(df['event_type'].value_counts(dropna=False))
+        print("\nMainclass Summary:")
+        print(df['mainclass'].value_counts(dropna=False))
+        print("\nSubclass Summary:")
+        print(df['subclass'].value_counts(dropna=False))
+
+
+    def to_dataframe(self):
+        """
+        Convert catalog metadata to a pandas DataFrame including magnitude,
+        origin coordinates, classification, and QuakeML metadata fields.
+        """
+        rows = []
+        for rec in self.records:
+            row = {
+                'datetime': rec.event.origins[0].time.datetime if rec.event.origins else None,
+                'magnitude': rec.event.magnitudes[0].mag if rec.event.magnitudes else None,
+                'latitude': rec.event.origins[0].latitude if rec.event.origins else None,
+                'longitude': rec.event.origins[0].longitude if rec.event.origins else None,
+                'depth': rec.event.origins[0].depth if rec.event.origins else None,
+                'duration': rec.trigger['duration'] if rec.trigger and 'duration' in rec.trigger else None,
+                'classification': rec.classification,
+                'filename': rec.miniseedfile
+            }
+            if rec.event.event_type:
+                row['event_type'] = rec.event.event_type
+            for c in rec.event.comments:
+                if 'mainclass:' in c.text:
+                    row['mainclass'] = c.text.split(':', 1)[-1].strip()
+                elif 'subclass:' in c.text:
+                    row['subclass'] = c.text.split(':', 1)[-1].strip()
+                elif 'classification:' in c.text and not row.get('classification'):
+                    row['classification'] = c.text.split(':', 1)[-1].strip()
+            if row['magnitude'] is not None:
+                row['energy'] = magnitude2Eseismic(row['magnitude'])
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    '''
+    def save(self, outdir, outfile, net='MV'):
+        """Write QuakeML and associated stream metadata to disk."""
+        self.write_events(outdir, net=net, xmlfile=outfile + '.xml')
+        pklfile = os.path.join(outdir, outfile + '_vars.pkl')
+        picklevars = {
+            'records': self.records,
+            'triggerParams': self.triggerParams,
+            'comments': self.comments,
+            'description': self.description,
+            'starttime': self.starttime.strftime('%Y/%m/%d %H:%M:%S') if self.starttime else None,
+            'endtime': self.endtime.strftime('%Y/%m/%d %H:%M:%S') if self.endtime else None
+        }
+        try:
+            with open(pklfile, "wb") as fileptr:
+                pickle.dump(picklevars, fileptr, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as ex:
+            print("Error during pickling object (Possibly unsupported):", ex)
+    '''
+
+    def save(self, outdir, outfile, net='MV'):
+        """Write catalog-wide QuakeML + JSON for each event and save summary metadata."""
+        self._write_events(outdir, net=net, xmlfile=outfile + '.xml')
+
+        summary_json = os.path.join(outdir, outfile + '_meta.json')
+        summary_vars = {
+            'triggerParams': self.triggerParams,
+            'comments': self.comments,
+            'description': self.description,
+            'starttime': self.starttime.strftime('%Y/%m/%d %H:%M:%S') if self.starttime else None,
+            'endtime': self.endtime.strftime('%Y/%m/%d %H:%M:%S') if self.endtime else None
+        }
+        try:
+            with open(summary_json, "w") as f:
+                json.dump(summary_vars, f, indent=2, default=str)
+        except Exception as ex:
+            print("Error saving catalog summary JSON:", ex)
+
+    def export_csv(self, filepath):
+        """
+        Export catalog metadata and classification fields to a CSV file.
+
+        Parameters
+        ----------
+        filepath : str
+            Path to save the CSV file.
+        """
+        df = self.to_dataframe()
+        df.to_csv(filepath, index=False)
+
+    def _write_events(self, outdir, net='MV', xmlfile=None):
+        """Write event metadata and associated streams to disk."""
+        if xmlfile:
+            self.write(os.path.join(outdir, xmlfile), format="QUAKEML")
+        for rec in self.records:
+            if not hasattr(rec, "to_enhancedevent"):
+                continue
+            enh = rec.to_enhancedevent()
+            t = enh.event.origins[0].time if enh.event.origins else None
+            if not t:
+                continue
+            base_path = os.path.join(outdir, 'WAV', net, t.strftime('%Y'), t.strftime('%m'), t.strftime('%Y%m%dT%H%M%S'))
+            os.makedirs(os.path.dirname(base_path), exist_ok=True)
+            enh.save(os.path.dirname(base_path), os.path.basename(base_path))
+
+    def filter_by_event_type(self, event_type):
+        """Return new catalog filtered by QuakeML event_type."""
+        mask = [rec.event.event_type == event_type for rec in self.records]
+        filtered_records = [rec for rec, m in zip(self.records, mask) if m]
+        filtered_events = [rec.event for rec in filtered_records]
+        return EnhancedCatalog(events=filtered_events, records=filtered_records)
+
+    def filter_by_mainclass(self, mainclass):
+        """Return new catalog filtered by 'mainclass' in comments."""
+        def match_mainclass(event):
+            return any('mainclass:' in c.text and mainclass in c.text for c in event.comments)
+        filtered_records = [rec for rec in self.records if match_mainclass(rec.event)]
+        filtered_events = [rec.event for rec in filtered_records]
+        return EnhancedCatalog(events=filtered_events, records=filtered_records)
+
+    def filter_by_subclass(self, subclass):
+        """Return new catalog filtered by 'subclass' in comments."""
+        def match_subclass(event):
+            return any('subclass:' in c.text and subclass in c.text for c in event.comments)
+        filtered_records = [rec for rec in self.records if match_subclass(rec.event)]
+        filtered_events = [rec.event for rec in filtered_records]
+        return EnhancedCatalog(events=filtered_events, records=filtered_records)
+
+    def group_by(self, field):
+        """
+        Group catalog into multiple subcatalogs by a classification field.
+
+        Parameters
+        ----------
+        field : str
+            One of 'event_type', 'mainclass', or 'subclass'.
+
+        Returns
+        -------
+        dict
+            Dictionary where keys are unique field values, values are EnhancedCatalogs.
+        """
+        grouped = defaultdict(list)
+        for rec in self.records:
+            value = None
+            if field == 'event_type':
+                value = rec.event.event_type
+            else:
+                for c in rec.event.comments:
+                    if f"{field}:" in c.text:
+                        value = c.text.split(':', 1)[-1].strip()
+                        break
+            grouped[value].append(rec)
+
+        return {
+            key: EnhancedCatalog(events=[r.event for r in recs], records=recs)
+            for key, recs in grouped.items()
+        }
+
+    @classmethod
+    def from_dataframe(cls, df, load_waveforms=False):
+        """
+        Construct a EnhancedCatalog from a DataFrame saved by `to_dataframe()`.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame with event metadata.
+        load_waveforms : bool
+            If True, attempt to load each miniSEED file path.
+
+        Returns
+        -------
+        catalog : EnhancedCatalog
+        """
+        records = []
+        for _, row in df.iterrows():
+            ev = Event()
+            if not pd.isna(row['magnitude']):
+                ev.magnitudes = [Magnitude(mag=row['magnitude'])]
+            if not pd.isna(row['latitude']):
+                ev.origins = [Origin(time=UTCDateTime(row['datetime']),
+                                     latitude=row['latitude'],
+                                     longitude=row['longitude'],
+                                     depth=row['depth'])]
+            if not pd.isna(row.get('event_type')):
+                ev.event_type = row['event_type']
+            for key in ['mainclass', 'subclass', 'classification']:
+                if key in row and not pd.isna(row[key]):
+                    ev.comments.append(Comment(text=f"{key}: {row[key]}"))
+
+            stream = None
+            if load_waveforms and isinstance(row.get('filename'), str) and os.path.exists(row['filename']):
+                try:
+                    stream = read(row['filename'])
+                except:
+                    pass
+
+            records.append(EventContainer(ev, stream=stream,
+                                              classification=row.get('classification'),
+                                              miniseedfile=row.get('filename')))
+
+        return cls(events=[r.event for r in records], records=records)
+
+    def plot_magnitudes(self, force_update=False, figsize=(10, 4), fontsize=8):
+        """
+        Plot local magnitude (ML) and energy magnitude (Me) versus time,
+        optionally color-coded by subclass if available.
+
+        Parameters
+        ----------
+        force_update : bool, optional
+            If True, forces a rebuild of the internal event DataFrame.
+        figsize : tuple, optional
+            Size of the matplotlib figure (default: (10, 4)).
+        fontsize : int, optional
+            Font size for labels and ticks.
+        
+        Example
+        -------
+        >>> cat.plot_magnitudes(force_update=True)
+        """
+        import matplotlib.pyplot as plt
+
+        if force_update:
+            self.update_dataframe(forcethese=True)
+
+        df = self.dataframe
+        df = df.dropna(subset=['datetime'])  # Ensure time is available
+
+        fig, ax = plt.subplots(figsize=figsize)
+
+        subclasses = df['subclass'].dropna().unique()
+        if len(subclasses) > 0:
+            for subclass in subclasses:
+                subdf = df[df['subclass'] == subclass]
+                ax.plot(subdf['datetime'], subdf['magnitude'], 'o', label=subclass, alpha=0.7)
+        else:
+            ax.plot(df['datetime'], df['magnitude'], 'o', label='ML', alpha=0.7)
+
+        if 'energy' in df.columns and df['energy'].notna().any():
+            df['Me'] = np.log10(df['energy']) / 1.5
+            ax.plot(df['datetime'], df['Me'], 'x', label='Me', alpha=0.7, color='gray')
+
+        ax.set_ylabel('Magnitude', fontsize=fontsize)
+        ax.set_xlabel('Time', fontsize=fontsize)
+        ax.grid(True)
+        ax.legend(title='Subclass', fontsize=fontsize - 1)
+        plt.xticks(rotation=45, fontsize=fontsize)
+        plt.yticks(fontsize=fontsize)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_eventrate(self, binsize=pd.Timedelta(days=1), time_limits=None, force_update=False, figsize=(10, 6), fontsize=8):
+        """
+        Plot histogram and cumulative count of events, and cumulative energy over time.
+
+        Parameters
+        ----------
+        binsize : pd.Timedelta, optional
+            Binning resolution (e.g. daily, hourly). Default is 1 day.
+        time_limits : tuple(datetime, datetime), optional
+            Optional start and end datetime for filtering the data.
+        force_update : bool, optional
+            If True, refresh the cached DataFrame before plotting.
+        figsize : tuple, optional
+            Size of the matplotlib figure (default: (10, 6)).
+        fontsize : int, optional
+            Font size for labels and ticks.
+
+        Returns
+        -------
+        dfsum : pd.DataFrame
+            Resampled DataFrame with summed and cumulative values.
+
+        Example
+        -------
+        >>> cat.plot_eventrate(binsize=pd.Timedelta(days=1), force_update=True)
+        """
+        import matplotlib.pyplot as plt
+
+        if force_update:
+            self.update_dataframe(force=True)
+
+        df = self.dataframe.copy()
+        df = df.dropna(subset=['datetime'])
+
+        df['counts'] = 1
+
+        if time_limits:
+            start, end = time_limits
+            df = df[(df['datetime'] >= start) & (df['datetime'] <= end)]
+
+        if df.empty:
+            print("No data to plot.")
+            return pd.DataFrame()
+
+        dfsum = df.set_index('datetime').resample(binsize).sum()
+        dfsum['cumcounts'] = dfsum['counts'].cumsum()
+        if 'energy' in dfsum.columns:
+            dfsum['cumenergy'] = dfsum['energy'].cumsum()
+        else:
+            dfsum['cumenergy'] = np.nan
+
+        fig, axs = plt.subplots(2, 1, sharex=True, figsize=figsize)
+
+        # Plot count and cumulative count
+        dfsum.plot(y='counts', ax=axs[0], style='-', color='black', legend=False)
+        if 'cumcounts' in dfsum:
+            dfsum.plot(y='cumcounts', ax=axs[0].twinx(), style='-', color='green', legend=False)
+        axs[0].set_ylabel("Counts", fontsize=fontsize)
+        axs[0].tick_params(labelsize=fontsize)
+
+        # Plot energy and cumulative energy
+        dfsum.plot(y='energy', ax=axs[1], style='-', color='black', legend=False)
+        if 'cumenergy' in dfsum:
+            dfsum.plot(y='cumenergy', ax=axs[1].twinx(), style='-', color='green', legend=False)
+        axs[1].set_ylabel("Energy", fontsize=fontsize)
+        axs[1].tick_params(labelsize=fontsize)
+        axs[1].set_xlabel("Time", fontsize=fontsize)
+
+        plt.xticks(rotation=45, fontsize=fontsize)
+        plt.tight_layout()
+        plt.show()
+
+        return dfsum
+
+
+
+
+def load_catalog(catdir, load_waveforms=False):
+    """
+    Load an EnhancedCatalog from per-event QuakeML + JSON files.
+
+    Parameters
+    ----------
+    catdir : str
+        Path to directory containing .qml + .json pairs.
+    load_waveforms : bool
+        Whether to read waveforms from disk.
+
+    Returns
+    -------
+    EnhancedCatalog
+    """
+    import glob
+    from flovopy.enhanced import EnhancedEvent, EnhancedCatalog, EventContainer
+
+    records = []
+    qml_files = sorted(glob.glob(os.path.join(catdir, "**", "*.qml"), recursive=True))
+
+    for qml_file in tqdm(qml_files, desc="Loading events"):
+        base_path = os.path.splitext(qml_file)[0]
+        try:
+            enh = EnhancedEvent.load(base_path)
+        except Exception as e:
+            print(f"[WARN] Skipping {base_path}: {e}")
+            continue
+
+        stream = None
+        mseedfile = enh.wav_paths[0] if enh.wav_paths else None
+        if load_waveforms and mseedfile and os.path.exists(mseedfile):
+            try:
+                stream = read(mseedfile)
+            except Exception as e:
+                print(f"[WARN] Could not load waveform {mseedfile}: {e}")
+
+        rec = EventContainer(
+            event=enh.event,
+            stream=stream,
+            trigger=enh.trigger_window,
+            classification=enh.metrics.get("class_label"),
+            miniseedfile=mseedfile
+        )
+        records.append(rec)
+
+    return EnhancedCatalog(events=[r.event for r in records], records=records)
+
+
+
+def triggers2catalog(trig_list, threshON, threshOFF, sta_secs, lta_secs, max_secs,
+                     stream=None, pretrig=None, posttrig=None):
+    """
+    Convert a list of trigger dictionaries to a EnhancedCatalog.
+
+    Parameters
+    ----------
+    trig_list : list of dict
+        Triggered events from a coincidence or STA/LTA detector.
+    threshON, threshOFF : float
+        Trigger thresholds.
+    sta_secs, lta_secs : float
+        STA/LTA window lengths.
+    max_secs : float
+        Maximum event duration allowed by trigger logic.
+    stream : obspy.Stream, optional
+        Continuous stream from which to extract waveforms.
+    pretrig, posttrig : float, optional
+        Time before/after trigger time to include in waveform.
+
+    Returns
+    -------
+    EnhancedCatalog
+        Catalog of triggered events with metadata and optional waveforms.
+    """
+    triggerParams = {
+        'threshON': threshON,
+        'threshOFF': threshOFF,
+        'sta': sta_secs,
+        'lta': lta_secs,
+        'max_secs': max_secs,
+        'pretrig': pretrig,
+        'posttrig': posttrig
+    }
+
+    starttime = stream[0].stats.starttime if stream else None
+    endtime = stream[-1].stats.endtime if stream else None
+
+    cat = EnhancedCatalog(triggerParams=triggerParams,
+                                starttime=starttime,
+                                endtime=endtime)
+
+    for thistrig in trig_list:
+        # Create minimal Origin
+        origin = Origin(time=thistrig['time'])
+
+        # Collect amplitudes and station magnitudes
+        amplitudes = []
+        station_magnitudes = []
+        sta_mags = []
+
+        if stream:
+            # Trim waveform
+            this_st = stream.copy().trim(
+                starttime=thistrig['time'] - pretrig,
+                endtime=thistrig['time'] + thistrig['duration'] + posttrig
+            )
+            for i, seed_id in enumerate(thistrig['trace_ids']):
+                tr = this_st.select(id=seed_id)[0]
+                sta_amp = np.nanmax(np.abs(tr.data))
+                snr = thistrig['cft_peaks'][i] if 'cft_peaks' in thistrig else None
+                wf_id = WaveformStreamID(seed_string=tr.id)
+
+                amplitudes.append(Amplitude(snr=snr,
+                                            generic_amplitude=sta_amp,
+                                            unit='dimensionless',
+                                            waveform_id=wf_id))
+
+                sta_mag = np.log10(sta_amp) - 2.5  # Simple placeholder ML
+                station_magnitudes.append(StationMagnitude(mag=sta_mag,
+                                                           mag_type='ML',
+                                                           waveform_id=wf_id))
+                sta_mags.append(sta_mag)
+
+            avg_mag = np.nanmean(sta_mags)
+            network_mag = Magnitude(mag=avg_mag, mag_type='ML')
+            stream_for_event = this_st
+        else:
+            stream_for_event = None
+            amplitudes = []
+            station_magnitudes = []
+            network_mag = None
+
+        # Build event
+        event = Event(origins=[origin],
+                      amplitudes=amplitudes,
+                      magnitudes=[network_mag] if network_mag else [],
+                      station_magnitudes=station_magnitudes,
+                      creation_info=CreationInfo(
+                          author='coincidence_trigger',
+                          creation_time=UTCDateTime()
+                      ),
+                      event_type="not reported")
+
+        # Add to catalog
+        cat.addEvent(event=event, stream=stream_for_event, trigger=thistrig)
+
+    return cat
+
+
+
+class EventFeatureExtractor:
+    """
+    Extracts features and classification labels for volcano-seismic events.
+
+    Designed to be used with EnhancedCatalog and SAM objects.
+    """
+    def __init__(self, catalog, rsamObj=None):
+        self.catalog = catalog
+        self.rsamObj = rsamObj
+
+    def extract_features(self):
+        """
+        Extracts features like peakf, meanf, duration, and RSAM timing indicators.
+
+        Returns
+        -------
+        pd.DataFrame
+            Feature matrix with one row per event.
+        """
+        rows = []
+        for rec in self.catalog.records:
+            feat = {}
+            trZ = rec.stream.select(component="Z")[0] if rec.stream else None
+
+            if hasattr(trZ.stats, "metrics"):
+                feat["peakf"] = trZ.stats.metrics.get("peakf")
+                feat["meanf"] = trZ.stats.metrics.get("meanf")
+
+            if rec.trigger:
+                feat["duration"] = rec.trigger.get("duration")
+
+            if self.rsamObj:
+                rscore = 0
+                for seed_id in self.rsamObj.dataframes:
+                    df2 = self.rsamObj.dataframes[seed_id]
+                    if df2.empty:
+                        continue
+                    maxi = np.argmax(df2["median"])
+                    r = maxi / len(df2)
+                    if 0.3 < r < 0.7:
+                        rscore += 3
+                    elif r < 0.3:
+                        rscore += 1
+                    else:
+                        rscore -= 2
+                feat["rsam_score"] = rscore
+
+            feat["subclass"] = self._get_subclass_label(rec)
+            feat["event_id"] = rec.event.resource_id.id if rec.event.resource_id else None
+            rows.append(feat)
+
+        return pd.DataFrame(rows)
+
+    def _get_subclass_label(self, rec):
+        for c in rec.event.comments:
+            if "subclass:" in c.text:
+                return c.text.split(":", 1)[-1].strip()
+        return None
+
+# --- Classifier scaffold ---
+class VolcanoEventClassifier:
+    def __init__(self):
+        self.classes = ['r', 'e', 'l', 'h', 't']
+
+    def classify(self, feature_dict):
+        """
+        Basic rule-based classifier.
+        Input: dict of features (e.g., 'peakf', 'meanf', 'duration', etc.)
+        Output: subclass label and scores
+        """
+        score = {k: 0.0 for k in self.classes}
+        f = feature_dict
+
+        if 'peakf' in f:
+            if f['peakf'] < 1.0:
+                score['l'] += 2
+                score['e'] += 1
+            elif f['peakf'] > 5.0:
+                score['t'] += 2
+            else:
+                score['h'] += 1
+
+        if 'meanf' in f:
+            if f['meanf'] < 1.0:
+                score['l'] += 2
+            elif f['meanf'] > 4.0:
+                score['t'] += 2
+
+        if 'skewness' in f and f['skewness'] > 2.0:
+            score['r'] += 2
+
+        if 'kurtosis' in f and f['kurtosis'] > 10:
+            score['t'] += 2
+            score['r'] += 1
+
+        if 'duration' in f:
+            d = f['duration']
+            if d < 5:
+                score['t'] += 4; score['h'] += 3; score['r'] -= 5; score['e'] -= 10
+            elif d < 10:
+                score['t'] += 3; score['h'] += 2; score['e'] -= 2
+            elif d < 20:
+                score['t'] += 2; score['h'] += 3; score['l'] += 2
+            elif d < 30:
+                score['h'] += 2; score['l'] += 3; score['r'] += 1
+            elif d < 40:
+                score['h'] += 1; score['l'] += 2; score['r'] += 2
+            else:
+                score['r'] += 3; score['e'] += 5
+
+        total = sum([max(0, v) for v in score.values()])
+        if total > 0:
+            for k in score:
+                score[k] = max(0, score[k]) / total
+
+        subclass = max(score, key=score.get)
+        return subclass, score
+
+# --- Classification wrapper ---
+def classify_and_add_event(stream, catalog, trigger=None, save_stream=False, classifier=None):
+    """
+    Wrapper to compute metrics, magnitudes, and classify subclass for a single event.
+
+    Parameters
+    ----------
+    stream : obspy.Stream
+        Seismic stream for the event.
+    catalog : EnhancedCatalog
+        Catalog to which the event should be added.
+    trigger : dict, optional
+        Dictionary of trigger info, including 'duration'.
+    save_stream : bool
+        Whether to store stream in the catalog (default False).
+    classifier : VolcanoEventClassifier, optional
+        Custom classifier to use.
+
+    Returns
+    -------
+    event : obspy.core.event.Event
+        The ObsPy Event object created and added to catalog.
+    subclass : str
+        Assigned subclass label.
+    features : dict
+        Dictionary of computed features.
+    """
+    # --- Compute metrics ---
+    for tr in stream:
+        ampengfftmag(tr)  # assume this adds metrics into tr.stats.metrics
+
+    # --- Extract features from metrics ---
+    features = {}
+    for tr in stream:
+        m = getattr(tr.stats, 'metrics', {})
+        for key in ['peakf', 'meanf', 'skewness', 'kurtosis']:
+            if key in m:
+                features[key] = m[key]
+    if trigger and 'duration' in trigger:
+        features['duration'] = trigger['duration']
+
+    # --- Classify ---
+    if not classifier:
+        classifier = VolcanoEventClassifier()
+    subclass, score = classifier.classify(features)
+
+    # --- Build event object ---
+    origin = Origin(time=stream[0].stats.starttime)
+    magnitudes = []
+    for tr in stream:
+        m = getattr(tr.stats, 'metrics', {})
+        if 'mag' in m:
+            magnitudes.append(m['mag'])
+    if magnitudes:
+        mag = Magnitude(mag=np.nanmean(magnitudes))
+        magnitude_list = [mag]
+    else:
+        magnitude_list = []
+
+    ev = Event(
+        origins=[origin],
+        magnitudes=magnitude_list,
+        creation_info=CreationInfo(author="classify_and_add_event")
+    )
+
+    # --- Add to catalog ---
+    catalog.addEvent(ev, stream=stream if save_stream else None, trigger=trigger,
+                     classification=subclass, event_type='volcanic eruption',
+                     mainclass='LV', subclass=subclass)
+
+    return ev, subclass, features
+
+
+class EnhancedEvent: # currently this is for the Seisan REA, WAV, AEF combo. Not for trace metrics.
+    @property
+    def event_id(self):
+        return self.event.resource_id.id
+
+    def __init__(self, obspy_event, metrics=None, sfile_path=None, wav_paths=None,
+                 aef_path=None, trigger_window=None, average_window=None, stream=None):
+        """
+        Enhanced representation of a seismic event.
+
+        Parameters
+        ----------
+        obspy_event : obspy.core.event.Event
+            Core ObsPy Event object.
+        metrics : dict, optional
+            Additional metrics or classifications (e.g., peakf, energy, subclass).
+        sfile_path : str, optional
+            Path to original SEISAN S-file.
+        wav_paths : list of str, optional
+            Paths to one or two associated waveform files.
+        aef_path : str, optional
+            Path to AEF file (if external).
+        trigger_window : float, optional
+            Trigger window duration in seconds.
+        average_window : float, optional
+            Averaging window duration in seconds. Used for AEF amplitude
+        stream : obspy.Stream or EnhancedStream, optional
+            Associated waveform stream.
+        """
+        self.event = obspy_event
+        self.metrics = metrics or {}
+        self.sfile_path = sfile_path
+        self.wav_paths = wav_paths or []
+        self.aef_path = aef_path
+        self.trigger_window = trigger_window
+        self.average_window = average_window
+        self.stream = stream
+
+    '''
+    def to_quakeml(self):
+        return self.event'
+    '''
+
+    def __str__(self):
+        summary = ''
+        for key, value in self.__dict__.items():
+            summary += f"{key}->{value}" + '\n'
+        return summary
+
+    def to_json(self):
+        return {
+            "event_id": str(self.event.resource_id),
+            "sfile_path": self.sfile_path,
+            "wav_paths": self.wav_paths,
+            "aef_path": self.aef_path,
+            "trigger_window": self.trigger_window,
+            "average_window": self.average_window,
+            "metrics": self.metrics,
+        }
+
+    def save(self, outdir, base_name):
+        """
+        Save to QuakeML and JSON.
+
+        Parameters
+        ----------
+        outdir : str
+            Base directory to save outputs.
+        base_name : str
+            Base filename (no extension).
+        """
+        qml_path = os.path.join(outdir, base_name + ".qml")
+        os.makedirs(os.path.dirname(qml_path), exist_ok=True)
+        json_path = os.path.join(outdir, base_name + ".json")
+        print(f'Writing obspy event to {qml_path}')
+        print(f'Writing json to {json_path}')
+        json_dict = self.to_json()
+        Catalog(events=[self.event]).write(qml_path, format="QUAKEML")
+
+        with open(json_path, "w") as f:
+            json.dump(json_dict, f, indent=2, default=str)
+        return qml_path, json_path
+
+
+    @classmethod
+    def load(cls, base_path):
+        """
+        Load an EnhancedEvent from a base path (no extension).
+
+        Parameters
+        ----------
+        base_path : str
+            Full path to the event file *without* extension.
+            Assumes `{base_path}.qml` and `{base_path}.json` exist.
+
+        Returns
+        -------
+        EnhancedEvent
+        """
+        qml_file = base_path + ".qml"
+        json_file = base_path + ".json"
+
+        if not os.path.exists(qml_file):
+            raise FileNotFoundError(f"Missing QuakeML file: {qml_file}")
+        if not os.path.exists(json_file):
+            raise FileNotFoundError(f"Missing JSON metadata file: {json_file}")
+
+        event = read_events(qml_file)[0]
+
+        with open(json_file, "r") as f:
+            metadata = json.load(f)
+
+        return cls(
+            obspy_event=event,
+            sfile_path=metadata.get("sfile_path"),
+            wav_paths=metadata.get("wav_paths", []),
+            aef_path=metadata.get("aef_path"),
+            trigger_window=metadata.get("trigger_window"),
+            average_window=metadata.get("average_window"),
+            metrics=metadata.get("metrics", {})
+        )
+    
+    def write_to_db(self, conn):
+        """
+        Write EnhancedEvent trace metrics to a database.
+
+        Parameters
+        ----------
+        conn : sqlite3.Connection
+            Open database connection.
+        """
+        cur = conn.cursor()
+
+        for trace in self.traces:
+            metrics = trace.get('metrics', {})
+            spectral = trace.get('spectral', {})
+
+            cur.execute('''INSERT OR REPLACE INTO aef_metrics 
+                (event_id, trace_id, network, station, location, channel, starttime,
+                distance_m, snr, peakamp, energy, peakf, meanf, skewness, kurtosis)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
+                self.event_id,
+                trace['id'],
+                trace['network'],
+                trace['station'],
+                trace['location'],
+                trace['channel'],
+                trace['starttime'],
+                trace.get('distance_m'),
+                metrics.get('snr'),
+                metrics.get('peakamp'),
+                metrics.get('energy'),
+                metrics.get('peakf'),
+                metrics.get('meanf'),
+                metrics.get('skewness'),
+                metrics.get('kurtosis')
+            ))
+
+        conn.commit()
+        print(f"[✓] Inserted {len(self.traces)} trace metrics into DB for event {self.event_id}")
+
+
+def catalog_to_dataframe(catalog, mag_type=None):
+    """
+    Convert an ObsPy Catalog to a pandas DataFrame with event info.
+    
+    Parameters:
+    - catalog (obspy.Catalog): The ObsPy catalog to convert.
+    - mag_type (str or None): If provided, filter by magnitude type (e.g., 'ML', 'MD', 'ME').
+
+    Returns:
+    - pd.DataFrame with columns ['time', 'longitude', 'latitude', 'depth', 'magnitude']
+    """
+    records = []
+    for event in catalog:
+        if not event.origins or not event.magnitudes:
+            continue
+
+        origin = event.origins[0]
+
+        # Select magnitude
+        magnitude = None
+        if mag_type:
+            for mag in event.magnitudes:
+                if mag.magnitude_type == mag_type:
+                    magnitude = mag
+                    break
+        else:
+            magnitude = event.magnitudes[0]
+
+        if magnitude is None:
+            continue
+
+        records.append({
+            'time': origin.time.datetime,
+            'longitude': origin.longitude,
+            'latitude': origin.latitude,
+            'depth': origin.depth / 1000.0 if origin.depth is not None else None,
+            'magnitude': magnitude.mag
+        })
+        
+
+    df = pd.DataFrame(records)
+    df['time'] = pd.to_datetime(df['time'])
+    return df
+
+
+def bin_events(df, interval='D', groupby=None, threshold_magnitude=1.0, lowest_magnitude=-2.0):
+    """
+    Bin seismic events and compute statistics per time interval.
+    
+    Parameters:
+    df (pd.DataFrame): Must include 'time' and 'magnitude' columns.
+    interval (str): Resampling frequency ('T', 'H', 'D', 'M', 'Y')
+    groupby (str or None): Optional secondary group, e.g., 'subclass'
+
+    Returns:
+    pd.DataFrame with columns:
+        - time
+        - event_count
+        - average_magnitude
+        - cumulative_energy (Joules)
+        - cumulative_magnitude (log10-scaled)
+        - plus optional group column
+    """
+    df = df.copy()
+    # Track placeholder replacement
+    df['imputed'] = df['magnitude'] < lowest_magnitude
+
+    # Replace magnitudes < -1 with smallest valid value
+    valid_magnitudes = df['magnitude'][df['magnitude'] >= lowest_magnitude]
+    if not valid_magnitudes.empty:
+        min_valid_mag = valid_magnitudes.min()
+        df['magnitude'] = df['magnitude'].where(df['magnitude'] >= -1, min_valid_mag)
+    else:
+        df['magnitude'] = lowest_magnitude
+
+    # Convert to energy
+    df['energy'] = magnitude2Eseismic(df['magnitude'])
+
+    # Replace 0.0 energy with smallest non-zero value
+    nonzero_energy = df['energy'][df['energy'] > 0.0]
+    if not nonzero_energy.empty:
+        min_energy = nonzero_energy.min()
+        df.loc[df['energy'] == 0.0, 'energy'] = min_energy
+
+    df['time'] = pd.to_datetime(df['time'])
+
+    if groupby and groupby in df.columns:
+        group_cols = [pd.Grouper(key='time', freq=interval), groupby]
+    else:
+        group_cols = [pd.Grouper(key='time', freq=interval)]
+
+    grouped = df.groupby(group_cols).agg({
+        'magnitude': ['count', 'min', 'mean', 'max'],
+        'energy': 'sum'
+    })
+    grouped.columns = ['event_count', 'minimum_magnitude', 'average_magnitude', 'maximum_magnitude', 'cumulative_energy']
+    grouped['cumulative_magnitude'] = Eseismic2magnitude(grouped['cumulative_energy'])
+    
+    df_threshold = df[df['magnitude'] >= threshold_magnitude]
+    thresholded = df_threshold.groupby(group_cols).agg({
+        'magnitude': ['count'],
+        'energy': 'sum'
+    })
+    
+    thresholded.columns = ['thresholded_count', 'thresholded_energy']   
+    grouped['thresholded_count'] = thresholded['thresholded_count'].fillna(0)
+    grouped['thresholded_energy'] = thresholded['thresholded_energy'].fillna(0)
+    grouped['thresholded_magnitude'] = Eseismic2magnitude(grouped['thresholded_energy'])
+    
+
+    return grouped.reset_index()
+
+import matplotlib.pyplot as plt
+'''
+def plot_event_statistics(binned_df, ax=None, label=None, outfile=None):
+    """
+    Plot event count and average magnitude. Use provided axes if given.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        own_fig = True
+    else:
+        own_fig = False
+
+    ax2 = ax.twinx()
+    ax.bar(binned_df['time'], binned_df['event_count'], color='blue', alpha=0.5, label='Count' if label is None else label)
+    ax.set_ylabel('Event Count', color='blue')
+    ax.tick_params(axis='y', labelcolor='blue')
+    ax.set_xlabel('Time')
+
+    ax2.plot(binned_df['time'], binned_df['average_magnitude'], color='green', marker='o', label='Avg Mag', markersize=2)
+    ax2.set_ylabel('Avg Magnitude', color='green')
+    ax2.tick_params(axis='y', labelcolor='green')
+
+    if own_fig:
+        ax.set_title('Event Count and Avg Magnitude Over Time')
+        plt.tight_layout()
+        if outfile:
+            plt.savefig(outfile, dpi=300)
+        else:
+            plt.show()
+
+def plot_event_statistics(binned_df, ax=None, label=None, outfile=None):
+    """
+    Plot event count (bar) and average magnitude (line) over time.
+
+    Parameters:
+    - binned_df: DataFrame with time, event_count, and average_magnitude
+    - ax: optional matplotlib axis to draw the bar chart on
+    - label: optional legend label for event count
+    - outfile: optional path to save the figure if ax is None
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Bar chart (left y-axis)
+    #bar = binned_df.plot(kind='bar', x='time', y='event_count', ax=ax, color='blue', alpha=0.5, label=label or 'Count', legend=False)
+    bar = binned_df.plot(x='time', y='event_count', ax=ax, kind='line', drawstyle='steps-mid', color='blue', label=label or 'Count', legend=False)
+    # Twin axis for average magnitude (right y-axis)
+    ax2 = ax.twinx()
+    ax2.plot(binned_df['time'], binned_df['average_magnitude'], color='green', marker='o', markersize=2, label='Avg Mag')
+    
+    ax.set_ylabel('Event Count', color='blue')
+    ax2.set_ylabel('Avg Magnitude', color='green')
+    ax.tick_params(axis='y', labelcolor='blue')
+    ax2.tick_params(axis='y', labelcolor='green')
+    ax.set_xlabel('Time')
+
+    if ax is None and outfile:
+        plt.tight_layout()
+        plt.savefig(outfile, dpi=300)
+        plt.close()
+    elif ax is None:
+        plt.tight_layout()
+        plt.show()
+
+def plot_event_statistics(
+    binned_df,
+    ax=None,
+    label=None,
+    secondary_y='cumulative_magnitude',
+    outfile=None
+):
+    """
+    Plot event count and a second variable (e.g. magnitude, energy) over time.
+    """
+    import matplotlib.dates as mdates
+
+    # Validate time column
+    binned_df = binned_df.copy()
+    binned_df['time'] = pd.to_datetime(binned_df['time'])
+    binned_df = binned_df.sort_values('time')
+
+    if secondary_y not in binned_df.columns:
+        print(f"[WARNING] {secondary_y} not found in DataFrame. Defaulting to 'cumulative_magnitude'.")
+        secondary_y = 'cumulative_magnitude'
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        own_fig = True
+    else:
+        own_fig = False
+
+    # Plot primary: event counts
+    ax.plot(binned_df['time'], binned_df['event_count'], drawstyle='steps-mid',
+            color='blue', label=label or 'Count', linewidth=1.5)
+
+    ax.set_ylabel('Event Count', color='blue')
+    ax.tick_params(axis='y', labelcolor='blue')
+    ax.set_xlabel('Time')
+
+    # Format time axis
+    format_time_axis(ax, binned_df['time'])
+
+    # Plot secondary axis
+    ax2 = ax.twinx()
+    ax2.plot(binned_df['time'], binned_df[secondary_y], color='green',
+             marker='o', linewidth=2, markersize=3, label=secondary_y)
+    ax2.set_ylabel(secondary_y.replace('_', ' ').title(), color='green')
+    ax2.tick_params(axis='y', labelcolor='green')
+
+    if own_fig:
+        plt.tight_layout()
+        if outfile:
+            plt.savefig(outfile, dpi=300)
+            plt.close()
+        else:
+            plt.show()
+'''
+def plot_event_statistics(
+    binned_df,
+    ax=None,
+    label=None,
+    secondary_y='cumulative_magnitude',
+    outfile=None
+):
+    import matplotlib.dates as mdates
+
+    df = binned_df.copy()
+    df['time'] = pd.to_datetime(df['time'])
+    df = df.sort_values('time')
+
+    if secondary_y not in df.columns:
+        print(f"[WARNING] {secondary_y} not found in DataFrame. Skipping.")
+        return
+
+    df = df[np.isfinite(df['event_count']) & np.isfinite(df[secondary_y])]
+
+    if df.empty:
+        print(f"[WARNING] No valid data to plot for {label or 'unknown'} subclass.")
+        return
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        own_fig = True
+    else:
+        own_fig = False
+
+    # Plot left axis: event count
+    ax.plot(df['time'], df['event_count'], drawstyle='steps-mid',
+            color='blue', label=label or 'Event Count', linewidth=1.5)
+    ax.fill_between(df['time'], df['event_count'], step='mid', color='blue', alpha=0.2)
+    ax.set_ylabel('Event Count', color='blue')
+    ax.tick_params(axis='y', labelcolor='blue')
+    ax.set_xlabel('')
+
+    # Format time axis
+    #format_time_axis(ax, df['time'])
+
+    # Plot right axis: secondary metric
+    ax2 = ax.twinx()
+    ax2.plot(df['time'], df[secondary_y], color='green', drawstyle='steps-mid',
+             linewidth=3, label=secondary_y)
+    ax2.set_ylabel(secondary_y.replace('_', ' ').title(), color='green')
+    ax2.tick_params(axis='y', labelcolor='green')
+
+    ax.grid(True, which='major', axis='both', linestyle='--', alpha=0.3)
+    ax.tick_params(axis='x', labelbottom=True)
+    if own_fig:
+        plt.tight_layout()
+        if outfile:
+            plt.savefig(outfile, dpi=300)
+            plt.close()
+        else:
+            plt.show()
+
+import matplotlib.dates as mdates
+'''
+def format_time_axis(ax, time_series):
+    """
+    Automatically format x-axis tick labels based on inferred frequency.
+    """
+    inferred_freq = pd.infer_freq(time_series.sort_values())
+    if inferred_freq is None:
+        inferred_freq = 'D'  # fallback default
+
+    # Set formatter and locator based on inferred frequency
+    if inferred_freq.startswith('T'):  # minute
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=10))
+    elif inferred_freq.startswith('H'):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %Hh'))
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+    elif inferred_freq.startswith('D'):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=7))
+    elif inferred_freq.startswith('W'):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y W%W'))
+        ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO, interval=1))    
+    elif inferred_freq.startswith('M'):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+    elif inferred_freq.startswith('Y'):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        ax.xaxis.set_major_locator(mdates.YearLocator())
+    else:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+
+'''
+def format_time_axis(ax, time_series):
+    """
+    Format time axis based on actual range and resolution of time_series.
+    Assumes time_series is sorted and datetime64[ns].
+    """
+    # Ensure datetime
+    time_series = pd.to_datetime(time_series)
+    time_series = time_series.dropna().sort_values()
+
+    if len(time_series) < 2:
+        return  # nothing to format
+
+    # Calculate actual time step
+    delta = (time_series.iloc[1] - time_series.iloc[0]).total_seconds()
+
+    # Choose format and locator based on delta
+    if delta < 3600:  # less than 1 hour
+        fmt = '%H:%M'
+        locator = mdates.MinuteLocator(interval=10)
+    elif delta < 86400:  # less than 1 day
+        fmt = '%Y-%m-%d %Hh'
+        locator = mdates.HourLocator(interval=6)
+    elif delta < 7 * 86400:  # less than 1 week
+        fmt = '%Y-%m-%d'
+        locator = mdates.DayLocator(interval=1)
+    elif delta < 32 * 86400:
+        fmt = '%Y-%m-%d'
+        locator = mdates.WeekdayLocator(byweekday=mdates.MO)
+    elif delta < 92 * 86400:
+        fmt = '%Y-%m'
+        locator = mdates.MonthLocator(interval=1)
+    else:
+        fmt = '%Y'
+        locator = mdates.YearLocator()
+
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt))
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+'''
+def plot_event_statistics(
+    binned_df,
+    ax=None,
+    label=None,
+    secondary_y='cumulative_magnitude',
+    outfile=None
+):
+    """
+    Plot event count (bars) and a second timeseries (line) on dual axes.
+
+    Parameters:
+    - binned_df: DataFrame with at least 'time', 'event_count', and secondary_y column
+    - ax: optional matplotlib axis
+    - label: label for bar chart (event count)
+    - secondary_y: column to plot on secondary y-axis
+    - outfile: optional file path to save the figure
+    """
+    if secondary_y not in binned_df.columns:
+        print(f"[WARNING] {secondary_y} not found in DataFrame. Defaulting to 'cumulative_magnitude'.")
+        secondary_y = 'cumulative_magnitude'
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        own_fig = True
+    else:
+        own_fig = False
+
+    # Bar plot on primary y-axis
+    binned_df.plot(kind='bar', x='time', y='event_count', ax=ax,
+                   color='blue', alpha=0.5, legend=False, label=label or 'Event Count')
+
+    # Line plot on secondary y-axis
+    ax2 = ax.twinx()
+    binned_df.plot(x='time', y=secondary_y, ax=ax2,
+                   color='green', marker='o', linewidth=2, markersize=3, legend=False)
+
+    ax.set_ylabel('Event Count', color='blue')
+    ax2.set_ylabel(secondary_y.replace('_', ' ').title(), color='green')
+    ax.tick_params(axis='y', labelcolor='blue')
+    ax2.tick_params(axis='y', labelcolor='green')
+    ax.set_xlabel('Time')
+
+    #format_time_axis(ax, binned_df['time'])
+
+    if own_fig:
+        plt.tight_layout()
+        if outfile:
+            plt.savefig(outfile, dpi=300)
+            plt.close()
+        else:
+            plt.show()        
+''' 
+def plot_event_energy(binned_df, ax=None, label=None, outfile=None):
+    """
+    Plot cumulative energy per time bin. Use provided axes if given.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        own_fig = True
+    else:
+        own_fig = False
+
+    ax.plot(binned_df['time'], binned_df['cumulative_energy'], linewidth=2, label=label)
+    ax.set_ylabel('Cumulative Energy')
+    ax.set_xlabel('Time')
+    if own_fig:
+        ax.set_title('Total Energy Over Time')
+        ax.grid(True)
+        plt.tight_layout()
+        if outfile:
+            plt.savefig(outfile, dpi=300)
+        else:
+            plt.show()
+
+if  __name__ == '__main__':
+    cat = EnhancedCatalog()
+
+    # 1. Parse the S-file
+    sfile_event_metadata = parse_sfile("path/to/SEISANfile.S")  # your existing function
+
+    # 2. Load waveform
+    raw_stream = read("path/to/miniseedfile.mseed")
+
+    # 3. Convert to EnhancedStream
+    enh_st = EnhancedStream(raw_stream)
+
+    # 4. Run ampengfftmag
+    enh_st.ampengfftmag(inventory=inventory, source_coords=sfile_event_metadata)
+
+    # 5. Build ObsPy Event
+    event = create_event_from_sfile_and_stream(sfile_event_metadata, enh_st, inventory, source_coords=sfile_event_metadata)
+
+    # 6. Add to catalog
+    cat.addEvent(triggerdict=sfile_event_metadata, stream=enh_st, obspy_event=event)
+

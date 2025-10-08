@@ -200,10 +200,10 @@ class EnhancedStream(Stream):
     def ampengfft(
         self,
         *,
-        differentiate: bool = False,          # applies to seismic only
         compute_spectral: bool = False,
         compute_ssam: bool = False,
         compute_bandratios: bool = False,
+        stream_units: str = "m/s",
         # SAM / SEM controls
         compute_sam: bool = True,
         compute_sem: bool = False,
@@ -216,17 +216,17 @@ class EnhancedStream(Stream):
         window_length: int = 9,
         polyorder: int = 2,
     ) -> None:
-        """Compute per-trace metrics (TD + optional spectral) and station rollup."""
+        """Compute per-trace metrics (TD + optional spectral) and station rollup.
+           Assumes EnhancedStream has displacement units """
         if len(self) == 0:
             self.station_metrics = pd.DataFrame()
             return
 
         for tr in self:
             m = self._ensure_metrics(tr)
-
             # detrend/taper (light)
             try:
-                tr.detrend("linear").taper(0.01)
+                tr.detrend("linear")
             except Exception:
                 pass
 
@@ -234,22 +234,29 @@ class EnhancedStream(Stream):
             y_raw = np.asarray(tr.data, dtype=np.float64)
 
             # ----- branch by data type -----
-            if self._is_infrasound(tr):
+            is_seismic = True
+            units = tr.stats.get('units', None)
+            if units.lower() in [None, "counts"]:
+                print('[AMPENGFFT]: You must set tr.stats.units on {tr.id} before calling this function. Rejecting this Trace.')
+                self.remove(tr)
+                continue
+            elif units.lower() == "m":
+                disp = tr.copy()
+                vel  = tr.copy().differentiate()
+                acc  = vel.copy().differentiate()  
+            elif units.lower() == "m/s":
+                vel  = tr
+                disp = tr.copy().integrate().detrend('linear').filter('highpass', freq=0.2, corners=2)
+                acc  = tr.copy().differentiate()    
+            elif units.lower == 'pa':                       
                 # pressure series
                 self._td_stats(tr, y_raw)
                 pap, pap_bp = self._pressure_metrics(tr, band=(1.0, 20.0))
                 m["pap"] = pap
                 m["pap_bp_1_20"] = pap_bp
-            else:
-                # seismic: treat input as velocity unless differentiate=True flips semantics
-                if differentiate:
-                    disp = tr.copy()
-                    vel  = tr.copy().differentiate()
-                    acc  = vel.copy().differentiate()
-                else:
-                    vel  = tr
-                    disp = tr.copy().integrate()
-                    acc  = tr.copy().differentiate()
+                is_seismic = False
+            
+            if is_seismic:
 
                 y = np.asarray(vel.data, dtype=np.float64)
                 self._td_stats(tr, y)
@@ -314,7 +321,7 @@ class EnhancedStream(Stream):
     def _vector_max_3c(self, trZ: Trace, trN: Trace, trE: Trace, *, kind="vel") -> float:
         def as_kind(tr):
             if kind == "vel":  return tr.copy()
-            if kind == "disp": return tr.copy().integrate()
+            if kind == "disp": return tr.copy().integrate().detrend('linear')
             if kind == "acc":  return tr.copy().differentiate()
             raise ValueError("kind must be vel|disp|acc")
         # trim to overlap
@@ -530,7 +537,7 @@ class EnhancedStream(Stream):
         source_coords: dict,
         *,
         # ampengfft params
-        differentiate: bool = True,
+        stream_units: str = "m/s",
         compute_spectral: bool = True,
         compute_ssam: bool = False,
         compute_bandratios: bool = False,
@@ -591,7 +598,7 @@ class EnhancedStream(Stream):
         # --- 3) Per-trace metrics ---
         if verbose: print("[3] Computing amplitude/spectral metrics…")
         self.ampengfft(
-            differentiate=differentiate,
+            stream_units=stream_units,
             compute_spectral=compute_spectral,
             compute_ssam=compute_ssam,
             compute_bandratios=compute_bandratios,

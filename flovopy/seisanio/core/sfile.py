@@ -8,7 +8,7 @@ from flovopy.seisanio.core.wavfile import Wavfile
 from flovopy.seisanio.core.aeffile import AEFfile
 from flovopy.seisanio.utils.helpers import filetime2wavpath, spath2datetime
 from flovopy.core.trace_utils import correct_nslc_mvo
-from flovopy.core.enhanced import EnhancedEvent
+from flovopy.obsolete.enhanced import EnhancedEvent
 import json
 
 class Sfile:

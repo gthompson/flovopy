@@ -512,7 +512,7 @@ def draw_multiline_title(
     title,                     # str with \n OR list/tuple of lines
     *,
     font="12p,Helvetica-Bold,black",
-    pad_rel=0.05,              # gap above top frame as a fraction of map height
+    pad_rel=0.0,              # gap above top frame as a fraction of map height
     line_rel=0.02,             # line spacing as a fraction of map height
     justify="TC",
 ):

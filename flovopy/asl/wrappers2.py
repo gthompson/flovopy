@@ -27,6 +27,8 @@ from flovopy.enhanced.stream import EnhancedStream
 from flovopy.asl.map import plot_heatmap_colored
 from flovopy.asl.asl import ASL
 from flovopy.processing.spectrograms import icewebSpectrogram
+from flovopy.processing.sam import VSAM, DSAM
+from flovopy.asl.reduced_time import shift_stream_by_travel_time
 
 # Needed for run_all_events()
 import traceback
@@ -462,10 +464,20 @@ def asl_sausage(
 
     return {"primary": primary_out, "refined": refined_out}
 
+
+def stream_add_units(st, mseed_units='m/s'):
+    for tr in st:
+        median_abs = float(np.nanmedian(np.abs(tr.data))) if tr.data is not None else np.inf
+        if median_abs < 1.0:
+            # probably already physical units
+            tr.stats["units"] = mseed_units  
+        else:
+            tr.stats["units"] = 'Counts'  
+
 # ---------------------------------------------------------------------
 # Single event
 # ---------------------------------------------------------------------
-
+'''
 def run_single_event(
     mseed_file: str,
     cfg: ASLConfig,
@@ -475,6 +487,7 @@ def run_single_event(
     topo_kw: Optional[dict] = None,
     switch_event_ctag: bool = True,
     vertical_only: bool = True,
+    mseed_units: str = None,
     debug: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -539,20 +552,18 @@ def run_single_event(
         else:
             print("[GAINS] No station gains DataFrame provided; skipping.")
 
+        # Could add more complex Trace processing here from my preprocessing and remove_response modules
         st.merge(fill_value='interpolate')
         st.detrend('linear')
         st.taper(max_percentage=0.02, type='cosine')
         st.filter('bandpass', freqmin=0.1, freqmax=18.0, corners=2, zerophase=True)
 
         # 2) Remove response if needed / set units based on SAM class
-        try:
-            from flovopy.processing.sam import DSAM, VSAM as _VSAM  # for class checks if available
-        except Exception:
-            DSAM = type("DSAM_PLACEHOLDER", (), {})  # sentinel if DSAM not importable
-            _VSAM = cfg.sam_class
+        if mseed_units:
+            stream_add_units(st, mseed_units='m/s')
 
-        units_by_class  = {DSAM: "m",    _VSAM: "m/s"}
-        output_by_class = {DSAM: "DISP", _VSAM: "VEL"}
+        units_by_class  = {DSAM: "m",    VSAM: "m/s"}
+        output_by_class = {DSAM: "DISP", VSAM: "VEL"}
         output = output_by_class.get(cfg.sam_class)
 
         for tr in st:
@@ -571,9 +582,32 @@ def run_single_event(
                         tr.remove_response(inventory=cfg.inventory, output=output)
                     except:
                         st.remove(tr)
+            if units == "m/s" and cfg.sam_class==DSAM:
+                print('[RUN_SINGLE_EVENT]: Units mismatch for {tr.id} Integrating')
+                # need to integrate
+                tr.detrend('linear')
+                tr.taper(0.02)
+                tr.integrate()
+                tr.units = "m"
+            elif units == "m" and cfg.sam_class==VSAM:
+                # need to differentiate
+                print('[RUN_SINGLE_EVENT]: Units mismatch for {tr.id}. Differentiating')
+                tr.differentiate()
+                tr.units = "m/s"
 
         if len(st) < int(cfg.min_stations):
             raise RuntimeError(f"Not enough stations: {len(st)} < {cfg.min_stations}")
+        
+        # Reduce by travel time
+        shift_stream_by_travel_time(
+            st, 
+            cfg.inventory, topo_kw['dome_location'],
+            speed_km_s=cfg.speed,       # or any speed you want to test
+            use_elevation=True,
+            inplace=True,
+            trim=True,
+            verbose=True,
+        )
 
 
         ##################################################################################
@@ -611,9 +645,11 @@ def run_single_event(
             stream_png = os.path.join(event_dir, "stream.png")
             if not os.path.isfile(stream_png):
                 st.plot(equal_scale=False, outfile=stream_png)
-            sgram_png = os.path.join(event_dir, "spectrogram.png")
+            sgram_png = os.path.join(event_dir, "spectrogram_log.png")
             if not os.path.isfile(sgram_png):
-                icewebSpectrogram(st).plot(fmin=0.1, fmax=10.0, log=True, cmap='plasma', dbscale=False, outfile=sgram_png)
+                icewebSpectrogram(st).plot(fmin=0.1, fmax=10.0, log=True, cmap='plasma', dbscale=False, outfile=sgram_png, title=str(Path(mseed_file).stem))
+                icewebSpectrogram(st).plot(fmin=0.1, fmax=10.0, log=False, cmap='plasma', dbscale=False, outfile=sgram_png.replace('_log.png', '_linear.png'), title=str(Path(mseed_file).stem))
+
 
         # --- Everything below gets teed to event.log ---
         with tee_stdouterr(log_file, also_console=debug):
@@ -664,7 +700,7 @@ def run_single_event(
     except Exception as e:
         traceback.print_exc()
         return {"tag": tag_str, "error": f"{type(e).__name__}: {e}", "outdir": cfg.outdir}
-    
+'''    
 # ---------------------------------------------------------------------
 # All events (with optional multiprocessing)
 # ---------------------------------------------------------------------
@@ -680,6 +716,7 @@ def run_all_events(
     max_events: Optional[int] = None,
     use_multiprocessing: bool = True,
     workers: Optional[int] = None,
+    mseed_units: Optional[str] = None,
     debug: bool = True,
 ) -> str:
     """
@@ -1302,6 +1339,7 @@ def run_single_event(
     mseed_file: str,
     cfg: ASLConfig,
     *,
+    mseed_units: str = None,
     refine_sector: bool = False,
     station_gains_df: Optional[pd.DataFrame] = None,
     topo_kw: Optional[dict] = None,
@@ -1528,65 +1566,101 @@ def run_single_event(
             print(f"[GAINS] Interval used: {s} → {e} | corrected {len(used)} traces; missing {len(miss)}")
         else:
             print("[GAINS] No station gains DataFrame provided; skipping.")
+        
 
+        # Could add more complex Trace processing here from my preprocessing and remove_response modules
         st.merge(fill_value="interpolate")
         st.detrend("linear")
-        st.taper(max_percentage=0.02, type="cosine")
-        st.filter("bandpass", freqmin=0.1, freqmax=18.0, corners=2, zerophase=True)
+        #st.taper(max_percentage=0.02, type="cosine")
+        st.filter("bandpass", freqmin=0.2, freqmax=18.0, corners=2, zerophase=True)
+
+        if mseed_units:
+            stream_add_units(st, mseed_units='m/s')
 
         # 2) Remove response if needed / set units based on SAM class
-        try:
-            from flovopy.processing.sam import DSAM, VSAM as _VSAM  # for class checks if available
-        except Exception:
-            DSAM = type("DSAM_PLACEHOLDER", (), {})
-            _VSAM = cfg.sam_class
-
-        units_by_class  = {DSAM: "m",    _VSAM: "m/s"}
-        output_by_class = {DSAM: "DISP", _VSAM: "VEL"}
+        units_by_class  = {DSAM: "m",    VSAM: "m/s"}
+        output_by_class = {DSAM: "DISP", VSAM: "VEL"}
         output = output_by_class.get(cfg.sam_class)
 
-        for tr in list(st):
+        for tr in st:
             units = tr.stats.get("units") or "Counts"
             tr.stats["units"] = units
             if units == "Counts":
-                median_abs = float(np.nanmedian(np.abs(tr.data))) if tr.data is not None else np.inf
-                if median_abs < 1.0:
-                    # probably already physical units
-                    new_units = units_by_class.get(cfg.sam_class)
-                    if new_units:
-                        tr.stats["units"] = new_units
-                else:
-                    print(f"[RESP] Removing instrument response from {tr.id}")
-                    try:
-                        tr.remove_response(inventory=cfg.inventory, output=output)
-                    except Exception:
-                        # drop trace if response removal fails
-                        try:
-                            st.remove(tr)
-                        except Exception:
-                            pass
+                # instrument correct the Trace
+                print(f"[RESP] Removing instrument response from {tr.id}")
+                try: # could replace this with my more robust remove_response() from flovopy.core.preprocessing
+                    tr.remove_response(inventory=cfg.inventory, output=output)
+                except:
+                    st.remove(tr)
+
+            # Fix the st Stream object so it is in the correct units even if already corrected
+            if units == "m/s" and cfg.sam_class==DSAM:
+                print(f'[RUN_SINGLE_EVENT]: Units mismatch for {tr.id} Integrating')
+                # need to integrate
+                tr.detrend('linear')
+                tr.integrate().detrend('linear').filter('highpass', freq=0.2, corners=2)
+                tr.units = "m"
+            elif units == "m" and cfg.sam_class==VSAM:
+                # need to differentiate
+                print(f'[RUN_SINGLE_EVENT]: Units mismatch for {tr.id}. Differentiating')
+                tr.differentiate()
+                tr.units = "m/s"
 
         if len(st) < int(cfg.min_stations):
             raise RuntimeError(f"Not enough stations: {len(st)} < {cfg.min_stations}")
+        
+        # Reduce by travel time
+        shift_stream_by_travel_time(
+            st, 
+            cfg.inventory, topo_kw['dome_location'],
+            speed_km_s=cfg.speed,      
+            use_elevation=True,
+            inplace=True,
+            trim=True,
+            verbose=True,
+        )
+
+        if mseed_units.lower() == 'm/s':
+            vel = st
+            disp = st.copy().integrate().detrend('linear').filter('highpass', freq=0.2, corners=2)
+
+        elif mseed_units.lower() == 'm':
+            disp = st
+            vel = st.copy().differentiate()
+
+        # --------------------------------------------------------------------------
+        # END OF STREAM PREPROCESSING - should now have a vel and disp Stream object
+        # Make figures now
+        # --------------------------------------------------------------------------
+        
 
         # If we got this far, it is time to create output directories for products
         Path(products_dir).mkdir(parents=True, exist_ok=True)
 
         # Debug plots (outside tee to avoid capturing large binary dumps)
         if debug:
-            stream_png = os.path.join(event_dir, "stream.png")
-            if not os.path.isfile(stream_png):
+            stream_VEL_png = os.path.join(event_dir, "stream_VEL.png")
+            if not os.path.isfile(stream_VEL_png):
                 try:
-                    st.plot(equal_scale=False, outfile=stream_png)
+                    vel.plot(equal_scale=False, outfile=stream_VEL_png)
                 except Exception as e:
-                    print(f"[ASL:WARN] stream plot failed: {e}")
-            sgram_png = os.path.join(event_dir, "spectrogram.png")
+                    print(f"[ASL:WARN] VEL stream plot failed: {e}")
+            stream_DISP_png = os.path.join(event_dir, "stream_DISP.png")
+            if not os.path.isfile(stream_DISP_png):
+                try:
+                    disp.plot(equal_scale=False, outfile=stream_DISP_png)
+                except Exception as e:
+                    print(f"[ASL:WARN] DISP stream plot failed: {e}")                    
+
+
+            sgram_png = os.path.join(event_dir, "spectrogram_log.png")
             if not os.path.isfile(sgram_png):
                 try:
-                    icewebSpectrogram(st).plot(fmin=0.1, fmax=10.0, log=True, cmap="plasma",
-                                               dbscale=False, outfile=sgram_png)
+                    icewebSpectrogram(vel).plot(fmin=0.1, fmax=10.0, secsPerFFT=10.0, log=True, cmap="plasma", dbscale=True, title=str(Path(mseed_file).stem), outfile=sgram_png)
+                    icewebSpectrogram(vel).plot(fmin=0.1, fmax=10.0, secsPerFFT=10.0, log=False, cmap="plasma", dbscale=True, title=str(Path(mseed_file).stem), outfile=sgram_png.replace('_log.png', '_linear.png'))
                 except Exception as e:
                     print(f"[ASL:WARN] spectrogram plot failed: {e}")
+
 
         # --- Everything below gets teed to event.log ---
 
@@ -1609,7 +1683,6 @@ def run_single_event(
 
                     # compute per-trace metrics ONCE
                     es.ampengfft(
-                        differentiate=True,            # tweak to your default
                         compute_spectral=True,
                         compute_ssam=False,
                         compute_bandratios=False,
@@ -1719,7 +1792,7 @@ def run_single_event(
                             model="body", Q=Q, c_earth=c_earth_ms, correction=3.7,
                             a=1.6, b=-0.15, g=0.0,
                             use_boatwright=True,
-                            rho_earth=2000.0, S=1.0, A=1.0,
+                            rho_earth=c_earth_ms, S=1.0, A=1.0,
                             rho_atmos=1.2, c_atmos=340.0, z=100000.0,
                             attach_coords=True, compute_distances=True,
                         )
@@ -1732,7 +1805,7 @@ def run_single_event(
                             me_mean=me_mean, me_std=me_std, n_me=n_me,
                             metadata={
                                 "used_source": "ASL_location",
-                                "best_lat": best_lat, "best_lon": best_lon,  # if you have them
+                                #"best_lat": best_lat, "best_lon": best_lon,  # if you have them
                             },
                         )
                         print(networkmag_df)

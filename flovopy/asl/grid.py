@@ -309,8 +309,6 @@ class Grid:
                 # Try alpha-shape via SciPy Delaunay, fall back to convex hull
                 try:
                     from scipy.spatial import Delaunay
-                    import shapely
-                    import numpy as np
 
                     pts = np.column_stack([xs, ys])
                     if pts.shape[0] < 4:

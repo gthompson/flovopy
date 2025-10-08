@@ -618,3 +618,106 @@ def compute_azimuthal_gap(origin_lat: float, origin_lon: float,
     azimuths.append(azimuths[0] + 360.0)
     gaps = [azimuths[i + 1] - azimuths[i] for i in range(n)]
     return max(gaps), n
+
+# Functions to support reducing Trace objects by travel time from dome to station
+# flovopy/asl/envelope_locate.py (or a utils module)
+
+def _station_key(seed_id: str, mode: str = "sta") -> str:
+    """'MV.MBGB..HHZ' -> 'MBGB' when mode='sta'."""
+    if mode == "full":
+        return seed_id
+    parts = str(seed_id).split(".")
+    if len(parts) >= 2:
+        net, sta = parts[0], parts[1]
+    else:
+        sta = parts[0]
+    return sta if mode == "sta" else f"{parts[0]}.{sta}"
+
+def _collapse_distances_by_station(
+    node_distances_km: Dict[str, np.ndarray],
+    prefer_z: bool = True,
+    station_key_mode: str = "sta",
+) -> Dict[str, np.ndarray]:
+    """
+    Collapse per-channel keys to one vector per station key.
+    Preference: a key ending with 'Z' if available.
+    """
+    collapsed: Dict[str, np.ndarray] = {}
+    chosen: Dict[str, str] = {}
+    for full_id, vec in node_distances_km.items():
+        key = _station_key(full_id, station_key_mode)
+        take = False
+        if key not in collapsed:
+            take = True
+        elif prefer_z and (full_id.endswith("Z") and not chosen[key].endswith("Z")):
+            take = True
+        if take:
+            collapsed[key] = np.asarray(vec, float)
+            chosen[key] = full_id
+    return collapsed
+
+def _resolve_dome_node_index(grid, dome_location) -> int:
+    """
+    Accept int index, {'lon','lat'}, or (lon,lat). Returns node index.
+    """
+    if isinstance(dome_location, int):
+        return int(dome_location)
+    glon = np.asarray(grid.gridlon).ravel()
+    glat = np.asarray(grid.gridlat).ravel()
+    if isinstance(dome_location, dict) and {'lon','lat'} <= set(dome_location):
+        lon, lat = float(dome_location['lon']), float(dome_location['lat'])
+    elif isinstance(dome_location, (tuple, list)) and len(dome_location) >= 2:
+        lon, lat = float(dome_location[0]), float(dome_location[1])
+    else:
+        raise ValueError("dome_location must be node index or {'lon','lat'} or (lon,lat).")
+    return int(np.argmin((glon - lon)**2 + (glat - lat)**2))
+
+def shift_stream_by_travel_time(
+    st: Stream,
+    *,
+    grid,
+    inventory: Inventory,
+    cache_dir: str,
+    dome_location,
+    speed_km_s: float,
+    station_key_mode: str = "sta",
+    prefer_z: bool = True,
+    use_elevation: bool = True,
+    inplace: bool = False,
+) -> Tuple[Stream, Dict[str, float]]:
+    """
+    Shift each station’s trace so that t=0 aligns to the dome-origin time by
+    subtracting the dome→station travel time:  starttime -= (distance / speed).
+
+    Returns (shifted_stream, travel_times_s_by_station).
+    """
+    if speed_km_s is None or not np.isfinite(speed_km_s) or speed_km_s <= 0:
+        raise ValueError(f"speed_km_s must be positive; got {speed_km_s}")
+
+    # Load or compute distances for all channels
+    node_distances_km, _, _ = compute_or_load_distances(
+        grid, cache_dir=cache_dir, inventory=inventory, stream=None, use_elevation=use_elevation
+    )
+    dist_by_sta = _collapse_distances_by_station(
+        node_distances_km, prefer_z=prefer_z, station_key_mode=station_key_mode
+    )
+    dome_idx = _resolve_dome_node_index(grid, dome_location)
+
+    # Build travel-time lookup (seconds) for available stations
+    tt_by_sta: Dict[str, float] = {}
+    for sta, dvec in dist_by_sta.items():
+        d = float(dvec[dome_idx])
+        if np.isfinite(d):
+            tt_by_sta[sta] = d / speed_km_s  # km / (km/s) = s
+
+    # Shift copies (or in place) by -tt
+    out = st if inplace else st.copy()
+    for tr in out:
+        sta = tr.stats.station
+        tt = tt_by_sta.get(sta)
+        if tt is None or not np.isfinite(tt):
+            continue
+        # Remove travel time so arrivals align to source time
+        tr.stats.starttime -= tt
+
+    return out, tt_by_sta
