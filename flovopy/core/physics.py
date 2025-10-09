@@ -27,7 +27,7 @@ def VASR(Eacoustic: Number, Eseismic: Number) -> Optional[float]:
         return None
 
 
-def Eseismic2magnitude(Eseismic: Union[Number, Iterable[Number]], correction: float = 3.2):
+def Eseismic2magnitude(Eseismic: Union[Number, Iterable[Number]], correction: float = 3.7):
     """
     Energy (J) -> magnitude using Hanks & Kanamori (1979) with joule correction (3.7).
     Accepts scalar or iterable. Returns scalar or list.
@@ -76,7 +76,7 @@ def Eseismic2magnitude(Eseismic: Union[Number, Iterable[Number]], correction: fl
     return _one(Eseismic)
 
 
-def magnitude2Eseismic(mag: Union[Number, Iterable[Number]], correction: float = 3.2):
+def magnitude2Eseismic(mag: Union[Number, Iterable[Number]], correction: float = 3.7):
     """
     Magnitude -> energy (J) using Hanks & Kanamori (1979) with joule correction (3.7).
     Accepts scalar or iterable. Returns scalar or list.
@@ -116,7 +116,7 @@ def magnitude2Eseismic(mag: Union[Number, Iterable[Number]], correction: float =
     
     *** Edited 2024/04/18
 
-    Now based on Choy & Boatright [1995] who find best value for a=-3.2, so altering default 
+    Choy & Boatright [1995] find best value of 3.2 (or is that 4.8)
 
 
     """
@@ -128,19 +128,23 @@ def magnitude2Eseismic(mag: Union[Number, Iterable[Number]], correction: float =
     return _one(mag)
 
 
-def Mlrichter(peakA: Number, R_km: Number, a: float = 1.6, b: float = -0.15, g: float = 0) -> Optional[float]:
+def Mlrichter(peakA: Number, R_km: Number, a: float = 1.6, b: float = -0.15, g: float = 0, force_HB=False) -> Optional[float]:
     """
     Local magnitude ML = log10(peakA) + a*log10(R_km) + b + g.
     Returns None if inputs are non-finite or R_km <= 0 or peakA <= 0.
     """
     try:
-        A = float(peakA)
-        Rk = float(R_km)
+        A = float(peakA) # in m
+        Rk = float(R_km) # in km
         if not (np.isfinite(A) and np.isfinite(Rk)) or A <= 0 or Rk <= 0:
             return None
-        return np.log10(A) + a * np.log10(Rk) + b + g
+        if Rk>15.0 and not force_HB: # classic Richter
+            return np.log10(A) + a * np.log10(Rk) + b + g
+        else: # Hutton and Boore 1987
+            return np.log10(A) + 1.11 * np.log10(Rk) + 0.00189 * Rk + 6.58
     except Exception:
         return None
+
 
 
 # ---------------------------------------------------------------------------
@@ -164,9 +168,10 @@ def estimate_distance(trace: Trace, source_coords: dict) -> Optional[float]:
         lat2 = float(source_coords["latitude"])
         lon2 = float(source_coords["longitude"])
         depth = float(source_coords.get("depth", 0.0))
+        elev2 = float(source_coords.get("elevation", 0.0))-depth
 
         epic_dist, _, _ = gps2dist_azimuth(lat1, lon1, lat2, lon2)
-        dz = depth + elev  # depth positive downward, add site elevation
+        dz = elev - elev2  # depth positive downward, add site elevation
         R = np.sqrt(epic_dist ** 2 + dz ** 2)
         return float(R)
     except Exception:
@@ -176,9 +181,15 @@ def estimate_distance(trace: Trace, source_coords: dict) -> Optional[float]:
 def pick_f_peak(trace: Trace) -> Optional[float]:
     """
     Try to obtain a representative peak frequency for attenuation:
-      - stats.spectrum['peakF'] if present
-      - else argmax of stats.spectral['amplitudes'] over ['freqs']
     """
+
+    try:
+        sp = getattr(trace.stats, "spectral", None)
+        if sp and "peakf" in sp and np.isfinite(sp["peakf"]): # also meanf which is usually higher
+            return float(sp["peakf"])
+    except Exception:
+        pass  
+
     try:
         s = getattr(trace.stats, "spectrum", None)
         if s and "peakF" in s and np.isfinite(s["peakF"]):
@@ -187,37 +198,15 @@ def pick_f_peak(trace: Trace) -> Optional[float]:
         pass
 
     try:
-        sp = getattr(trace.stats, "spectral", None)
-        if sp and "freqs" in sp and "amplitudes" in sp:
-            f = np.asarray(sp["freqs"], dtype=float)
-            A = np.asarray(sp["amplitudes"], dtype=float)
-            if f.size and A.size and np.any(np.isfinite(A)):
-                i = int(np.nanargmax(A))
-                return float(f[i])
+        m = getattr(trace.stats, "metrics", None)
+        if m and "fdom" in m and np.isfinite(m["fdom"]): 
+            return float(m["fdom"])
     except Exception:
-        pass
+        pass   
 
     return None
 
 
-def attenuation(trace: Trace, R: Number, Q: float = 50.0, c_earth: float = 2500.0,
-                f_peak: Optional[float] = None) -> Optional[float]:
-    """
-    Path attenuation factor A_att = exp(-pi * f_peak * R / (Q * c_earth)).
-    If f_peak not supplied, attempts to infer via pick_f_peak(trace).
-    Returns None if inputs invalid.
-    """
-    try:
-        R = float(R)
-        if not np.isfinite(R) or R < 0:
-            return None
-        if f_peak is None:
-            f_peak = pick_f_peak(trace)
-        if f_peak is None or f_peak <= 0 or not np.isfinite(f_peak):
-            return None
-        return float(np.exp(-np.pi * f_peak * R / (Q * c_earth)))
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -225,39 +214,14 @@ def attenuation(trace: Trace, R: Number, Q: float = 50.0, c_earth: float = 2500.
 # ---------------------------------------------------------------------------
 
 def _check_units(trace2: Trace, units_needed="m/s"):
-    if units_needed == "m/s":
-        if trace2.stats.get('units', None).lower() == "m":
-            trace = trace2.copy().differentiate()
-        else:
-            trace = trace2
-    elif units_needed == "m":
-        if trace2.stats.get('units', None).lower() == "m/s":
-            trace = trace2.copy().integrate().detrend('linear')
-        else:
-            trace = trace2       
+    trace=trace2
+    if units_needed == "m/s" and trace2.stats.get('units', None).lower() == "m":
+        trace = trace2.copy().differentiate()
+    elif units_needed == "m" and trace2.stats.get('units', None).lower() == "m/s":
+        trace = trace2.copy().integrate().detrend('linear')      
     return trace 
 
-def _geom_spreading(model: str, R: Number, f_peak: float, c_earth: float) -> Optional[float]:
-    """
-    Geometric spreading undo factor for energy back-projection.
-    - 'body': proportional to R^2 (hemispherical)
-    - 'surface': proportional to R * wavelength (2D cylindrical), wavelength = c/f
-    Returns None if invalid.
-    """
-    try:
-        R = float(R)
-        if not np.isfinite(R) or R <= 0:
-            return None
-        if model == "body":
-            return R ** 2
-        if model == "surface":
-            wavelength = c_earth / f_peak if f_peak > 0 else None
-            return R * wavelength if wavelength and np.isfinite(wavelength) else None
-        return None
-    except Exception:
-        return None
-
-
+'''
 def estimate_source_energy(trace2: Trace, R: Number, *, model: str = "body",
                            Q: float = 50.0, c_earth: float = 2500.0) -> Optional[float]:
     """
@@ -284,13 +248,13 @@ def estimate_source_energy(trace2: Trace, R: Number, *, model: str = "body",
         return float(E_obs * geom / A_att)
     except Exception:
         return None
-
+'''
 
 # --- Boatwright-style back-projection (Johnson & Aster, 2005) ----------------
 
 def Eseismic_Boatwright(val: Union[Trace, Number], R: Number,
-                        rho_earth: float = 2000.0, c_earth: float = 2500.0,
-                        S: float = 1.0, A: float = 1.0) -> Optional[float]:
+                        rho_earth: float = 2500.0, c_earth: float = 2500.0,
+                        S: float = 1.0, A: float = 1.0, Q: float = 1e4) -> Optional[float]:
     """
     Boatwright seismic energy back-projection:
         E0 = 2 * pi * R^2 * rho * c * S^2 * E_station / A
@@ -302,12 +266,17 @@ def Eseismic_Boatwright(val: Union[Trace, Number], R: Number,
         if isinstance(val, Trace):
             val2 = _check_units(val, units_needed="m/s")
             E_station = getattr(val2.stats, "metrics", {}).get("energy")
+            peakf = pick_f_peak(val)
         else:
             E_station = float(val)
+            peakf=2.0
         R = float(R)
         if not (np.isfinite(E_station) and np.isfinite(R)) or R <= 0:
             return None
-        return float(2.0 * pi * (R ** 2) * rho_earth * c_earth * (S ** 2) * E_station / A)
+        #print(f'[Boatwright] R={R}, rho={rho_earth}, c={c_earth}, S={S}, A={A}, E={E_station}')
+        
+        aE = inelastic_energy(R/1000, peakf_hz=peakf, wavespeed_kms=c_earth/1000, Q=Q)
+        return float(2.0 * pi * (R ** 2) * rho_earth * c_earth * (S ** 2) * E_station / A * aE)
     except Exception:
         return None
 
@@ -349,16 +318,23 @@ def estimate_local_magnitude(trace: Trace, R_km: Number,
     Convenience wrapper: reads `trace.stats.metrics['peakamp']` and computes ML.
     Stores result in `trace.stats.metrics['local_magnitude']` if successful.
     """
-    trace2 = _check_units(trace, units_needed="m")
+
+    peakamp = None
     try:
-        #peakamp = getattr(trace2.stats, "metrics", {}).get("peakamp")
-        peakamp = max(abs(trace2.data))
-        ml = Mlrichter(peakamp, R_km, a=a, b=b, g=g) if peakamp is not None else None
-        if ml is not None:
-            trace.stats.metrics["local_magnitude"] = ml
-        return ml
+        m = getattr(trace.stats, "metrics", None)
+        if m and "pgd" in m and np.isfinite(m["pgd"]): 
+            peakamp = float(m["pgd"])
     except Exception:
-        return None
+        pass   
+    if not peakamp:
+        trace2 = _check_units(trace, units_needed="m")
+        peakamp = max(abs(trace2.data))
+
+    ml = Mlrichter(peakamp, R_km, a=a, b=b, g=g) if peakamp is not None else None
+    if ml is not None:
+        trace.stats.metrics["local_magnitude"] = ml
+    return ml
+
     
 #--------------------------------------------------------------------------------
 
@@ -377,6 +353,29 @@ def _preserve_nan(mask_from: np.ndarray, arr: np.ndarray) -> np.ndarray:
 # --------------------------
 # Geometrical spreading (amplitude)
 # --------------------------
+
+def _geom_spreading(model: str, R: Number, f_peak: float, c_earth: float) -> Optional[float]:
+    """
+    Geometric spreading undo factor for energy back-projection.
+    R in m.
+    - 'body': proportional to R^2 (hemispherical)
+    - 'surface': proportional to R * wavelength (2D cylindrical), wavelength = c/f
+    Returns None if invalid.
+    """
+    try:
+        R = float(R)
+        if not np.isfinite(R) or R <= 0:
+            return None
+        if model == "body":
+            return R ** 2
+        if model == "surface":
+            wavelength = c_earth / f_peak if f_peak > 0 else None
+            return R * wavelength if wavelength and np.isfinite(wavelength) else None
+        return None
+    except Exception:
+        return None
+
+
 def geom_spread_amp(
     dist_km: np.ndarray,
     *,
@@ -457,6 +456,28 @@ def geom_spread_energy_legacy(
 # --------------------------
 # Inelastic attenuation
 # --------------------------
+
+def attenuation(trace: Trace, R: Number, Q: float = 50.0, c_earth: float = 2500.0,
+                f_peak: Optional[float] = None) -> Optional[float]:
+    """
+    Path attenuation factor A_att = exp(-pi * f_peak * R / (Q * c_earth)).
+    If f_peak not supplied, attempts to infer via pick_f_peak(trace).
+    Returns None if inputs invalid.
+    """
+    try:
+        R = float(R)
+        if not np.isfinite(R) or R < 0:
+            return None
+        if f_peak is None:
+            f_peak = pick_f_peak(trace)
+        if f_peak is None or f_peak <= 0 or not np.isfinite(f_peak):
+            return None
+        return float(np.exp(-np.pi * f_peak * R / (Q * c_earth)))
+    except Exception:
+        return None
+
+
+
 def inelastic_amp(
     dist_km: np.ndarray,
     *,
@@ -541,5 +562,30 @@ def total_energy_correction(
         gE = geom_spread_energy(dist_km, chan=chan, surface_waves=surface_waves,
                                 wavespeed_kms=wavespeed_kms, peakf_hz=peakf_hz, out_dtype=out_dtype)
     aE = inelastic_energy(dist_km, peakf_hz=peakf_hz, wavespeed_kms=wavespeed_kms, Q=Q, out_dtype=out_dtype)
+    print(f'geometrical={gE}, attenuation={aE}')
     out = gE * aE
     return _preserve_nan(np.asarray(dist_km), out)
+
+def estimate_source_energy(trace2: Trace, R: Number, *, model: str = "body",
+                           Q: float = 50.0, c_earth: float = 2500.0, rho_earth: float = 2500) -> Optional[float]:
+    """
+    Estimate source energy E0 (J) from observed station energy:
+        E0 = E_obs * geom_spreading / attenuation
+    Uses time-domain energy in trace.stats.metrics['energy'] and a representative f_peak.
+    Returns None on missing data.
+    """
+    trace = _check_units(trace2, units_needed="m/s")
+    E_obs = getattr(trace.stats, "metrics", {}).get("energy")
+    if E_obs is None or not np.isfinite(E_obs):
+        return None
+
+    fpk = pick_f_peak(trace)
+    if fpk is None:
+        return None
+    
+    # our geometrical spreading correction is in km^2 so we need to convert it to m^2 by multiplying by 1e6
+    energy_correction = total_energy_correction(np.array(R/1000), chan=trace.stats.channel, surface_waves=model=='surface', wavespeed_kms=c_earth/1000, peakf_hz=fpk, Q=Q) * 1e6
+    #for v in [trace.id, E_obs, fpk, energy_correction, R, Q, model, c_earth, rho_earth]:
+    #    print(v, type(v))
+    return float(E_obs * energy_correction * 2 * np.pi * rho_earth * c_earth)
+

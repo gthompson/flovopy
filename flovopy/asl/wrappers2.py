@@ -214,8 +214,13 @@ def _asl_output_source_results(
 
     # ---- Reduced displacement/velocity plot
     outs["reduced_disp_png"] = str(event_dir / f"reduced_disp_{base_name}.png")
-    print("[ASL:PLOT_REDUCED_DISPLACEMENT]")
-    ok = _safe_plot(aslobj.plot_reduced_displacement, outfile=outs["reduced_disp_png"], show=show)
+    if cfg.sam_class == DSAM:
+        displacement = True
+    else:
+        displacement = False
+        outs['reduced_disp_png'] =  outs["reduced_disp_png"].replace('disp', 'vel')
+    print("[ASL:PLOT_REDUCED_DISPLACEMENT/VELOCITY]")
+    ok = _safe_plot(aslobj.plot_reduced_displacement, displacement=displacement, outfile=outs["reduced_disp_png"], show=show)
     if not ok:
         outs["reduced_disp_png"] = None
 
@@ -227,11 +232,15 @@ def _asl_output_source_results(
         outs["misfit_png"] = None
 
     # ---- Misfit heatmap
-    outs["misfit_heatmap_png"] = str(event_dir / f"misfit_heatmap_{base_name}.png")
-    print("[ASL:PLOT_MISFIT_HEATMAP]")
-    ok = _safe_plot(aslobj.plot_misfit_heatmap, outfile=outs["misfit_heatmap_png"], topo_kw=topo_kw, show=show)
-    if not ok:
-        outs["misfit_heatmap_png"] = None
+    # this is faiing after refine_and_relocate still
+    try:
+        outs["misfit_heatmap_png"] = str(event_dir / f"misfit_heatmap_{base_name}.png")
+        print("[ASL:PLOT_MISFIT_HEATMAP]")
+        ok = _safe_plot(aslobj.plot_misfit_heatmap, outfile=outs["misfit_heatmap_png"], topo_kw=topo_kw, show=show)
+        if not ok:
+            outs["misfit_heatmap_png"] = None
+    except Exception as e:
+        print(e)
 
     return outs
 
@@ -771,6 +780,7 @@ def run_all_events(
                     refine_sector=refine_sector,
                     station_gains_df=station_gains_df,
                     topo_kw=topo_kw,
+                    mseed_units=mseed_units,
                     debug=debug,
                 )
             except Exception as e:
@@ -1347,6 +1357,7 @@ def run_single_event(
     vertical_only: bool = True,
     enhance: bool = True,           # <— NEW
     debug: bool = True,
+    reduce_time: bool = True,
 ) -> Dict[str, Any]:
     """
     Minimal, notebook-friendly runner (delegates to asl_sausage).
@@ -1525,7 +1536,7 @@ def run_single_event(
     # Per-event log file
     log_file = str(products_dir / "event.log")
 
-    netmagcsv = event_dir / "network_magnitudes.csv"
+    netmagcsv = products_dir / "network_magnitudes.csv"
     networkmag_df = pd.DataFrame()
 
     es_pickle_file = products_dir / "enhanced_stream.pkl"
@@ -1548,6 +1559,8 @@ def run_single_event(
             st = read(mseed_file, format="MSEED").select(component="Z")
         else:
             st = read(mseed_file, format="MSEED")
+        if reduce_time:
+            raw = st.copy()
 
         # ----------------------------------------------------------------
         # STREAM PREPROCESSING
@@ -1652,14 +1665,19 @@ def run_single_event(
                 except Exception as e:
                     print(f"[ASL:WARN] DISP stream plot failed: {e}")                    
 
+            if reduce_time:
+                stream_RAW_png = os.path.join(event_dir, "stream_RAW.png")
+                if not os.path.isfile(stream_RAW_png):
+                    try:
+                        raw.plot(equal_scale=False, outfile=stream_RAW_png)
+                    except Exception as e:
+                        print(f"[ASL:WARN] RAW stream plot failed: {e}")  
+                del raw            
 
-            sgram_png = os.path.join(event_dir, "spectrogram_log.png")
+            sgram_png = os.path.join(event_dir, "spectrogram_VEL.png")
             if not os.path.isfile(sgram_png):
-                try:
-                    icewebSpectrogram(vel).plot(fmin=0.1, fmax=10.0, secsPerFFT=10.0, log=True, cmap="plasma", dbscale=True, title=str(Path(mseed_file).stem), outfile=sgram_png)
-                    icewebSpectrogram(vel).plot(fmin=0.1, fmax=10.0, secsPerFFT=10.0, log=False, cmap="plasma", dbscale=True, title=str(Path(mseed_file).stem), outfile=sgram_png.replace('_log.png', '_linear.png'))
-                except Exception as e:
-                    print(f"[ASL:WARN] spectrogram plot failed: {e}")
+                from flovopy.processing.spectrograms import plot_strongest_trace
+                plot_strongest_trace(vel, log=False, dbscale=True, cmap='inferno', fmin=0.01, fmax=20.0, secsPerFFT=5.0, outfile=sgram_png)
 
 
         # --- Everything below gets teed to event.log ---
@@ -1692,10 +1710,7 @@ def run_single_event(
 
                     # Provisional magnitudes using dome_location if present
                     dome = (topo_kw or {}).get("dome_location")
-                    if dome and isinstance(dome, dict) and all(k in dome for k in ("lat", "lon")):
-                        src_pre = {"latitude": float(dome["lat"]), "longitude": float(dome["lon"])}
-                        if "depth" in dome and dome["depth"] is not None:
-                            src_pre["depth"] = float(dome["depth"])
+                    if 'lat' in dome:
 
                         c_earth_ms = float(getattr(cfg, "speed", 2.5)) * 1000.0    # km/s → m/s
                         Q = float(getattr(cfg, "Q", 50.0))
@@ -1703,13 +1718,14 @@ def run_single_event(
                         print("[MAG] Provisional magnitudes (dome_location)…")
                         es.compute_station_magnitudes(
                             inventory=cfg.inventory,
-                            source_coords=src_pre,
-                            model="body", 
+                            source_coords={'latitude':dome['lat'], 'longitude':dome['lon'], 'elevation':dome['elev']},
+                            model=cfg.wave_kind, 
                             Q=cfg.Q, 
                             c_earth=c_earth_ms, 
                             use_boatwright=True,
                             attach_coords=True, 
                             compute_distances=True,
+                            correction=2.4, 
                         )
                         
 
@@ -1753,7 +1769,7 @@ def run_single_event(
                 es = st
             
     
-
+            
             # ----------------------------------------------------------------
             # Run ASL sausage
             # ----------------------------------------------------------------
@@ -1790,10 +1806,7 @@ def run_single_event(
                             inventory=cfg.inventory,
                             source_coords=src_post,
                             model="body", Q=Q, c_earth=c_earth_ms, correction=3.7,
-                            a=1.6, b=-0.15, g=0.0,
                             use_boatwright=True,
-                            rho_earth=c_earth_ms, S=1.0, A=1.0,
-                            rho_atmos=1.2, c_atmos=340.0, z=100000.0,
                             attach_coords=True, compute_distances=True,
                         )
                         ml_mean, ml_std, n_ml = es.estimate_network_magnitude("local_magnitude")

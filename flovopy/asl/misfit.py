@@ -470,46 +470,60 @@ def compute_node_misfit_for_time(
 def plot_misfit_heatmap_for_peak_DR(
     aslobj,
     *,
-    backend: Optional[MisfitBackend] = None,
+    backend: Optional["MisfitBackend"] = None,
     min_stations: int = 3,
     eps: float = 1e-9,
     dtype=np.float32,
     cmap: str = "turbo",
     transparency: int = 35,
-    topo_kw: Optional[dict] = None,   # <-- single source for topo_map kwargs
+    topo_kw: Optional[dict] = None,   # caller supplies all basemap options here
     outfile: Optional[str] = None,
     show: bool = True,
 ):
     """
-    Compute the per-node misfit at the time of maximum DR and plot it atop a topo_map().
-    - Works with 2D regular grids via grdimage or 1D "stream grids" via scatter.
-    - Honors ASL grid masks (masked nodes show as NaN / not plotted).
-    - Basemap is created *only* from passed topo_kw (no duplicate kwargs here).
+    Compute the per-node misfit at the time of maximum DR and plot it atop topo_map().
+
+    - Works for rectangular (2D) grids via grdimage and for 1D "stream" grids via scatter.
+    - Uses the evaluated-node mapping from the latest fast_locate() if present:
+        * aslobj._last_eval_idx  : global node indices evaluated (np.ndarray[int])
+        * aslobj._last_misfit_vec: misfit values at the peak-DR frame for those indices
+      Falls back to meta['node_index'] from the backend; finally to the Grid's mask.
+    - Never assumes the current Grid mask matches the refined subset.
 
     Returns
     -------
-    (fig, misfit_2d_or_1d)
-        fig: PyGMT Figure
-        misfit array: 2D (nlat,nlon) for regular grids; 1D for stream grids
+    (fig, arr)
+        fig : PyGMT Figure
+        arr : 2D (nlat,nlon) array for grdimage, else 1D array for scatter
     """
-
+    import numpy as np
     import pygmt
     import xarray as xr
     from datetime import datetime
     from flovopy.asl.map import topo_map
+    # compute_node_misfit_for_time should be available in the same module/namespace
+    # from flovopy.asl.misfit import compute_node_misfit_for_time  # if needed
 
-    ts = lambda: datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    topo_kw = dict(topo_kw or {})  # copy so we don't mutate caller's dict
+    def ts():
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-    if aslobj.source is None:
+    topo_kw = dict(topo_kw or {})  # copy to avoid mutating caller dict
+
+    # --- Preconditions ---
+    if getattr(aslobj, "source", None) is None or "DR" not in aslobj.source:
         print(f"[{ts()}] [MISFIT] No source; run locate()/fast_locate() first.")
         return None
 
-    # 1) Select time-of-peak DR
-    t_idx = int(np.nanargmax(aslobj.source["DR"]))
+    DR = np.asarray(aslobj.source.get("DR", []), float)
+    if DR.size == 0 or not np.isfinite(DR).any():
+        print(f"[{ts()}] [MISFIT] No finite DR samples to pick a peak.")
+        return None
+
+    # --- 1) Time of peak DR ---
+    t_idx = int(np.nanargmax(DR))
     print(f"[{ts()}] [MISFIT] peak DR index = {t_idx}")
 
-    # 2) Compute per-node misfit (local space if backend subsets nodes)
+    # --- 2) Misfit at that time (local space) ---
     misfit_vec, jstar_local, meta = compute_node_misfit_for_time(
         aslobj,
         t_idx,
@@ -521,126 +535,163 @@ def plot_misfit_heatmap_for_peak_DR(
     misfit_vec = np.asarray(misfit_vec, float)
     print(f"[{ts()}] [MISFIT] misfit_vec shape={misfit_vec.shape} finite={np.isfinite(misfit_vec).sum()}")
 
+    # --- 3) Build a full-grid buffer (or robust scatter fallback) ---
+    grid = aslobj.cfg.gridobj if hasattr(aslobj, "cfg") else getattr(aslobj, "gridobj")
+    gridlat = np.asarray(grid.gridlat)
+    gridlon = np.asarray(grid.gridlon)
+    gridlat_flat = gridlat.ravel()
+    gridlon_flat = gridlon.ravel()
+    Nfull = gridlat_flat.size
 
+    # candidate mappings (in order of preference)
+    eval_idx = getattr(aslobj, "_last_eval_idx", None)  # global indices from fast_locate refinement
+    meta_idx = meta.get("node_index") if isinstance(meta, dict) else None
+    grid_mask_idx = getattr(grid, "_node_mask_idx", None)  # persistent mask on Grid
 
-    # 3) Handle grid/mask; build 2D field when possible
-    grid = aslobj.gridobj
-    grid_mask_idx = getattr(aslobj.gridobj, "_node_mask_idx", None)  # persistent mask on Grid
+    # Normalize indices to np.ndarray[int] or None
+    def _as_idx(x):
+        if x is None:
+            return None
+        arr = np.asarray(x, int)
+        return arr if arr.size else None
 
-    # Mapping from local (backend) index → global grid index if provided
-    node_index = meta.get("node_index") if isinstance(meta, dict) else None
-    if node_index is not None:
-        node_index = np.asarray(node_index, int)
+    eval_idx  = _as_idx(eval_idx)
+    meta_idx  = _as_idx(meta_idx)
+    mask_idx  = _as_idx(grid_mask_idx)
 
-    def _local_to_global(ix_local: int) -> int:
-        if node_index is not None:
-            return int(node_index[ix_local])
-        if grid_mask_idx is not None:
-            return int(np.asarray(grid_mask_idx, int)[ix_local])
-        return int(ix_local)
+    # Pick the best mapping that matches misfit_vec length
+    mapping = None
+    for candidate in (eval_idx, meta_idx, mask_idx):
+        if candidate is not None and candidate.size == misfit_vec.size:
+            mapping = candidate
+            break
 
-    jstar_global = _local_to_global(jstar_local)
+    # If none matched, degrade to a simple [0..len-1] mapping for scatter fallback
+    if mapping is None:
+        print("[ASL:PLOT] WARN: No index mapping equals misfit length; "
+              "falling back to scatter with local ordering.")
+        mapping = np.arange(misfit_vec.size, dtype=int)
+        # Keep in mind: these indices are not global; we will avoid M_full assignment.
 
-    # Regular 2D grid?
-    has_2d = getattr(grid, "gridlat", None) is not None and np.ndim(grid.gridlat) == 2
-    gridlat_flat = grid.gridlat.reshape(-1)
-    gridlon_flat = grid.gridlon.reshape(-1)
+    # Resolve best-node global index (for the red marker)
+    def _local_to_global(j_local: int) -> int:
+        if eval_idx is not None and eval_idx.size > j_local:
+            return int(eval_idx[j_local])
+        if meta_idx is not None and meta_idx.size > j_local:
+            return int(meta_idx[j_local])
+        if mask_idx is not None and mask_idx.size > j_local:
+            return int(mask_idx[j_local])
+        # final fallback: assume identity (only safe if no refinement)
+        return int(j_local)
 
-    if has_2d:
-        nlat, nlon = grid.gridlat.shape
-        M_full = np.full(nlat * nlon, np.nan, dtype=float)
+    jstar_global = _local_to_global(int(jstar_local))
 
-        if (node_index is None) and (grid_mask_idx is None):
-            # misfit_vec already corresponds to full grid in order
-            if misfit_vec.size == M_full.size:
-                M_full[:] = misfit_vec
-            else:
-                # defensive fallback: place what we can at the start
-                M_full[:misfit_vec.size] = misfit_vec
-        else:
-            # scatter from local space into the full field
-            if node_index is not None:
-                M_full[node_index] = misfit_vec
-            else:  # use grid persistent mask indices
-                M_full[np.asarray(grid_mask_idx, int)] = misfit_vec
+    # Rectangular (2D) grid?
+    is_2d = gridlat.ndim == 2 and gridlon.ndim == 2 and gridlat.shape == gridlon.shape
 
+    # Try to populate a full-grid field when we have global indices
+    can_assign_full = (mapping is eval_idx) or (mapping is meta_idx) or (mapping is mask_idx)
+    M_plot = None  # will end up 2D array or 1D vector
+
+    if is_2d and can_assign_full and np.nanmax(mapping, initial=-1) < Nfull:
+        # Fill full grid with NaNs then place misfits
+        M_full = np.full(Nfull, np.nan, dtype=float)
+        M_full[mapping] = misfit_vec
+        # reshape to 2D
+        nlat, nlon = gridlat.shape
         M2 = M_full.reshape(nlat, nlon)
 
-        # Ensure increasing lat axis
-        lat_axis = np.unique(grid.gridlat.ravel())
-        lon_axis = np.unique(grid.gridlon.ravel())
+        # Ensure ascending latitude for grdimage
+        lat_axis = np.unique(gridlat.ravel())
+        lon_axis = np.unique(gridlon.ravel())
         if lat_axis[0] > lat_axis[-1]:
             lat_axis = lat_axis[::-1]
             M2 = M2[::-1, :]
 
         misfit_da = xr.DataArray(M2, coords={"lat": lat_axis, "lon": lon_axis}, dims=("lat", "lon"))
-        M_plot = M2
+        M_plot = M2  # 2D
     else:
-        # 1D node set ("streams" style) → scatter plot
-        if (node_index is None) and (grid_mask_idx is None):
-            M_plot = misfit_vec
+        # Scatter fallback (1D)
+        misfit_da = None
+        if can_assign_full and np.nanmax(mapping, initial=-1) < Nfull:
+            M_full = np.full(Nfull, np.nan, dtype=float)
+            M_full[mapping] = misfit_vec
+            M_plot = M_full  # 1D aligned to full grid
         else:
-            M_full = np.full_like(gridlat_flat, np.nan, dtype=float)
-            if node_index is not None:
-                M_full[node_index] = misfit_vec
-            else:
-                M_full[np.asarray(grid_mask_idx, int)] = misfit_vec
-            M_plot = M_full
-        misfit_da = None  # use scatter
+            # No trustworthy global mapping: plot only the evaluated subset
+            M_plot = misfit_vec  # 1D local
+            # mapping in this branch is local (0..len-1)
 
-    # 4) Create basemap strictly via topo_kw (caller controls everything there)
-    #    If caller didn't supply a title, provide a friendly default.
+    # --- 4) Basemap (entirely controlled by topo_kw) ---
     topo_kw.setdefault("title", "Misfit heatmap (peak DR time)")
     topo_kw.setdefault("show", False)
-
-    # Optionally center on the peak location if not overridden by topo_kw
     if "centerlat" not in topo_kw or "centerlon" not in topo_kw:
         topo_kw.setdefault("centerlat", float(aslobj.source["lat"][t_idx]))
         topo_kw.setdefault("centerlon", float(aslobj.source["lon"][t_idx]))
 
     fig = topo_map(**topo_kw)
 
-    # 5) Color scale from data range
-    finite = np.isfinite(M_plot)
+    # --- 5) Color scale from finite data range ---
+    arr_for_limits = M_plot.ravel() if M_plot is not None and np.ndim(M_plot) >= 1 else np.array([])
+    finite = np.isfinite(arr_for_limits)
     if finite.any():
-        vmin = float(np.nanmin(M_plot[finite]))
-        vmax = float(np.nanmax(M_plot[finite]))
-        if vmin == vmax:
+        vmin = float(np.nanmin(arr_for_limits[finite]))
+        vmax = float(np.nanmax(arr_for_limits[finite]))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
             vmin, vmax = (0.0, 1.0)
     else:
         vmin, vmax = (0.0, 1.0)
-
     pygmt.makecpt(cmap=cmap, series=[vmin, vmax], continuous=True)
 
-    # 6) Draw heatmap or scatter
+    # --- 6) Draw heatmap or scatter ---
     if misfit_da is not None:
+        # 2D rectangular via grdimage
         fig.grdimage(grid=misfit_da, cmap=True, transparency=transparency)
     else:
-        # 1D scatter
-        lats = gridlat_flat
-        lons = gridlon_flat
-        tbl = np.column_stack([lons[finite], lats[finite], M_plot[finite]])
-        if tbl.size:
-            fig.plot(data=tbl, style="c0.15c", cmap=True, transparency=transparency)
+        # Scatter (either full-grid 1D with NaNs or evaluated-subset only)
+        if M_plot.size == Nfull:
+            # full-grid 1D with NaNs
+            finite_mask = np.isfinite(M_plot)
+            if finite_mask.any():
+                tbl = np.column_stack([gridlon_flat[finite_mask], gridlat_flat[finite_mask], M_plot[finite_mask]])
+                fig.plot(data=tbl, style="c0.15c", cmap=True, transparency=transparency)
+        else:
+            # evaluated-subset only (local mapping)
+            # If mapping is global-sized (unlikely here), use it; else plot in local order
+            if can_assign_full and np.nanmax(mapping, initial=-1) < Nfull:
+                xx = gridlon_flat[mapping]
+                yy = gridlat_flat[mapping]
+            else:
+                # No global mapping: best effort—use winning node neighborhood if available,
+                # else default to dome center or bounds (but here we need coords per index;
+                # since we don't have them, skip coordinates we can't place)
+                print("[ASL:PLOT] WARN: Missing global coordinates for subset; "
+                      "cannot place points on map reliably.")
+                xx = np.array([])
+                yy = np.array([])
+            if xx.size and yy.size:
+                tbl = np.column_stack([xx, yy, misfit_vec])
+                fig.plot(data=tbl, style="c0.15c", cmap=True, transparency=transparency)
 
     fig.colorbar(frame='+l"Misfit"')
 
-    # 7) Mark best node
-    best_lon = float(gridlon_flat[jstar_global])
-    best_lat = float(gridlat_flat[jstar_global])
-
+    # --- 7) Mark best node ---
     try:
+        best_lon = float(gridlon_flat[jstar_global])
+        best_lat = float(gridlat_flat[jstar_global])
+
+        # If caller set a fixed region, warn if best node is outside
         region = topo_kw.get("region", None)
-        if region is not None:
+        if region is not None and len(region) == 4:
             xmin, xmax, ymin, ymax = region
             if not (xmin <= best_lon <= xmax and ymin <= best_lat <= ymax):
-                print(f"[MISFIT] Best node ({best_lat:.5f},{best_lon:.5f}) is outside region {region}")
+                print(f"[MISFIT] Best node ({best_lat:.5f},{best_lon:.5f}) outside region {region}")
+
+        fig.plot(x=[best_lon], y=[best_lat], style="c0.26c", fill="red", pen="1p,red")
     except Exception:
         pass
 
-    fig.plot(x=[best_lon], y=[best_lat], style="c0.26c", fill="red", pen="1p,red")
-
-    # 8) Output
+    # --- 8) Output ---
     if outfile:
         fig.savefig(outfile)
         print(f"[{ts()}] [MISFIT] saved: {outfile}")

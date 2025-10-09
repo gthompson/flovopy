@@ -576,7 +576,8 @@ class ASL:
         temporal_smooth_mode: str = "none",  # "none" | "median" | "viterbi"
         temporal_smooth_win: int = 5,        # window (median) or horizon (viterbi)
         viterbi_lambda_km: float = 5.0,      # km cost per step in viterbi
-        viterbi_max_step_km: float = 25.0,   # km hard cutoff for viterbi steps
+        viterbi_max_step_km: float = 1.0,   # km hard cutoff for viterbi steps
+        candidate_idx: np.ndarray | list | None = None,   # indices (into full grid) to evaluate
         verbose: bool = True,
     ):
         """
@@ -726,6 +727,20 @@ class ASL:
         ...                 temporal_smooth_win=7,
         ...                 viterbi_lambda_km=8.0,
         ...                 viterbi_max_step_km=30.0)
+
+        Changes:
+
+        Now supports an optional `candidate_idx` sub-grid mapping and exports the
+        misfit vector for the frame with peak DR for plotting heatmaps after
+        refinement.
+
+        Side-effects (unchanged + new):
+        self.source                : dict with track arrays
+        self.connectedness         : dict
+        self.located               : bool
+        self._last_eval_idx        : np.ndarray[int] (global node indices evaluated)
+        self._last_misfit_vec      : np.ndarray[float] (misfit at _last_eval_idx for peak-DR frame)
+        self._last_misfit_frame    : int (frame index where DR peaked)
         """
         
         cfg = self.cfg
@@ -735,9 +750,24 @@ class ASL:
         if verbose:
             print("[ASL] fast_locate: preparing data…")
 
-        # Grid vectors
+        # Grid vectors (global)
         gridlat = cfg.gridobj.gridlat.reshape(-1)
         gridlon = cfg.gridobj.gridlon.reshape(-1)
+        n_nodes_full = gridlat.size
+
+        # --- Candidate (sub-grid) mapping ---
+        # Order of precedence:
+        # 1) explicit candidate_idx, else
+        # 2) grid mask (if any), else
+        # 3) full grid
+        if candidate_idx is not None:
+            node_index = np.asarray(candidate_idx, dtype=int).ravel()
+        else:
+            mask_idx = cfg.gridobj.get_mask_indices()
+            if mask_idx is not None and np.size(mask_idx) > 0:
+                node_index = np.asarray(mask_idx, dtype=int).ravel()
+            else:
+                node_index = np.arange(n_nodes_full, dtype=int)
 
         # Stream → Y
         st = self.metric2stream()
@@ -746,11 +776,12 @@ class ASL:
         t = st[0].times("utcdatetime")
         nsta, ntime = Y.shape
 
-        # Refresh grid-provided mask
+        # Refresh grid-provided mask for legacy compatibility
         self._node_mask = cfg.gridobj.get_mask_indices()
 
-        # Backend context (uses config + mask)
+        # Backend context (uses config + mapping)
         ctx = misfit_backend.prepare(self, seed_ids, dtype=np.float32)
+        ctx["node_index"] = node_index  # <— expose mapping to backend/downstream
 
         # Station coords (for azgap)
         station_coords = []
@@ -780,12 +811,18 @@ class ASL:
             print(f"[ASL] fast_locate: nsta={nsta}, ntime={ntime}, batch={batch_size}, "
                 f"spatial_blur={'on' if can_blur else 'off'}, "
                 f"temporal_smooth={temporal_smooth_mode}, "
-                f"temporal_win={temporal_smooth_win}")
+                f"temporal_win={temporal_smooth_win}, "
+                f"nodes_eval={node_index.size}/{n_nodes_full}")
 
         # Viterbi support
         want_viterbi = (temporal_smooth_mode or "none").lower() == "viterbi"
         misfit_hist = [] if want_viterbi else None
         mean_hist   = [] if want_viterbi else None
+
+        # --- Track the frame with maximum DR and keep its misfit vector ---
+        _best_DR_val = -np.inf
+        _best_DR_idx = None
+        _best_misfit_vec_local = None  # local (length == len(node_index))
 
         for i0 in range(0, ntime, batch_size):
             i1 = min(i0 + batch_size, ntime)
@@ -795,21 +832,27 @@ class ASL:
 
             for k in range(Yb.shape[1]):
                 y = Yb[:, k]
-                misfit, extras = misfit_backend.evaluate(y, ctx, min_stations=min_stations, eps=eps)
 
-                # Collect history for Viterbi
+                # Evaluate misfit over the candidate set
+                misfit, extras = misfit_backend.evaluate(y, ctx, min_stations=min_stations, eps=eps)
+                misfit = np.asarray(misfit, float).ravel()  # shape == len(node_index)
+
+                # Collect history for Viterbi (local-node domain)
                 if want_viterbi:
-                    misfit_hist.append(np.asarray(misfit, float).copy())
+                    misfit_hist.append(misfit.copy())
                     mvec = extras.get("mean", extras.get("DR", None))
                     if mvec is None:
                         mvec = np.full_like(misfit, np.nan, dtype=float)
-                    mean_hist.append(np.asarray(mvec, float).copy())
+                    mean_hist.append(np.asarray(mvec, float).ravel().copy())
 
-                # Optional spatial smoothing
+                # Optional spatial smoothing (requires rectangular grid)
                 if can_blur:
                     nlat, nlon = grid_shape
                     try:
-                        m2 = misfit.reshape(nlat, nlon)
+                        # Build a dense misfit frame and blur only the candidate cells
+                        M_full = np.full(n_nodes_full, np.nan, dtype=float)
+                        M_full[node_index] = misfit
+                        m2 = M_full.reshape(nlat, nlon)
                         valid = np.isfinite(m2)
                         if valid.any():
                             LARGE = float(np.nanmax(m2[valid]) if np.isfinite(m2[valid]).any() else 1.0)
@@ -819,7 +862,8 @@ class ASL:
                             with np.errstate(invalid="ignore", divide="ignore"):
                                 Mblur = np.where(W > 1e-6, G / np.maximum(W, 1e-6), LARGE)
                             Mblur = np.where(valid, Mblur, LARGE)
-                            misfit = Mblur.reshape(-1)
+                            # Pull back the smoothed values ONLY at the candidate nodes
+                            misfit = Mblur.reshape(-1)[node_index]
                     except Exception:
                         pass
 
@@ -835,12 +879,9 @@ class ASL:
                     continue
 
                 jstar_local = int(np.nanargmin(misfit))
-                jstar_global = jstar_local
-                node_index = ctx.get("node_index", None)
-                if node_index is not None:
-                    jstar_global = int(node_index[jstar_local])
+                jstar_global = int(node_index[jstar_local])  # local → global
 
-                # DR
+                # DR at the winning node
                 DR_t = extras.get("mean", extras.get("DR", None))
                 if DR_t is not None and np.ndim(DR_t) == 1:
                     DR_t = DR_t[jstar_local]
@@ -864,9 +905,15 @@ class ASL:
                 azgap, _ = compute_azimuthal_gap(source_lat[i], source_lon[i], station_coords)
                 source_azgap[i] = azgap
 
+                # Keep the misfit vector for the frame with maximal DR
+                if np.isfinite(DR_t) and DR_t > _best_DR_val:
+                    _best_DR_val = float(DR_t)
+                    _best_DR_idx = int(i)
+                    _best_misfit_vec_local = misfit.copy()  # shape == len(node_index)
+
         # --- Temporal smoothing ---
-        flat_lat = cfg.gridobj.gridlat.ravel()
-        flat_lon = cfg.gridobj.gridlon.ravel()
+        flat_lat = gridlat
+        flat_lon = gridlon
         mode = (temporal_smooth_mode or "none").lower()
 
         if mode == "median" and temporal_smooth_win and temporal_smooth_win >= 3 and temporal_smooth_win % 2 == 1:
@@ -876,10 +923,10 @@ class ASL:
             source_DR  = _movavg_1d(source_DR, temporal_smooth_win)
 
         elif mode == "viterbi" and want_viterbi and misfit_hist:
-            M = np.vstack(misfit_hist)
-            node_index = ctx.get("node_index", None)
-            flat_lat_local = flat_lat if node_index is None else flat_lat[node_index]
-            flat_lon_local = flat_lon if node_index is None else flat_lon[node_index]
+            # Histories are in the local-node domain; supply lat/lon in local too
+            M = np.vstack(misfit_hist)                        # (T, J_local)
+            flat_lat_local = flat_lat[node_index]             # (J_local,)
+            flat_lon_local = flat_lon[node_index]             # (J_local,)
 
             sm_local = _viterbi_smooth_indices(
                 misfits_TJ=M,
@@ -888,11 +935,11 @@ class ASL:
                 lambda_km=float(viterbi_lambda_km),
                 max_step_km=(None if viterbi_max_step_km is None else float(viterbi_max_step_km)),
             )
-            sm_global = sm_local if node_index is None else np.asarray(node_index, int)[sm_local]
+            sm_global = node_index[np.asarray(sm_local, dtype=int)]
             source_lat = flat_lat[sm_global]
             source_lon = flat_lon[sm_global]
             try:
-                mean_M = np.vstack(mean_hist)
+                mean_M = np.vstack(mean_hist)                # (T, J_local)
                 source_DR = np.array([mean_M[t, sm_local[t]] for t in range(mean_M.shape[0])], dtype=float)
             except Exception:
                 pass
@@ -906,7 +953,7 @@ class ASL:
             "misfit": source_misfit,
             "azgap": source_azgap,
             "nsta": source_nsta,
-            "node_index": source_node,
+            "node_index": source_node,  # global indices per frame
         }
 
         # Connectedness
@@ -916,6 +963,11 @@ class ASL:
         )
         self.connectedness = conn
         self.source["connectedness"] = conn["score"]
+
+        # --- Export evaluated-node mapping + misfit for the peak-DR frame ---
+        self._last_eval_idx = node_index                               # global indices evaluated this run
+        self._last_misfit_vec = _best_misfit_vec_local                 # len == len(node_index)
+        self._last_misfit_frame = _best_DR_idx                         # int or None
 
         self.located = True
         if hasattr(self, "set_id"):
@@ -1094,11 +1146,23 @@ class ASL:
         ...     temporal_smooth_mode="viterbi", temporal_smooth_win=7,
         ...     viterbi_lambda_km=8.0, viterbi_max_step_km=30.0,
         ... )
+
+        CHANGES:
+        Temporarily restrict the spatial search domain, run fast_locate() on that
+        sub-grid, and then restore the original Grid mask.
+
+        In addition, this stashes:
+        - self._last_eval_idx  (np.ndarray[int]): node indices actually evaluated
+        - self._last_misfit_vec (np.ndarray[float], if available): per-node misfit
+        so plotting code can paint misfit back onto the full grid safely.
         """
+        import numpy as np
+        from obspy.geodetics.base import gps2dist_azimuth
+
         if self.source is None:
             raise RuntimeError("No source yet. Run fast_locate()/locate() first.")
 
-        # Parameter sanity (non-fatal clamps)
+        # ---------- sanitize knobs ----------
         top_frac = float(np.clip(top_frac, 0.0, 1.0))
         if top_frac_for_bearing is not None:
             top_frac_for_bearing = float(np.clip(top_frac_for_bearing, 0.0, 1.0))
@@ -1115,9 +1179,9 @@ class ASL:
         if top_frac_for_bearing is None:
             top_frac_for_bearing = top_frac
 
-        # Convenience handles
-        lat = np.asarray(self.source["lat"], float)
-        lon = np.asarray(self.source["lon"], float)
+        # ---------- current track handles ----------
+        lat = np.asarray(self.source.get("lat"), float)
+        lon = np.asarray(self.source.get("lon"), float)
         dr  = np.asarray(self.source.get("DR", np.full_like(lat, np.nan)), float)
         mis = np.asarray(self.source.get("misfit", np.full_like(lat, np.nan)), float)
 
@@ -1127,8 +1191,9 @@ class ASL:
                 print("[ASL] refine_and_relocate: no finite source coords; skipping")
             return self
 
-        g_lat = np.asarray(self.gridobj.gridlat).reshape(-1)
-        g_lon = np.asarray(self.gridobj.gridlon).reshape(-1)
+        grid = self.gridobj
+        g_lat = np.asarray(grid.gridlat).reshape(-1)
+        g_lon = np.asarray(grid.gridlon).reshape(-1)
         nn = g_lat.size
 
         # ---------- mask builders ----------
@@ -1140,9 +1205,13 @@ class ASL:
             k_frac = int(np.ceil(top_frac * idx_all.size))
             k = max(1, min_top_points, k_frac)
             k = min(k, idx_all.size)
-            order = np.argsort(dr[idx_all])[::-1] if np.isfinite(dr[idx_all]).any() else np.arange(idx_all.size)
-            idx_top = idx_all[order[:k]]
 
+            if np.isfinite(dr[idx_all]).any():
+                order = np.argsort(dr[idx_all])[::-1]
+            else:
+                order = np.arange(idx_all.size)
+
+            idx_top = idx_all[order[:k]]
             lat_top = lat[idx_top]; lon_top = lon[idx_top]
 
             lat0 = float(np.nanmedian(lat_top))
@@ -1164,10 +1233,10 @@ class ASL:
             return mask
 
         def _mask_sector() -> np.ndarray:
-            apx_lat = apex_lat if apex_lat is not None else getattr(self.gridobj, "apex_lat", None)
-            apx_lon = apex_lon if apex_lon is not None else getattr(self.gridobj, "apex_lon", None)
+            apx_lat = apex_lat if apex_lat is not None else getattr(grid, "apex_lat", None)
+            apx_lon = apex_lon if apex_lon is not None else getattr(grid, "apex_lon", None)
             if apx_lat is None or apx_lon is None:
-                raise ValueError("sector mask requires apex_lat/apex_lon (or gridobj.apex_lat/apex_lon).")
+                raise ValueError("sector mask requires apex_lat/apex_lon (or grid.apex_lat/apex_lon).")
 
             def _bearing(aplat, aplon, tlat, tlon) -> float:
                 _, az, _ = gps2dist_azimuth(float(aplat), float(aplon), float(tlat), float(tlon))
@@ -1193,10 +1262,12 @@ class ASL:
                 if verbose:
                     print(f"[ASL] refine_and_relocate[sector]: bearing from top-DR median: {bearing_deg:.1f}°")
 
+            # great-circle distance & azimuth from apex to all nodes
             dist_km = np.empty(nn, float)
             az_deg  = np.empty(nn, float)
             for i in range(nn):
-                d_m, az, _ = gps2dist_azimuth(float(apx_lat), float(apx_lon), float(g_lat[i]), float(g_lon[i]))
+                d_m, az, _ = gps2dist_azimuth(float(apx_lat), float(apx_lon),
+                                            float(g_lat[i]), float(g_lon[i]))
                 dist_km[i] = 0.001 * float(d_m)
                 az_deg[i]  = float(az % 360.0)
 
@@ -1225,14 +1296,13 @@ class ASL:
             raise ValueError("mask_method must be one of {'bbox','sector'}")
 
         # ---------- intersect with existing masks ----------
-        # Start with refinement mask (flat bool)
         combined_bool = np.asarray(mask_bool, bool).ravel()
 
         # Intersect with persistent Grid mask (if any)
-        base_idx = self.gridobj.get_mask_indices()
-        if base_idx is not None and base_idx.size:
+        base_idx = grid.get_mask_indices()
+        if base_idx is not None and np.size(base_idx) > 0:
             base_bool = np.zeros_like(combined_bool, dtype=bool)
-            base_bool[base_idx] = True
+            base_bool[np.asarray(base_idx, int)] = True
             combined_bool &= base_bool
 
         # Intersect with any ASL temp mask (legacy support)
@@ -1243,7 +1313,7 @@ class ASL:
 
         sub_idx = np.flatnonzero(combined_bool)
 
-        # ---------- fast_locate passthrough kwargs ----------
+        # ---------- kwargs passthrough to fast_locate ----------
         kwargs = {
             "misfit_backend":        misfit_backend,
             "spatial_smooth_sigma":  spatial_smooth_sigma if spatial_smooth_sigma is not None else spatial_sigma_nodes,
@@ -1258,11 +1328,18 @@ class ASL:
         }
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-        # ---------- run or bail gracefully ----------
+        # ---------- run (or bail gracefully) ----------
         if sub_idx.size == 0:
             if verbose:
                 print("[ASL] refine_and_relocate: sub-grid empty after intersection; keeping current domain.")
+            # Run as-is (full/current mask), and let fast_locate set its own _last_eval_idx
             self.fast_locate(verbose=verbose, **kwargs)
+            # If fast_locate didn’t set an eval index, default to current mask or full grid
+            if not hasattr(self, "_last_eval_idx"):
+                current_idx = grid.get_mask_indices()
+                self._last_eval_idx = (np.asarray(current_idx, int).ravel()
+                                    if current_idx is not None and np.size(current_idx) > 0
+                                    else np.arange(nn, dtype=int))
             return self
 
         if verbose:
@@ -1270,19 +1347,43 @@ class ASL:
             print(f"[ASL] refine_and_relocate[{mm}]: {sub_idx.size} nodes (~{frac:.1f}% of grid)")
 
         # ---------- TEMPORARY mask application on Grid ----------
-        # Stash current Grid mask (indices or None)
-        old_idx = self.gridobj.get_mask_indices()
+        old_idx = grid.get_mask_indices()  # stash current mask (indices or None)
 
         try:
             # Apply combined mask temporarily (replace)
-            self.gridobj.apply_mask_boolean(combined_bool, mode="replace")
-            self.fast_locate(verbose=verbose, **kwargs)
+            grid.apply_mask_boolean(combined_bool, mode="replace")
+
+            # If your fast_locate accepts a node list, pass it (best). If not, the
+            # grid mask will already restrict the domain.
+            try:
+                self.fast_locate(candidate_idx=sub_idx, verbose=verbose, **kwargs)
+            except TypeError:
+                # Older API: no candidate_idx; rely on mask
+                self.fast_locate(verbose=verbose, **kwargs)
+
+            # Stash *exact* indices evaluated this run (for plotting)
+            self._last_eval_idx = np.asarray(sub_idx, int).ravel()
+
+            # Try to stash the per-node misfit vector if the locator exposes it
+            # (these attribute names are just common patterns—adjust if your code differs)
+            if hasattr(self, "last_misfit_vector") and self.last_misfit_vector is not None:
+                self._last_misfit_vec = np.asarray(self.last_misfit_vector, float).ravel()
+            elif hasattr(self, "_last_misfit_vec") and isinstance(self._last_misfit_vec, np.ndarray):
+                # already set by fast_locate; ensure it matches size or drop it
+                if self._last_misfit_vec.size != sub_idx.size:
+                    # size mismatch—discard to avoid plotting errors later
+                    delattr(self, "_last_misfit_vec")
+            elif hasattr(self, "misfit_backend") and hasattr(self.misfit_backend, "last_per_node"):
+                vec = np.asarray(self.misfit_backend.last_per_node, float).ravel()
+                if vec.size == sub_idx.size:
+                    self._last_misfit_vec = vec
+
         finally:
             # Restore prior Grid mask exactly
             if old_idx is None:
-                self.gridobj.clear_mask()
+                grid.clear_mask()
             else:
-                self.gridobj.apply_mask_indices(old_idx)
+                grid.apply_mask_indices(old_idx)
 
         return self
         
@@ -1457,9 +1558,9 @@ class ASL:
         return fig if return_fig else None
 
 
-    def plot_reduced_displacement(self, threshold_DR: float = 0.0, outfile: str | None = None, *, show: bool = True):
+    def plot_reduced_displacement(self, threshold_DR: float = 0.0, outfile: str | None = None, *, displacement=True, show: bool = True):
         """
-        Plot the time series of reduced displacement (DR).
+        Plot the time series of reduced displacement (DR) or reduced velocity.
 
         Parameters
         ----------
@@ -1488,7 +1589,10 @@ class ASL:
         if threshold_DR:
             plt.axhline(float(threshold_DR), linestyle="--")
         plt.xlabel("Date/Time (UTC)")
-        plt.ylabel("Reduced Displacement (${cm}^2$)")
+        if displacement:
+            plt.ylabel("Reduced Displacement (${cm}^2$)")
+        else:
+            plt.ylabel("Reduced Velocity (${cm}^2/s$)")
         if outfile:
             plt.savefig(outfile); plt.close()
         elif show:
@@ -1580,7 +1684,14 @@ class ASL:
             return None
 
         try:
-            return pd.DataFrame(self.source)
+            df = pd.DataFrame(self.source)
+            if "t" in df.columns:
+                try:
+                    # Convert ObsPy UTCDateTime objects to Python datetime first
+                    df["t"] = pd.to_datetime([tt.datetime for tt in self.source["t"]], utc=True, errors="coerce")
+                except Exception as e:
+                    print(f"[ASL] Failed to convert t column: {e}")
+            return df
         except Exception as e:
             print(f"[ASL] Could not convert source to DataFrame: {e!r}")
             return None
@@ -1636,23 +1747,11 @@ class ASL:
         """
         Write the current ASL source track to CSV.
 
-        Output characteristics
-        ----------------------
+        Output
+        ------
         - `t` column in ISO-8601 UTC (YYYY-MM-DDTHH:MM:SS.ssssssZ).
         - Stable, analysis-friendly column ordering.
         - Only writes if a source is available and non-empty.
-
-        Parameters
-        ----------
-        csvfile : str
-            Destination CSV path.
-        index : bool, default False
-            Include DataFrame index in CSV.
-
-        Returns
-        -------
-        str | None
-            Path to the written CSV on success, else None.
         """
         df = self.source_to_dataframe()
         if df is None or df.empty:
@@ -1660,33 +1759,22 @@ class ASL:
             return None
 
         # Stable column order
-        preferred = ["t", "lat", "lon", "DR", "misfit", "azgap", "nsta", "node_index", "connectedness"]
-        cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+        preferred = ["t", "lat", "lon", "DR", "misfit", "azgap",
+                    "nsta", "node_index", "connectedness"]
+        cols = [c for c in preferred if c in df.columns] \
+            + [c for c in df.columns if c not in preferred]
         df = df.loc[:, cols]
 
-        # Ensure ISO-8601 UTC strings for time
-        if "t" in df.columns:
-            try:
-                # `source_to_dataframe()` should already have converted to pandas datetime64[ns, UTC],
-                # but guard anyway:
-                tcol = df["t"]
-                if not np.issubdtype(tcol.dtype, np.datetime64):
-                    # Try to convert from UTCDateTime objects or strings
-                    df["t"] = pd.to_datetime(tcol, utc=True, errors="coerce")
-                # Format as ISO-8601 with 'Z'
-                df["t"] = df["t"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-            except Exception:
-                # Fall back to raw string conversion
-                df["t"] = df["t"].astype(str)
+        # Format `t` as ISO-8601 with trailing Z
+        if "t" in df.columns and pd.api.types.is_datetime64_any_dtype(df["t"]):
+            df["t"] = df["t"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
-        try:
-            Path(os.path.dirname(os.path.abspath(csvfile)) or ".").mkdir(parents=True, exist_ok=True)
-            df.to_csv(csvfile, index=index)
-            print(f"[ASL] Source written to CSV: {csvfile}")
-            return csvfile
-        except Exception as e:
-            print(f"[ASL] ERROR writing CSV: {e!r}")
-            return None
+        # Ensure destination folder exists
+        Path(csvfile).parent.mkdir(parents=True, exist_ok=True)
+
+        df.to_csv(csvfile, index=index)
+        print(f"[ASL] Source written to CSV: {csvfile}")
+        return csvfile
         
     def estimate_decay_params(
         self,

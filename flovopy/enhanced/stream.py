@@ -459,11 +459,11 @@ class EnhancedStream(Stream):
                     tr.stats.metrics = {}
 
                 E0 = None
-                if use_boatwright:
+                if use_boatwright: # Boatwright is body wave only and has no attenuation term
                     if len(tr.stats.channel) >= 2 and tr.stats.channel[1].upper() == "D":
                         E0 = Eacoustic_Boatwright(tr, R, rho_atmos=rho_atmos, c_atmos=c_atmos, z=z)
                     else:
-                        E0 = Eseismic_Boatwright(tr, R, rho_earth=rho_earth, c_earth=c_earth, S=S, A=A)
+                        E0 = Eseismic_Boatwright(tr, R, rho_earth=rho_earth, c_earth=c_earth, S=S, A=A, Q=Q)
 
                         # optional Q correction using spectral peak if present
                         '''
@@ -478,7 +478,9 @@ class EnhancedStream(Stream):
                                     E0 = float(E0) / float(A_att)
                         '''
                 else:
-                    E0 = estimate_source_energy(tr, R, model=model, Q=Q, c_earth=c_earth)
+                    # 
+                    E0 = estimate_source_energy(tr, R, model=model, Q=Q, c_earth=c_earth, rho_earth=rho_earth)
+                    print('back from estimate_source_energy')
 
                 # Convert only if E0 is usable
                 if E0 is not None and np.isfinite(E0) and E0 > 0:

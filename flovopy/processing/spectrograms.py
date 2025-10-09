@@ -684,3 +684,15 @@ def amp2dB(X):
 def dB2amp(X):
     return np.power(10.0, float(X)/20.0)
 
+
+
+
+def plot_strongest_trace(st, detrend=True, clip_level=1.0, fmin=None, fmax=None, dbscale=True, log=False, cmap='inferno', secsPerFFT=1.0, outfile=None):
+    if detrend:
+        st.detrend('linear')
+    peakA = np.array([max(abs(tr.data)) for tr in st])
+    peakA[peakA>clip_level]=0.0 # outlier in wrong units?
+    maxA = max(peakA)
+    strongest_tr = Stream(traces=st[np.argmax(peakA)])
+    spobj = icewebSpectrogram(strongest_tr, secsPerFFT=secsPerFFT)
+    spobj.plot(log=log, dbscale=dbscale, cmap=cmap, fmin=fmin, fmax=fmax, clim=[maxA/200, maxA/3], outfile=outfile)
