@@ -1,7 +1,7 @@
 from __future__ import annotations
 import numpy as np
 from typing import Tuple
-from obspy import Trace, UTCDateTime
+from obspy import Trace, UTCDateTime, Stream
 from collections import defaultdict
 
 # Reuse the local helpers (or import from core if colocated)
@@ -307,3 +307,35 @@ def stationxml_match_report(st: Stream, inv, t1: UTCDateTime | None = None):
         print(f"[INV] missing ({reason}): {ids}")
 
     return {"matched": matched, "misses": dict(misses)}
+
+
+def safe_pad_taper_filter_stream(
+    st: Stream,
+    *,
+    taper_fraction: float,
+    filter_type: str,
+    freq,
+    corners: int,
+    zerophase: bool,
+    inv=None,
+    output_type: str = "VEL",
+    verbose: bool = False,
+) -> Stream:
+    """Apply safe_pad_taper_filter to each Trace in a Stream; returns filtered Stream."""
+    out = Stream()
+    for tr in st:
+        tr2 = tr.copy()
+        ok = safe_pad_taper_filter(
+            tr2,
+            taper_fraction=taper_fraction,
+            filter_type=filter_type,
+            freq=freq,
+            corners=corners,
+            zerophase=zerophase,
+            inv=inv,
+            output_type=output_type,
+            verbose=verbose,
+        )
+        if ok:
+            out += tr2
+    return out

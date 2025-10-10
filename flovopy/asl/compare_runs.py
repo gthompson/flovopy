@@ -17,7 +17,6 @@ import pandas as pd
 # Public API
 __all__ = [
     # pairwise (baseline vs variants)
-    "tweak_config",
     "compare_runs",
     "safe_compare",
     "load_all_event_comparisons",
@@ -476,63 +475,7 @@ def ensure_csv_for(
             return None
     return csv
 
-from itertools import product
-from typing import Dict, Iterable, Optional
 
-def tweak_config(
-    baseline,
-    *,
-    changes: Optional[Iterable[dict]] = None,
-    axes: Optional[Dict[str, Iterable]] = None,
-    landgridobj=None,                           # backward-compat convenience
-    annual_station_corrections_df=None,         # backward-compat convenience
-    include_baseline: bool = False,             # optionally include the baseline itself
-    dedupe: bool = True,                        # dedupe by tag() if collisions
-) -> Dict[str, "ASLConfig"]:
-    """
-    Build a dict of ASLConfig variants derived from `baseline`.
-
-    - `changes`: an iterable of override dicts, e.g. [{'Q':100}, {'speed':3.0}]
-    - `axes`: a Cartesian sweep, e.g. {'speed':[1.0,3.0], 'Q':[10,100]}
-      -> produces all combinations
-    - Keys of the returned dict are each config's `tag()` string.
-    """
-
-    # Normalize inputs
-    variant_specs: list[dict] = []
-    if include_baseline:
-        variant_specs.append({})
-
-    if changes:
-        variant_specs.extend(dict(c) for c in changes)
-
-    if axes:
-        keys = list(axes.keys())
-        for values in product(*[axes[k] for k in keys]):
-            variant_specs.append({k: v for k, v in zip(keys, values)})
-
-    # Back-compat conveniences
-    if landgridobj is not None:
-        variant_specs.append({"gridobj": landgridobj})
-    if annual_station_corrections_df is not None:
-        variant_specs.append({"station_correction_dataframe": annual_station_corrections_df})
-
-    # If nothing was requested, return empty dict
-    if not variant_specs:
-        return {}
-
-    out: Dict[str, "ASLConfig"] = {}
-    for spec in variant_specs:
-        cfg = baseline.copy(**spec)  # your copy() auto-builds if needed
-        key = cfg.tag()              # use canonical config tag as the label
-
-        if key in out and dedupe:
-            # Last one wins; collide silently or print if you prefer:
-            # print(f"[tweak_config] duplicate tag {key}; overwriting")
-            pass
-        out[key] = cfg
-
-    return out
 
 def compare_runs(
     baseline_cfg,

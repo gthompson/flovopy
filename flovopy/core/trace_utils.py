@@ -1438,3 +1438,28 @@ def select_by_index_list(st, chosen):
         if i in chosen:
             st2.append(tr)
     return st2 
+
+
+def stream_add_units(st, default_units="m/s"):
+    """
+    If a trace has no .stats.units, infer:
+      - 'Counts' when amplitudes look large
+      - default_units (e.g., 'm/s' or 'm') when amplitudes look small
+    """
+    for tr in st:
+        # keep any existing unit annotation
+        current_units = getattr(tr.stats, "units", None)
+        if current_units:
+            continue
+
+        data = tr.data
+        if data is None or len(data) == 0:
+            tr.stats["units"] = "Counts"
+            continue
+
+        median_abs = float(np.nanmedian(np.abs(data)))
+        if np.isfinite(median_abs) and median_abs < 1.0:
+            # likely already in physical units
+            tr.stats["units"] = default_units
+        else:
+            tr.stats["units"] = "Counts"

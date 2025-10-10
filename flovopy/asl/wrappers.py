@@ -1,48 +1,45 @@
-# flovopy/asl/config.py
 from __future__ import annotations
-import os
-from pathlib import Path
-from typing import Optional, List, Dict, Any
 
+# stdlib
+import contextlib
+import io
+import json
+import os
+import sys
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from glob import glob
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# third-party
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from obspy import read, UTCDateTime, Stream
-from obspy.core.inventory import Inventory
 
-from flovopy.asl.distances import distances_signature
+# project
 from flovopy.asl.ampcorr import AmpCorrParams, AmpCorr
-#from flovopy.processing.sam import VSAM  # default
-from flovopy.asl.config import ASLConfig
-from flovopy.asl.station_corrections import apply_interval_station_gains
+from flovopy.asl.asl import ASL
+from flovopy.asl.distances import distances_signature
+from flovopy.asl.map import plot_heatmap_colored
 from flovopy.asl.misfit import (
     StdOverMeanMisfit,
     R2DistanceMisfit,
     LinearizedDecayMisfit,
+    # HuberMisfit,  # if/when implemented
 )
-# from flovopy.asl.misfit import HuberMisfit  # if implemented
-from flovopy.enhanced.event import EnhancedEvent, EnhancedEventMeta
-from flovopy.enhanced.catalog import EnhancedCatalog
-from flovopy.enhanced.stream import EnhancedStream
-from flovopy.asl.map import plot_heatmap_colored
-from flovopy.asl.asl import ASL
-from flovopy.processing.spectrograms import icewebSpectrogram
-from flovopy.processing.sam import VSAM, DSAM
 from flovopy.asl.reduced_time import shift_stream_by_travel_time
-
-# Needed for run_all_events()
-import traceback
-import json
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from glob import glob
-
-# Needed for monte carlo simulations
-from dataclasses import replace
-from typing import List, Dict, Any, Optional
-
-# --- at module top (once) ---
-import sys, io,  contextlib
-
+from flovopy.asl.station_corrections import apply_interval_station_gains
+from flovopy.enhanced.catalog import EnhancedCatalog
+from flovopy.enhanced.event import EnhancedEvent, EnhancedEventMeta
+from flovopy.enhanced.stream import EnhancedStream
+from flovopy.processing.sam import VSAM, DSAM
+from flovopy.processing.spectrograms import plot_strongest_trace
+from flovopy.asl.config import tweak_config, ASLConfig
+from flovopy.core.trace_utils import stream_add_units, add_processing_step
+from flovopy.core.preprocess import preprocess_trace
+from flovopy.core.remove_response import safe_pad_taper_filter, safe_pad_taper_filter_stream
 
 class _Tee(io.TextIOBase):
     def __init__(self, *streams):
@@ -77,6 +74,308 @@ def tee_stdouterr(log_path: str, also_console: bool = True):
                 ts2 = UTCDateTime().strftime("%Y-%m-%d %H:%M:%S")
                 f.write(f"\n===== END {ts2} pid={os.getpid()} =====\n")
                 f.flush()
+
+#####################################
+# -------- HELPER FUNCTIONS ---------
+
+
+
+def _resolve_misfit_backend(name_or_obj, *, peakf_hz: float | None = None, speed_kms: float | None = None):
+    """
+    Accepts a backend instance or a string name and returns a backend instance.
+    Known names:
+      'l2','std','som','std_over_mean' -> StdOverMeanMisfit()
+      'r2','r2distance'                -> R2DistanceMisfit()
+      'lin','linearized','linearized_decay' -> LinearizedDecayMisfit(f_hz=..., v_kms=..., alpha=1.0)
+      'huber' (if shipped)            -> HuberMisfit()
+    """
+    if name_or_obj is None:
+        return None
+    if not isinstance(name_or_obj, str):
+        return name_or_obj
+
+    key = name_or_obj.strip().lower()
+    if key in ("l2", "std", "som", "std_over_mean"):
+        return StdOverMeanMisfit()
+    if key in ("r2", "r2distance"):
+        return R2DistanceMisfit()
+    if key in ("lin", "linearized", "linearized_decay"):
+        return LinearizedDecayMisfit(
+            f_hz=peakf_hz if peakf_hz is not None else 8.0,
+            v_kms=speed_kms if speed_kms is not None else 1.5,
+            alpha=1.0,
+        )
+    # if you ship Huber:
+    # if key in ("huber",):
+    #     return HuberMisfit()
+
+    print(f"[ASL:MISFIT] Unknown backend '{name_or_obj}', using StdOverMean.")
+    return StdOverMeanMisfit()
+
+
+def find_event_files(root_dir: str, extensions=(".cleaned", ".mseed")) -> List[str]:
+    files = []
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            if filename.endswith(extensions):
+                files.append(os.path.join(dirpath, filename))
+    return sorted(files)
+
+
+RESULT_PATTERNS = (
+    "**/*node_results.csv",
+    "**/*node_results.parquet",
+    "**/*node_metrics.csv",
+    "**/*vsam_nodes.csv",
+)
+
+_COL_ALIASES = {
+    "latitude":  ("latitude", "lat", "y"),
+    "longitude": ("longitude", "lon", "x"),
+    "amplitude": ("amplitude", "amp", "energy", "value"),
+}
+
+def _pick(df: pd.DataFrame, canonical: str) -> str | None:
+    for cand in _COL_ALIASES[canonical]:
+        if cand in df.columns:
+            return cand
+    return None
+
+def collect_node_results(run_outdir: str) -> pd.DataFrame:
+    matches: List[str] = []
+    for pat in RESULT_PATTERNS:
+        matches.extend(glob(os.path.join(run_outdir, pat), recursive=True))
+
+    dfs: List[pd.DataFrame] = []
+    for f in sorted(set(matches)):
+        try:
+            df = pd.read_parquet(f) if f.lower().endswith(".parquet") else pd.read_csv(f)
+        except Exception:
+            continue
+
+        # normalize to lowercase col names
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        lat_col = _pick(df, "latitude")
+        lon_col = _pick(df, "longitude")
+        amp_col = _pick(df, "amplitude")
+        if not (lat_col and lon_col and amp_col):
+            continue
+
+        sub = df[[lat_col, lon_col, amp_col]].rename(
+            columns={lat_col: "latitude", lon_col: "longitude", amp_col: "amplitude"}
+        )
+        sub = sub.dropna(subset=["latitude", "longitude", "amplitude"])
+        if not sub.empty:
+            dfs.append(sub)
+
+    if not dfs:
+        print(f"[HEATMAP] No node CSVs matched under: {run_outdir}")
+        return pd.DataFrame(columns=["latitude", "longitude", "amplitude"])
+
+    return pd.concat(dfs, ignore_index=True)
+
+
+def enhanced_catalogs_from_outputs(
+    outputs_list: List[Dict[str, Any]],
+    *,
+    outdir: str,
+    write_files: bool = True,
+    load_waveforms: bool = False,
+    primary_name: str = "catalog_primary",
+    refined_name: str = "catalog_refined",
+) -> Dict[str, Any]:
+
+    """
+    Build EnhancedCatalogs (primary, refined) from the per-event outputs dicts
+    returned by `asl_sausage()`.
+
+    Each element in outputs_list is expected to be:
+      {"primary": {"qml": "...", "json": "...", ...},
+       "refined": {"qml": "...", "json": "...", ...} or None,
+       "_meta": {...}}
+
+    Returns:
+      {
+        "primary": EnhancedCatalog,
+        "refined": EnhancedCatalog,
+        "primary_qml": <path or None>,
+        "refined_qml": <path or None>,
+        "primary_csv": <path or None>,
+        "refined_csv": <path or None>,
+      }
+    """
+    os.makedirs(outdir, exist_ok=True)
+
+    prim_recs, ref_recs = [], []
+
+    def _append_rec(block: Dict[str, Any], bucket: list):
+        if not block:
+            return
+        qml = block.get("qml")
+        jjs = block.get("json")
+        if not qml or not jjs:
+            return
+        if not (os.path.exists(qml) and os.path.exists(jjs)):
+            return
+        try:
+            enh = EnhancedEvent.load(os.path.splitext(qml)[0])
+            if not load_waveforms:
+                enh.stream = None
+            bucket.append(enh)
+        except Exception:
+            pass
+
+    for out in outputs_list:
+        _append_rec((out or {}).get("primary") or {}, prim_recs)
+        _append_rec((out or {}).get("refined") or {}, ref_recs)
+
+    prim_cat = EnhancedCatalog(
+        events=[r.event for r in prim_recs],
+        records=prim_recs,
+        description="Primary ASL locations",
+    )
+    ref_cat = EnhancedCatalog(
+        events=[r.event for r in ref_recs],
+        records=ref_recs,
+        description="Refined ASL locations",
+    )
+
+    primary_qml = refined_qml = primary_csv = refined_csv = None
+    if write_files:
+        if len(prim_cat):
+            primary_qml = os.path.join(outdir, f"{primary_name}.qml")
+            prim_cat.write(primary_qml, format="QUAKEML")
+            primary_csv = os.path.join(outdir, f"{primary_name}.csv")
+            prim_cat.export_csv(primary_csv)
+        if len(ref_cat):
+            refined_qml = os.path.join(outdir, f"{refined_name}.qml")
+            ref_cat.write(refined_qml, format="QUAKEML")
+            refined_csv = os.path.join(outdir, f"{refined_name}.csv")
+            ref_cat.export_csv(refined_csv)
+
+    return {
+        "primary": prim_cat,
+        "refined": ref_cat,
+        "primary_qml": primary_qml,
+        "refined_qml": refined_qml,
+        "primary_csv": primary_csv,
+        "refined_csv": refined_csv,
+    }
+
+
+
+
+def _prepare_stream_for_sam(
+    st_in: Stream,
+    *,
+    cfg,
+    mseed_units: str | None,
+    band: tuple[float, float] = (0.2, 18.0),
+    taper_fraction: float = 0.05,
+    debug: bool = False,
+) -> Stream:
+    """
+    Return a new Stream in the units required by the chosen SAM:
+      - VSAM → 'm/s'
+      - DSAM → 'm'
+    Uses flovopy.core.preprocess/remove_response for pad/taper-safe filtering & response removal.
+    """
+    want_units      = "m/s" if cfg.sam_class is VSAM else "m"
+    response_output = "VEL" if want_units == "m/s" else "DISP"
+
+    st = st_in.copy()
+    if mseed_units:
+        stream_add_units(st, default_units=mseed_units)
+
+    out = Stream()
+    for tr in st:
+        units = tr.stats.get("units") or "Counts"
+        tr2 = tr.copy()
+
+        # A) Counts → remove response directly to the target output (VEL/DISP),
+        #    with pad/taper-safe filtering built in.
+        if units == "Counts":
+            ok = preprocess_trace(
+                tr2,
+                do_clean=True,
+                taper_fraction=taper_fraction,
+                filter_type="bandpass",
+                freq=band,
+                corners=2,
+                zerophase=True,
+                inv=cfg.inventory,
+                output_type=response_output,
+                verbose=debug,
+            )
+            if not ok:
+                if debug: print(f"[RESP] drop {tr2.id} (Counts→{response_output}) failed")
+                continue
+            tr2.stats["units"] = want_units
+            if debug: add_processing_step(tr2, f"units:{want_units}")
+
+        # B) Already physical → clean without response; convert if needed
+        else:
+            # Clean with pad/taper-safe filter
+            ok = preprocess_trace(
+                tr2,
+                do_clean=True,
+                taper_fraction=taper_fraction,
+                filter_type="bandpass",
+                freq=band,
+                corners=2,
+                zerophase=True,
+                inv=None,                 # no response removal on physical data
+                output_type="VEL",        # ignored when inv=None
+                verbose=debug,
+            )
+            if not ok:
+                if debug: print(f"[CLEAN] drop {tr2.id} (bandpass) failed")
+                continue
+
+            # Convert if domain mismatches desired SAM units
+            cur = tr2.stats.get("units") or units
+            if want_units == "m/s" and cur == "m":
+                if debug: print(f"[CONVERT] {tr2.id} m→m/s (differentiate)")
+                try:
+                    tr2.detrend("linear")
+                    tr2.differentiate()
+                    tr2.stats["units"] = "m/s"
+                except Exception as e:
+                    if debug: print(f"[CONVERT:WARN] {tr2.id}: diff failed: {e}")
+                    continue
+
+            elif want_units == "m" and cur == "m/s":
+                if debug: print(f"[CONVERT] {tr2.id} m/s→m (integrate + HP)")
+                try:
+                    tr2.detrend("linear")
+                    tr2.integrate()
+                    # stabilize LF drift with a *padded* highpass:
+                    ok_hp = safe_pad_taper_filter(
+                        tr2,
+                        taper_fraction=taper_fraction,
+                        filter_type="highpass",
+                        freq=0.2,
+                        corners=2,
+                        zerophase=True,
+                        inv=None,
+                        output_type="DISP",
+                        verbose=debug,
+                    )
+                    if not ok_hp:
+                        if debug: print(f"[CONVERT:WARN] {tr2.id}: HP after integrate failed")
+                        continue
+                    tr2.stats["units"] = "m"
+                except Exception as e:
+                    if debug: print(f"[CONVERT:WARN] {tr2.id}: integ failed: {e}")
+                    continue
+
+        out += tr2
+
+    return out
+
+
+
 
 def _asl_output_source_results(
     aslobj,
@@ -474,877 +773,14 @@ def asl_sausage(
     return {"primary": primary_out, "refined": refined_out}
 
 
-def stream_add_units(st, mseed_units='m/s'):
-    for tr in st:
-        median_abs = float(np.nanmedian(np.abs(tr.data))) if tr.data is not None else np.inf
-        if median_abs < 1.0:
-            # probably already physical units
-            tr.stats["units"] = mseed_units  
-        else:
-            tr.stats["units"] = 'Counts'  
 
-# ---------------------------------------------------------------------
-# Single event
-# ---------------------------------------------------------------------
-'''
-def run_single_event(
-    mseed_file: str,
-    cfg: ASLConfig,
-    *,
-    refine_sector: bool = False,
-    station_gains_df: Optional[pd.DataFrame] = None,
-    topo_kw: Optional[dict] = None,
-    switch_event_ctag: bool = True,
-    vertical_only: bool = True,
-    mseed_units: str = None,
-    debug: bool = True,
-) -> Dict[str, Any]:
-    """
-    Minimal, notebook-friendly runner (delegates to asl_sausage).
-
-    Returns:
-      {
-        "tag": <cfg tag string>,
-        "outdir": <cfg outdir>,
-        "event_dir": "<per-event dir>",
-        "outputs": {"primary": {...}, "refined": {... or None}},
-        "elapsed_s": <float>
-      }
-      or, on error:
-      {
-        "tag": <cfg tag string>,
-        "error": "...",
-        "outdir": <cfg outdir>
-      }
-    """
-
-    t0 = UTCDateTime()
-
-    try:
-        if getattr(cfg, "inventory", None) is None or not getattr(cfg, "outdir", ""):
-            if debug:
-                print("[ASL] Building configuration (distances/ampcorr caches)…")
-            cfg.build()
-    except Exception as e:
-        traceback.print_exc()
-        tag_str = getattr(cfg, "tag_str", None) or cfg.tag()
-        return {"tag": tag_str, "error": f"{type(e).__name__}: {e}", "outdir": str(getattr(cfg, "outdir", ""))}
-
-    try:
-        # could replace this with my more robust read_mseed() from flovopy.core.miniseed_io
-        if vertical_only:
-            st = read(mseed_file, format='MSEED').select(component="Z")
-        else:
-            st = read(mseed_file, format='MSEED')
-
-        ##################################################################################
-        ### DO ANY STREAM PREPROCESSING IN THIS BLOCK, OR BEFORE CALLING THIS FUNCTION ###
-        ##################################################################################
-
-        # 1) Station gains (optional)
-
-        # Resolve station-gains / corrections
-        gains_df = station_gains_df
-        if gains_df is None:
-            gains_df = getattr(cfg, "station_corr_df_built", None)
-
-        if gains_df is not None and len(gains_df):
-            info = apply_interval_station_gains(
-                st,
-                gains_df,
-                allow_station_fallback=True,
-                verbose=True,
-            )
-            s = info.get("interval_start"); e = info.get("interval_end")
-            used = info.get("used", []); miss = info.get("missing", [])
-            print(f"[GAINS] Interval used: {s} → {e} | corrected {len(used)} traces; missing {len(miss)}")
-        else:
-            print("[GAINS] No station gains DataFrame provided; skipping.")
-
-        # Could add more complex Trace processing here from my preprocessing and remove_response modules
-        st.merge(fill_value='interpolate')
-        st.detrend('linear')
-        st.taper(max_percentage=0.02, type='cosine')
-        st.filter('bandpass', freqmin=0.1, freqmax=18.0, corners=2, zerophase=True)
-
-        # 2) Remove response if needed / set units based on SAM class
-        if mseed_units:
-            stream_add_units(st, mseed_units='m/s')
-
-        units_by_class  = {DSAM: "m",    VSAM: "m/s"}
-        output_by_class = {DSAM: "DISP", VSAM: "VEL"}
-        output = output_by_class.get(cfg.sam_class)
-
-        for tr in st:
-            units = tr.stats.get("units") or "Counts"
-            tr.stats["units"] = units
-            if units == "Counts":
-                median_abs = float(np.nanmedian(np.abs(tr.data))) if tr.data is not None else np.inf
-                if median_abs < 1.0:
-                    # probably already physical units
-                    new_units = units_by_class.get(cfg.sam_class)
-                    if new_units:
-                        tr.stats["units"] = new_units
-                else:
-                    print(f"[RESP] Removing instrument response from {tr.id}")
-                    try: # could replace this with my more robust remove_response() from flovopy.core.preprocessing
-                        tr.remove_response(inventory=cfg.inventory, output=output)
-                    except:
-                        st.remove(tr)
-            if units == "m/s" and cfg.sam_class==DSAM:
-                print('[RUN_SINGLE_EVENT]: Units mismatch for {tr.id} Integrating')
-                # need to integrate
-                tr.detrend('linear')
-                tr.taper(0.02)
-                tr.integrate()
-                tr.units = "m"
-            elif units == "m" and cfg.sam_class==VSAM:
-                # need to differentiate
-                print('[RUN_SINGLE_EVENT]: Units mismatch for {tr.id}. Differentiating')
-                tr.differentiate()
-                tr.units = "m/s"
-
-        if len(st) < int(cfg.min_stations):
-            raise RuntimeError(f"Not enough stations: {len(st)} < {cfg.min_stations}")
-        
-        # Reduce by travel time
-        shift_stream_by_travel_time(
-            st, 
-            cfg.inventory, topo_kw['dome_location'],
-            speed_km_s=cfg.speed,       # or any speed you want to test
-            use_elevation=True,
-            inplace=True,
-            trim=True,
-            verbose=True,
-        )
-
-
-        ##################################################################################
-        ### END OF STREAM PREPROCESSING BLOCK                                          ###
-        ##################################################################################
-
-        # Directory setup
-        if switch_event_ctag:
-            event_dir = Path(cfg.outdir).parent / Path(mseed_file).stem
-            #cfg.outdir = event_dir / cfg.tag() # immutable
-            products_dir = event_dir / Path(cfg.outdir).name
-        else:
-            products_dir = Path(cfg.outdir) / Path(mseed_file).stem
-            event_dir = products_dir
-
-        Path(products_dir).mkdir(parents=True, exist_ok=True)
-        tag_str = getattr(cfg, "tag_str", None) or cfg.tag()
-
-        # Per-event log file
-        log_file = str(products_dir / "event.log")
-
-
-        # Optionally plot grid once (unchanged)
-        if debug and getattr(cfg, "gridobj", None) is not None and not switch_event_ctag:
-            print("[ASL] Using this Grid:")
-            print(cfg.gridobj)
-            gridpng = os.path.join(cfg.outdir, "grid.png")
-            if not os.path.isfile(gridpng):
-                try:
-                    cfg.gridobj.plot(show=True, topo_map_kwargs=topo_kw, force_all_nodes=True, outfile=gridpng)
-                except Exception as e:
-                    print(f"[ASL:WARN] Grid plot failed: {e}")
-
-        if debug:
-            stream_png = os.path.join(event_dir, "stream.png")
-            if not os.path.isfile(stream_png):
-                st.plot(equal_scale=False, outfile=stream_png)
-            sgram_png = os.path.join(event_dir, "spectrogram_log.png")
-            if not os.path.isfile(sgram_png):
-                icewebSpectrogram(st).plot(fmin=0.1, fmax=10.0, log=True, cmap='plasma', dbscale=False, outfile=sgram_png, title=str(Path(mseed_file).stem))
-                icewebSpectrogram(st).plot(fmin=0.1, fmax=10.0, log=False, cmap='plasma', dbscale=False, outfile=sgram_png.replace('_log.png', '_linear.png'), title=str(Path(mseed_file).stem))
-
-
-        # --- Everything below gets teed to event.log ---
-        with tee_stdouterr(log_file, also_console=debug):
-            print(f"[ASL] Running single event: {mseed_file}")
-
-            outputs = asl_sausage(
-                stream=st,
-                event_dir=str(products_dir),
-                cfg=cfg,
-                dry_run=False,
-                peakf_override=None,
-                refine_sector=refine_sector,
-                topo_kw=topo_kw,
-                debug=debug,
-            )
-
-            if not isinstance(outputs, dict) or "primary" not in outputs:
-                raise RuntimeError("asl_sausage() did not return the expected outputs dict.")
-            primary = outputs.get("primary")
-            if not isinstance(primary, dict) or not primary.get("qml") or not primary.get("json"):
-                raise RuntimeError("asl_sausage() returned outputs without required 'qml'/'json' paths for the primary solution.")
-
-            # Inject the log-file path into the sidecar JSON (safe/no-op on error)
-            try:
-                sidecar = primary.get("json")
-                if sidecar and os.path.exists(sidecar):
-                    with open(sidecar, "r", encoding="utf-8") as f:
-                        payload = json.load(f)
-                    payload.setdefault("metrics", {})
-                    payload["metrics"]["log_file"] = log_file
-                    with open(sidecar, "w", encoding="utf-8") as f:
-                        json.dump(payload, f, indent=2, default=str)
-            except Exception as e:
-                print(f"[ASL:WARN] Could not tag sidecar with log path: {e}")
-
-            summ = {
-                "tag": tag_str,
-                "outdir": cfg.outdir,
-                "event_dir": str(event_dir),
-                "log_file": log_file,
-                "outputs": outputs,
-                "elapsed_s": round(UTCDateTime() - t0, 2),
-            }
-            if debug:
-                print(f"[ASL] Single-event summary: {summ}")
-            return summ
-
-    except Exception as e:
-        traceback.print_exc()
-        return {"tag": tag_str, "error": f"{type(e).__name__}: {e}", "outdir": cfg.outdir}
-'''    
-# ---------------------------------------------------------------------
-# All events (with optional multiprocessing)
-# ---------------------------------------------------------------------
-
-
-def run_all_events(
-    input_dir: str,
-    *,
-    cfg: ASLConfig,
-    topo_kw: Optional[dict] = None,
-    station_gains_df: Optional[pd.DataFrame] = None,
-    refine_sector: bool = False,
-    max_events: Optional[int] = None,
-    use_multiprocessing: bool = True,
-    workers: Optional[int] = None,
-    mseed_units: Optional[str] = None,
-    debug: bool = True,
-) -> str:
-    """
-    Process all miniSEED files under input_dir with the same ASLConfig.
-    - Parallel by default using N-2 workers (>=1).
-    - Writes JSONL summaries.
-    - Generates a global heatmap and builds EnhancedCatalogs when possible.
-
-    Returns cfg.outdir.
-    """
-    # Ensure cfg is fully built (outdir, inventory, caches)
-    if getattr(cfg, "inventory", None) is None or not getattr(cfg, "outdir", ""):
-        if debug:
-            print("[RUN] Building configuration before batch run…")
-        cfg.build()
-
-    run_dir = Path(cfg.outdir)
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    files = sorted(set(map(str, find_event_files(input_dir))))
-    if max_events:
-        files = files[: int(max_events)]
-    if not files:
-        print("[RUN] No event files found.")
-        return str(run_dir)
-
-    if use_multiprocessing:
-        if workers is None:
-            cpu = os.cpu_count() or 2
-            workers = max(1, cpu - 2)
-        print(f"[RUN] multiprocessing ON  workers={workers}")
-    else:
-        workers = 1
-        print("[RUN] multiprocessing OFF")
-
-    t0 = UTCDateTime()
-    processed = 0
-    all_outputs: List[Dict[str, Any]] = []
-    summary_path = run_dir / "summary.jsonl"
-
-    def _append_summary(rec: Dict[str, Any]):
-        with open(summary_path, "a", encoding="utf-8") as sfo:
-            sfo.write(json.dumps(rec) + "\n")
-
-    # Serial path (helpful for debugging)
-    if workers == 1:
-        for f in files:
-            try:
-                res = run_single_event(
-                    mseed_file=f,
-                    cfg=cfg,
-                    refine_sector=refine_sector,
-                    station_gains_df=station_gains_df,
-                    topo_kw=topo_kw,
-                    mseed_units=mseed_units,
-                    debug=debug,
-                )
-            except Exception as e:
-                res = {
-                    "tag": getattr(cfg, "tag_str", None) or cfg.tag(),
-                    "error": f"{type(e).__name__}: {e}",
-                    "traceback": traceback.format_exc(),
-                    "mseed_file": f,
-                }
-            _append_summary(res)
-            all_outputs.append(res)
-            processed += 1
-            print("[OK]" if "error" not in res else "[ERR]", f)
-
-    # Parallel path
-    else:
-        # NOTE: cfg must be picklable; ASLConfig dataclass is OK if its fields are picklable.
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            fut2file = {
-                ex.submit(
-                    run_single_event,
-                    mseed_file=f,
-                    cfg=cfg,
-                    refine_sector=refine_sector,
-                    station_gains_df=station_gains_df,
-                    topo_kw=topo_kw,
-                    debug=debug,
-                ): f
-                for f in files
-            }
-            for fut in as_completed(fut2file):
-                f = fut2file[fut]
-                try:
-                    res = fut.result()
-                except Exception as e:
-                    res = {
-                        "tag": getattr(cfg, "tag_str", None) or cfg.tag(),
-                        "error": f"{type(e).__name__}: {e}",
-                        "traceback": traceback.format_exc(),
-                        "mseed_file": f,
-                    }
-                _append_summary(res)
-                all_outputs.append(res)
-                processed += 1
-                print("[OK]" if "error" not in res else "[ERR]", f)
-
-    dt = UTCDateTime() - t0  # seconds as float
-    print(f"[DONE] Processed {processed}/{len(files)} events in {dt:.1f}s")
-
-    # ---- Heatmap aggregation & plot
-    try:
-        df = collect_node_results(str(run_dir))
-        if not df.empty:
-            heat_png = os.path.join(run_dir, "heatmap_energy.png")
-            print("[HEATMAP] Generating overall heatmap…")
-            plot_heatmap_colored(
-                df,
-                lat_col="latitude",
-                lon_col="longitude",
-                amp_col="amplitude",
-                log_scale=True,
-                node_spacing_m=cfg.gridobj.node_spacing_m,
-                outfile=heat_png,
-                title=f"Energy Heatmap — {getattr(cfg, 'tag_str', None) or cfg.tag()}",
-                topo_kw=topo_kw,
-            )
-            print("[HEATMAP] Wrote:", heat_png)
-        else:
-            print("[HEATMAP] No data found to plot.")
-    except Exception as e:
-        print("[HEATMAP:WARN] Failed to generate heatmap:", e)
-
-    # ---- Optional: assemble EnhancedCatalogs from per-event outputs
-    try:
-        good = []
-        for rec in all_outputs:
-            if isinstance(rec, dict) and "outputs" in rec and isinstance(rec["outputs"], dict):
-                good.append(rec["outputs"])
-        if good:
-            cat_info = enhanced_catalogs_from_outputs(
-                good,
-                outdir=str(run_dir),
-                write_files=True,
-                load_waveforms=False,
-                primary_name="catalog_primary",
-                refined_name="catalog_refined",
-            )
-            if cat_info.get("primary_qml"):
-                print("[CATALOG] Primary:", cat_info["primary_qml"])
-            if cat_info.get("refined_qml"):
-                print("[CATALOG] Refined:", cat_info["refined_qml"])
-            if cat_info.get("primary_csv"):
-                print("[CATALOG] Primary CSV:", cat_info["primary_csv"])
-            if cat_info.get("refined_csv"):
-                print("[CATALOG] Refined CSV:", cat_info["refined_csv"])
-        else:
-            print("[CATALOG] No successful event outputs to assemble.")
-    except Exception as e:
-        print(f"[CATALOG:WARN] Could not build EnhancedCatalogs: {e}")
-
-    return str(run_dir)
-
-
-
-
-def _resolve_misfit_backend(name_or_obj, *, peakf_hz: float | None = None, speed_kms: float | None = None):
-    """
-    Accepts a backend instance or a string name and returns a backend instance.
-    Known names:
-      'l2','std','som','std_over_mean' -> StdOverMeanMisfit()
-      'r2','r2distance'                -> R2DistanceMisfit()
-      'lin','linearized','linearized_decay' -> LinearizedDecayMisfit(f_hz=..., v_kms=..., alpha=1.0)
-      'huber' (if shipped)            -> HuberMisfit()
-    """
-    if name_or_obj is None:
-        return None
-    if not isinstance(name_or_obj, str):
-        return name_or_obj
-
-    key = name_or_obj.strip().lower()
-    if key in ("l2", "std", "som", "std_over_mean"):
-        return StdOverMeanMisfit()
-    if key in ("r2", "r2distance"):
-        return R2DistanceMisfit()
-    if key in ("lin", "linearized", "linearized_decay"):
-        return LinearizedDecayMisfit(
-            f_hz=peakf_hz if peakf_hz is not None else 8.0,
-            v_kms=speed_kms if speed_kms is not None else 1.5,
-            alpha=1.0,
-        )
-    # if you ship Huber:
-    # if key in ("huber",):
-    #     return HuberMisfit()
-
-    print(f"[ASL:MISFIT] Unknown backend '{name_or_obj}', using StdOverMean.")
-    return StdOverMeanMisfit()
-
-
-def find_event_files(root_dir: str, extensions=(".cleaned", ".mseed")) -> List[str]:
-    files = []
-    for dirpath, _, filenames in os.walk(root_dir):
-        for filename in filenames:
-            if filename.endswith(extensions):
-                files.append(os.path.join(dirpath, filename))
-    return sorted(files)
-
-
-RESULT_PATTERNS = (
-    "**/*node_results.csv",
-    "**/*node_results.parquet",
-    "**/*node_metrics.csv",
-    "**/*vsam_nodes.csv",
-)
-
-_COL_ALIASES = {
-    "latitude":  ("latitude", "lat", "y"),
-    "longitude": ("longitude", "lon", "x"),
-    "amplitude": ("amplitude", "amp", "energy", "value"),
-}
-
-def _pick(df: pd.DataFrame, canonical: str) -> str | None:
-    for cand in _COL_ALIASES[canonical]:
-        if cand in df.columns:
-            return cand
-    return None
-
-def collect_node_results(run_outdir: str) -> pd.DataFrame:
-    matches: List[str] = []
-    for pat in RESULT_PATTERNS:
-        matches.extend(glob(os.path.join(run_outdir, pat), recursive=True))
-
-    dfs: List[pd.DataFrame] = []
-    for f in sorted(set(matches)):
-        try:
-            df = pd.read_parquet(f) if f.lower().endswith(".parquet") else pd.read_csv(f)
-        except Exception:
-            continue
-
-        # normalize to lowercase col names
-        df.columns = [c.strip().lower() for c in df.columns]
-
-        lat_col = _pick(df, "latitude")
-        lon_col = _pick(df, "longitude")
-        amp_col = _pick(df, "amplitude")
-        if not (lat_col and lon_col and amp_col):
-            continue
-
-        sub = df[[lat_col, lon_col, amp_col]].rename(
-            columns={lat_col: "latitude", lon_col: "longitude", amp_col: "amplitude"}
-        )
-        sub = sub.dropna(subset=["latitude", "longitude", "amplitude"])
-        if not sub.empty:
-            dfs.append(sub)
-
-    if not dfs:
-        print(f"[HEATMAP] No node CSVs matched under: {run_outdir}")
-        return pd.DataFrame(columns=["latitude", "longitude", "amplitude"])
-
-    return pd.concat(dfs, ignore_index=True)
-
-
-def enhanced_catalogs_from_outputs(
-    outputs_list: List[Dict[str, Any]],
-    *,
-    outdir: str,
-    write_files: bool = True,
-    load_waveforms: bool = False,
-    primary_name: str = "catalog_primary",
-    refined_name: str = "catalog_refined",
-) -> Dict[str, Any]:
-
-    """
-    Build EnhancedCatalogs (primary, refined) from the per-event outputs dicts
-    returned by `asl_sausage()`.
-
-    Each element in outputs_list is expected to be:
-      {"primary": {"qml": "...", "json": "...", ...},
-       "refined": {"qml": "...", "json": "...", ...} or None,
-       "_meta": {...}}
-
-    Returns:
-      {
-        "primary": EnhancedCatalog,
-        "refined": EnhancedCatalog,
-        "primary_qml": <path or None>,
-        "refined_qml": <path or None>,
-        "primary_csv": <path or None>,
-        "refined_csv": <path or None>,
-      }
-    """
-    os.makedirs(outdir, exist_ok=True)
-
-    prim_recs, ref_recs = [], []
-
-    def _append_rec(block: Dict[str, Any], bucket: list):
-        if not block:
-            return
-        qml = block.get("qml")
-        jjs = block.get("json")
-        if not qml or not jjs:
-            return
-        if not (os.path.exists(qml) and os.path.exists(jjs)):
-            return
-        try:
-            enh = EnhancedEvent.load(os.path.splitext(qml)[0])
-            if not load_waveforms:
-                enh.stream = None
-            bucket.append(enh)
-        except Exception:
-            pass
-
-    for out in outputs_list:
-        _append_rec((out or {}).get("primary") or {}, prim_recs)
-        _append_rec((out or {}).get("refined") or {}, ref_recs)
-
-    prim_cat = EnhancedCatalog(
-        events=[r.event for r in prim_recs],
-        records=prim_recs,
-        description="Primary ASL locations",
-    )
-    ref_cat = EnhancedCatalog(
-        events=[r.event for r in ref_recs],
-        records=ref_recs,
-        description="Refined ASL locations",
-    )
-
-    primary_qml = refined_qml = primary_csv = refined_csv = None
-    if write_files:
-        if len(prim_cat):
-            primary_qml = os.path.join(outdir, f"{primary_name}.qml")
-            prim_cat.write(primary_qml, format="QUAKEML")
-            primary_csv = os.path.join(outdir, f"{primary_name}.csv")
-            prim_cat.export_csv(primary_csv)
-        if len(ref_cat):
-            refined_qml = os.path.join(outdir, f"{refined_name}.qml")
-            ref_cat.write(refined_qml, format="QUAKEML")
-            refined_csv = os.path.join(outdir, f"{refined_name}.csv")
-            ref_cat.export_csv(refined_csv)
-
-    return {
-        "primary": prim_cat,
-        "refined": ref_cat,
-        "primary_qml": primary_qml,
-        "refined_qml": refined_qml,
-        "primary_csv": primary_csv,
-        "refined_csv": refined_csv,
-    }
 
 
 #########################################
 
 
 
-# --- helper -------------------------------------------------------------
 
-
-# wrappers2.py
-import os
-from pathlib import Path
-from contextlib import contextmanager
-import sys
-
-@contextmanager
-def tee_stdouterr(filepath: str, also_console: bool = True):
-    """
-    Tee both stdout and stderr to `filepath`.
-    Works in notebooks and scripts.
-    """
-    Path(os.path.dirname(filepath)).mkdir(parents=True, exist_ok=True)
-    old_out, old_err = sys.stdout, sys.stderr
-    f = open(filepath, "a", buffering=1)
-    class Tee:
-        def __init__(self, *streams): self.streams = streams
-        def write(self, x):
-            for s in self.streams: 
-                try: s.write(x)
-                except Exception: pass
-        def flush(self):
-            for s in self.streams:
-                try: s.flush()
-                except Exception: pass
-    try:
-        sys.stdout  = Tee(old_out, f) if also_console else Tee(f)
-        sys.stderr  = Tee(old_err, f) if also_console else Tee(f)
-        yield
-    finally:
-        sys.stdout, sys.stderr = old_out, old_err
-        f.flush(); f.close()
-
-# --- public API ---------------------------------------------------------
-
-def run_event_monte_carlo(
-    mseed_file: str,
-    configs: List[ASLConfig],
-    *,
-    inventory: Inventory | str | Path | None,
-    output_base: str | Path,
-    gridobj: Any,
-    topo_kw: Optional[dict] = None,
-    station_gains_df=None,
-    parallel: bool = True,
-    max_workers: Optional[int] = None,
-    global_cache: str | Path | None = None,
-    debug: bool = True,
-) -> List[Dict[str, Any]]:
-    """
-    Run a **single event** across many ASL parameter configurations.
-
-    Each item in `configs` is an `ASLConfig` carrying the *physical knobs*
-    (wave kind, speed, Q, misfit, etc.). This function injects the shared
-    run context (`inventory`, `output_base`, `gridobj`, optional `global_cache`)
-    into each config (without mutating originals), then delegates to
-    `run_single_event` for execution.
-
-    Notes on performance / parallelism
-    ----------------------------------
-    - If `parallel=True`, processes run in separate workers via
-      `ProcessPoolExecutor`.
-    - Passing a large ObsPy `Inventory` object between processes may be
-      expensive. For best performance in parallel mode, prefer passing a
-      **path** to StationXML (string/Path) as `inventory`; each worker will
-      read it locally.
-    - `run_single_event` calls `cfg.ensure_built()`, so configs do **not**
-      need to be built ahead of time.
-
-    Parameters
-    ----------
-    mseed_file : str
-        Path to the event’s miniSEED (already preprocessed).
-    configs : list of ASLConfig
-        Parameter draws to evaluate.
-    inventory : Inventory | str | Path | None
-        Shared station inventory (or path). If None, each `cfg` must already
-        have a usable `inventory`.
-    output_base : str | Path
-        Base output directory; each config writes to a unique tag-scoped subdir.
-    gridobj : Any
-        Shared node grid (must implement `.signature()` at minimum).
-    topo_kw : dict, optional
-        Extra map/plotting kwargs passed down to plotting helpers.
-    station_gains_df : pandas.DataFrame, optional
-        Optional per-station gain corrections for this event.
-    parallel : bool, default True
-        Run configurations in parallel.
-    max_workers : int, optional
-        Worker count; defaults to CPU-2 (min 1).
-    global_cache : str | Path, optional
-        Shared cache root for distances/ampcorr; if None, configs’ own values apply.
-    debug : bool, default True
-        Verbose logging.
-
-    Returns
-    -------
-    list of dict
-        One result per configuration. Each element is the dict returned by
-        `run_single_event`, or an error record of the form:
-        `{"tag": "<cfg tag or unknown>", "error": "Type: message"}`
-    """
-
-    def _with_context(
-        cfg: ASLConfig,
-        *,
-        inventory: Inventory | str | Path | None,
-        output_base: str | Path | None,
-        gridobj: Any | None,
-        global_cache: str | Path | None = None,
-        debug: Optional[bool] = None,
-    ) -> ASLConfig:
-        """
-        Return a new ASLConfig with context fields set (without mutating the original).
-        """
-        updates = {}
-        if inventory is not None:
-            updates["inventory"] = inventory
-        if output_base is not None:
-            updates["output_base"] = output_base
-        if gridobj is not None:
-            updates["gridobj"] = gridobj
-        if global_cache is not None:
-            updates["global_cache"] = global_cache
-        if debug is not None:
-            updates["debug"] = debug
-        return replace(cfg, **updates)
-
-
-    def _run_one(cfg0):
-        try:
-            # Materialize a concrete cfg with the shared context (your existing helper)
-            cfg = _with_context(
-                cfg0,
-                inventory=inventory,
-                output_base=output_base,
-                gridobj=gridobj,
-                global_cache=global_cache,
-                debug=debug,
-            )
-
-            # Ensure cfg is built so tag/outdir exist
-            if getattr(cfg, "outdir", "") == "" or getattr(cfg, "ampcorr", None) is None:
-                if debug:
-                    print("[MC] Building cfg (distances/ampcorr)…")
-                cfg.build()
-
-            # Event stem for foldering/log names
-            event_stem = Path(mseed_file).stem
-            tag = getattr(cfg, "tag_str", None) or cfg.tag()
-
-            # Per-trial log path: <outdir>/<event_stem>/monte_carlo/<tag>.log
-            trial_dir = Path(cfg.outdir) / event_stem / "monte_carlo"
-            trial_dir.mkdir(parents=True, exist_ok=True)
-            log_path = trial_dir / f"{tag}.log"
-
-            with tee_stdouterr(str(log_path), also_console=debug):
-                print(f"[MC] Starting trial tag={tag} event={mseed_file}")
-
-                result = run_single_event(
-                    mseed_file=mseed_file,
-                    cfg=cfg,
-                    refine_sector=False,
-                    station_gains_df=station_gains_df,
-                    topo_kw=topo_kw,
-                    debug=debug,
-                )
-
-                status = "OK" if "error" not in result else f"ERROR: {result['error']}"
-                print(f"[MC] Finished trial tag={tag} status={status}")
-                return result
-
-        except Exception as e:
-            # Make sure the exception surfaces both in console and logs
-            try:
-                # Best-effort to still write into a per-trial log
-                event_stem = Path(mseed_file).stem
-                tag = getattr(cfg0, "tag_str", None) or getattr(cfg0, "tag", lambda: "<unknown>")()
-                trial_dir = Path(getattr(cfg0, "outdir", output_base)) / event_stem / "monte_carlo"
-                trial_dir.mkdir(parents=True, exist_ok=True)
-                log_path = trial_dir / f"{tag}.log"
-                with open(log_path, "a") as fh:
-                    fh.write(f"[MC:ERROR] Trial tag={tag} raised {type(e).__name__}: {e}\n")
-                    fh.write(traceback.format_exc())
-            except Exception:
-                pass  # don’t mask original error if logging setup fails
-
-            print(f"[MC:ERROR] Trial raised {type(e).__name__}: {e}", file=sys.stderr)
-            traceback.print_exc()
-            return {"tag": getattr(cfg0, "tag_str", None) or getattr(cfg0, "tag", lambda: "<unknown>")(),
-                    "error": f"{type(e).__name__}: {e}"}
-
-    if not parallel:
-        return [_run_one(cfg) for cfg in configs]
-
-    # Parallel path (per-process logs, one file per config tag)
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    results = []
-    with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(_run_one, cfg): cfg for cfg in configs}
-        for fut in as_completed(futs):
-            try:
-                results.append(fut.result())
-            except Exception as e:
-                results.append({"tag": "<unknown>", "error": f"{type(e).__name__}: {e}"})
-    return results
-
-'''
-def monte_carlo_wrapper_example() -> None:
-    """
-    Example: build a small grid of configs and run a single event across them.
-
-    Illustrates:
-    - Creating parameter draws with `ASLConfig.generate_config_list`
-      (tweak the sequences to taste).
-    - Supplying shared run context (inventory path, output_base, gridobj).
-    - Invoking `run_event_monte_carlo` in parallel.
-    """
-
-    # Simple 6-draw sweep (replace with your own priors/sequences)
-    configs = ASLConfig.generate_config_list(
-        wave_kinds=("surface",),
-        station_corr_opts=(False, True),
-        speeds=(1.4, 2.0),
-        Qs=(100,),
-        dist_modes=("3d",),
-        misfit_engines=("l2",),
-        peakfs=(6.0, 8.0),
-        # context can be set later; set here if you like:
-        inventory_xml=None,
-        output_base=None,
-        gridobj=None,
-        global_cache=None,
-        debug=False,
-    )
-
-    # Shared run context
-    mseed_file   = "/path/to/event.mseed"
-    inventory_xml= "/path/to/stations.xml"     # NOTE: path recommended for parallel performance
-    output_base  = "/tmp/asl_runs"
-    final_grid   = build_or_load_your_nodegrid_somehow()  # user-defined
-
-    # Optional map bits
-    topo_kw = dict(
-        dome_location={"lat": 16.72, "lon": -62.18},
-        # ... any other keys your plotting utils expect
-    )
-
-    results = run_event_monte_carlo(
-        mseed_file=mseed_file,
-        configs=configs,
-        inventory=inventory_xml,
-        output_base=output_base,
-        gridobj=final_grid,
-        topo_kw=topo_kw,
-        station_gains_df=None,
-        parallel=True,
-        max_workers=None,
-        global_cache=None,
-        debug=True,
-    )
-
-    # Inspect or summarize `results` as needed
-    n_ok = sum(1 for r in results if "error" not in r)
-    print(f"[MC] Completed {n_ok}/{len(results)} runs OK")
-'''
-
-from pprint import pprint
 def run_single_event(
     mseed_file: str,
     cfg: ASLConfig,
@@ -1395,7 +831,7 @@ def run_single_event(
         Write per-trace metrics and station summary CSVs for an EnhancedStream `es`,
         *without* writing waveforms. Returns (trace_csv, station_csv).
         """
-        import pandas as pd
+
         if basepath.endswith(".mseed"):
             basepath = basepath[:-6]
         outdir = os.path.dirname(basepath)
@@ -1476,9 +912,7 @@ def run_single_event(
         me_mean, me_std, n_me,
         metadata: dict | None = None,
     ):
-        import numpy as np
-        import pandas as pd
-        import os
+
 
         def _num(x):
             try:
@@ -1567,8 +1001,6 @@ def run_single_event(
         # ----------------------------------------------------------------
 
         # 1) Station gains (optional)
-        from flovopy.asl.station_corrections import apply_interval_station_gains
-
         gains_df = station_gains_df or getattr(cfg, "station_corr_df_built", None)
         if gains_df is not None and len(gains_df):
             info = apply_interval_station_gains(
@@ -1580,66 +1012,47 @@ def run_single_event(
         else:
             print("[GAINS] No station gains DataFrame provided; skipping.")
         
+        #st.merge(fill_value="interpolate")
 
-        # Could add more complex Trace processing here from my preprocessing and remove_response modules
-        st.merge(fill_value="interpolate")
-        st.detrend("linear")
-        #st.taper(max_percentage=0.02, type="cosine")
-        st.filter("bandpass", freqmin=0.2, freqmax=18.0, corners=2, zerophase=True)
-
-        if mseed_units:
-            stream_add_units(st, mseed_units='m/s')
-
-        # 2) Remove response if needed / set units based on SAM class
-        units_by_class  = {DSAM: "m",    VSAM: "m/s"}
-        output_by_class = {DSAM: "DISP", VSAM: "VEL"}
-        output = output_by_class.get(cfg.sam_class)
-
-        for tr in st:
-            units = tr.stats.get("units") or "Counts"
-            tr.stats["units"] = units
-            if units == "Counts":
-                # instrument correct the Trace
-                print(f"[RESP] Removing instrument response from {tr.id}")
-                try: # could replace this with my more robust remove_response() from flovopy.core.preprocessing
-                    tr.remove_response(inventory=cfg.inventory, output=output)
-                except:
-                    st.remove(tr)
-
-            # Fix the st Stream object so it is in the correct units even if already corrected
-            if units == "m/s" and cfg.sam_class==DSAM:
-                print(f'[RUN_SINGLE_EVENT]: Units mismatch for {tr.id} Integrating')
-                # need to integrate
-                tr.detrend('linear')
-                tr.integrate().detrend('linear').filter('highpass', freq=0.2, corners=2)
-                tr.units = "m"
-            elif units == "m" and cfg.sam_class==VSAM:
-                # need to differentiate
-                print(f'[RUN_SINGLE_EVENT]: Units mismatch for {tr.id}. Differentiating')
-                tr.differentiate()
-                tr.units = "m/s"
+        # 2) Prepare stream in the SAM-required domain using pad/taper-safe core utils
+        st = _prepare_stream_for_sam(
+            st,
+            cfg=cfg,
+            mseed_units=mseed_units,
+            band=(0.2, 18.0),
+            taper_fraction=0.05,
+            debug=debug,
+        )
 
         if len(st) < int(cfg.min_stations):
             raise RuntimeError(f"Not enough stations: {len(st)} < {cfg.min_stations}")
-        
-        # Reduce by travel time
+
+        # 3) Travel-time reduction AFTER units & band are correct
         shift_stream_by_travel_time(
-            st, 
-            cfg.inventory, topo_kw['dome_location'],
-            speed_km_s=cfg.speed,      
+            st,
+            cfg.inventory,
+            topo_kw['dome_location'],
+            speed_km_s=cfg.speed,
             use_elevation=True,
             inplace=True,
             trim=True,
             verbose=True,
         )
 
-        if mseed_units.lower() == 'm/s':
+        # 4) Build both convenience views for plotting, independent of input file units
+        if cfg.sam_class is VSAM:
             vel = st
-            disp = st.copy().integrate().detrend('linear').filter('highpass', freq=0.2, corners=2)
-
-        elif mseed_units.lower() == 'm':
+            disp = st.copy().integrate().detrend('linear')
+            safe_pad_taper_filter_stream(disp, taper_fraction=0.05, filter_type="highpass", freq=0.2, corners=2, zerophase=True, inv=None, verbose=False)
+            for tr in disp:
+                tr.stats["units"] = "m"
+        else:
             disp = st
-            vel = st.copy().differentiate()
+            vel = st.copy().differentiate().detrend('linear')
+            # (Velocity after differentiation is usually OK; pad-HP not strictly needed here.)
+            vel.stats["units"] = "m/s"
+            for tr in vel:
+                tr["units"] = "m/s"
 
         # --------------------------------------------------------------------------
         # END OF STREAM PREPROCESSING - should now have a vel and disp Stream object
@@ -1676,7 +1089,6 @@ def run_single_event(
 
             sgram_png = os.path.join(event_dir, "spectrogram_VEL.png")
             if not os.path.isfile(sgram_png):
-                from flovopy.processing.spectrograms import plot_strongest_trace
                 plot_strongest_trace(vel, log=False, dbscale=True, cmap='inferno', fmin=0.01, fmax=20.0, secsPerFFT=5.0, outfile=sgram_png)
 
 
@@ -1696,7 +1108,7 @@ def run_single_event(
 
             if enhance:
                 try:
-                    from flovopy.enhanced.stream import EnhancedStream
+                    
                     es = EnhancedStream(stream=st.copy())
 
                     # compute per-trace metrics ONCE
@@ -1728,8 +1140,8 @@ def run_single_event(
                             correction=2.4, 
                         )
                         
-
-                        print(es)
+                        if debug:
+                            print(es)
                         for tr in es:
                             print()
                             print(tr.id,":")
@@ -1757,7 +1169,24 @@ def run_single_event(
                                 "used_source": "dome_location",
                             },
                         )
-                        print(networkmag_df)
+                        if debug:
+                            print(networkmag_df)
+
+                            # ---- Record section
+                        try:
+                            record_section_png = products_dir / "record_section.png"
+                            if debug:
+                                print("[ASL:RECORD_SECTION]")
+                            st.plot(type='section', 
+                                    vred=cfg.speed*1000, 
+                                    norm_method='stream', 
+                                    ev_coords=[topo_kw['dome_location']['lat'], topo_kw['dome_location']['lon']], 
+                                    orientation='horizontal', 
+                                    fillcolors=(None ,None), 
+                                    scale=1.5,
+                                    outfile=record_section_png);
+                        except:
+                            print('Record section failed')
 
                     # Persist pre-metrics (with/without provisional mags)
                     pre_base = str(products_dir / "pre_metrics")
@@ -1878,3 +1307,340 @@ def run_single_event(
         traceback.print_exc()
         tag_str = getattr(cfg, "tag_str", None) or cfg.tag()
         return {"tag": tag_str, "error": f"{type(e).__name__}: {e}", "outdir": cfg.outdir}
+    
+
+
+
+
+
+# ---------------------------------------------------------------------
+# All events (with optional multiprocessing)
+# ---------------------------------------------------------------------
+
+
+def run_all_events(
+    input_dir: str | Path,
+    *,
+    cfg: ASLConfig,
+    topo_kw: Optional[dict] = None,
+    station_gains_df: Optional[pd.DataFrame] = None,
+    refine_sector: bool = False,
+    max_events: Optional[int] = None,
+    use_multiprocessing: bool = True,
+    workers: Optional[int] = None,
+    mseed_units: Optional[str] = None,
+    reduce_time: bool = True,          # NEW: mirror recent single-run default
+    switch_event_ctag: bool = True,    # NEW: keep per-event ctag behavior aligned
+    debug: bool = True,
+) -> str:
+    """
+    Process all miniSEED files under input_dir with the same ASLConfig.
+    - Parallel by default using N-2 workers (>=1).
+    - Writes JSONL summaries.
+    - Generates a global heatmap and builds EnhancedCatalogs when possible.
+
+    Returns cfg.outdir.
+    """
+    # Ensure cfg is fully built (outdir, inventory, caches)
+    if getattr(cfg, "inventory", None) is None or not getattr(cfg, "outdir", ""):
+        if debug:
+            print("[RUN] Building configuration before batch run…")
+        cfg.build()
+
+    run_dir = Path(cfg.outdir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    files = sorted(set(map(str, find_event_files(input_dir))))
+    if max_events:
+        files = files[: int(max_events)]
+    if not files:
+        print("[RUN] No event files found.")
+        return str(run_dir)
+
+    if use_multiprocessing:
+        if workers is None:
+            cpu = os.cpu_count() or 2
+            workers = max(1, cpu - 2)
+        print(f"[RUN] multiprocessing ON  workers={workers}")
+    else:
+        workers = 1
+        print("[RUN] multiprocessing OFF")
+
+    t0 = UTCDateTime()
+    processed = 0
+    all_outputs: List[Dict[str, Any]] = []
+    summary_path = run_dir / "summary.jsonl"
+
+    def _append_summary(rec: Dict[str, Any]):
+        with open(summary_path, "a", encoding="utf-8") as sfo:
+            sfo.write(json.dumps(rec) + "\n")
+
+    # --- Serial path (good for debugging)
+    if workers == 1:
+        for f in files:
+            try:
+                res = run_single_event(
+                    mseed_file=f,
+                    cfg=cfg,
+                    refine_sector=refine_sector,
+                    station_gains_df=station_gains_df,
+                    topo_kw=topo_kw,
+                    switch_event_ctag=switch_event_ctag,  # NEW
+                    mseed_units=mseed_units,               # was already present in your serial path
+                    reduce_time=reduce_time,               # NEW
+                    debug=debug,
+                )
+            except Exception as e:
+                res = {
+                    "tag": getattr(cfg, "tag_str", None) or cfg.tag(),
+                    "error": f"{type(e).__name__}: {e}",
+                    "traceback": traceback.format_exc(),
+                    "mseed_file": f,
+                }
+            _append_summary(res)
+            all_outputs.append(res)
+            processed += 1
+            print("[OK]" if "error" not in res else "[ERR]", f)
+
+    # --- Parallel path
+    else:
+        # NOTE: cfg must be picklable. If you run into pickling issues on macOS,
+        # consider setting use_multiprocessing=False or switching start method to "spawn".
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            fut2file = {
+                ex.submit(
+                    run_single_event,
+                    mseed_file=f,
+                    cfg=cfg,
+                    refine_sector=refine_sector,
+                    station_gains_df=station_gains_df,
+                    topo_kw=topo_kw,
+                    switch_event_ctag=switch_event_ctag,  # NEW (was missing before)
+                    mseed_units=mseed_units,               # NEW (was missing before)
+                    reduce_time=reduce_time,               # NEW
+                    debug=debug,
+                ): f
+                for f in files
+            }
+            for fut in as_completed(fut2file):
+                f = fut2file[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {
+                        "tag": getattr(cfg, "tag_str", None) or cfg.tag(),
+                        "error": f"{type(e).__name__}: {e}",
+                        "traceback": traceback.format_exc(),
+                        "mseed_file": f,
+                    }
+                _append_summary(res)
+                all_outputs.append(res)
+                processed += 1
+                print("[OK]" if "error" not in res else "[ERR]", f)
+
+    dt = UTCDateTime() - t0  # seconds as float
+    print(f"[DONE] Processed {processed}/{len(files)} events in {dt:.1f}s")
+
+    # ---- Heatmap aggregation & plot
+    try:
+        df = collect_node_results(str(run_dir))
+        if not df.empty:
+            heat_png = os.path.join(run_dir, "heatmap_energy.png")
+            print("[HEATMAP] Generating overall heatmap…")
+            plot_heatmap_colored(
+                df,
+                lat_col="latitude",
+                lon_col="longitude",
+                amp_col="amplitude",
+                log_scale=True,
+                node_spacing_m=cfg.gridobj.node_spacing_m,
+                outfile=heat_png,
+                title=f"Energy Heatmap — {getattr(cfg, 'tag_str', None) or cfg.tag()}",
+                topo_kw=topo_kw,
+            )
+            print("[HEATMAP] Wrote:", heat_png)
+        else:
+            print("[HEATMAP] No data found to plot.")
+    except Exception as e:
+        print("[HEATMAP:WARN] Failed to generate heatmap:", e)
+
+    # ---- Optional: assemble EnhancedCatalogs from per-event outputs
+    try:
+        good = []
+        for rec in all_outputs:
+            if isinstance(rec, dict) and "outputs" in rec and isinstance(rec["outputs"], dict):
+                good.append(rec["outputs"])
+        if good:
+            cat_info = enhanced_catalogs_from_outputs(
+                good,
+                outdir=str(run_dir),
+                write_files=True,
+                load_waveforms=False,
+                primary_name="catalog_primary",
+                refined_name="catalog_refined",
+            )
+            if cat_info.get("primary_qml"):
+                print("[CATALOG] Primary:", cat_info["primary_qml"])
+            if cat_info.get("refined_qml"):
+                print("[CATALOG] Refined:", cat_info["refined_qml"])
+            if cat_info.get("primary_csv"):
+                print("[CATALOG] Primary CSV:", cat_info["primary_csv"])
+            if cat_info.get("refined_csv"):
+                print("[CATALOG] Refined:", cat_info["refined_csv"])
+        else:
+            print("[CATALOG] No successful event outputs to assemble.")
+    except Exception as e:
+        print(f"[CATALOG:WARN] Could not build EnhancedCatalogs: {e}")
+
+    return str(run_dir)
+
+
+
+
+# ---------------------------------------------------------------------
+# Simple sweep (“Monte Carlo”) runner built on tweak_config / .copy()
+# ---------------------------------------------------------------------
+
+def run_event_sweep(
+    mseed_file: str | Path,
+    *,
+    baseline_cfg: ASLConfig,
+    axes: Optional[Dict[str, List]] = None,
+    changes: Optional[List[Dict]] = None,
+    variants: Optional[Dict[str, ASLConfig]] = None,  # skip building if you already have them
+    station_gains_df: Optional[pd.DataFrame] = None,
+    topo_kw: Optional[dict] = None,
+    switch_event_ctag: bool = True,
+    mseed_units: Optional[str] = None,
+    reduce_time: bool = True,
+    parallel: bool = True,
+    workers: Optional[int] = None,
+    debug: bool = True,
+) -> List[Dict]:
+    """
+    Run a single event across many configs. Returns list of per-run dicts from run_single_event().
+    - Provide either `variants` or (`axes` and/or `changes`). If none given, runs baseline only.
+    - Minimal JSONL log is written under each config’s tag folder: <cfg.outdir>/<event>/sweep.jsonl
+    """
+    
+
+    mseed_file = str(mseed_file)
+    event_stem = Path(mseed_file).stem
+
+    # Build variants if not supplied
+    if variants is None:
+        variants = tweak_config(
+            baseline_cfg,
+            axes=axes,
+            changes=changes,
+            include_baseline=True,   # include baseline by default for easy comparison
+        )
+
+    # Ensure all configs are “built” so tag/outdir exist (copy() already builds when needed;
+    # for safety, call build() if someone passed an unbuilt cfg).
+    ready = []
+    for cfg in variants.values():
+        if not getattr(cfg, "outdir", "") or getattr(cfg, "ampcorr", None) is None:
+            cfg = cfg.build()
+        ready.append(cfg)
+
+    def _run_one(cfg: ASLConfig) -> Dict:
+        tag = getattr(cfg, "tag_str", None) or cfg.tag()
+        outdir = Path(cfg.outdir) / event_stem
+        outdir.mkdir(parents=True, exist_ok=True)
+        log_jsonl = outdir / "sweep.jsonl"
+        try:
+            res = run_single_event(
+                mseed_file=mseed_file,
+                cfg=cfg,
+                refine_sector=False,
+                station_gains_df=station_gains_df,
+                topo_kw=topo_kw,
+                switch_event_ctag=switch_event_ctag,
+                mseed_units=mseed_units,
+                reduce_time=reduce_time,
+                debug=debug,
+            )
+        except Exception as e:
+            res = {
+                "tag": tag,
+                "mseed_file": mseed_file,
+                "error": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc(),
+            }
+        # append a minimal JSONL record
+        try:
+            with open(log_jsonl, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(res) + "\n")
+        except Exception:
+            pass
+        if debug:
+            print(("[OK] " if "error" not in res else "[ERR] ") + tag)
+        return res
+
+    # Serial or parallel
+    if not parallel:
+        return [_run_one(cfg) for cfg in ready]
+
+    if workers is None:
+        cpu = os.cpu_count() or 2
+        workers = max(1, cpu - 2)
+    results: List[Dict] = []
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_run_one, cfg): cfg for cfg in ready}
+        for fut in as_completed(futs):
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                results.append({"tag": "<unknown>", "mseed_file": mseed_file,
+                                "error": f"{type(e).__name__}: {e}"})
+    return results
+
+
+'''
+EXAMPLES:
+
+1. Grid search example:
+-----------------------
+# build a sweep that tries speed × Q, and also the whole grid with 2D distances
+# Cartesian sweep over speed × Q
+
+from flovopy.asl.config import tweak_config
+
+variants = tweak_config(
+    baseline_cfg,
+    axes={
+        "speed": [1.5, 3.0],
+        "Q": [23, 100],
+    },
+    changes=[{"dist_mode": "2d"}],  # also try all of the above in 2D
+    include_baseline=True,          # optional: include baseline itself
+)
+
+# run a SINGLE event across the sweep
+_ = run_event_sweep(
+    mseed_file=best_event_files[0],
+    baseline_cfg=baseline_cfg,
+    variants=variants,                 # pass prebuilt variants (or omit to build inline)
+    station_gains_df=station_gains_df, # optional
+    topo_kw=topo_kw,                   # optional
+    mseed_units="m/s",
+    reduce_time=True,
+    parallel=True,
+    debug=True,
+)
+
+We can also use:
+
+
+2. Monte Carlo:
+---------------
+
+import random
+def sample_axes(ranges: Dict[str, List], n: int) -> Dict[str, List]:
+    return {k: [random.choice(v) for _ in range(n)] for k, v in ranges.items()}
+
+rand_axes = sample_axes({"speed":[1.0,1.5,2.0,3.0], "Q":[20,40,60,80,100]}, n=20)
+variants = build_variants(baseline_cfg, axes=rand_axes, include_baseline=True)
+
+'''

@@ -492,7 +492,12 @@ def normalize_stream_gaps(
         # 2) Piecewise detrend over valid spans (no split/merge, no taper)
         if piecewise:
             # use_null_values=False because we already carry masks for long gaps
-            work = piecewise_detrend(work, use_null_values=False)
+            work = piecewise_detrend(
+                work,
+                null_values=None,
+                use_null_values=False,
+                keep_mask=False,
+            )
 
         # 3) Fill long gaps according to policy
         if isinstance(work.data, np.ma.MaskedArray) and np.any(work.data.mask):
