@@ -1,8 +1,12 @@
-# flovopy.asl.compare_runs
-# ------------------------
-# Compare a baseline ASLConfig against one-change variants, write pairwise CSVs,
-# and produce rollups / winners. Also supports baseline-free (absolute) scoring
-# by computing intrinsic metrics per run and summarizing across events.
+"""
+flovopy.asl.compare_runs
+------------------------
+Compare a baseline ASLConfig against one-change variants, write pairwise CSVs,
+and produce rollups / winners.
+
+This consolidates the old helpers from analyze_run_pairs.py and adds a clean
+orchestrator entrypoint.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +20,6 @@ import pandas as pd
 
 # Public API
 __all__ = [
-    # pairwise (baseline vs variants)
     "cfg_variants_from",
     "compare_runs",
     "safe_compare",
@@ -24,16 +27,16 @@ __all__ = [
     "add_composite_score",
     "summarize_variants",
     "per_event_winner",
-    # baseline-free (absolute)
+    # scores
     "build_intrinsic_table",
     "add_baseline_free_scores",
     "summarize_absolute_runs",
     "per_event_winner_abs",
-    "crawl_intrinsic_runs",
 ]
 
+
 # =============================================================================
-# Tiny geo + safe math helpers
+# Tiny geo + CSV utilities
 # =============================================================================
 
 def _gc_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -44,28 +47,8 @@ def _gc_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlmb/2)**2
     return 2 * R * math.asin(min(1.0, math.sqrt(a)))
 
-def _finite1(x) -> tuple[np.ndarray, int]:
-    x = np.asarray(x, dtype=float)
-    m = np.isfinite(x)
-    return x[m], int(m.sum())
-
-def safe_mean(x) -> float:
-    x, n = _finite1(x)
-    return float(np.nan if n == 0 else x.mean())
-
-def safe_median(x) -> float:
-    x, n = _finite1(x)
-    return float(np.nan if n == 0 else np.median(x))
-
-# =============================================================================
-# CSV loader + alignment for pairwise comparisons
-# =============================================================================
 
 def _load_run_csv(path: str | Path) -> dict:
-    """
-    Load a per-run CSV into a dict with normalized columns.
-    Tries to parse UTC timestamps; falls back to index-aligned time if not present.
-    """
     path = Path(path)
     if not path.exists():
         raise IOError(f"{path} does not exist")
@@ -74,15 +57,12 @@ def _load_run_csv(path: str | Path) -> dict:
 
     # case-insensitive column map
     cmap = {c.lower(): c for c in df.columns}
-    def has(name: str) -> bool:
-        return name.lower() in cmap
 
     def getcol(name: str, default=np.nan) -> np.ndarray:
         key = name.lower()
         if key in cmap:
-            return pd.to_numeric(df[cmap[key]], errors="coerce").to_numpy()
-        # vectorized default
-        return np.full(len(df), default, dtype=float)
+            return df[cmap[key]].to_numpy()
+        return np.full(len(df), default)
 
     # parse time (t/time/utc/timestamp), normalize to UTC, round to seconds
     time_cols = [c for c in ("t", "time", "utc", "timestamp") if c in cmap]
@@ -102,16 +82,16 @@ def _load_run_csv(path: str | Path) -> dict:
     out = {
         "t": t,
         "time_kind": time_kind,
-        "lat": getcol("lat"),
-        "lon": getcol("lon"),
-        "DR": getcol("dr"),
-        "misfit": getcol("misfit"),
-        "azgap": getcol("azgap"),
-        "connectedness": float(safe_mean(getcol("connectedness"))) if has("connectedness") else np.nan,
+        "lat": getcol("lat").astype(float),
+        "lon": getcol("lon").astype(float),
+        "DR":   getcol("dr").astype(float),            # case-insensitive via cmap
+        "misfit": getcol("misfit").astype(float),
+        "azgap":  getcol("azgap").astype(float),
+        "connectedness": float(np.nanmean(getcol("connectedness"))) if "connectedness" in cmap else np.nan,
         "tag": path.stem,
-        "path": str(path),
     }
     return out
+
 
 def _align_two(
     A: dict, B: dict, *, return_mode: bool = False
@@ -133,15 +113,14 @@ def _align_two(
 
     mode = "index"
     if A["time_kind"] == "real" and B["time_kind"] == "real":
-        # unify to second resolution but keep ns dtype for consistent keys
         tA = A["t"].astype("datetime64[s]").astype("datetime64[ns]")
         tB = B["t"].astype("datetime64[s]").astype("datetime64[ns]")
         common = np.intersect1d(tA, tB)
         if common.size > 0:
             idxA = {v: i for i, v in enumerate(tA)}
             idxB = {v: i for i, v in enumerate(tB)}
-            iA = np.fromiter((idxA[v] for v in common), dtype=int, count=common.size)
-            iB = np.fromiter((idxB[v] for v in common), dtype=int, count=common.size)
+            iA = np.array([idxA[v] for v in common], dtype=int)
+            iB = np.array([idxB[v] for v in common], dtype=int)
             mode = "time"
         else:
             n = min(A["t"].shape[0], B["t"].shape[0])
@@ -162,10 +141,8 @@ def _align_two(
     B2 = take(B, iB, common)
     return (A2, B2, mode) if return_mode else (A2, B2)
 
+
 def compare_two_runs_csv(csvA: Path, csvB: Path, label: str = "(baseline vs alt)") -> Optional[dict]:
-    """
-    Build a single pairwise-comparison row between two per-run CSVs.
-    """
     csvA = Path(csvA); csvB = Path(csvB)
     if not csvA.is_file():
         print(f"{csvA} does not exist")
@@ -196,11 +173,12 @@ def compare_two_runs_csv(csvA: Path, csvB: Path, label: str = "(baseline vs alt)
     w = DRw / (DRw.sum() + 1e-12) if DRw.max() > 0 else np.ones_like(DRw) / max(1, DRw.size)
 
     # per-sample spatial separation
-    sep = np.empty(len(latA), dtype=float)
-    sep[:] = np.nan
-    for i in range(len(latA)):
-        if np.isfinite(latA[i]) and np.isfinite(lonA[i]) and np.isfinite(latB[i]) and np.isfinite(lonB[i]):
-            sep[i] = _gc_km(latA[i], lonA[i], latB[i], lonB[i])
+    sep = np.array([
+        _gc_km(latA[i], lonA[i], latB[i], lonB[i])
+        if np.isfinite(latA[i]) and np.isfinite(lonA[i]) and np.isfinite(latB[i]) and np.isfinite(lonB[i])
+        else np.nan
+        for i in range(len(latA))
+    ], dtype=float)
 
     mask = np.isfinite(sep)
     mean_sep   = float(np.nanmean(sep[mask])) if mask.any() else np.nan
@@ -218,12 +196,12 @@ def compare_two_runs_csv(csvA: Path, csvB: Path, label: str = "(baseline vs alt)
     lon_r = float(np.corrcoef(lonA[m], lonB[m])[0, 1]) if np.count_nonzero(m) > 3 else np.nan
 
     # misfit / azgap averages and deltas
-    mean_misfit_A = float(safe_mean(A["misfit"]))
-    mean_misfit_B = float(safe_mean(B["misfit"]))
+    mean_misfit_A = float(np.nanmean(A["misfit"]))
+    mean_misfit_B = float(np.nanmean(B["misfit"]))
     d_misfit = mean_misfit_B - mean_misfit_A
 
-    mean_azgap_A = float(safe_mean(A["azgap"]))
-    mean_azgap_B = float(safe_mean(B["azgap"]))
+    mean_azgap_A = float(np.nanmean(A["azgap"]))
+    mean_azgap_B = float(np.nanmean(B["azgap"]))
     d_azgap = mean_azgap_B - mean_azgap_A
 
     return {
@@ -251,6 +229,7 @@ def compare_two_runs_csv(csvA: Path, csvB: Path, label: str = "(baseline vs alt)
         "delta_connectedness_B_minus_A": float(B["connectedness"] - A["connectedness"])
             if (np.isfinite(B["connectedness"]) and np.isfinite(A["connectedness"])) else np.nan,
     }
+
 
 def safe_compare(summary_csv: Path | str, csvA: Path | str, csvB: Path | str, label: str):
     """
@@ -285,7 +264,7 @@ def safe_compare(summary_csv: Path | str, csvA: Path | str, csvB: Path | str, la
     return row
 
 # =============================================================================
-# Roll-up + scoring (pairwise mode)
+# Roll-up + scoring
 # =============================================================================
 
 def load_all_event_comparisons(root: Path | str) -> pd.DataFrame:
@@ -301,7 +280,7 @@ def load_all_event_comparisons(root: Path | str) -> pd.DataFrame:
         for csv in root.rglob(pat):
             try:
                 df = pd.read_csv(csv)
-                df["event_id"] = csv.parent.name   # event folder
+                df["event_id"] = csv.parent.name
                 rows.append(df)
             except Exception as e:
                 print(f"[skip] {csv}: {e}")
@@ -310,24 +289,23 @@ def load_all_event_comparisons(root: Path | str) -> pd.DataFrame:
 
     out = pd.concat(rows, ignore_index=True)
     out["variant"] = out.get("label", "").astype(str)
-
-    # Ensure expected columns exist
+    # guard expected columns
     for c in ["mean_sep_km", "delta_misfit_B_minus_A", "delta_azgap_B_minus_A"]:
         if c not in out.columns:
             out[c] = np.nan
-
     return out
+
 
 def add_composite_score(
     df: pd.DataFrame, w_sep: float = 1.0, w_misfit: float = 0.5, w_azgap: float = 0.1
 ) -> pd.DataFrame:
     """
-    Lower is better. Negative deltas are good (reduce misfit/azgap).
-    Uses global z-scores across all events.
+    Lower is better. Negative deltas are good if they reduce misfit/azgap.
+    Uses global z-scores (switch to per-event if needed).
     """
     d = df.copy()
     for col in ["mean_sep_km", "delta_misfit_B_minus_A", "delta_azgap_B_minus_A"]:
-        x = pd.to_numeric(d[col], errors="coerce").to_numpy(dtype=float)
+        x = d[col].to_numpy(dtype=float)
         mu = np.nanmean(x)
         sd = np.nanstd(x)
         if not np.isfinite(sd) or sd == 0:
@@ -341,25 +319,23 @@ def add_composite_score(
     )
     return d
 
+
 def summarize_variants(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    One line per variant: mean/median/SE of metrics + composite score.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
+    g = df.groupby("variant", dropna=False)
 
     def _se(x):
         x = pd.to_numeric(x, errors="coerce")
         n = x.notna().sum()
-        return (np.nanstd(x, ddof=1) / np.sqrt(n)) if n > 1 else np.nan
+        if n <= 1:
+            return np.nan
+        return np.nanstd(x, ddof=1) / np.sqrt(n)
 
-    g = df.groupby("variant", dropna=False)
     agg = g.agg(
         n_events          = ("event_id", "nunique"),
         n_rows            = ("event_id", "size"),
         mean_sep_km_mean  = ("mean_sep_km", "mean"),
         mean_sep_km_med   = ("mean_sep_km", "median"),
-        mean_sep_km_se    = ("mean_sep_km", _se),
+        mean_sep_km_se    = ("mean_sep_km", _se),   # <— use guarded SE
         dmisfit_mean      = ("delta_misfit_B_minus_A", "mean"),
         dmisfit_med       = ("delta_misfit_B_minus_A", "median"),
         dazgap_mean       = ("delta_azgap_B_minus_A", "mean"),
@@ -368,40 +344,60 @@ def summarize_variants(df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index().sort_values("score_mean")
     return agg
 
+
 def per_event_winner(df_scored: pd.DataFrame):
     """
     For each event, pick the variant with the lowest composite score.
     Skips events where score is all-NaN. Returns (winners_df, win_counts_df).
     """
+    # Empty/column guards
     if df_scored is None or df_scored.empty or "score" not in df_scored.columns:
-        return (pd.DataFrame(columns=["event_id", "variant", "score"]),
-                pd.DataFrame(columns=["variant", "wins"]))
+        empty_winners = pd.DataFrame(columns=["event_id", "variant", "score"])
+        empty_counts  = pd.DataFrame(columns=["variant", "wins"])
+        return empty_winners, empty_counts
 
+    # Keep rows where 'score' is finite
     d = df_scored[np.isfinite(df_scored["score"])].copy()
     if d.empty:
-        return (pd.DataFrame(columns=["event_id", "variant", "score"]),
-                pd.DataFrame(columns=["variant", "wins"]))
+        empty_winners = pd.DataFrame(columns=["event_id", "variant", "score"])
+        empty_counts  = pd.DataFrame(columns=["variant", "wins"])
+        return empty_winners, empty_counts
 
-    # idxmin returns index labels; .loc works with labels
+    # idxmin over groups -> positions into 'd'
+    # Drop NaNs (events with all-NaN scores) and force int for iloc
     idx = d.groupby("event_id")["score"].idxmin()
     idx = idx.dropna()
-    winners = d.loc[idx, ["event_id", "variant", "score"]].reset_index(drop=True)
+    if hasattr(idx, "astype"):
+        try:
+            idx = idx.astype(int)
+        except Exception:
+            idx = pd.Series(idx).dropna().astype(int)
+
+    if len(idx) == 0:
+        empty_winners = pd.DataFrame(columns=["event_id", "variant", "score"])
+        empty_counts  = pd.DataFrame(columns=["variant", "wins"])
+        return empty_winners, empty_counts
+
+    # Use iloc to avoid the .loc ambiguity you hit
+    winners = d.iloc[idx][["event_id", "variant", "score"]].reset_index(drop=True)
 
     win_counts = (winners["variant"]
                   .value_counts()
                   .rename_axis("variant")
                   .reset_index(name="wins")
                   .sort_values("wins", ascending=False))
+
     return winners, win_counts
 
 # =============================================================================
-# Orchestrator + variant factory (pairwise mode)
+# Orchestrator + variant factory
 # =============================================================================
 
 def _products_dir_for(cfg, mseed_file: str | Path) -> Path:
     mseed_file = Path(mseed_file)
     event_dir = Path(cfg.output_base) / mseed_file.stem
     return event_dir / Path(cfg.outdir).name
+
 
 def csv_for_run(cfg, mseed_file: str | Path) -> Optional[Path]:
     """Locate a CSV output for a config + event, if present."""
@@ -417,6 +413,7 @@ def csv_for_run(cfg, mseed_file: str | Path) -> Optional[Path]:
         if c.exists():
             return c
     return None
+
 
 def ensure_csv_for(
     cfg,
@@ -436,6 +433,7 @@ def ensure_csv_for(
             print(f"  [run error] {Path(mseed_file).stem} · {cfg.tag()}: {e}")
             return None
     return csv
+
 
 def cfg_variants_from(
     baseline,
@@ -472,6 +470,7 @@ def cfg_variants_from(
         variants["landgrid"] = replace(baseline, gridobj=landgridobj).build()
     # prune Nones
     return {k: v for k, v in variants.items() if v is not None}
+
 
 def compare_runs(
     baseline_cfg,
@@ -541,7 +540,7 @@ def compare_runs(
                 safe_compare(summary_csv, base_csv, alt_csv, label=vcfg.tag())
             except Exception as e:
                 print(f"  [compare error] {vcfg.tag()}: {e}")
-
+    
     # Roll-up from the baseline's output root
     ROOT = Path(baseline_cfg.output_base)
     allcmp = load_all_event_comparisons(ROOT)
@@ -555,9 +554,44 @@ def compare_runs(
     winners, win_counts = per_event_winner(scored)
     return scored, summary, win_counts
 
-# =============================================================================
+
+#### New scoring functions
+def robust_scale(x):
+    x = np.asarray(x, dtype=float)
+    med = np.nanmedian(x)
+    mad = np.nanmedian(np.abs(x - med))
+    denom = 1.4826 * mad if mad > 0 else (np.nanstd(x) or 1.0)
+    return (x - med) / denom
+
+def event_scores(df_event, weights):
+    # df_event: rows=runs, cols include ["mean_sep_km","mean_misfit","mean_azgap","roughness","connectedness"]
+    cols_lower = ["mean_sep_km","mean_misfit","mean_azgap","roughness"]
+    cols_higher = ["connectedness"]  # flip sign
+
+    Z = {}
+    for c in cols_lower:
+        Z[c] = robust_scale(df_event[c].values)
+    for c in cols_higher:
+        Z[c] = -robust_scale(df_event[c].values)
+
+    # cap extreme z’s
+    for c in Z:
+        Z[c] = np.clip(Z[c], -3, 3)
+
+    score = np.zeros(len(df_event))
+    for c, w in weights.items():  # e.g., {"mean_sep_km":1.0, "mean_misfit":0.5, "mean_azgap":0.1, "roughness":0.2, "connectedness":0.2}
+        score += w * Z[c]
+    return score
+
+def medoid_distance(df_event, pairwise_dist):
+    # pairwise_dist: (n_runs x n_runs) symmetric matrix per event
+    dmean = np.nanmean(np.where(np.isfinite(pairwise_dist), pairwise_dist, np.nan), axis=1)
+    return dmean  # lower is better
+
+
+# -----------------------------------------------------------------------------
 # Intrinsic metrics (baseline-free, per run)
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 def _pairwise_gc_km(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
     """Distance (km) between successive samples; length n-1."""
@@ -565,11 +599,12 @@ def _pairwise_gc_km(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
     if n <= 1:
         return np.zeros(0, dtype=float)
     seg = np.empty(n-1, dtype=float)
-    seg[:] = np.nan
     for i in range(n-1):
         if (np.isfinite(lat[i]) and np.isfinite(lon[i]) and
             np.isfinite(lat[i+1]) and np.isfinite(lon[i+1])):
             seg[i] = _gc_km(lat[i], lon[i], lat[i+1], lon[i+1])
+        else:
+            seg[i] = np.nan
     return seg
 
 def _chord_km(lat: np.ndarray, lon: np.ndarray) -> float:
@@ -577,9 +612,9 @@ def _chord_km(lat: np.ndarray, lon: np.ndarray) -> float:
     m = np.isfinite(lat) & np.isfinite(lon)
     if np.count_nonzero(m) < 2:
         return np.nan
-    idx = np.where(m)[0]
-    i0 = idx[0]
-    i1 = idx[-1]
+    i0 = np.argmax(m)                      # first True index
+    i1_candidates = np.where(m)[0]
+    i1 = i1_candidates[-1]                 # last True index
     return _gc_km(lat[i0], lon[i0], lat[i1], lon[i1])
 
 def _roughness_ratio(lat: np.ndarray, lon: np.ndarray) -> float:
@@ -597,46 +632,77 @@ def _roughness_ratio(lat: np.ndarray, lon: np.ndarray) -> float:
 def intrinsic_metrics_from_csv(path: str | Path) -> Optional[dict]:
     """
     Load one run CSV and compute absolute metrics that do not depend on a baseline.
-    Returns a dict with keys at least:
+    Returns a dict with keys:
       - tag, event_id
       - n_samples, valid_frac
       - mean_misfit, mean_azgap, connectedness
       - path_len_km, chord_len_km, roughness_ratio
     """
+    try:
+        R = _load_run_csv(path)
+    except Exception as e:
+        print(f"[intrinsic] load error {path}: {e}")
+        return None
+
+    lat = R["lat"]; lon = R["lon"]
+    mis = R["misfit"]; azg = R["azgap"]
+
+    seg = _pairwise_gc_km(lat, lon)
+    path_len = float(np.nansum(seg)) if seg.size else np.nan
+    chord = float(_chord_km(lat, lon))
+    rough = float(_roughness_ratio(lat, lon))
+
+    valid_xy = np.isfinite(lat) & np.isfinite(lon)
+    n = int(len(lat))
+    vfrac = float(np.count_nonzero(valid_xy)) / n if n > 0 else np.nan
+
+    return {
+        "tag": R["tag"],
+        "event_id": Path(path).parents[1].name if len(Path(path).parents) >= 2 else "",
+        "n_samples": n,
+        "valid_frac": vfrac,
+        "mean_misfit": float(np.nanmean(mis)),
+        "mean_azgap":  float(np.nanmean(azg)),
+        "connectedness": float(R.get("connectedness", np.nan)),
+        "path_len_km": path_len,
+        "chord_len_km": chord,
+        "roughness_ratio": rough,
+    }
+
+def intrinsic_metrics_from_csv(path: str | Path) -> dict | None:
     p = Path(path)
     try:
         df = pd.read_csv(p)
-    except Exception as e:
-        print(f"[intrinsic] read error {p}: {e}")
+    except Exception:
         return None
 
     cmap = {c.lower(): c for c in df.columns}
     def has(c): return c.lower() in cmap
 
     # lat/lon
-    lat = pd.to_numeric(df[cmap["lat"]], errors="coerce").to_numpy() if has("lat") else np.array([])
-    lon = pd.to_numeric(df[cmap["lon"]], errors="coerce").to_numpy() if has("lon") else np.array([])
+    lat = df[cmap["lat"]].to_numpy(float) if has("lat") else np.array([])
+    lon = df[cmap["lon"]].to_numpy(float) if has("lon") else np.array([])
 
-    n_samples = int(len(df))
-    valid_xy = (np.isfinite(lat) & np.isfinite(lon)) if (lat.size and lon.size) else np.zeros(n_samples, dtype=bool)
-    valid_frac = float(valid_xy.mean()) if n_samples > 0 else np.nan
-
-    # geometry
-    seg = _pairwise_gc_km(lat, lon) if (lat.size and lon.size) else np.zeros(0)
-    path_len = float(np.nansum(seg)) if seg.size else np.nan
-    chord = float(_chord_km(lat, lon)) if (lat.size and lon.size) else np.nan
-    rough = float(_roughness_ratio(lat, lon)) if (lat.size and lon.size) else np.nan
+    # roughness from stepwise great-circle distances
+    rough = np.nan
+    if lat.size >= 2 and lon.size >= 2:
+        with np.errstate(invalid="ignore"):
+            dists = []
+            for i in range(1, len(lat)):
+                if np.isfinite(lat[i-1]) and np.isfinite(lon[i-1]) and np.isfinite(lat[i]) and np.isfinite(lon[i]):
+                    dists.append(_gc_km(lat[i-1], lon[i-1], lat[i], lon[i]))
+                else:
+                    dists.append(np.nan)
+            rough = safe_mean(dists)
 
     # misfit/azgap (may be missing)
-    mis = pd.to_numeric(df[cmap["misfit"]], errors="coerce").to_numpy() if has("misfit") else np.array([])
-    azg = pd.to_numeric(df[cmap["azgap"]], errors="coerce").to_numpy()  if has("azgap")  else np.array([])
-    mean_misfit = safe_mean(mis)
-    mean_azgap  = safe_mean(azg)
+    mis = df[cmap["misfit"]].to_numpy(float) if has("misfit") else np.array([])
+    azg = df[cmap["azgap"]].to_numpy(float)  if has("azgap")  else np.array([])
 
     # connectedness (scalar summary)
     conn = np.nan
     if has("connectedness"):
-        conn = safe_mean(pd.to_numeric(df[cmap["connectedness"]], errors="coerce").to_numpy())
+        conn = safe_mean(df[cmap["connectedness"]].to_numpy(float))
 
     # tag
     tag = p.stem
@@ -645,160 +711,14 @@ def intrinsic_metrics_from_csv(path: str | Path) -> Optional[dict]:
     if tag.endswith("_refined"):
         tag = tag[:-len("_refined")]
 
-    # infer event_id from directory: .../<event_id>/<products_dir>/<file.csv>
-    event_id = ""
-    try:
-        event_id = p.parent.parent.name
-    except Exception:
-        event_id = p.parent.name
-
     return {
-        "event_id": event_id,
-        "tag": tag,
-        "path": str(p),
-        "n_samples": n_samples,
-        "valid_frac": valid_frac,
-        "mean_misfit": mean_misfit,
-        "mean_azgap":  mean_azgap,
+        "mean_misfit":   safe_mean(mis),
+        "mean_azgap":    safe_mean(azg),
+        "roughness":     rough,
         "connectedness": float(conn),
-        "path_len_km": path_len,
-        "chord_len_km": chord,
-        "roughness_ratio": rough,
+        "tag":           tag,
     }
 
-# =============================================================================
-# Baseline-free (absolute) scoring
-# =============================================================================
-
-def _robust_scale_vector(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=float)
-    z = np.zeros_like(x, dtype=float)
-    m = np.isfinite(x)
-    if m.sum() == 0:
-        return z  # no info → neutral
-    xm = x[m]
-    med = np.median(xm)
-    mad = np.median(np.abs(xm - med))
-    if mad > 0:
-        denom = 1.4826 * mad
-    else:
-        sd = np.std(xm)
-        denom = sd if sd > 0 else 1.0
-    z[m] = (xm - med) / denom
-    return z
-
-def add_baseline_free_scores(
-    df_abs: pd.DataFrame,
-    *,
-    weights: Optional[Dict[str, float]] = None,
-    cap: float = 3.0,
-) -> pd.DataFrame:
-    """
-    Compute a robust composite `score_abs` per (event_id, tag) using *only* intrinsic metrics.
-    Lower is better after sign conventions below.
-
-    Default weights favor misfit, lightly penalize azgap & roughness,
-    and lightly reward connectedness and valid fraction (negative weights).
-    """
-    if df_abs is None or df_abs.empty:
-        return df_abs
-
-    d = df_abs.copy()
-
-    if weights is None:
-        weights = {
-            "mean_misfit":       0.8,   # lower better
-            "mean_azgap":        0.2,   # lower better
-            "roughness_ratio":   0.2,   # lower better
-            "connectedness":    -0.2,   # higher better (negative weight)
-            "valid_frac":       -0.2,   # higher better (negative weight)
-        }
-
-    out = []
-    # group per event_id for within-event normalization
-    for ev, g in d.groupby("event_id", dropna=False):
-        gg = g.copy()
-
-        Z: Dict[str, np.ndarray] = {}
-        # lower-is-better metrics
-        for col in ("mean_misfit", "mean_azgap", "roughness_ratio"):
-            arr = pd.to_numeric(gg.get(col, np.nan), errors="coerce").to_numpy()
-            z = _robust_scale_vector(arr)
-            Z[col] = np.clip(z, -cap, cap)
-
-        # higher-is-better metrics (we'll apply negative weights)
-        for col in ("connectedness", "valid_frac"):
-            arr = pd.to_numeric(gg.get(col, np.nan), errors="coerce").to_numpy()
-            z = _robust_scale_vector(arr)
-            Z[col] = np.clip(z, -cap, cap)
-
-        # composite score
-        score = np.zeros(len(gg))
-        for col, w in weights.items():
-            if col in Z:
-                score += w * Z[col]
-
-        gg["score_abs"] = score
-        out.append(gg)
-
-    return pd.concat(out, ignore_index=True)
-
-def summarize_absolute_runs(df_abs_scored: pd.DataFrame) -> pd.DataFrame:
-    """
-    Summary across events for absolute scores. Lower is better.
-    """
-    if df_abs_scored is None or df_abs_scored.empty:
-        return pd.DataFrame()
-
-    def _se(x):
-        x = pd.to_numeric(x, errors="coerce")
-        n = x.notna().sum()
-        return (np.nanstd(x, ddof=1) / np.sqrt(n)) if n > 1 else np.nan
-
-    g = df_abs_scored.groupby("tag")
-    return (g.agg(
-                n_events=("event_id","nunique"),
-                n_rows=("event_id","size"),
-                score_abs_mean=("score_abs","mean"),
-                score_abs_med =("score_abs","median"),
-                score_abs_se  =("score_abs", _se),
-                misfit_mean   =("mean_misfit","mean"),
-                azgap_mean    =("mean_azgap","mean"),
-                rough_mean    =("roughness_ratio","mean"),
-                conn_mean     =("connectedness","mean"),
-                vfrac_mean    =("valid_frac","mean"),
-            )
-            .reset_index()
-            .sort_values("score_abs_mean"))
-
-def per_event_winner_abs(df_abs_scored: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Winners by lowest absolute score per event (no baselines).
-    Returns (winners_df, win_counts_df).
-    """
-    if df_abs_scored is None or df_abs_scored.empty or "score_abs" not in df_abs_scored.columns:
-        W = pd.DataFrame(columns=["event_id","tag","score_abs"])
-        C = pd.DataFrame(columns=["tag","wins"])
-        return W, C
-
-    d = df_abs_scored[np.isfinite(df_abs_scored["score_abs"])].copy()
-    if d.empty:
-        W = pd.DataFrame(columns=["event_id","tag","score_abs"])
-        C = pd.DataFrame(columns=["tag","wins"])
-        return W, C
-
-    idx = d.groupby("event_id")["score_abs"].idxmin()
-    idx = idx.dropna()
-    winners = d.loc[idx, ["event_id","tag","score_abs"]].reset_index(drop=True)
-
-    win_counts = (winners["tag"].value_counts()
-                  .rename_axis("tag").reset_index(name="wins")
-                  .sort_values("wins", ascending=False))
-    return winners, win_counts
-
-# =============================================================================
-# Build intrinsic table (ensures CSVs exist, then compute intrinsic metrics)
-# =============================================================================
 
 def _ensure_and_get_csv(cfg, ev, *, run_if_missing, run_single_event, **kwargs) -> Optional[Path]:
     return ensure_csv_for(cfg, ev, run_if_missing=run_if_missing,
@@ -835,7 +755,7 @@ def build_intrinsic_table(
             station_gains_df=None, switch_event_ctag=True,
             mseed_units="m/s", reduce_time=True, debug=True,
         )
-        if bcsv is not None and Path(bcsv).exists():
+        if bcsv is not None and bcsv.exists():
             r = intrinsic_metrics_from_csv(bcsv)
             if r: rows.append(r)
 
@@ -849,50 +769,256 @@ def build_intrinsic_table(
                 station_gains_df=None, switch_event_ctag=True,
                 mseed_units="m/s", reduce_time=True, debug=True,
             )
-            if vcsv is not None and Path(vcsv).exists():
+            if vcsv is not None and vcsv.exists():
                 r = intrinsic_metrics_from_csv(vcsv)
                 if r: rows.append(r)
 
     return pd.DataFrame(rows)
 
-# =============================================================================
-# Crawler for absolute mode (discover all runs already on disk)
-# =============================================================================
 
+# -----------------------------------------------------------------------------
+# Baseline-free (absolute) scoring
+# -----------------------------------------------------------------------------
+
+def robust_scale(x):
+    x = np.asarray(x, dtype=float)
+    m = np.isfinite(x)
+    z = np.zeros_like(x, dtype=float)
+    if m.sum() == 0:
+        return z  # no info → neutral score
+    xm = x[m]
+    med = np.median(xm)
+    mad = np.median(np.abs(xm - med))
+    if mad > 0:
+        denom = 1.4826 * mad
+    else:
+        sd = np.std(xm)
+        denom = sd if sd > 0 else 1.0
+    z[m] = (xm - med) / denom
+    return z
+
+def add_baseline_free_scores(
+    df_abs: pd.DataFrame,
+    *,
+    weights: Optional[Dict[str, float]] = None,
+    cap: float = 3.0,
+) -> pd.DataFrame:
+    """
+    Compute a robust composite `score_abs` per (event_id, tag) using *only* intrinsic metrics.
+    Lower is better after sign conventions below.
+
+    Default weights favor separation & misfit, lightly penalize azgap & roughness,
+    and lightly reward connectedness and valid fraction.
+    """
+    if df_abs is None or df_abs.empty:
+        return df_abs
+
+    d = df_abs.copy()
+
+    # Defaults chosen so terms are O(1) after robust scaling
+    if weights is None:
+        weights = {
+            "mean_misfit":       0.8,   # lower better
+            "mean_azgap":        0.2,   # lower better
+            "roughness_ratio":   0.2,   # lower better
+            "connectedness":    -0.2,   # higher better (note: negative weight)
+            "valid_frac":       -0.2,   # higher better (note: negative weight)
+        }
+
+    # Build Z-scores per event (robust to outliers)
+    out = []
+    for ev, g in d.groupby("event_id", dropna=False):
+        gg = g.copy()
+        Z = {}
+
+        # lower-is-better metrics
+        for col in ("mean_misfit", "mean_azgap", "roughness_ratio"):
+            if col in gg.columns:
+                z = robust_scale(gg[col].values)
+                Z[col] = np.clip(z, -cap, cap)
+            else:
+                Z[col] = np.full(len(gg), np.nan)
+
+        # higher-is-better metrics (flip sign via negative weight)
+        for col in ("connectedness", "valid_frac"):
+            if col in gg.columns:
+                z = robust_scale(gg[col].values)
+                Z[col] = np.clip(z, -cap, cap)
+            else:
+                Z[col] = np.full(len(gg), np.nan)
+
+        # composite
+        score = np.zeros(len(gg))
+        for col, w in weights.items():
+            if col in Z:
+                # If this is a higher-better metric, its negative weight makes lower score = better.
+                score += w * Z[col]
+        gg["score_abs"] = score
+        out.append(gg)
+
+    return pd.concat(out, ignore_index=True)
+
+def summarize_absolute_runs(df_abs_scored: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summary across events for absolute scores. Lower is better.
+    """
+    if df_abs_scored is None or df_abs_scored.empty:
+        return pd.DataFrame()
+
+    g = df_abs_scored.groupby("tag")
+    def _se(x):
+        x = pd.to_numeric(x, errors="coerce")
+        n = x.notna().sum()
+        return (np.nanstd(x, ddof=1) / np.sqrt(n)) if n > 1 else np.nan
+
+    return (g.agg(
+                n_events=("event_id","nunique"),
+                n_rows=("event_id","size"),
+                score_abs_mean=("score_abs","mean"),
+                score_abs_med =("score_abs","median"),
+                score_abs_se  =("score_abs", _se),
+                misfit_mean   =("mean_misfit","mean"),
+                azgap_mean    =("mean_azgap","mean"),
+                rough_mean    =("roughness_ratio","mean"),
+                conn_mean     =("connectedness","mean"),
+                vfrac_mean    =("valid_frac","mean"),
+            )
+            .reset_index()
+            .sort_values("score_abs_mean"))
+
+def per_event_winner_abs(df_abs_scored: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Winners by lowest absolute score per event (no baselines).
+    Returns (winners_df, win_counts_df).
+    """
+    if df_abs_scored is None or df_abs_scored.empty or "score_abs" not in df_abs_scored.columns:
+        W = pd.DataFrame(columns=["event_id","tag","score_abs"])
+        C = pd.DataFrame(columns=["tag","wins"])
+        return W, C
+
+    d = df_abs_scored[np.isfinite(df_abs_scored["score_abs"])].copy()
+    if d.empty:
+        W = pd.DataFrame(columns=["event_id","tag","score_abs"])
+        C = pd.DataFrame(columns=["tag","wins"])
+        return W, C
+
+    idx = d.groupby("event_id")["score_abs"].idxmin()
+    idx = idx.dropna()
+    try:
+        idx = idx.astype(int)
+    except Exception:
+        idx = pd.Series(idx).dropna().astype(int)
+
+    if len(idx) == 0:
+        W = pd.DataFrame(columns=["event_id","tag","score_abs"])
+        C = pd.DataFrame(columns=["tag","wins"])
+        return W, C
+
+    winners = d.iloc[idx][["event_id","tag","score_abs"]].reset_index(drop=True)
+    win_counts = (winners["tag"].value_counts()
+                  .rename_axis("tag").reset_index(name="wins")
+                  .sort_values("wins", ascending=False))
+    return winners, win_counts
+
+
+# if we want to just discover what runs are available
 def crawl_intrinsic_runs(root: str | Path) -> pd.DataFrame:
     """
     Walk output tree under `root` and compute intrinsic (baseline-free) metrics
     for every per-run CSV we can recognize. Returns one row per (event_id, tag).
     """
     root = Path(root)
-    rows: List[dict] = []
+    rows = []
+
+    # heuristics: look for common per-run outputs, skip pairwise summaries
+    name_ok = lambda p: (
+        p.suffix.lower() == ".csv"
+        and not p.name.startswith("pairwise_")
+        and not p.name.endswith("_comparisons.csv")
+    )
+    patterns = ["**/source_*_refined.csv", "**/source_*.csv", "**/*_refined.csv", "**/*.csv"]
+
+    seen = set()  # dedupe by (event_id, tag, path)
+    for pat in patterns:
+        for csv in root.glob(pat):
+            if not name_ok(csv):
+                continue
+
+            # infer event_id (parent of products dir)
+            # e.g., .../<event_id>/<products_dir>/<file.csv>
+            try:
+                event_id = csv.parent.parent.name
+            except Exception:
+                event_id = csv.parent.name
+
+            # infer tag from filename
+            nm = csv.stem  # without .csv
+            if nm.startswith("source_"):
+                tag = nm[len("source_"):]
+            else:
+                tag = nm
+            if tag.endswith("_refined"):
+                tag = tag[:-len("_refined")]
+
+            key = (event_id, tag, str(csv))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            r = intrinsic_metrics_from_csv(csv)
+            if r:
+                r["event_id"] = event_id
+                r["tag"] = tag
+                r["path"] = str(csv)
+                rows.append(r)
+
+    return pd.DataFrame(rows)
+
+
+# safe reducers
+def _finite1(x) -> tuple[np.ndarray, int]:
+    x = np.asarray(x, dtype=float)
+    m = np.isfinite(x)
+    return x[m], int(m.sum())
+
+def safe_mean(x) -> float:
+    x, n = _finite1(x)
+    return float(np.nan if n == 0 else x.mean())
+
+def safe_median(x) -> float:
+    x, n = _finite1(x)
+    return float(np.nan if n == 0 else np.median(x))
+
+def crawl_intrinsic_runs(root: str | Path) -> pd.DataFrame:
+    root = Path(root)
+    rows = []
+    patterns = ["**/source_*_refined.csv", "**/source_*.csv", "**/*_refined.csv", "**/*.csv"]
 
     def is_per_run_csv(p: Path) -> bool:
-        if p.suffix.lower() != ".csv":
+        if not p.name.endswith(".csv"):
             return False
-        nm = p.name
-        if nm.startswith("pairwise_"):
+        if p.name.startswith("pairwise_"):
             return False
-        if nm.endswith("_comparisons.csv"):
+        if p.name.endswith("_comparisons.csv"):
             return False
         return True
 
-    patterns = [
-        "**/source_*_refined.csv",
-        "**/source_*.csv",
-        "**/*_refined.csv",
-        "**/*.csv",
-    ]
-
-    seen: set = set()
+    seen = set()
     for pat in patterns:
         for csv in root.glob(pat):
             if not is_per_run_csv(csv):
                 continue
+
+            # heuristics for event_id
+            event_id = csv.parent.parent.name if csv.parent.parent != root else csv.parent.name
+
             r = intrinsic_metrics_from_csv(csv)
             if not r:
                 continue
-            key = (r["event_id"], r["tag"], r.get("path", str(csv)))
+            r["event_id"] = event_id
+            r["path"] = str(csv)
+
+            key = (r["event_id"], r["tag"], r["path"])
             if key in seen:
                 continue
             seen.add(key)

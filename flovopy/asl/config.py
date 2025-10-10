@@ -11,8 +11,49 @@ from flovopy.asl.grid import summarize_station_node_distances, Grid
 from flovopy.asl.ampcorr import AmpCorrParams, AmpCorr, summarize_ampcorr_ranges
 from flovopy.processing.sam import VSAM  # default
 
-#Number = float | int
+def _is_pathlike(x):
+    return isinstance(x, (str, Path))
 
+def _value_equal(a, b) -> bool:
+    # Same object shortcut
+    if a is b:
+        return True
+
+    # Handle None vs non-None
+    if (a is None) ^ (b is None):
+        return False
+
+    # Pathlike: normalize to absolute string
+    if _is_pathlike(a) and _is_pathlike(b):
+        try:
+            return Path(a).resolve() == Path(b).resolve()
+        except Exception:
+            return str(a) == str(b)
+
+    # Pandas DataFrame/Series: structural equality
+    if isinstance(a, pd.DataFrame) and isinstance(b, pd.DataFrame):
+        try:
+            return a.equals(b)
+        except Exception:
+            return False
+    if isinstance(a, pd.Series) and isinstance(b, pd.Series):
+        try:
+            return a.equals(b)
+        except Exception:
+            return False
+
+    # Numpy arrays
+    if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+        try:
+            return np.array_equal(a, b, equal_nan=True)
+        except Exception:
+            return False
+
+    # Fallback: regular equality (guard exceptions)
+    try:
+        return a == b
+    except Exception:
+        return False
 @dataclass(frozen=True)
 class ASLConfig:
     """
@@ -283,6 +324,81 @@ class ASLConfig:
 
         return self
 
+    @property
+    def built(self) -> bool:
+        """True iff this config has been built (tag_str populated)."""
+        return bool(getattr(self, "tag_str", ""))
+
+    def _changes_dict(self, overrides: dict) -> dict:
+        """Return only the keys that actually change value, using robust equality."""
+        out = {}
+        for k, v in (overrides or {}).items():
+            if not _value_equal(getattr(self, k), v):
+                out[k] = v
+        return out
+
+    def needs_rebuild(self, *, changes: dict | None = None) -> dict:
+        """
+        Decide what to recompute given a set of changes.
+
+        Returns a dict:
+        {
+            "requires_distances": bool,   # dist_mode change (2d ↔ 3d) or structural changes
+            "requires_ampcorr":   bool,   # wave_kind/speed/Q/peakf change (or above)
+            "requires_any":       bool,   # either of the above OR not built yet OR station corr changed
+        }
+        """
+        changes = self._changes_dict(changes or {})
+
+        structural = {"inventory", "gridobj", "global_cache"}
+        structural_changed = any(k in changes for k in structural)
+
+        requires_distances = structural_changed or ("dist_mode" in changes)
+
+        physics = {"wave_kind", "speed", "Q", "peakf"}
+        physics_changed = any(k in changes for k in physics)
+        requires_ampcorr = structural_changed or physics_changed or requires_distances
+
+        # If the station corrections table/path changed, we want to run build() to
+        # resolve & stash the new DataFrame even though it doesn't affect distances/ampcorr.
+        stacorr_changed = "station_correction_dataframe" in changes
+
+        requires_any = (not self.built) or requires_distances or requires_ampcorr or stacorr_changed
+
+        return {
+            "requires_distances": requires_distances or (not self.built),
+            "requires_ampcorr":   requires_ampcorr   or (not self.built),
+            "requires_any":       requires_any,
+        }
+
+    # --- copying APIs ---------------------------------------------------
+    def copy(self, **overrides) -> "ASLConfig":
+        """
+        Make a new config with one or more parameters replaced. If the new
+        config needs derived artifacts (distances/ampcorr), this will call
+        .build() automatically; otherwise it returns a cheap, unbuilt copy.
+
+        Example:
+            cfg2 = cfg.copy(Q=200, speed=3.0)        # auto-builds (AmpCorr depends)
+            cfg3 = cfg.copy(dist_mode="2d")          # auto-builds (distances depend)
+            cfg4 = cfg.copy(sam_metric="median")     # returns as-is (no rebuild needed)
+        """
+        from dataclasses import replace
+
+        overrides = dict(overrides or {})
+        new_cfg = replace(self, **overrides)
+
+        need = self.needs_rebuild(changes=overrides)
+        return new_cfg.build() if need["requires_any"] else new_cfg
+
+    def copy_unbuilt(self, **overrides) -> "ASLConfig":
+        """
+        Make a new config with overrides but **do not build** it.
+        Useful if you want to stage many variants and build later.
+        """
+        from dataclasses import replace
+        return replace(self, **(overrides or {}))
+
     # ---------------- sweep helper ----------------
 
     @staticmethod
@@ -352,32 +468,26 @@ class ASLConfig:
         list of ASLConfig
             One configuration per combination of parameter values.
         """
-        out: List[ASLConfig] = []
-        for w in wave_kinds:
-            for sc_tab in station_corr_tables:
-                for v in speeds:
-                    for q in Qs:
-                        for d in dist_modes:
-                            for m in misfit_engines:
-                                for f in peakfs:
-                                    out.append(
-                                        ASLConfig(
-                                            inventory=inventory,
-                                            output_base=output_base,
-                                            gridobj=gridobj,
-                                            global_cache=global_cache,
-                                            wave_kind=w,
-                                            station_correction_dataframe=sc_tab,
-                                            speed=float(v),
-                                            Q=int(q),
-                                            dist_mode=str(d),
-                                            misfit_engine=str(m),
-                                            peakf=float(f),
-                                            window_seconds=float(window_seconds),
-                                            min_stations=int(min_stations),
-                                            sam_class=sam_class,
-                                            sam_metric=sam_metric,
-                                            debug=debug,
-                                        )
-                                    )
-        return out
+        # Create a baseline “template” (unbuilt) and then use axes
+        base = ASLConfig(
+            inventory=inventory, output_base=output_base,
+            gridobj=gridobj, global_cache=global_cache,
+            wave_kind=wave_kinds[0],  # seed; will be overridden
+            station_correction_dataframe=station_corr_tables[0],
+            speed=speeds[0], Q=Qs[0], dist_mode=dist_modes[0],
+            misfit_engine=misfit_engines[0], peakf=peakfs[0],
+            window_seconds=window_seconds, min_stations=min_stations,
+            sam_class=sam_class, sam_metric=sam_metric, debug=debug,
+        )
+        axes = {
+            "wave_kind": wave_kinds,
+            "station_correction_dataframe": station_corr_tables,
+            "speed": speeds,
+            "Q": Qs,
+            "dist_mode": dist_modes,
+            "misfit_engine": misfit_engines,
+            "peakf": peakfs,
+        }
+        # reuse your variants helper:
+        from flovopy.asl.compare_runs import tweak_config  # or cfg_variants_from
+        return list(tweak_config(base, axes=axes, include_baseline=False).values())
