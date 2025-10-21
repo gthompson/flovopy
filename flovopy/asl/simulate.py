@@ -29,7 +29,7 @@ def simulate_SAM(inv: Inventory, source, units="m/s", assume_surface_waves=False
         net, sta, loc, chan = sid.split(".")
         coords = inv.get_coordinates(sid)
         dist_km = degrees2kilometers(locations2degrees(coords["latitude"], coords["longitude"], source["lat"], source["lon"]))
-        gsc = sam_class.compute_geometrical_spreading_correction(dist_km, chan, assume_surface_waves=assume_surface_waves, wave_speed_kms=wave_speed_kms, peakf=peakf)
+        gsc = sam_class.compute_geometrical_spreading_correction(dist_km, chan, surfaceWaves=assume_surface_waves, wavespeed_kms=wave_speed_kms, peakf=peakf)
         isc = sam_class.compute_inelastic_attenuation_correction(dist_km, peakf, wave_speed_kms, Q)
         times = [UTCDateTime().timestamp + i for i in range(npts)]
         amplitude = source["DR"] / (gsc * isc) * 1e-7
@@ -39,7 +39,7 @@ def simulate_SAM(inv: Inventory, source, units="m/s", assume_surface_waves=False
 
     return sam_class(dataframes=dataframes, sampling_interval=1.0, verbose=verbose)
 
-def plot_SAM(samobj, gridobj, K=3, metric="mean", DEM_DIR=None, inv=None, colors=None, seed=None, show_map=True, figsize=6.0):
+def plot_SAM(samobj, gridobj, K=3, metric="mean", colors=None, seed=None, topo_kw=None, show_map=True):
     rng = np.random.default_rng(seed)
     total_nodes = gridobj.gridlat.size
     K = max(1, min(K, total_nodes))
@@ -65,9 +65,9 @@ def plot_SAM(samobj, gridobj, K=3, metric="mean", DEM_DIR=None, inv=None, colors
 
     fig_map = None
     if show_map:
-        fig_map = topo_map(show=False, zoom_level=0, inv=inv, add_labels=True, contour_interval=100, topo_color=False, DEM_DIR=DEM_DIR, figsize=figsize)
+        fig_map = topo_map(**topo_kw)
         lonf, latf = gridobj.gridlon.ravel(), gridobj.gridlat.ravel()
         for i, node in enumerate(chosen_nodes):
-            fig_map.plot(x=[lonf[node]], y=[latf[node]], style="c0.28c", pen=f"1p,{colors[i]}", fill=colors[i])
+            fig_map.plot(x=[lonf[node]], y=[latf[node]], style="c0.6c", pen=f"1p,{colors[i]}", fill=colors[i])
         fig_map.show()
     return fig_map, chosen_nodes

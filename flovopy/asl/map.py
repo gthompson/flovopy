@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import pickle
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, List, Union, Dict, Any
 import xarray as xr  
 from pathlib import Path
 import numpy as np
@@ -334,6 +334,7 @@ def topo_map(
     # --------------------
     # CPT (avoid -Z warning by omitting continuous=True without increment)
     # --------------------
+    cmap='gray' # REMOVE THIS
     use_palette = cmap if cmap is not None else ("geo" if topo_color else "gray")
     use_cmap_flag = None
 
@@ -628,77 +629,3 @@ def _resolve_dem_to_grid_and_bounds(
 
 
 
-
-# ----------------------------
-# Heatmap
-# ----------------------------
-def plot_heatmap_colored(
-    df: pd.DataFrame,
-    lat_col: str = "latitude",
-    lon_col: str = "longitude",
-    amp_col: str = "amplitude",
-    topo_kw: dict = None,
-    cmap: str = "viridis",
-    log_scale: bool = True,
-    node_spacing_m: int = 10,
-    outfile: Optional[str] = None,
-    title: Optional[str] = None,
-    scale: float = 1.0,
-    verbose: bool = False,
-):
-    """
-    Render a colored heatmap of energy (sum amplitude^2) on a topo basemap.
-    """
-    if df is None or df.empty:
-        raise ValueError("plot_heatmap_colored: input DataFrame is empty")
-
-    df = df.copy()
-    df["energy"] = df[amp_col] ** 2
-    grouped = df.groupby([lat_col, lon_col])["energy"].sum().reset_index()
-
-    x = grouped[lon_col].to_numpy(float)
-    y = grouped[lat_col].to_numpy(float)
-    z = grouped["energy"].to_numpy(float)
-    if log_scale:
-        z = np.log10(z + 1e-12)
-    if verbose:
-        print(f'z={z}')
-
-    # drop non-finite
-    m = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
-    x, y, z = x[m], y[m], z[m]
-    if x.size == 0:
-        raise ValueError("plot_heatmap_colored: no finite data to plot")
-    
-
-    # Basemap with DEM
-    fig = topo_map(**topo_kw, title=title, add_colorbar=False)#, add_topography=False)
-
-    # CPT for the heatmap (separate from topo shading)
-    zmin, zmax = float(np.nanmin(z)), float(np.nanmax(z))
-    pygmt.makecpt(
-        cmap=cmap,
-        series=[zmin, zmax, (zmax - zmin) / 100.0 if zmax > zmin else 0.01],
-        continuous=True,
-    )
-
-    # symbol size
-    symbol_size_cm = node_spacing_m * 0.077 / 50.0 * scale
-
-    # Plot heatmap squares with viridis CPT
-    fig.plot(
-        x=x,
-        y=y,
-        style=f"s{symbol_size_cm}c",
-        fill=z,     # <-- THIS is the critical change
-        cmap=True,  # <-- tell PyGMT to use the active CPT (viridis)
-        pen=None,
-    )
-
-    fig.colorbar(frame='+l"Log10 Total Energy"' if log_scale else '+l"Total Energy"')
-
-    if outfile:
-        fig.savefig(outfile)
-    else:
-        fig.show()
-    return fig

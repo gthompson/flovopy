@@ -40,6 +40,7 @@ from flovopy.asl.config import tweak_config, ASLConfig
 from flovopy.core.trace_utils import stream_add_units, add_processing_step
 from flovopy.core.preprocess import preprocess_trace
 from flovopy.core.remove_response import safe_pad_taper_filter, safe_pad_taper_filter_stream
+from flovopy.asl.diagnostics import extract_asl_diagnostics, compare_asl_sources
 
 class _Tee(io.TextIOBase):
     def __init__(self, *streams):
@@ -456,6 +457,7 @@ def asl_sausage(
         peakf_event = int(round(peakf_override))
         print(f"[ASL] Using peak frequency override: {peakf_event} Hz")
 
+    
     # Debug info
     ampcorr_params = cfg.ampcorr.params
     if debug:
@@ -472,32 +474,60 @@ def asl_sausage(
             if dmax > 100:
                 print("[ASL:WARN] Distances look like meters! (max > 100 km)")
 
-        # Summit sanity check (reduction)
-        if topo_kw and topo_kw.get("dome_location"):
-            if cfg.sam_class.__name__ == "VSAM":
-                print("[ASL_SAUSAGE]: Sanity check: VSAM → VR/VRS at dome")
-                VR = samObj.compute_reduced_velocity(
-                    cfg.inventory,
-                    topo_kw["dome_location"],
-                    surfaceWaves=ampcorr_params.assume_surface_waves,
-                    Q=ampcorr_params.Q,
-                    wavespeed_kms=ampcorr_params.wave_speed_kms,
-                    peakf=peakf_event,
-                )
-                print(VR)
-                VR.plot(outfile=os.path.join(event_dir, "VR_at_dome.png"))
-            elif cfg.sam_class.__name__ == "DSAM":
-                print("[ASL_SAUSAGE]: Sanity check: DSAM → DR/DRS at dome")
-                DR = samObj.compute_reduced_displacement(
-                    cfg.inventory,
-                    topo_kw["dome_location"],
-                    surfaceWaves=ampcorr_params.assume_surface_waves,
-                    Q=ampcorr_params.Q,
-                    wavespeed_kms=ampcorr_params.wave_speed_kms,
-                    peakf=peakf_event,
-                )
-                print(DR)
-                DR.plot(outfile=os.path.join(event_dir, "DR_at_dome.png"))
+    # Summit sanity check (reduction)
+    outlier_trace_ids = []
+    if topo_kw and topo_kw.get("dome_location"):
+        if cfg.sam_class.__name__ == "VSAM":
+            print("[ASL_SAUSAGE]: Sanity check: VSAM → VR/VRS at dome")
+            VR = samObj.compute_reduced_velocity(
+                cfg.inventory,
+                topo_kw["dome_location"],
+                surfaceWaves=ampcorr_params.assume_surface_waves,
+                Q=ampcorr_params.Q,
+                wavespeed_kms=ampcorr_params.wave_speed_kms,
+                peakf=peakf_event,
+            )
+            vrmedian, vrcorrections = VR.examine_spread()
+            #network_avg = vrmedian[cfg.sam_metric]['network_median']
+            
+            for trace_id in [tr.id for tr in stream]:
+                #trace_avg = vrmedian[cfg.sam_metric][trace_id]
+                #if trace_avg > 10 * network_avg or trace_avg < network_avg/10:
+                trace_avg = vrcorrections[trace_id]
+                if trace_avg > 10 or trace_avg < 0.1:
+                    outlier_trace_ids.append(trace_id)
+            VR.plot(outfile=os.path.join(event_dir, "VR_at_dome.png"))
+
+        elif cfg.sam_class.__name__ == "DSAM":
+            print("[ASL_SAUSAGE]: Sanity check: DSAM → DR/DRS at dome")
+            DR = samObj.compute_reduced_displacement(
+                cfg.inventory,
+                topo_kw["dome_location"],
+                surfaceWaves=ampcorr_params.assume_surface_waves,
+                Q=ampcorr_params.Q,
+                wavespeed_kms=ampcorr_params.wave_speed_kms,
+                peakf=peakf_event,
+            )
+            drmedian, drcorrections = DR.examine_spread()
+            #network_avg = drmedian[cfg.sam_metric]['network_median']
+            
+            for trace_id in [tr.id for tr in stream]:
+                #trace_avg = drmedian[cfg.sam_metric][trace_id]
+                #if trace_avg > 10 * network_avg or trace_avg < network_avg/10:
+                trace_avg = drcorrections[trace_id]
+                if trace_avg > 10 or trace_avg < 0.1:
+                    outlier_trace_ids.append(trace_id)
+            VR.plot(outfile=os.path.join(event_dir, "VR_at_dome.png"))
+            DR.plot(outfile=os.path.join(event_dir, "DR_at_dome.png"))
+            
+    if outlier_trace_ids:
+        dataframes = {}
+        for trace_id in samObj.dataframes:
+            if trace_id in outlier_trace_ids:
+                continue
+            else:
+                dataframes[trace_id] = samObj.dataframes[trace_id]
+        samObj.dataframes = dataframes
 
     # 5) Amplitude corrections cache (swap if peakf differs)
     ampcorr: AmpCorr = cfg.ampcorr
@@ -892,6 +922,8 @@ def run_single_event(
             verbose=True,
         )
 
+
+
         # 4) Build both convenience views for plotting, independent of input file units
         if cfg.sam_class is VSAM:
             vel = st
@@ -903,9 +935,8 @@ def run_single_event(
             disp = st
             vel = st.copy().differentiate().detrend('linear')
             # (Velocity after differentiation is usually OK; pad-HP not strictly needed here.)
-            vel.stats["units"] = "m/s"
             for tr in vel:
-                tr["units"] = "m/s"
+                tr.stats["units"] = "m/s"
 
         # --------------------------------------------------------------------------
         # END OF STREAM PREPROCESSING - should now have a vel and disp Stream object
@@ -1186,7 +1217,6 @@ def run_all_events(
     Process all event files under input_dir with the same ASLConfig.
     Writes JSONL summaries and a single global heatmap at OUTPUT_DIR/heatmap_{ctag}.png.
     """
-    from flovopy.asl.wrappers import run_single_event, find_event_files  # ensure available
 
     if getattr(cfg, "inventory", None) is None or not getattr(cfg, "outdir", ""):
         if debug:
@@ -1477,444 +1507,3 @@ rand_axes = sample_axes({"speed":[1.0,1.5,2.0,3.0], "Q":[20,40,60,80,100]}, n=20
 variants = build_variants(baseline_cfg, axes=rand_axes, include_baseline=True)
 
 '''
-
-# -------------------------------------------------------------------
-# EVERYTHING BELOW IS FOR HEATMAPS
-# -------------------------------------------------------------------
-
-def _load_source_csv(path: str) -> pd.DataFrame | None:
-    """
-    Load a single source_<ctag>.csv, requiring lat/lon and DR (case-insensitive for DR).
-    Output columns are exactly: lat, lon, DR
-    """
-    try:
-        df = pd.read_csv(path)
-        # normalize column names for selection, but we will restore 'DR' as uppercase
-        lower = {c.lower(): c for c in df.columns}
-        # require lat/lon
-        if "lat" not in lower or "lon" not in lower:
-            return None
-        # DR can appear as 'DR' or 'dr'
-        dr_key = lower.get("dr", None)
-        if dr_key is None:
-            return None
-
-        sub = df[[lower["lat"], lower["lon"], dr_key]].copy()
-        sub.columns = ["lat", "lon", "DR"]  # enforce exact output names
-        # coerce and drop bad rows
-        sub["lat"] = pd.to_numeric(sub["lat"], errors="coerce")
-        sub["lon"] = pd.to_numeric(sub["lon"], errors="coerce")
-        sub["DR"]  = pd.to_numeric(sub["DR"],  errors="coerce")
-        sub.dropna(subset=["lat", "lon", "DR"], inplace=True)
-
-        return sub if not sub.empty else None
-    except Exception:
-        return None
-
-
-def collect_sources_for_ctag(output_root: str | Path, ctag: str, refined: bool = False) -> pd.DataFrame:
-    """
-    Collect source CSVs for a given ctag.
-    If refined=True, loads only *_refined.csv.
-    If refined=False, loads only the unrefined CSVs.
-    """
-    output_root = Path(output_root)
-    dfs: list[pd.DataFrame] = []
-
-    for ev_dir in sorted(d for d in output_root.iterdir() if d.is_dir()):
-        run_dir = ev_dir / ctag
-        if not run_dir.is_dir():
-            continue
-
-        if refined:
-            f = run_dir / f"source_{ctag}_refined.csv"
-        else:
-            f = run_dir / f"source_{ctag}.csv"
-
-        if f.is_file():
-            sub = _load_source_csv(str(f))
-            if sub is not None:
-                dfs.append(sub)
-
-    if not dfs:
-        label = "refined" if refined else "primary"
-        print(f"[HEATMAP] No {label} source CSVs found for ctag={ctag}")
-        return pd.DataFrame(columns=["lat", "lon", "DR"])
-
-    return pd.concat(dfs, ignore_index=True)
-
-
-
-def write_global_heatmap_for_ctag(
-    output_root: str | Path,
-    ctag: str,
-    *,
-    node_spacing_m: float = 10.0,
-    topo_kw: dict | None = None,
-    title: str | None = None,
-    include_refined: bool = True,
-    log_scale: bool = False,
-    cmap = 'viridis',
-    scale: float = 1.0,
-    verbose: bool = False,
-) -> str | None:
-    """
-    Aggregate source_<ctag>.csv (+ optional _refined) across OUTPUT_DIR/{event}/{ctag}
-    and write one heatmap: OUTPUT_DIR/heatmap_{ctag}.png
-    """
-    from flovopy.asl.map import plot_heatmap_colored  # local import to avoid cycles
-
-    results = {"primary": None, "refined": None}
-
-    for refined_flag, label in [(False, "primary"), (True, "refined")]:
-        df = collect_sources_for_ctag(output_root, ctag, refined=refined_flag)
-        if df.empty:
-            continue
-
-        out_png = Path(output_root) / f"heatmap_{ctag}_{label}.png"
-        plot_heatmap_colored(
-            df,
-            lat_col="lat",
-            lon_col="lon",
-            amp_col="DR",
-            log_scale=log_scale,
-            node_spacing_m=node_spacing_m,
-            outfile=str(out_png),
-            title=title or f"Energy Heatmap ({label}) — {ctag}",
-            topo_kw=topo_kw,
-            cmap=cmap,
-            scale=scale,
-            verbose=verbose,
-        )
-        print(f"[HEATMAP] Wrote {label}: {out_png}")
-        results[label] = str(out_png)
-
-    return results
-
-
-
-'''
-Example:
-
-# Basic: aggregate all events found under OUTPUT_DIR/<event>/<ctag>
-res = rebuild_heatmap_for_ctag(
-    OUTPUT_DIR,
-    ctag=cfg.tag(),
-    topo_kw=topo_kw,
-    cfg=cfg,                   # provides node_spacing_m and a nice title
-    write_catalogs=False       # set True if you also want per-event catalogs refreshed
-)
-print(res["heatmap_png"])
-
-# With a date window filter (example: event folders like '2024-08-02_13-41-00')
-from obspy import UTCDateTime
-date_from = UTCDateTime("2024-07-01")
-date_to   = UTCDateTime("2024-07-31")
-
-def in_july(name: str) -> bool:
-    # parse your event folder naming here; this is just an example
-    # expect 'YYYY-MM-DD_HH-MM-SS'
-    try:
-        ts = UTCDateTime(name.replace("_", " ").replace("-", ":", 2))
-        return date_from <= ts <= date_to
-    except Exception:
-        return False
-
-res = rebuild_heatmap_for_ctag(
-    OUTPUT_DIR,
-    ctag=cfg.tag(),
-    topo_kw=topo_kw,
-    cfg=cfg,
-    event_filter=in_july,
-    outfile_suffix="2024-07",
-)
-
-'''
-
-
-# -------------------------------------------------------------------
-# Enhanced catalogs (unchanged)
-# -------------------------------------------------------------------
-
-def enhanced_catalogs_from_outputs(
-    outputs_list: List[Dict[str, Any]],
-    *,
-    outdir: str,
-    write_files: bool = True,
-    load_waveforms: bool = False,
-    primary_name: str = "catalog_primary",
-    refined_name: str = "catalog_refined",
-) -> Dict[str, Any]:
-    import os
-    from flovopy.enhanced.event import EnhancedEvent
-    from flovopy.enhanced.catalog import EnhancedCatalog
-
-    os.makedirs(outdir, exist_ok=True)
-
-    prim_recs, ref_recs = [], []
-
-    def _append_rec(block: Dict[str, Any], bucket: list):
-        if not block:
-            return
-        qml = block.get("qml")
-        jjs = block.get("json")
-        if not qml or not jjs:
-            return
-        if not (os.path.exists(qml) and os.path.exists(jjs)):
-            return
-        try:
-            enh = EnhancedEvent.load(os.path.splitext(qml)[0])
-            if not load_waveforms:
-                enh.stream = None
-            bucket.append(enh)
-        except Exception:
-            pass
-
-    for out in outputs_list:
-        _append_rec((out or {}).get("primary") or {}, prim_recs)
-        _append_rec((out or {}).get("refined") or {}, ref_recs)
-
-    prim_cat = EnhancedCatalog(
-        events=[r.event for r in prim_recs],
-        records=prim_recs,
-        description="Primary ASL locations",
-    )
-    ref_cat = EnhancedCatalog(
-        events=[r.event for r in ref_recs],
-        records=ref_recs,
-        description="Refined ASL locations",
-    )
-
-    primary_qml = refined_qml = primary_csv = refined_csv = None
-    if write_files:
-        if len(prim_cat):
-            primary_qml = os.path.join(outdir, f"{primary_name}.qml")
-            prim_cat.write(primary_qml, format="QUAKEML")
-            primary_csv = os.path.join(outdir, f"{primary_name}.csv")
-            prim_cat.export_csv(primary_csv)
-        if len(ref_cat):
-            refined_qml = os.path.join(outdir, f"{refined_name}.qml")
-            ref_cat.write(refined_qml, format="QUAKEML")
-            refined_csv = os.path.join(outdir, f"{refined_name}.csv")
-            ref_cat.export_csv(refined_csv)
-
-    return {
-        "primary": prim_cat,
-        "refined": ref_cat,
-        "primary_qml": primary_qml,
-        "refined_qml": refined_qml,
-        "primary_csv": primary_csv,
-        "refined_csv": refined_csv,
-    }
-
-
-    # ======================================================================
-# Assimilation helpers across OUTPUT_DIR/{event}/{tag}
-# - CSV gatherers
-# - Catalog builders (primary/refined)
-# - EventRate CSV + plots (count, cumulative magnitude, dual)
-# ======================================================================
-
-from flovopy.enhanced.eventrate import EventRate, EventRateConfig
-
-def _iter_event_run_dirs(output_root: str | Path, ctag: str) -> List[Path]:
-    root = Path(output_root)
-    out: List[Path] = []
-    for ev_dir in sorted(d for d in root.iterdir() if d.is_dir()):
-        # skip a top-level folder accidentally named exactly like the ctag
-        if ev_dir.name == ctag:
-            continue
-        run_dir = ev_dir / ctag
-        if run_dir.is_dir():
-            out.append(run_dir)
-    return out
-
-
-def gather_post_metrics(output_root: str | Path, ctag: str) -> str | None:
-    """
-    Concatenate all post_metrics.csv under OUTPUT_DIR/{event}/{ctag}/
-    into OUTPUT_DIR/{ctag}/post_metrics.csv. Returns the output path or None.
-    """
-    root = Path(output_root)
-    outdir = root / ctag
-    outdir.mkdir(parents=True, exist_ok=True)
-    out_csv = outdir / "post_metrics.csv"
-
-    dfs: List[pd.DataFrame] = []
-    for run_dir in _iter_event_run_dirs(root, ctag):
-        f = run_dir / "post_metrics.csv"
-        if f.is_file():
-            try:
-                df = pd.read_csv(f)
-                df["__event_dir"] = run_dir.parent.name  # traceability
-                dfs.append(df)
-            except Exception:
-                pass
-
-    if not dfs:
-        print(f"[ASSIM] No post_metrics.csv found for ctag={ctag}")
-        return None
-
-    out = pd.concat(dfs, ignore_index=True)
-    out.to_csv(out_csv, index=False)
-    print(f"[ASSIM] Wrote: {out_csv}  ({len(out)} rows)")
-    return str(out_csv)
-
-
-def gather_network_magnitudes(output_root: str | Path, ctag: str) -> str | None:
-    """
-    Concatenate all network_magnitudes.csv under OUTPUT_DIR/{event}/{ctag}/
-    into OUTPUT_DIR/{ctag}/network_magnitudes.csv. Returns the output path or None.
-    """
-    root = Path(output_root)
-    outdir = root / ctag
-    outdir.mkdir(parents=True, exist_ok=True)
-    out_csv = outdir / "network_magnitudes.csv"
-
-    dfs: List[pd.DataFrame] = []
-    for run_dir in _iter_event_run_dirs(root, ctag):
-        f = run_dir / "network_magnitudes.csv"
-        if f.is_file():
-            try:
-                df = pd.read_csv(f)
-                df["__event_dir"] = run_dir.parent.name
-                dfs.append(df)
-            except Exception:
-                pass
-
-    if not dfs:
-        print(f"[ASSIM] No network_magnitudes.csv found for ctag={ctag}")
-        return None
-
-    out = pd.concat(dfs, ignore_index=True)
-    out.to_csv(out_csv, index=False)
-    print(f"[ASSIM] Wrote: {out_csv}  ({len(out)} rows)")
-    return str(out_csv)
-
-
-def _discover_qml_json_pairs(run_dir: Path, base_name: str) -> tuple[str | None, str | None]:
-    """
-    Given a run_dir and base_name (e.g., 'VSAM_...'), return (qml, json) if both exist, else (None, None).
-    """
-    qml = run_dir / f"{base_name}.qml"
-    jsn = run_dir / f"{base_name}.json"
-    if qml.is_file() and jsn.is_file():
-        return str(qml), str(jsn)
-    return None, None
-
-
-def _load_catalog_for_tag_kind(output_root: str | Path, ctag: str, *, refined: bool) -> EnhancedCatalog:
-    """
-    Walk OUTPUT_DIR/{event}/{ctag}/ and collect EnhancedEvents from {ctag}.qml/json
-    or {ctag}_refined.qml/json depending on `refined`.
-    """
-    base = f"{ctag}_refined" if refined else f"{ctag}"
-    records = []
-    for run_dir in _iter_event_run_dirs(output_root, ctag):
-        qml, jsn = _discover_qml_json_pairs(run_dir, base)
-        if qml and jsn:
-            try:
-                enh = EnhancedEvent.load(os.path.splitext(qml)[0])
-                # Do not attach waveforms during assimilation
-                enh.stream = None
-                records.append(enh)
-            except Exception as e:
-                print(f"[ASSIM:WARN] Skipping {run_dir}: {e}")
-
-    return EnhancedCatalog(events=[r for r in records], records=records,
-                           description=("Refined" if refined else "Primary") + f" ASL locations ({ctag})")
-
-
-def _write_event_rate_outputs(cat: EnhancedCatalog, outdir: Path, prefix: str,
-                              *, er_cfg: EventRateConfig | None) -> Dict[str, Any]:
-    """
-    Build EventRate, write CSV and three plots (count, cumulative magnitude, dual).
-    Returns dict with file paths.
-    """
-    out: Dict[str, Any] = {}
-    if len(cat) == 0:
-        return out
-
-    cfg = er_cfg or EventRateConfig(interval="D", rolling=7, ema_alpha=None)
-    er = cat.to_event_rate(config=cfg)
-
-    # CSV
-    er_csv = outdir / f"eventrate_{prefix}.csv"
-    er.to_csv(str(er_csv))
-    out["csv"] = str(er_csv)
-
-    # Plots
-    import matplotlib.pyplot as plt
-
-    # 1) Event count
-    fig1, ax1 = plt.subplots(figsize=(12, 4))
-    er.plot_event_count(ax=ax1)
-    fig1.tight_layout()
-    f1 = outdir / f"eventrate_{prefix}_count.png"
-    fig1.savefig(f1, dpi=150)
-    plt.close(fig1)
-
-    # 2) Cumulative magnitude
-    fig2, ax2 = plt.subplots(figsize=(12, 4))
-    er.plot_cumulative_magnitude(ax=ax2)
-    fig2.tight_layout()
-    f2 = outdir / f"eventrate_{prefix}_cumMag.png"
-    fig2.savefig(f2, dpi=150)
-    plt.close(fig2)
-
-    # 3) Dual
-    fig3, ax3 = plt.subplots(figsize=(12, 5))
-    er.plot_dual(ax=ax3)
-    fig3.tight_layout()
-    f3 = outdir / f"eventrate_{prefix}_dual.png"
-    fig3.savefig(f3, dpi=150)
-    plt.close(fig3)
-
-    out["plots"] = [str(f1), str(f2), str(f3)]
-    print(f"[ASSIM] EventRate ({prefix}) -> {er_csv}, {f1.name}, {f2.name}, {f3.name}")
-    return out
-
-
-def build_enhanced_catalogs_for_tag(
-    output_root: str | Path,
-    ctag: str,
-    *,
-    write_event_rates: bool = True,
-    er_config: EventRateConfig | None = None,
-) -> Dict[str, Any]:
-    """
-    Build catalogs by scanning OUTPUT_DIR/{event}/{ctag}/ for:
-      - Primary:  {ctag}.qml + {ctag}.json
-      - Refined:  {ctag}_refined.qml + {ctag}_refined.json
-
-    Writes event-rate CSV + plots into OUTPUT_DIR/{ctag}/ if requested.
-
-    Returns:
-      {
-        "primary": EnhancedCatalog,
-        "refined": EnhancedCatalog,
-        "primary_eventrate": {"csv": ..., "plots": [...] } or {},
-        "refined_eventrate": {"csv": ..., "plots": [...] } or {},
-      }
-    """
-    root = Path(output_root)
-    outdir = root / ctag
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    primary = _load_catalog_for_tag_kind(root, ctag, refined=False)
-    refined = _load_catalog_for_tag_kind(root, ctag, refined=True)
-
-    res: Dict[str, Any] = {
-        "primary": primary,
-        "refined": refined,
-        "primary_eventrate": {},
-        "refined_eventrate": {},
-    }
-
-    if write_event_rates:
-        if len(primary):
-            res["primary_eventrate"] = _write_event_rate_outputs(primary, outdir, "primary", er_cfg=er_config)
-        if len(refined):
-            res["refined_eventrate"] = _write_event_rate_outputs(refined, outdir, "refined", er_cfg=er_config)
-
-    return res

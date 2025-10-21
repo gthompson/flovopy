@@ -1125,3 +1125,365 @@ def estimate_speed_source_at_dome_from_stable_pairs(
         print(f"Speed (median ± MAD): {c_med:.3f} ± {mad:.3f} km/s")
         print(f"Speed (weighted mean): {c_wmean:.3f} km/s")
     return out
+
+
+from typing import Optional, Tuple, Dict, Iterable, Literal
+import numpy as np
+import matplotlib.pyplot as plt
+
+try:
+    from obspy import Stream, Trace, UTCDateTime
+except Exception as e:
+    raise ImportError("This function requires ObsPy (pip install obspy).") from e
+
+
+def plot_stream_with_envelopes(
+    st: "Stream",
+    env: "Stream",
+    *,
+    time_window: Optional[Tuple["UTCDateTime", "UTCDateTime"]] = None,
+    match: Literal["id", "net.sta.cha", "sta.cha"] = "id",
+    mode: Literal["auto", "stacked", "section"] = "auto",
+    # Record-section controls
+    reduction_velocity_km_s: Optional[float] = None,     # e.g., 3.5 for reduced time
+    normalize: Literal["trace", "global", "none"] = "trace",
+    trace_scale: float = 0.8,                            # vertical scale (km units) for section
+    section_height_per_trace: float = 0.30,              # inches per trace (section mode)
+    section_min_height: float = 4.0,                     # minimum total height (section)
+    # Envelope overlay scaling
+    env_normalize: bool = True,
+    env_norm_frac: float = 0.9,
+    env_scale: float = 1.0,
+    # Station annotations (SECTION MODE)
+    annotate_stations: bool = True,
+    annotation_where: Literal["end", "start", "center", "maxamp"] = "end",
+    annotation_dx: float = 0.0,                          # seconds shift in x
+    annotation_dy_km: float = 0.0,                       # km shift in y
+    annotation_kwargs: Optional[Dict] = None,            # e.g., {"fontsize":8, "color":"k", "bbox":{...}}
+    # Style
+    line_kwargs: Optional[Dict] = None,
+    env_kwargs: Optional[Dict] = None,
+    section_env_kwargs: Optional[Dict] = None,
+    figsize: Tuple[float, float] = (12, 1.8),            # width used; height auto in section mode
+    suptitle: Optional[str] = None,
+    show_legend: bool = False,                           # off by default
+):
+    """
+    Plot a Stream and superimpose an envelope Stream on each trace.
+
+    - If every trace has `trace.stats.distance`, draws a **record section** (distance vs time).
+    - Otherwise draws a **stacked** multi-panel plot.
+    - Envelopes are matched by 'match' key and interpolated onto the trace grid.
+
+    Station labels (section mode):
+      - annotate_stations=True writes station codes directly on the traces.
+      - annotation_where ∈ {"end","start","center","maxamp"} controls placement:
+          * "end": right edge at y = distance (default; tidy labels)
+          * "start": left edge
+          * "center": mid time
+          * "maxamp": at the sample of maximum absolute (normalized) amplitude
+      - annotation_dx (s) / annotation_dy_km (km) nudge the label position.
+    """
+    line_kwargs = {"lw": 0.8} | (line_kwargs or {})
+    env_kwargs  = {"lw": 1.0, "alpha": 0.9} | (env_kwargs or {})
+    section_env_kwargs = section_env_kwargs or {"lw": 1.0, "alpha": 0.9}
+
+    if annotation_kwargs is None:
+        # Defaults tuned for readability over wiggles
+        annotation_kwargs = {
+            "fontsize": 8,
+            "color": "k",
+            "ha": "left",
+            "va": "center",
+            "bbox": dict(facecolor="white", edgecolor="none", alpha=0.6, pad=1.5),
+        }
+
+    def key_for(tr: "Trace") -> str:
+        if match == "id":
+            return tr.id  # NET.STA.LOC.CHA
+        if match == "net.sta.cha":
+            return f"{tr.stats.network}.{tr.stats.station}.{tr.stats.channel}"
+        if match == "sta.cha":
+            return f"{tr.stats.station}.{tr.stats.channel}"
+        raise ValueError(f"Unsupported match mode: {match}")
+
+    # Basic checks (do NOT slice whole streams up front)
+    if len(st) == 0:
+        raise ValueError("Input `st` has no traces.")
+    env_map: Dict[str, "Trace"] = {key_for(tr): tr for tr in env}
+
+    # Decide plotting mode
+    all_have_distance = all(hasattr(tr.stats, "distance") for tr in st)
+    use_section = (mode == "section") or (mode == "auto" and all_have_distance)
+
+    # ---------- STACKED MODE ----------
+    if not use_section:
+        candidates = []
+        for tr in st:
+            if time_window is not None:
+                w0, w1 = time_window
+                t0 = max(w0, tr.stats.starttime)
+                t1 = min(w1, tr.stats.endtime)
+            else:
+                t0, t1 = tr.stats.starttime, tr.stats.endtime
+            if t1 > t0:
+                candidates.append((tr, t0, t1))
+
+        if not candidates:
+            _raise_overlap_diagnostic("stacked", st, time_window)
+
+        # global normalization base if needed
+        global_peak = 1.0
+        if normalize == "global":
+            peaks = []
+            for tr, t0, t1 in candidates:
+                tr_s = tr.copy().slice(t0, t1, nearest_sample=False)
+                if tr_s.stats.npts:
+                    peaks.append(float(np.max(np.abs(tr_s.data))))
+            global_peak = max(peaks) if peaks else 1.0
+
+        n = len(candidates)
+        fig_h = max(1.2, figsize[1]) * n
+        fig, axes = plt.subplots(
+            nrows=n, ncols=1, figsize=(figsize[0], fig_h),
+            sharex=True, constrained_layout=True
+        )
+        if n == 1:
+            axes = [axes]
+
+        xmin, xmax = None, None
+
+        for ax, (tr, t0, t1) in zip(axes, candidates):
+            tr_s = tr.copy().slice(t0, t1, nearest_sample=False)
+            if tr_s.stats.npts == 0:
+                continue
+            sr   = float(tr_s.stats.sampling_rate)
+            t_rel = np.arange(tr_s.stats.npts, dtype=float) / sr
+
+            # normalization
+            if normalize == "trace":
+                base = np.max(np.abs(tr_s.data)) or 1.0
+            elif normalize == "global":
+                base = global_peak or 1.0
+            else:
+                base = 1.0
+
+            ax.plot(t_rel, tr_s.data / base, **line_kwargs)
+
+            # envelope (stacked)
+            env_tr = env_map.get(key_for(tr))
+            if env_tr is not None:
+                env_s = env_tr.copy().slice(t0, t1, nearest_sample=False)
+                if env_s.stats.npts:
+                    sr_e = float(env_s.stats.sampling_rate)
+                    t_env = np.arange(env_s.stats.npts, dtype=float) / sr_e
+                    env_interp = np.interp(t_rel, t_env, env_s.data.astype(float))
+                    if env_normalize:
+                        peak = np.max(np.abs(tr_s.data / base)) or 1.0
+                        emax = np.max(np.abs(env_interp)) or 1.0
+                        env_plot = env_interp * (env_norm_frac * peak / emax) * float(env_scale)
+                    else:
+                        env_plot = env_interp * float(env_scale) / base
+                    ax.plot(t_rel, env_plot, **env_kwargs)
+
+            ax.set_ylabel(key_for(tr), rotation=0, ha="right", va="center", labelpad=20)
+            xmin = t_rel[0] if xmin is None else min(xmin, t_rel[0])
+            xmax = t_rel[-1] if xmax is None else max(xmax, t_rel[-1])
+
+        axes[-1].set_xlabel("Time (s) from window start")
+        if xmin is not None and xmax is not None:
+            for ax in axes:
+                ax.set_xlim(xmin, xmax)
+
+        if suptitle:
+            fig.suptitle(suptitle, y=1.02)
+
+        if show_legend:
+            for ax in axes:
+                ax.legend(loc="upper right", fontsize=8)
+
+        return fig, axes
+
+    # ---------- RECORD SECTION MODE ----------
+    # absolute window
+    if time_window is not None:
+        t0_abs, t1_abs = time_window
+    else:
+        # prefer intersection; fallback to union
+        t0_abs = max(tr.stats.starttime for tr in st)
+        t1_abs = min(tr.stats.endtime   for tr in st)
+        if t1_abs <= t0_abs:
+            t0_abs = min(tr.stats.starttime for tr in st)
+            t1_abs = max(tr.stats.endtime   for tr in st)
+
+    # candidates with any overlap
+    candidates = []
+    for tr in st:
+        t0 = max(t0_abs, tr.stats.starttime)
+        t1 = min(t1_abs, tr.stats.endtime)
+        if t1 > t0:
+            candidates.append((tr, t0, t1))
+
+    if not candidates:
+        _raise_overlap_diagnostic("section", st, time_window)
+
+    # common grid (finest dt)
+    dt = min(1.0 / float(tr.stats.sampling_rate) for tr, _, _ in candidates)
+    npts = max(1, int(np.floor((t1_abs - t0_abs) / dt)))
+    t_rel = np.arange(npts, dtype=float) * dt
+
+    # normalization base
+    if normalize == "global":
+        gpeak = 0.0
+        for tr, _, _ in candidates:
+            tr_s = tr.copy().slice(t0_abs, t1_abs, nearest_sample=False)
+            if tr_s.stats.npts:
+                gpeak = max(gpeak, float(np.max(np.abs(tr_s.data))))
+        global_base = gpeak or 1.0
+    else:
+        global_base = 1.0
+
+    # distance helper (km)
+    def dist_km(tr: "Trace") -> float:
+        d = float(tr.stats.distance)
+        return d / 1000.0 if d > 1000.0 else d
+
+    # sort by distance
+    candidates.sort(key=lambda item: dist_km(item[0]))
+
+    # dynamic height
+    fig_w = figsize[0]
+    fig_h = max(section_min_height, section_height_per_trace * len(candidates))
+    fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h), constrained_layout=True)
+
+    # pick label horizontal align based on placement
+    def _ha_for(where: str) -> str:
+        if where == "start": return "right"
+        if where == "center": return "center"
+        return "left"  # "end" and "maxamp"
+
+    for tr, t0, t1 in candidates:
+        dkm = dist_km(tr)
+        tr_s = tr.copy().slice(t0, t1, nearest_sample=False)
+        if tr_s.stats.npts == 0:
+            continue
+
+        sr = float(tr_s.stats.sampling_rate)
+        t_tr = np.arange(tr_s.stats.npts, dtype=float) / sr
+        tr_interp = np.interp(t_rel, t_tr, tr_s.data.astype(float), left=0.0, right=0.0)
+
+        if normalize == "trace":
+            base = np.max(np.abs(tr_interp)) or 1.0
+        elif normalize == "global":
+            base = global_base
+        else:
+            base = 1.0
+
+        # time axis
+        if reduction_velocity_km_s and reduction_velocity_km_s > 0:
+            x = t_rel - (dkm / float(reduction_velocity_km_s))
+            xlab = f"Reduced Time (s), Vred={reduction_velocity_km_s:g} km/s"
+        else:
+            x = t_rel
+            xlab = "Time (s) from window start"
+
+        y_tr = dkm + trace_scale * (tr_interp / base)
+        ax.plot(x, y_tr, **line_kwargs)
+
+        # envelope overlay
+        env_tr = env_map.get(key_for(tr))
+        if env_tr is not None:
+            env_s = env_tr.copy().slice(t0, t1, nearest_sample=False)
+            if env_s.stats.npts:
+                sr_e = float(env_s.stats.sampling_rate)
+                t_env = np.arange(env_s.stats.npts, dtype=float) / sr_e
+                env_interp = np.interp(t_rel, t_env, env_s.data.astype(float), left=0.0, right=0.0)
+                if env_normalize:
+                    peak = np.max(np.abs(tr_interp / base)) or 1.0
+                    emax = np.max(np.abs(env_interp)) or 1.0
+                    env_plot = env_interp * (env_norm_frac * peak / emax) * float(env_scale)
+                else:
+                    env_plot = env_interp * float(env_scale) / base
+                y_env = dkm + trace_scale * env_plot
+                ax.plot(x, y_env, **section_env_kwargs)
+
+        # ---- Station annotation (on the trace) ----
+        if annotate_stations:
+            # Choose anchor x,y
+            if annotation_where == "start":
+                xi = 0
+                x_pos = x[0] + annotation_dx
+                y_pos = dkm + annotation_dy_km
+            elif annotation_where == "center":
+                xi = len(x) // 2
+                x_pos = x[xi] + annotation_dx
+                y_pos = dkm + annotation_dy_km
+            elif annotation_where == "maxamp":
+                xi = int(np.argmax(np.abs(tr_interp))) if tr_interp.size else 0
+                x_pos = x[xi] + annotation_dx
+                # place exactly on the wiggle at max amplitude:
+                y_pos = y_tr[xi] + annotation_dy_km
+            else:  # "end"
+                xi = -1
+                x_pos = x[-1] + annotation_dx
+                y_pos = dkm + annotation_dy_km
+
+            # adapt horiz alignment based on placement
+            akw = annotation_kwargs.copy()
+            akw.setdefault("ha", _ha_for(annotation_where))
+            ax.text(x_pos, y_pos, tr.stats.station, **akw)
+
+    ax.set_xlabel(xlab)
+    ax.set_ylabel("Distance (km)")
+    if suptitle:
+        ax.set_title(suptitle)
+
+    if show_legend:
+        h1, = ax.plot([], [], **line_kwargs, label="trace")
+        h2, = ax.plot([], [], **section_env_kwargs, label="envelope")
+        ax.legend(handles=[h1, h2], loc="best", fontsize=9, frameon=False)
+
+    return fig, [ax]
+
+
+def _raise_overlap_diagnostic(mode: str, st: "Stream", time_window):
+    if time_window is None:
+        msg = (f"No traces overlap a usable window in {mode} mode. "
+               "Input streams may have disjoint time ranges.")
+    else:
+        w0, w1 = time_window
+        msg = (f"No traces overlap the requested time_window "
+               f"[{w0} … {w1}] in {mode} mode.")
+    spans = []
+    for tr in st:
+        spans.append(f"{tr.id}: {tr.stats.starttime} … {tr.stats.endtime} ({tr.stats.npts} npts)")
+    detail = "\n".join(spans[:12])
+    raise ValueError(msg + "\nFirst traces:\n" + detail)
+
+
+'''
+# Minimal example
+
+from obspy import read, UTCDateTime
+
+st = read("waveforms.mseed")      # main
+env = read("envelopes.mseed")     # envelope traces (same channels)
+
+# Record section with reduced time at 3.5 km/s:
+t0 = UTCDateTime(2001, 2, 6, 12, 0, 0)
+t1 = t0 + 120
+fig, _ = plot_stream_with_envelopes(
+    st, env,
+    time_window=(t0, t1),
+    match="net.sta.cha",
+    mode="auto",                        # switches to "section" if distance exists
+    reduction_velocity_km_s=3.5,
+    normalize="trace",
+    trace_scale=0.5,
+    line_kwargs={"lw": 0.6},
+    section_env_kwargs={"lw": 1.0, "alpha": 0.8},
+    suptitle="Record Section with Envelopes"
+)
+# fig.show()
+
+'''

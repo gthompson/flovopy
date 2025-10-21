@@ -35,7 +35,7 @@ class GridSignature:
     lonmin: float
     lonmax: float
     dem_tag: Optional[str] = None  # indicates DEM source/sampler signature
-
+    
 
     def as_tuple(self) -> Tuple:
         return (
