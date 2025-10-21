@@ -637,22 +637,20 @@ def plot_heatmap_colored(
     lat_col: str = "latitude",
     lon_col: str = "longitude",
     amp_col: str = "amplitude",
-    zoom_level: int = 0,
-    inventory: Optional[Inventory] = None,
-    color_scale: float = 0.4,  # kept for API compatibility
-    cmap: str = "turbo",
+    topo_kw: dict = None,
+    cmap: str = "viridis",
     log_scale: bool = True,
-    node_spacing_m: int = 50,
+    node_spacing_m: int = 10,
     outfile: Optional[str] = None,
-    region: Optional[List[float]] = None,
     title: Optional[str] = None,
-    dem_tif: Optional[str] = None,
+    scale: float = 1.0,
+    verbose: bool = False,
 ):
     """
     Render a colored heatmap of energy (sum amplitude^2) on a topo basemap.
     """
     if df is None or df.empty:
-        raise ValueError("plot_heatmap_montserrat_colored: input DataFrame is empty")
+        raise ValueError("plot_heatmap_colored: input DataFrame is empty")
 
     df = df.copy()
     df["energy"] = df[amp_col] ** 2
@@ -663,40 +661,41 @@ def plot_heatmap_colored(
     z = grouped["energy"].to_numpy(float)
     if log_scale:
         z = np.log10(z + 1e-12)
+    if verbose:
+        print(f'z={z}')
 
-    # Drop non-finite before range calc/plot
+    # drop non-finite
     m = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
     x, y, z = x[m], y[m], z[m]
     if x.size == 0:
-        raise ValueError("plot_heatmap_montserrat_colored: no finite (lon,lat,energy) to plot")
+        raise ValueError("plot_heatmap_colored: no finite data to plot")
+    
 
-    # color palette
+    # Basemap with DEM
+    fig = topo_map(**topo_kw, title=title, add_colorbar=False)#, add_topography=False)
+
+    # CPT for the heatmap (separate from topo shading)
     zmin, zmax = float(np.nanmin(z)), float(np.nanmax(z))
-    if not np.isfinite(zmin) or not np.isfinite(zmax):
-        raise ValueError("plot_heatmap_montserrat_colored: invalid z-range after filtering")
     pygmt.makecpt(
         cmap=cmap,
         series=[zmin, zmax, (zmax - zmin) / 100.0 if zmax > zmin else 0.01],
         continuous=True,
     )
 
-    fig = topo_map(
-        zoom_level=zoom_level,
-        inv=inventory,
-        topo_color=False,
-        region=region,
-        title=title,
-        dem_tif=dem_tif,
+    # symbol size
+    symbol_size_cm = node_spacing_m * 0.077 / 50.0 * scale
+
+    # Plot heatmap squares with viridis CPT
+    fig.plot(
+        x=x,
+        y=y,
+        style=f"s{symbol_size_cm}c",
+        fill=z,     # <-- THIS is the critical change
+        cmap=True,  # <-- tell PyGMT to use the active CPT (viridis)
+        pen=None,
     )
 
-    # approximate symbol size in cm
-    symbol_size_cm = node_spacing_m * 0.077 / 50.0
-    fig.plot(x=x, y=y, style=f"s{symbol_size_cm}c", fill=z, cmap=True, pen=None)
-
     fig.colorbar(frame='+l"Log10 Total Energy"' if log_scale else '+l"Total Energy"')
-
-    if region:
-        fig.basemap(region=_validate_region(region), frame=True)
 
     if outfile:
         fig.savefig(outfile)

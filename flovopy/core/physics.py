@@ -128,6 +128,113 @@ def magnitude2Eseismic(mag: Union[Number, Iterable[Number]], correction: float =
     return _one(mag)
 
 
+def magnitude2Eseismic(mag: Union[Number, Iterable[Number]], correction: float = 3.7):
+    """
+    Magnitude -> energy (J) using Hanks & Kanamori (1979) with joule correction (default 3.7).
+    Accepts scalar, iterable, numpy array, or pandas Series/DataFrame.
+    Returns the same type/shape, with float values.
+
+    Conversion is based on:
+        mag = 2/3 * log10(E) - 4.7
+    Rearranged:
+        E = 10^(1.5 * (mag + correction))
+
+    Parameters
+    ----------
+    mag : float, int, iterable, np.ndarray, or pandas object
+        Magnitude(s) to convert.
+    correction : float, optional
+        Joule correction factor. Default is 3.7 (Montserrat calibration).
+
+    Returns
+    -------
+    float, list, np.ndarray, or pandas object
+        Energy values in Joules, matching the input type.
+    """
+    import pandas as pd
+
+    def _one(M):
+        try:
+            M = float(M)
+            return float(np.power(10.0, 1.5 * M + correction)) if np.isfinite(M) else np.nan
+        except Exception:
+            return np.nan
+
+    # pandas objects
+    if isinstance(mag, pd.Series):
+        return mag.apply(_one)
+    if isinstance(mag, pd.DataFrame):
+        return mag.applymap(_one)
+
+    # numpy arrays, lists, tuples
+    if isinstance(mag, (list, tuple, np.ndarray)):
+        return np.array([_one(M) for M in mag])
+
+    # scalar
+    return _one(mag)
+
+def Eseismic2magnitude(Eseismic: Union[Number, Iterable[Number]], correction: float = 3.7):
+    """
+    Energy (J) -> magnitude using Hanks & Kanamori form with joule correction (default 3.7).
+    Accepts scalar, iterable, numpy array (any shape), or pandas Series/DataFrame.
+    Returns the same type/shape.
+        mag = 2/3 * log10(E) - 4.7  ~  log10(E)/1.5 - correction
+    """
+    import pandas as pd
+    def _one(E):
+        try:
+            E = float(E)
+            return (np.log10(E) / 1.5) - correction if (E > 0 and np.isfinite(E)) else np.nan
+        except Exception:
+            return np.nan
+
+    # pandas
+    if isinstance(Eseismic, pd.Series):
+        return Eseismic.apply(_one)
+    if isinstance(Eseismic, pd.DataFrame):
+        return Eseismic.applymap(_one)
+
+    # numpy / list / tuple (preserve shape)
+    if isinstance(Eseismic, (list, tuple, np.ndarray)):
+        arr = np.asarray(Eseismic, dtype=object)  # object dtype to avoid coercion errors
+        vfunc = np.vectorize(_one, otypes=[float])
+        return vfunc(arr)
+
+    # scalar
+    return _one(Eseismic)
+
+
+def magnitude2Eseismic(mag: Union[Number, Iterable[Number]], correction: float = 3.7):
+    """
+    Magnitude -> energy (J) using Hanks & Kanamori form with joule correction (default 3.7).
+    Accepts scalar, iterable, numpy array (any shape), or pandas Series/DataFrame.
+    Returns the same type/shape.
+        E = 10^(1.5 * (mag + correction))
+    """
+    import pandas as pd
+    def _one(M):
+        try:
+            M = float(M)
+            return float(np.power(10.0, 1.5 * M + correction)) if np.isfinite(M) else np.nan
+        except Exception:
+            return np.nan
+
+    # pandas
+    if isinstance(mag, pd.Series):
+        return mag.apply(_one)
+    if isinstance(mag, pd.DataFrame):
+        return mag.applymap(_one)
+
+    # numpy / list / tuple (preserve shape)
+    if isinstance(mag, (list, tuple, np.ndarray)):
+        arr = np.asarray(mag, dtype=object)
+        vfunc = np.vectorize(_one, otypes=[float])
+        return vfunc(arr)
+
+    # scalar
+    return _one(mag)
+
+
 def Mlrichter(peakA: Number, R_km: Number, a: float = 1.6, b: float = -0.15, g: float = 0, force_HB=False) -> Optional[float]:
     """
     Local magnitude ML = log10(peakA) + a*log10(R_km) + b + g.
