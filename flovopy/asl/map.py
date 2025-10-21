@@ -334,6 +334,7 @@ def topo_map(
     # --------------------
     # CPT (avoid -Z warning by omitting continuous=True without increment)
     # --------------------
+    cmap='gray' # REMOVE THIS
     use_palette = cmap if cmap is not None else ("geo" if topo_color else "gray")
     use_cmap_flag = None
 
@@ -647,6 +648,8 @@ def plot_heatmap_colored(
     region: Optional[List[float]] = None,
     title: Optional[str] = None,
     dem_tif: Optional[str] = None,
+    topo_kw: dict = {},
+    scale: float = 1.0,
 ):
     """
     Render a colored heatmap of energy (sum amplitude^2) on a topo basemap.
@@ -680,14 +683,18 @@ def plot_heatmap_colored(
         continuous=True,
     )
 
-    fig = topo_map(
-        zoom_level=zoom_level,
-        inv=inventory,
-        topo_color=False,
-        region=region,
-        title=title,
-        dem_tif=dem_tif,
-    )
+    if not topo_kw:
+        topo_kw = {
+            "inv": inventory,
+            "add_labels": False,
+            "cmap": "gray",
+            "region": region,
+            "dem_tif": dem_tif,  # basemap shading from your GeoTIFF - but does not actually seem to use this unless topo_color=True and cmap=None
+            "frame": True,
+            "topo_color": False,
+        }
+
+    fig = topo_map(**topo_kw)
 
     # approximate symbol size in cm
     symbol_size_cm = node_spacing_m * 0.077 / 50.0
@@ -702,4 +709,89 @@ def plot_heatmap_colored(
         fig.savefig(outfile)
     else:
         fig.show()
+    return fig
+
+def plot_heatmap_colored(
+    df: pd.DataFrame,
+    *,
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    amp_col: str = "amplitude",
+    inventory=None,
+    cmap: str = "turbo",
+    log_scale: bool = True,
+    node_spacing_m: int = 50,
+    outfile: Optional[Union[str, Path]] = None,
+    region: Optional[List[float]] = None,
+    title: Optional[str] = None,
+    dem_tif: Optional[Union[str, Path]] = None,
+    topo_kw: Optional[Dict[str, Any]] = None,
+) -> "pygmt.Figure":
+    """
+    Render a colored heatmap of energy (sum amplitude^2) on a topo basemap.
+    Draw basemap first, then create CPT, then plot points (fill=z with cmap=True), then colorbar.
+    """
+    if df is None or df.empty:
+        raise ValueError("plot_heatmap_colored: input DataFrame is empty")
+
+    df = df.copy()
+    df["energy"] = df[amp_col].astype(float) ** 2
+    grouped = df.groupby([lat_col, lon_col], as_index=False)["energy"].sum()
+
+    x = grouped[lon_col].to_numpy(float)
+    y = grouped[lat_col].to_numpy(float)
+    z = grouped["energy"].to_numpy(float)
+    if log_scale:
+        z = np.log10(z + 1e-12)
+
+    m = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+    x, y, z = x[m], y[m], z[m]
+    if x.size == 0:
+        raise ValueError("plot_heatmap_colored: no finite (lon,lat,energy) to plot")
+
+    # 1) Basemap first
+    if topo_kw is None:
+        topo_kw = {
+            "inv": inventory,
+            "add_labels": False,
+            "cmap": "gray",
+            "region": region,
+            "dem_tif": dem_tif,
+            "frame": True,
+            "topo_color": False,
+            "add_colorbar": False,
+        }
+    fig = topo_map(**topo_kw)
+
+    # 2) Make our CPT (so it is the current CPT)
+    zmin, zmax = float(np.nanmin(z)), float(np.nanmax(z))
+    if zmax == zmin:
+        zmin -= 0.01
+        zmax += 0.01
+    step = (zmax - zmin) / 100.0 if zmax > zmin else 0.01
+    pygmt.makecpt(cmap=cmap, series=[zmin, zmax, step], continuous=True)
+
+    # 3) Plot points — IMPORTANT: fill=z *and* cmap=True
+    symbol_size_cm = max(0.06, node_spacing_m * 0.077 / 50.0)
+    fig.plot(
+        x=x,
+        y=y,
+        style=f"s{symbol_size_cm}c",
+        fill=z,       # numeric array to map through CPT
+        cmap=True,    # use current CPT to color by 'fill' values
+        pen=None
+    )
+
+    # 4) Colorbar from current CPT
+    fig.colorbar(frame='+l"Log10 Total Energy"' if log_scale else '+l"Total Energy"')
+
+    # 5) Optional title (use position OR x/y, not both)
+    if title:
+        fig.text(text=title, position="TL", offset="0.5c/0.5c", no_clip=True)
+
+    if outfile:
+        outpath = Path(outfile)
+        outpath.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(outpath))
+
     return fig

@@ -40,6 +40,7 @@ from flovopy.asl.config import tweak_config, ASLConfig
 from flovopy.core.trace_utils import stream_add_units, add_processing_step
 from flovopy.core.preprocess import preprocess_trace
 from flovopy.core.remove_response import safe_pad_taper_filter, safe_pad_taper_filter_stream
+from flovopy.asl.diagnostics import extract_asl_diagnostics, compare_asl_sources
 
 class _Tee(io.TextIOBase):
     def __init__(self, *streams):
@@ -603,6 +604,7 @@ def asl_sausage(
         peakf_event = int(round(peakf_override))
         print(f"[ASL] Using peak frequency override: {peakf_event} Hz")
 
+    
     # Debug info
     ampcorr_params = cfg.ampcorr.params
     if debug:
@@ -619,32 +621,60 @@ def asl_sausage(
             if dmax > 100:
                 print("[ASL:WARN] Distances look like meters! (max > 100 km)")
 
-        # Summit sanity check (reduction)
-        if topo_kw and topo_kw.get("dome_location"):
-            if cfg.sam_class.__name__ == "VSAM":
-                print("[ASL_SAUSAGE]: Sanity check: VSAM → VR/VRS at dome")
-                VR = samObj.compute_reduced_velocity(
-                    cfg.inventory,
-                    topo_kw["dome_location"],
-                    surfaceWaves=ampcorr_params.assume_surface_waves,
-                    Q=ampcorr_params.Q,
-                    wavespeed_kms=ampcorr_params.wave_speed_kms,
-                    peakf=peakf_event,
-                )
-                print(VR)
-                VR.plot(outfile=os.path.join(event_dir, "VR_at_dome.png"))
-            elif cfg.sam_class.__name__ == "DSAM":
-                print("[ASL_SAUSAGE]: Sanity check: DSAM → DR/DRS at dome")
-                DR = samObj.compute_reduced_displacement(
-                    cfg.inventory,
-                    topo_kw["dome_location"],
-                    surfaceWaves=ampcorr_params.assume_surface_waves,
-                    Q=ampcorr_params.Q,
-                    wavespeed_kms=ampcorr_params.wave_speed_kms,
-                    peakf=peakf_event,
-                )
-                print(DR)
-                DR.plot(outfile=os.path.join(event_dir, "DR_at_dome.png"))
+    # Summit sanity check (reduction)
+    outlier_trace_ids = []
+    if topo_kw and topo_kw.get("dome_location"):
+        if cfg.sam_class.__name__ == "VSAM":
+            print("[ASL_SAUSAGE]: Sanity check: VSAM → VR/VRS at dome")
+            VR = samObj.compute_reduced_velocity(
+                cfg.inventory,
+                topo_kw["dome_location"],
+                surfaceWaves=ampcorr_params.assume_surface_waves,
+                Q=ampcorr_params.Q,
+                wavespeed_kms=ampcorr_params.wave_speed_kms,
+                peakf=peakf_event,
+            )
+            vrmedian, vrcorrections = VR.examine_spread()
+            #network_avg = vrmedian[cfg.sam_metric]['network_median']
+            
+            for trace_id in [tr.id for tr in stream]:
+                #trace_avg = vrmedian[cfg.sam_metric][trace_id]
+                #if trace_avg > 10 * network_avg or trace_avg < network_avg/10:
+                trace_avg = vrcorrections[trace_id]
+                if trace_avg > 10 or trace_avg < 0.1:
+                    outlier_trace_ids.append(trace_id)
+            VR.plot(outfile=os.path.join(event_dir, "VR_at_dome.png"))
+
+        elif cfg.sam_class.__name__ == "DSAM":
+            print("[ASL_SAUSAGE]: Sanity check: DSAM → DR/DRS at dome")
+            DR = samObj.compute_reduced_displacement(
+                cfg.inventory,
+                topo_kw["dome_location"],
+                surfaceWaves=ampcorr_params.assume_surface_waves,
+                Q=ampcorr_params.Q,
+                wavespeed_kms=ampcorr_params.wave_speed_kms,
+                peakf=peakf_event,
+            )
+            drmedian, drcorrections = DR.examine_spread()
+            #network_avg = drmedian[cfg.sam_metric]['network_median']
+            
+            for trace_id in [tr.id for tr in stream]:
+                #trace_avg = drmedian[cfg.sam_metric][trace_id]
+                #if trace_avg > 10 * network_avg or trace_avg < network_avg/10:
+                trace_avg = drcorrections[trace_id]
+                if trace_avg > 10 or trace_avg < 0.1:
+                    outlier_trace_ids.append(trace_id)
+            VR.plot(outfile=os.path.join(event_dir, "VR_at_dome.png"))
+            DR.plot(outfile=os.path.join(event_dir, "DR_at_dome.png"))
+            
+    if outlier_trace_ids:
+        dataframes = {}
+        for trace_id in samObj.dataframes:
+            if trace_id in outlier_trace_ids:
+                continue
+            else:
+                dataframes[trace_id] = samObj.dataframes[trace_id]
+        samObj.dataframes = dataframes
 
     # 5) Amplitude corrections cache (swap if peakf differs)
     ampcorr: AmpCorr = cfg.ampcorr
@@ -1039,6 +1069,8 @@ def run_single_event(
             verbose=True,
         )
 
+
+
         # 4) Build both convenience views for plotting, independent of input file units
         if cfg.sam_class is VSAM:
             vel = st
@@ -1050,9 +1082,8 @@ def run_single_event(
             disp = st
             vel = st.copy().differentiate().detrend('linear')
             # (Velocity after differentiation is usually OK; pad-HP not strictly needed here.)
-            vel.stats["units"] = "m/s"
             for tr in vel:
-                tr["units"] = "m/s"
+                tr.stats["units"] = "m/s"
 
         # --------------------------------------------------------------------------
         # END OF STREAM PREPROCESSING - should now have a vel and disp Stream object
@@ -1644,3 +1675,1136 @@ rand_axes = sample_axes({"speed":[1.0,1.5,2.0,3.0], "Q":[20,40,60,80,100]}, n=20
 variants = build_variants(baseline_cfg, axes=rand_axes, include_baseline=True)
 
 '''
+'''
+
+# make heatmap
+from obspy import UTCDateTime
+from pathlib import Path
+
+LOCALPROJECTDIR = Path("/path/to/LOCALPROJECTDIR")
+
+# If you want to let the code infer the tag from your sample CSV:
+default_tag_csv = Path("/mnt/data/source_VSAM_mean_5s_surface_v1.5_Q23_F2_3d_r2_SC.csv")
+
+fig = make_asl_heatmap_from_events(
+    startdate=UTCDateTime(2001, 2, 6),
+    enddate=UTCDateTime(2001, 4, 2),
+    localprojectdir=LOCALPROJECTDIR,
+    # tag=None -> inferred from default_tag_from (or from the first event in range)
+    default_tag_from=default_tag_csv,
+    # Optional region/DEM/etc.
+    # region=[-62.25, -62.10, 16.65, 16.78],
+    # dem_tif="/path/to/montserrat_dem.tif",
+    # outfile="asl_heatmap_2001-02-06_to_2001-04-02.png",
+)
+'''
+
+
+from pathlib import Path
+from typing import Optional, List, Union, Iterable
+import re
+import pandas as pd
+from datetime import datetime, timezone
+
+try:
+    from obspy import UTCDateTime
+except Exception:
+    UTCDateTime = None  # optional
+
+from flovopy.asl.map import plot_heatmap_colored
+
+
+# ---------- helpers ----------
+def _to_utc_datetime(dt_like: Union[str, datetime, "UTCDateTime"]) -> datetime:
+    """Normalize input into a timezone-aware UTC datetime."""
+    if UTCDateTime and isinstance(dt_like, UTCDateTime):
+        return dt_like.datetime.replace(tzinfo=timezone.utc)
+    if isinstance(dt_like, datetime):
+        return dt_like.astimezone(timezone.utc) if dt_like.tzinfo else dt_like.replace(tzinfo=timezone.utc)
+    if isinstance(dt_like, str):
+        # Accept ISO-like strings or 'YYYY-mm-dd-HHMM-SS'
+        try:
+            d = datetime.fromisoformat(dt_like)
+        except ValueError:
+            d = datetime.strptime(dt_like, "%Y-%m-%d-%H%M-%S")
+        return d.astimezone(timezone.utc) if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    raise TypeError(f"Unsupported datetime-like type: {type(dt_like)}")
+
+
+_DIR_RE = re.compile(r"^(?P<stamp>\d{4}-\d{2}-\d{2}-\d{4}-\d{2,3})\.MVO___0?\d{2,3}$")
+_TAG_FROM_FILENAME_RE = re.compile(r"^source_(?P<tag>.+)\.csv$", re.IGNORECASE)
+
+
+def _parse_event_time_from_dirname(dirname: str) -> Optional[datetime]:
+    """Extract UTC datetime from 'YYYY-mm-dd-HHMM-SS[optional extra].MVO___0NN'."""
+    m = _DIR_RE.match(dirname)
+    if not m:
+        return None
+    stamp = m.group("stamp")
+    parts = stamp.split("-")
+    if len(parts[-1]) == 3:  # trim SSS -> SS for parsing
+        stamp = "-".join(parts[:-1] + [parts[-1][:2]])
+    try:
+        dt = datetime.strptime(stamp, "%Y-%m-%d-%H%M-%S")
+        return dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _infer_tag_from_filename(path: Union[str, Path]) -> Optional[str]:
+    name = Path(path).name
+    m = _TAG_FROM_FILENAME_RE.match(name)
+    return m.group("tag") if m else None
+
+
+def _discover_tags(event_dir: Path) -> List[str]:
+    """Return all tags present under event_dir/*/source_*.csv."""
+    tags: set[str] = set()
+    for sub in event_dir.iterdir():
+        if not sub.is_dir():
+            continue
+        for csv_path in sub.glob("source_*.csv"):
+            t = _infer_tag_from_filename(csv_path.name)
+            if t:
+                tags.add(t)
+    return sorted(tags)
+
+
+def _ensure_iterable_tags(tag: Optional[Union[str, Iterable[str]]]) -> Optional[List[str]]:
+    if tag is None:
+        return None
+    if isinstance(tag, str):
+        return [tag]
+    return list(tag)
+
+
+# ---------- main ----------
+
+from pathlib import Path
+from typing import Optional, List, Union, Iterable, Dict, Tuple
+import re
+import pandas as pd
+from datetime import datetime, timezone
+
+try:
+    from obspy import UTCDateTime
+except Exception:
+    UTCDateTime = None  # optional
+
+from flovopy.asl.map import plot_heatmap_colored
+
+
+# ---------- helpers ----------
+def _to_utc_datetime(dt_like: Union[str, datetime, "UTCDateTime"]) -> datetime:
+    """Normalize input into a timezone-aware UTC datetime."""
+    if UTCDateTime and isinstance(dt_like, UTCDateTime):
+        return dt_like.datetime.replace(tzinfo=timezone.utc)
+    if isinstance(dt_like, datetime):
+        return dt_like.astimezone(timezone.utc) if dt_like.tzinfo else dt_like.replace(tzinfo=timezone.utc)
+    if isinstance(dt_like, str):
+        try:
+            d = datetime.fromisoformat(dt_like)
+        except ValueError:
+            d = datetime.strptime(dt_like, "%Y-%m-%d-%H%M-%S")
+        return d.astimezone(timezone.utc) if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    raise TypeError(f"Unsupported datetime-like type: {type(dt_like)}")
+
+
+_DIR_RE = re.compile(r"^(?P<stamp>\d{4}-\d{2}-\d{2}-\d{4}-\d{2})(.*)$")
+_TAG_FROM_FILENAME_RE = re.compile(r"^source_(?P<tag>.+)\.csv$", re.IGNORECASE)
+
+
+def _parse_event_time_from_dirname(dirname: str) -> Optional[datetime]:
+    """Extract UTC datetime from 'YYYY-mm-dd-HHMM-SS[optional extra].MVO___0NN'."""
+    m = _DIR_RE.match(dirname)
+    if not m:
+        return None
+    stamp = m.group("stamp")
+    parts = stamp.split("-")
+    if len(parts[-1]) == 3:  # trim SSS -> SS for parsing
+        stamp = "-".join(parts[:-1] + [parts[-1][:2]])
+    try:
+        dt = datetime.strptime(stamp, "%Y-%m-%d-%H%M-%S")
+        return dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _infer_tag_from_filename(path: Union[str, Path]) -> Optional[str]:
+    name = Path(path).name
+    m = _TAG_FROM_FILENAME_RE.match(name)
+    return m.group("tag") if m else None
+
+
+def _discover_tags(event_dir: Path) -> List[str]:
+    """Return all tags present under event_dir/*/source_*.csv."""
+    tags: set[str] = set()
+    for sub in event_dir.iterdir():
+        if not sub.is_dir():
+            continue
+        for csv_path in sub.glob("source_*.csv"):
+            t = _infer_tag_from_filename(csv_path.name)
+            if t:
+                tags.add(t)
+    return sorted(tags)
+
+
+def _ensure_iterable_tags(tag: Optional[Union[str, Iterable[str]]]) -> Optional[List[str]]:
+    if tag is None:
+        return None
+    if isinstance(tag, str):
+        return [tag]
+    return list(tag)
+
+
+# ---------- main (one heatmap per tag) ----------
+
+from pathlib import Path
+from typing import Optional, Iterable, Union, List, Tuple, Dict
+from datetime import datetime, timezone
+import re
+
+import numpy as np
+import pandas as pd
+
+
+# ------------ small helpers ------------
+
+_DIR_RE = re.compile(r"^(?P<stamp>\d{4}-\d{2}-\d{2}-\d{4}-\d{2})")
+
+def _parse_event_time_from_dirname(name: str) -> Optional[datetime]:
+    """
+    Parse leading 'YYYY-mm-dd-HHMM-SS' from an event directory name and return UTC datetime.
+    Returns None if pattern not found.
+    """
+    m = _DIR_RE.match(name)
+    if not m:
+        return None
+    stamp = m.group("stamp")
+    dt = datetime.strptime(stamp, "%Y-%m-%d-%H%M-%S")
+    return dt.replace(tzinfo=timezone.utc)
+
+def _ensure_iterable_tags(tag: Optional[Union[str, Iterable[str]]]) -> Optional[List[str]]:
+    if tag is None:
+        return None
+    if isinstance(tag, str):
+        return [tag]
+    # already an iterable (list/tuple/etc.)
+    return list(tag)
+
+def _infer_tag_from_filename(example: Union[str, Path]) -> Optional[str]:
+    """
+    Given a path like '.../source_<tag>.csv', return '<tag>'.
+    If a directory is provided, returns None (we don't scan).
+    """
+    p = Path(example)
+    if p.is_dir():
+        return None
+    name = p.name
+    if name.startswith("source_") and name.endswith(".csv"):
+        return name[len("source_") : -len(".csv")]
+    return None
+
+def _discover_tags(event_dir: Path) -> List[str]:
+    """
+    Return all subdir names that look like tags *and* contain a matching source_<tag>.csv.
+    """
+    tags: List[str] = []
+    if not event_dir.is_dir():
+        return tags
+    for child in event_dir.iterdir():
+        if child.is_dir():
+            t = child.name
+            candidate = child / f"source_{t}.csv"
+            if candidate.exists():
+                tags.append(t)
+    return sorted(tags)
+
+
+# ------------ your provided converter ------------
+# uses your working _to_utc_datetime and plot_heatmap_colored definitions
+
+def make_asl_heatmaps_per_tag(
+    startdate: Union[str, datetime, "UTCDateTime"],
+    enddate:   Union[str, datetime, "UTCDateTime"],
+    *,
+    localprojectdir: Union[str, Path],
+    tag: Optional[Union[str, Iterable[str]]] = None,
+    default_tag_from: Optional[Union[str, Path]] = None,  # e.g., '/path/to/source_<tag>.csv'
+    # Source CSV schema (yours): t, lat, lon, DR, misfit, azgap, nsta, node_index, connectedness
+    lat_col: str = "lat",
+    lon_col: str = "lon",
+    amp_col: str = "DR",
+    # Row filters (all optional; applied only if column exists)
+    misfit_max: Optional[float] = None,
+    nsta_min: Optional[int] = None,
+    connectedness_min: Optional[float] = None,
+    azgap_max: Optional[float] = None,
+    dr_min: Optional[float] = None,
+    dr_max: Optional[float] = None,
+    # Plot options -> forwarded to plot_heatmap_colored()
+    zoom_level: int = 0,                 # kept for API compatibility
+    inventory=None,
+    color_scale: float = 0.4,            # kept for API compatibility
+    cmap: str = "turbo",
+    log_scale: bool = True,
+    node_spacing_m: int = 50,
+    region: Optional[List[float]] = None,
+    dem_tif: Optional[str] = None,
+    # Titles / output
+    title_fmt: str = "ASL Heatmap: {tag} ({start}–{end} UTC)",
+    outfile_pattern: Optional[str] = None,  # e.g., "heatmaps/{tag}_{start}_{end}.png"
+    # Return dataframes/figures
+    return_df: bool = True,
+) -> Dict[str, Tuple["pygmt.Figure", pd.DataFrame]]:
+    """
+    Build **one heatmap per tag** from per-event 'source_<tag>.csv' files
+    in LOCALPROJECTDIR between startdate and enddate (inclusive).
+
+    Directory layout per event:
+        LOCALPROJECTDIR /
+          {YYYY-mm-dd-HHMM-SS}S... /
+            <tag> /
+              source_<tag>.csv
+    """
+    lp = Path(localprojectdir)
+    if not lp.exists():
+        raise FileNotFoundError(f"localprojectdir not found: {lp}")
+
+    start_dt = _to_utc_datetime(startdate)
+    end_dt   = _to_utc_datetime(enddate)
+    if end_dt < start_dt:
+        raise ValueError("enddate is earlier than startdate")
+
+    # Resolve tags
+    tags = _ensure_iterable_tags(tag)
+    if tags is None and default_tag_from:
+        inferred = _infer_tag_from_filename(default_tag_from)
+        if inferred:
+            tags = [inferred]
+
+    if tags is None:
+        # Probe first in-range event and discover tags
+        probe_dir = None
+        for event_dir in sorted(lp.iterdir()):
+            if not event_dir.is_dir():
+                continue
+            evt_time = _parse_event_time_from_dirname(event_dir.name)
+            if evt_time is None or not (start_dt <= evt_time <= end_dt):
+                continue
+            probe_dir = event_dir
+            break
+
+        if probe_dir:
+            found = _discover_tags(probe_dir)
+            if len(found) == 1:
+                tags = [found[0]]
+            elif len(found) > 1:
+                raise ValueError(
+                    f"Multiple tags present under {probe_dir}. "
+                    f"Please pass tag=... (choices: {found})"
+                )
+
+    if not tags:
+        raise ValueError("No tag provided and could not infer any tag.")
+
+    # Pretty labels
+    start_str  = pd.Timestamp(start_dt).strftime("%Y-%m-%d %H:%M:%S")
+    end_str    = pd.Timestamp(end_dt).strftime("%Y-%m-%d %H:%M:%S")
+    start_safe = pd.Timestamp(start_dt).strftime("%Y%m%dT%H%M%S")
+    end_safe   = pd.Timestamp(end_dt).strftime("%Y%m%dT%H%M%S")
+
+    results: Dict[str, Tuple["pygmt.Figure", Optional[pd.DataFrame]]] = {}
+
+    # Process each tag independently
+    for tname in tags:
+        rows: List[pd.DataFrame] = []
+        missing_files = 0
+
+        # iterate event directories
+        for event_dir in sorted(lp.iterdir()):
+            if not event_dir.is_dir():
+                continue
+            evt_time = _parse_event_time_from_dirname(event_dir.name)
+            if evt_time is None or not (start_dt <= evt_time <= end_dt):
+                continue
+
+            csv_path = event_dir / tname / f"source_{tname}.csv"
+            if not csv_path.exists():
+                missing_files += 1
+                continue
+
+            try:
+                df_evt = pd.read_csv(csv_path)
+            except Exception as e:
+                print(f"[warn] Could not read {csv_path}: {e}")
+                continue
+
+            # Require core fields only; other filters applied if present
+            needed = {"t", lat_col, lon_col, amp_col}
+            if not needed.issubset(df_evt.columns):
+                # Not an AMPMAP/ASL source CSV for this pipeline
+                continue
+
+            # (Optional) filters, only if columns exist
+            m = pd.Series(True, index=df_evt.index)
+            if misfit_max is not None and "misfit" in df_evt.columns:
+                m &= df_evt["misfit"] <= misfit_max
+            if nsta_min is not None and "nsta" in df_evt.columns:
+                m &= df_evt["nsta"] >= nsta_min
+            if connectedness_min is not None and "connectedness" in df_evt.columns:
+                m &= df_evt["connectedness"] >= connectedness_min
+            if azgap_max is not None and "azgap" in df_evt.columns:
+                m &= df_evt["azgap"] <= azgap_max
+            if dr_min is not None:
+                m &= df_evt[amp_col] >= dr_min
+            if dr_max is not None:
+                m &= df_evt[amp_col] <= dr_max
+
+            df_evt = df_evt.loc[m, [lat_col, lon_col, amp_col]].copy()
+            if df_evt.empty:
+                continue
+
+            df_evt["event_time"] = evt_time
+            rows.append(df_evt)
+
+        if not rows:
+            raise ValueError(
+                f"No matching data for tag='{tname}' after filtering "
+                f"({start_str}–{end_str} UTC). Missing files (sample) count={missing_files}."
+            )
+
+        df_tag = pd.concat(rows, ignore_index=True)
+
+        # Title per tag
+        title = title_fmt.format(tag=tname, start=start_str, end=end_str)
+
+        # Outfile per tag
+        if outfile_pattern:
+            outpath = outfile_pattern.format(tag=tname, start=start_safe, end=end_safe)
+            outpath = str(Path(outpath))
+        else:
+            outpath = None
+
+        fig = plot_heatmap_colored(
+            df_tag,
+            lat_col=lat_col,
+            lon_col=lon_col,
+            amp_col=amp_col,       # usually "DR"
+            inventory=inventory,
+            cmap=cmap,
+            log_scale=log_scale,
+            node_spacing_m=node_spacing_m,
+            outfile=outpath,
+            region=region,
+            title=title,
+            dem_tif=dem_tif,
+            topo_kw=None,          # let your plotter use its default gray basemap
+        )
+
+        results[tname] = (fig, df_tag if return_df else None)
+
+    return results
+
+
+
+def make_asl_heatmap_for_ampmap(
+    startdate: Union[str, "UTCDateTime", pd.Timestamp, datetime],
+    enddate:   Union[str, "UTCDateTime", pd.Timestamp, datetime],
+    *,
+    localprojectdir: Path,
+    lat_col: str = "lat",
+    lon_col: str = "lon",
+    amp_col: str = "DR",
+    # Optional row filters (only applied if column exists)
+    misfit_max: Optional[float] = None,
+    nsta_min: Optional[int] = None,
+    connectedness_min: Optional[float] = None,
+    azgap_max: Optional[float] = None,
+    dr_min: Optional[float] = None,
+    dr_max: Optional[float] = None,
+    # Plot options
+    inventory=None,
+    cmap: str = "turbo",
+    log_scale: bool = True,
+    node_spacing_m: int = 50,
+    region: Optional[List[float]] = None,
+    dem_tif: Optional[Union[str, Path]] = None,
+    title_fmt: str = "ASL Heatmap (AMPMAP): {start}–{end} UTC",
+    outfile: Optional[Union[str, Path]] = None,  # e.g. "heatmaps/ampmap_{start}_{end}.png"
+    # File discovery
+    glob_pattern: str = "*.csv",
+    recursive: bool = False,
+    topo_kw: Optional[Dict[str, Any]] = None,
+    return_df: bool = True,
+) -> Tuple["pygmt.Figure", Optional[pd.DataFrame]]:
+    """
+    Load AMPMAP CSVs from a directory, filter by time and optional quality fields,
+    concatenate rows, and plot a heatmap.
+    """
+    lp = Path(localprojectdir)
+    if not lp.exists():
+        raise FileNotFoundError(f"localprojectdir not found: {lp}")
+
+    start_dt = _to_utc_datetime(startdate)
+    end_dt   = _to_utc_datetime(enddate)
+    if end_dt < start_dt:
+        raise ValueError("enddate is earlier than startdate")
+
+    rows: List[pd.DataFrame] = []
+    csv_iter = lp.rglob(glob_pattern) if recursive else lp.glob(glob_pattern)
+
+    for csv_path in csv_iter:
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            print(f"[warn] Could not read {csv_path}: {e}")
+            continue
+
+        # Require t, lat, lon, DR (or custom amp_col)
+        needed = {"t", lat_col, lon_col, amp_col}
+        if not needed.issubset(df.columns):
+            continue
+
+        t_parsed = pd.to_datetime(df["t"], utc=True, errors="coerce")
+        mask_time = (t_parsed >= pd.Timestamp(start_dt)) & (t_parsed <= pd.Timestamp(end_dt))
+        df = df.loc[mask_time].copy()
+        if df.empty:
+            continue
+
+        # Optional filters (only if columns exist)
+        if misfit_max is not None and "misfit" in df.columns:
+            df = df[df["misfit"] <= misfit_max]
+        if nsta_min is not None and "nsta" in df.columns:
+            df = df[df["nsta"] >= nsta_min]
+        if connectedness_min is not None and "connectedness" in df.columns:
+            df = df[df["connectedness"] >= connectedness_min]
+        if azgap_max is not None and "azgap" in df.columns:
+            df = df[df["azgap"] <= azgap_max]
+        if dr_min is not None:
+            df = df[df[amp_col] >= dr_min]
+        if dr_max is not None:
+            df = df[df[amp_col] <= dr_max]
+        if df.empty:
+            continue
+
+        df = df[[lat_col, lon_col, amp_col]].astype(float)
+        finite = np.isfinite(df[lat_col]) & np.isfinite(df[lon_col]) & np.isfinite(df[amp_col])
+        df = df.loc[finite]
+        if not df.empty:
+            rows.append(df)
+
+    if not rows:
+        raise ValueError("No AMPMAP CSV rows matched the date range and filters in the specified directory.")
+
+    df_all = pd.concat(rows, ignore_index=True)
+
+    start_str = pd.Timestamp(start_dt).strftime("%Y-%m-%d %H:%M:%S")
+    end_str   = pd.Timestamp(end_dt).strftime("%Y-%m-%d %H:%M:%S")
+    title = title_fmt.format(start=start_str, end=end_str)
+
+    # Allow tokens in outfile
+    if outfile:
+        start_safe = pd.Timestamp(start_dt).strftime("%Y%m%dT%H%M%S")
+        end_safe   = pd.Timestamp(end_dt).strftime("%Y%m%dT%H%M%S")
+        outfile = str(outfile).format(start=start_safe, end=end_safe)
+
+    fig = plot_heatmap_colored(
+        df_all,
+        lat_col=lat_col,
+        lon_col=lon_col,
+        amp_col=amp_col,
+        inventory=inventory,
+        cmap=cmap,
+        log_scale=log_scale,
+        node_spacing_m=node_spacing_m,
+        outfile=outfile,
+        region=region,
+        title=title,
+        dem_tif=dem_tif,
+        topo_kw=topo_kw,
+    )
+
+    return (fig, df_all) if return_df else (fig, None)
+
+
+'''
+# 1) One tag (inferred from your attached filename), with filters and auto filenames
+
+from pathlib import Path
+from obspy import UTCDateTime
+
+LOCALPROJECTDIR = Path("/data/ASL_runs")
+sample = "/mnt/data/source_VSAM_mean_5s_surface_v1.5_Q23_F2_3d_r2_SC.csv"
+
+res = make_asl_heatmaps_per_tag(
+    startdate=UTCDateTime(2001, 2, 6),
+    enddate=UTCDateTime(2001, 4, 2),
+    localprojectdir=LOCALPROJECTDIR,
+    default_tag_from=sample,            # -> infers the tag
+    misfit_max=0.35, nsta_min=4, connectedness_min=0.6, azgap_max=180,
+    zoom_level=11,
+    region=[-62.25, -62.10, 16.65, 16.78],
+    dem_tif="/path/to/montserrat_dem.tif",
+    outfile_pattern="heatmaps/{tag}_{start}_{end}.png",  # one file per tag
+)
+# res is a dict: {tag: (figure, dataframe)}
+
+
+# 2) Multiple explicit tags (each gets its own heatmap)
+
+res = make_asl_heatmaps_per_tag(
+    "2001-02-06 00:00:00", "2001-02-10 00:00:00",
+    localprojectdir="/data/ASL_runs",
+    tag=[
+        "VSAM_mean_5s_surface_v1.5_Q23_F2_3d_r2_SC",
+        "VSAM_mean_5s_surface_v1.5_Q23_F2_3d_r2_Watson",
+    ],
+    nsta_min=5, misfit_max=0.30,
+    outfile_pattern="heatmaps/{tag}_{start}_{end}.png"
+)
+
+
+'''
+'''
+# make heatmap
+from obspy import UTCDateTime
+from pathlib import Path
+
+LOCALPROJECTDIR = Path("/path/to/LOCALPROJECTDIR")
+
+# let the code infer the tag from the sample CSV filename
+default_tag_csv = Path("/mnt/data/source_VSAM_mean_5s_surface_v1.5_Q23_F2_3d_r2_SC.csv")
+
+fig = make_asl_heatmap_from_events(
+    startdate=UTCDateTime(2001, 2, 6),
+    enddate=UTCDateTime(2001, 4, 2),
+    localprojectdir=LOCALPROJECTDIR,
+    default_tag_from=default_tag_csv,
+    # region=[-62.25, -62.10, 16.65, 16.78],
+    # dem_tif="/path/to/montserrat_dem.tif",
+    # outfile="asl_heatmap_{start}_{end}.png",
+)
+'''
+
+# ---------------------------------------------------------------------
+# Drop-in: make_asl_heatmap_from_events(...) + helpers
+# ---------------------------------------------------------------------
+
+
+from pathlib import Path
+from typing import Optional, Iterable, Union, List, Tuple, Dict, Any
+from datetime import datetime, timezone
+import re
+
+import numpy as np
+import pandas as pd
+
+try:
+    from obspy import UTCDateTime  # optional
+except Exception:
+    UTCDateTime = None
+
+from flovopy.asl.map import plot_heatmap_colored
+
+
+# ---------- helpers ----------
+def _to_utc_datetime(dt_like: Union[str, datetime, "UTCDateTime", pd.Timestamp]) -> datetime:
+    """Normalize input into timezone-aware UTC datetime."""
+    if isinstance(dt_like, pd.Timestamp):
+        return dt_like.tz_convert("UTC").to_pydatetime() if dt_like.tzinfo else dt_like.tz_localize("UTC").to_pydatetime()
+    if UTCDateTime and isinstance(dt_like, UTCDateTime):  # type: ignore
+        return dt_like.datetime.replace(tzinfo=timezone.utc)
+    if isinstance(dt_like, datetime):
+        return dt_like.astimezone(timezone.utc) if dt_like.tzinfo else dt_like.replace(tzinfo=timezone.utc)
+    if isinstance(dt_like, str):
+        try:
+            d = datetime.fromisoformat(dt_like)
+        except ValueError:
+            d = datetime.strptime(dt_like, "%Y-%m-%d-%H%M-%S")
+        return d.astimezone(timezone.utc) if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    raise TypeError(f"Unsupported datetime-like type: {type(dt_like)}")
+
+
+# event dir like: 2001-03-09-1248-42S.MVO___019
+_DIR_RE = re.compile(r"^(?P<stamp>\d{4}-\d{2}-\d{2}-\d{4}-\d{2,3}).*$")
+_TAGFN_RE = re.compile(r"^source_(?P<tag>.+)\.csv$", re.IGNORECASE)
+
+def _parse_event_time_from_dirname(dirname: str) -> Optional[datetime]:
+    """Extract UTC datetime from 'YYYY-mm-dd-HHMM-SS...' at start of dirname."""
+    m = _DIR_RE.match(dirname)
+    if not m:
+        return None
+    stamp = m.group("stamp")
+    parts = stamp.split("-")
+    # Trim SSS -> SS if present
+    if len(parts[-1]) == 3:
+        stamp = "-".join(parts[:-1] + [parts[-1][:2]])
+    try:
+        dt = datetime.strptime(stamp, "%Y-%m-%d-%H%M-%S")
+        return dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+def _infer_tag_from_filename(path: Union[str, Path]) -> Optional[str]:
+    name = Path(path).name
+    m = _TAGFN_RE.match(name)
+    return m.group("tag") if m else None
+
+def _discover_tags(event_dir: Path) -> List[str]:
+    """Return tags under event_dir/*/source_<tag>.csv."""
+    tags: list[str] = []
+    for sub in event_dir.iterdir():
+        if not sub.is_dir():
+            continue
+        t = sub.name
+        if (sub / f"source_{t}.csv").exists():
+            tags.append(t)
+    return sorted(tags)
+
+
+# ---------- main ----------
+def make_asl_heatmap_from_events(
+    startdate: Union[str, datetime, "UTCDateTime", pd.Timestamp],
+    enddate:   Union[str, datetime, "UTCDateTime", pd.Timestamp],
+    *,
+    localprojectdir: Union[str, Path],
+    tag: Optional[str] = None,
+    default_tag_from: Optional[Union[str, Path]] = None,  # e.g., '/path/to/source_<tag>.csv'
+    # CSV schema: t, lat, lon, DR, misfit, azgap, nsta, node_index, connectedness
+    lat_col: str = "lat",
+    lon_col: str = "lon",
+    amp_col: str = "DR",
+    # Optional filters (applied only if column exists)
+    misfit_max: Optional[float] = None,
+    nsta_min: Optional[int] = None,
+    connectedness_min: Optional[float] = None,
+    azgap_max: Optional[float] = None,
+    dr_min: Optional[float] = None,
+    dr_max: Optional[float] = None,
+    # Plot options (forwarded to plot_heatmap_colored)
+    inventory=None,
+    cmap: str = "turbo",
+    log_scale: bool = True,
+    node_spacing_m: int = 50,
+    region: Optional[List[float]] = None,
+    dem_tif: Optional[Union[str, Path]] = None,
+    title_fmt: str = "ASL Heatmap: {tag} ({start}–{end} UTC)",
+    outfile: Optional[Union[str, Path]] = None,   # e.g., "heatmaps/asl_{start}_{end}.png"
+    topo_kw: Optional[Dict[str, Any]] = None,
+    return_df: bool = False,
+    verbose: bool = False,
+) -> Union["pygmt.Figure", Tuple["pygmt.Figure", pd.DataFrame]]:
+    """
+    Build ONE heatmap by concatenating all per-event 'source_<tag>.csv' files
+    under LOCALPROJECTDIR where the event folder timestamp is inside the window.
+    The tag can be provided, inferred from default_tag_from, or discovered if unique.
+    """
+    lp = Path(localprojectdir)
+    if not lp.exists():
+        raise FileNotFoundError(f"localprojectdir not found: {lp}")
+
+    start_dt = _to_utc_datetime(startdate)
+    end_dt   = _to_utc_datetime(enddate)
+    if end_dt < start_dt:
+        raise ValueError("enddate is earlier than startdate")
+
+    # Resolve tag
+    if tag is None and default_tag_from:
+        inferred = _infer_tag_from_filename(default_tag_from)
+        if inferred:
+            tag = inferred
+
+    if tag is None:
+        # discover from first in-range event
+        probe_dir = None
+        for event_dir in sorted(lp.iterdir()):
+            if not event_dir.is_dir():
+                continue
+            evt_time = _parse_event_time_from_dirname(event_dir.name)
+            if evt_time is None or not (start_dt <= evt_time <= end_dt):
+                continue
+            probe_dir = event_dir
+            break
+        if probe_dir:
+            found = _discover_tags(probe_dir)
+            if len(found) == 1:
+                tag = found[0]
+            elif len(found) > 1:
+                raise ValueError(
+                    f"Multiple tags present under {probe_dir}. Please pass tag=... (choices: {found})"
+                )
+
+    if not tag:
+        raise ValueError("No tag provided and could not infer a tag.")
+
+    # Collect rows across matching events
+    rows: List[pd.DataFrame] = []
+    missing = 0
+
+    for event_dir in sorted(lp.iterdir()):
+        if not event_dir.is_dir():
+            continue
+        evt_time = _parse_event_time_from_dirname(event_dir.name)
+        if evt_time is None or not (start_dt <= evt_time <= end_dt):
+            continue
+
+        csv_path = event_dir / tag / f"source_{tag}.csv"
+        if not csv_path.exists():
+            missing += 1
+            if verbose:
+                print(f"[miss] {csv_path}")
+            continue
+
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            if verbose:
+                print(f"[warn] Could not read {csv_path}: {e}")
+            continue
+
+        # We don't require 't' here because the event folder time already gates inclusion.
+        needed = {lat_col, lon_col, amp_col}
+        if not needed.issubset(df.columns):
+            if verbose:
+                print(f"[skip] Missing {needed - set(df.columns)} in {csv_path}")
+            continue
+
+        # Optional filters (only if columns exist)
+        m = pd.Series(True, index=df.index)
+        if misfit_max is not None and "misfit" in df.columns:
+            m &= df["misfit"] <= misfit_max
+        if nsta_min is not None and "nsta" in df.columns:
+            m &= df["nsta"] >= nsta_min
+        if connectedness_min is not None and "connectedness" in df.columns:
+            m &= df["connectedness"] >= connectedness_min
+        if azgap_max is not None and "azgap" in df.columns:
+            m &= df["azgap"] <= azgap_max
+        if dr_min is not None:
+            m &= df[amp_col] >= dr_min
+        if dr_max is not None:
+            m &= df[amp_col] <= dr_max
+
+        df = df.loc[m, [lat_col, lon_col, amp_col]].copy()
+        if df.empty:
+            continue
+
+        # numeric + finite
+        df[[lat_col, lon_col, amp_col]] = df[[lat_col, lon_col, amp_col]].astype(float)
+        finite = np.isfinite(df[lat_col]) & np.isfinite(df[lon_col]) & np.isfinite(df[amp_col])
+        df = df.loc[finite]
+        if df.empty:
+            continue
+
+        df["event_time"] = evt_time
+        rows.append(df)
+
+    if not rows:
+        raise ValueError(
+            f"No matching data for tag='{tag}' after filtering "
+            f"({pd.Timestamp(start_dt)}–{pd.Timestamp(end_dt)} UTC). "
+            f"Missing files count={missing}."
+        )
+
+    df_all = pd.concat(rows, ignore_index=True)
+
+    # Titles / filenames
+    start_str  = pd.Timestamp(start_dt).strftime("%Y-%m-%d %H:%M:%S")
+    end_str    = pd.Timestamp(end_dt).strftime("%Y-%m-%d %H:%M:%S")
+    start_safe = pd.Timestamp(start_dt).strftime("%Y%m%dT%H%M%S")
+    end_safe   = pd.Timestamp(end_dt).strftime("%Y%m%dT%H%M%S")
+    title = title_fmt.format(tag=tag, start=start_str, end=end_str)
+
+    if outfile:
+        outfile = str(outfile).format(tag=tag, start=start_safe, end=end_safe)
+        Path(outfile).parent.mkdir(parents=True, exist_ok=True)
+
+    fig = plot_heatmap_colored(
+        df_all,
+        lat_col=lat_col,
+        lon_col=lon_col,
+        amp_col=amp_col,
+        inventory=inventory,
+        cmap=cmap,
+        log_scale=log_scale,
+        node_spacing_m=node_spacing_m,
+        outfile=outfile,
+        region=region,
+        title=title,
+        dem_tif=dem_tif,
+        topo_kw=topo_kw,
+    )
+
+    return (fig, df_all) if return_df else fig
+
+# ---------------------------------------------------------------------
+# FULL DROP-IN REPLACEMENT
+# - Imports
+# - Helpers (UTC coercion, event time parsing, tag inference)
+# - make_asl_heatmap_from_events(...)
+# - Example usage (at bottom)
+# ---------------------------------------------------------------------
+
+
+from pathlib import Path
+from typing import Optional, Union, List, Tuple, Dict, Any
+from datetime import datetime, timezone
+import re
+
+import numpy as np
+import pandas as pd
+
+# Optional ObsPy import (your example uses UTCDateTime)
+try:
+    from obspy import UTCDateTime  # type: ignore
+except Exception:  # pragma: no cover
+    UTCDateTime = None  # ok if ObsPy isn't available in some environments
+
+# Your GMT basemap/heatmap plotter
+from flovopy.asl.map import plot_heatmap_colored
+
+
+# ---------- helpers ----------
+def _to_utc_datetime(dt_like: Union[str, datetime, "UTCDateTime", pd.Timestamp]) -> datetime:
+    """Normalize input into a timezone-aware UTC datetime."""
+    # Pandas Timestamp
+    if isinstance(dt_like, pd.Timestamp):
+        return (
+            dt_like.tz_convert("UTC").to_pydatetime()
+            if dt_like.tzinfo
+            else dt_like.tz_localize("UTC").to_pydatetime()
+        )
+    # ObsPy UTCDateTime
+    if UTCDateTime and isinstance(dt_like, UTCDateTime):  # type: ignore
+        return dt_like.datetime.replace(tzinfo=timezone.utc)
+    # Python datetime
+    if isinstance(dt_like, datetime):
+        return dt_like.astimezone(timezone.utc) if dt_like.tzinfo else dt_like.replace(tzinfo=timezone.utc)
+    # Strings: ISO first, fall back to 'YYYY-mm-dd-HHMM-SS'
+    if isinstance(dt_like, str):
+        try:
+            d = datetime.fromisoformat(dt_like)
+        except ValueError:
+            d = datetime.strptime(dt_like, "%Y-%m-%d-%H%M-%S")
+        return d.astimezone(timezone.utc) if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    raise TypeError(f"Unsupported datetime-like type: {type(dt_like)}")
+
+
+# Event dir like: 2001-03-09-1248-42S.MVO___019 (we only need the leading timestamp)
+_DIR_RE = re.compile(r"^(?P<stamp>\d{4}-\d{2}-\d{2}-\d{4}-\d{2,3}).*$")
+_TAGFN_RE = re.compile(r"^source_(?P<tag>.+)\.csv$", re.IGNORECASE)
+
+def _parse_event_time_from_dirname(dirname: str) -> Optional[datetime]:
+    """Extract UTC datetime from 'YYYY-mm-dd-HHMM-SS...' at start of dirname."""
+    m = _DIR_RE.match(dirname)
+    if not m:
+        return None
+    stamp = m.group("stamp")
+    parts = stamp.split("-")
+    # Trim SSS -> SS if present
+    if len(parts[-1]) == 3:
+        stamp = "-".join(parts[:-1] + [parts[-1][:2]])
+    try:
+        dt = datetime.strptime(stamp, "%Y-%m-%d-%H%M-%S")
+        return dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+def _infer_tag_from_filename(path: Union[str, Path]) -> Optional[str]:
+    """Get '<tag>' from 'source_<tag>.csv'."""
+    name = Path(path).name
+    m = _TAGFN_RE.match(name)
+    return m.group("tag") if m else None
+
+def _discover_tags(event_dir: Path) -> List[str]:
+    """Return tags under event_dir/*/source_<tag>.csv."""
+    tags: list[str] = []
+    for sub in event_dir.iterdir():
+        if not sub.is_dir():
+            continue
+        t = sub.name
+        if (sub / f"source_{t}.csv").exists():
+            tags.append(t)
+    return sorted(tags)
+
+
+# ---------- main ----------
+def make_asl_heatmap_from_events(
+    startdate: Union[str, datetime, "UTCDateTime", pd.Timestamp],
+    enddate:   Union[str, datetime, "UTCDateTime", pd.Timestamp],
+    *,
+    localprojectdir: Union[str, Path],
+    tag: Optional[str] = None,
+    default_tag_from: Optional[Union[str, Path]] = None,  # e.g., '/path/to/source_<tag>.csv'
+    # CSV schema: t, lat, lon, DR, misfit, azgap, nsta, node_index, connectedness
+    lat_col: str = "lat",
+    lon_col: str = "lon",
+    amp_col: str = "DR",
+    # Optional filters (applied only if column exists)
+    misfit_max: Optional[float] = None,
+    nsta_min: Optional[int] = None,
+    connectedness_min: Optional[float] = None,
+    azgap_max: Optional[float] = None,
+    dr_min: Optional[float] = None,
+    dr_max: Optional[float] = None,
+    # Plot options (forwarded to plot_heatmap_colored)
+    inventory=None,
+    cmap: str = "turbo",
+    log_scale: bool = True,
+    node_spacing_m: int = 50,
+    region: Optional[List[float]] = None,
+    dem_tif: Optional[Union[str, Path]] = None,
+    title_fmt: str = "ASL Heatmap: {tag} ({start}–{end} UTC)",
+    outfile: Optional[Union[str, Path]] = None,   # e.g., "heatmaps/asl_{start}_{end}.png"
+    topo_kw: Optional[Dict[str, Any]] = None,
+    return_df: bool = False,
+    verbose: bool = False,
+) -> Union["pygmt.Figure", Tuple["pygmt.Figure", pd.DataFrame]]:
+    """
+    Build ONE heatmap by concatenating all per-event 'source_<tag>.csv' files
+    under LOCALPROJECTDIR where the event folder timestamp is inside the window.
+    The tag can be provided, inferred from default_tag_from, or discovered if unique.
+    """
+    lp = Path(localprojectdir)
+    if not lp.exists():
+        raise FileNotFoundError(f"localprojectdir not found: {lp}")
+
+    start_dt = _to_utc_datetime(startdate)
+    end_dt   = _to_utc_datetime(enddate)
+    if end_dt < start_dt:
+        raise ValueError("enddate is earlier than startdate")
+
+    # Resolve tag
+    if tag is None and default_tag_from:
+        inferred = _infer_tag_from_filename(default_tag_from)
+        if inferred:
+            tag = inferred
+
+    if tag is None:
+        # discover from first in-range event
+        probe_dir = None
+        for event_dir in sorted(lp.iterdir()):
+            if not event_dir.is_dir():
+                continue
+            evt_time = _parse_event_time_from_dirname(event_dir.name)
+            if evt_time is None or not (start_dt <= evt_time <= end_dt):
+                continue
+            probe_dir = event_dir
+            break
+        if probe_dir:
+            found = _discover_tags(probe_dir)
+            if len(found) == 1:
+                tag = found[0]
+            elif len(found) > 1:
+                raise ValueError(
+                    f"Multiple tags present under {probe_dir}. Please pass tag=... (choices: {found})"
+                )
+
+    if not tag:
+        raise ValueError("No tag provided and could not infer a tag.")
+
+    # Collect rows across matching events
+    rows: List[pd.DataFrame] = []
+    missing = 0
+
+    for event_dir in sorted(lp.iterdir()):
+        if not event_dir.is_dir():
+            continue
+        evt_time = _parse_event_time_from_dirname(event_dir.name)
+        if evt_time is None or not (start_dt <= evt_time <= end_dt):
+            continue
+
+        csv_path = event_dir / tag / f"source_{tag}.csv"
+        if not csv_path.exists():
+            missing += 1
+            if verbose:
+                print(f"[miss] {csv_path}")
+            continue
+
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            if verbose:
+                print(f"[warn] Could not read {csv_path}: {e}")
+            continue
+
+        # We don't require 't' here because the event folder time already gates inclusion.
+        needed = {lat_col, lon_col, amp_col}
+        if not needed.issubset(df.columns):
+            if verbose:
+                print(f"[skip] Missing {needed - set(df.columns)} in {csv_path}")
+            continue
+
+        # Optional filters (only if columns exist)
+        m = pd.Series(True, index=df.index)
+        if misfit_max is not None and "misfit" in df.columns:
+            m &= df["misfit"] <= misfit_max
+        if nsta_min is not None and "nsta" in df.columns:
+            m &= df["nsta"] >= nsta_min
+        if connectedness_min is not None and "connectedness" in df.columns:
+            m &= df["connectedness"] >= connectedness_min
+        if azgap_max is not None and "azgap" in df.columns:
+            m &= df["azgap"] <= azgap_max
+        if dr_min is not None:
+            m &= df[amp_col] >= dr_min
+        if dr_max is not None:
+            m &= df[amp_col] <= dr_max
+
+        df = df.loc[m, [lat_col, lon_col, amp_col]].copy()
+        if df.empty:
+            continue
+
+        # numeric + finite
+        df[[lat_col, lon_col, amp_col]] = df[[lat_col, lon_col, amp_col]].astype(float)
+        finite = np.isfinite(df[lat_col]) & np.isfinite(df[lon_col]) & np.isfinite(df[amp_col])
+        df = df.loc[finite]
+        if df.empty:
+            continue
+
+        df["event_time"] = evt_time
+        rows.append(df)
+
+    if not rows:
+        raise ValueError(
+            f"No matching data for tag='{tag}' after filtering "
+            f"({pd.Timestamp(start_dt)}–{pd.Timestamp(end_dt)} UTC). "
+            f"Missing files count={missing}."
+        )
+
+    df_all = pd.concat(rows, ignore_index=True)
+
+    # Titles / filenames
+    start_str  = pd.Timestamp(start_dt).strftime("%Y-%m-%d %H:%M:%S")
+    end_str    = pd.Timestamp(end_dt).strftime("%Y-%m-%d %H:%M:%S")
+    start_safe = pd.Timestamp(start_dt).strftime("%Y%m%dT%H%M%S")
+    end_safe   = pd.Timestamp(end_dt).strftime("%Y%m%dT%H%M%S")
+    title = title_fmt.format(tag=tag, start=start_str, end=end_str)
+
+    if outfile:
+        outfile = str(outfile).format(tag=tag, start=start_safe, end=end_safe)
+        Path(outfile).parent.mkdir(parents=True, exist_ok=True)
+
+    fig = plot_heatmap_colored(
+        df_all,
+        lat_col=lat_col,
+        lon_col=lon_col,
+        amp_col=amp_col,
+        inventory=inventory,
+        cmap=cmap,
+        log_scale=log_scale,
+        node_spacing_m=node_spacing_m,
+        outfile=outfile,
+        region=region,
+        title=title,
+        dem_tif=dem_tif,
+        topo_kw=topo_kw,
+    )
+
+    return (fig, df_all) if return_df else fig
+
+
+# ---------------------------------------------------------------------
+# Example usage (adjust the two paths)
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    pass

@@ -289,6 +289,12 @@ class ASLConfig:
     def copy_unbuilt(self, **overrides) -> "ASLConfig":
         """Make a new config with overrides but DO NOT build it."""
         return replace(self, **(overrides or {}))
+    
+    # ---------------- save config as pickle -----------
+
+    def save(self, outfile):
+        # add code to save pickle file
+        pass
 
 
 # ---------------------------------------------------------------------

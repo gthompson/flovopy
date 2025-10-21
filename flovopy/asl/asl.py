@@ -2019,5 +2019,9 @@ class ASL:
             key=lambda p: (np.nan_to_num(p.get("r2", np.nan), nan=-np.inf),
                         -abs(p.get("N", np.nan)) if np.isfinite(p.get("N", np.nan)) else -np.inf)
         )
-        best["candidates"] = [(int(f["node_index"]), float(f["r2"])) for f in fits]
+        
+        best["candidates"]= [(int(f["node_index"]), float(f["r2"])) for f in fits]
+        B = best['candidates']
+        print(f"A={B['A0']}*R^{B['N']}*exp(-{B['k']}R)")
+        print(f"Q={B['Q']}, f={freq_hz}Hz, c={wave_speed_kms}km/s ")
         return best
