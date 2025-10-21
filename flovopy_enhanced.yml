@@ -4,7 +4,7 @@
 # - passoft requires python 3.9 or 3.10, but is verified to work with flovopy on 3.10
 # - ispaq requires python 3.8
 # It might be possible to build these from source code (github repos), if really needed in same env
-name: flovopy_plus
+name: flovopy_enhanced
 channels:
   - conda-forge
   - defaults
