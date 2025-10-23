@@ -22,7 +22,7 @@ from obspy import read, UTCDateTime, Stream
 from flovopy.asl.ampcorr import AmpCorrParams, AmpCorr
 from flovopy.asl.asl import ASL
 from flovopy.asl.distances import distances_signature
-from flovopy.asl.map import plot_heatmap_colored
+from flovopy.asl.heatmaps import plot_heatmap_colored
 from flovopy.asl.misfit import (
     StdOverMeanMisfit,
     R2DistanceMisfit,
@@ -40,7 +40,7 @@ from flovopy.asl.config import tweak_config, ASLConfig
 from flovopy.core.trace_utils import stream_add_units, add_processing_step
 from flovopy.core.preprocess import preprocess_trace
 from flovopy.core.remove_response import safe_pad_taper_filter, safe_pad_taper_filter_stream
-from flovopy.asl.diagnostics import extract_asl_diagnostics, compare_asl_sources
+from flovopy.asl.compare import extract_asl_diagnostics, compare_asl_sources
 
 class _Tee(io.TextIOBase):
     def __init__(self, *streams):

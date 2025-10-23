@@ -13,7 +13,6 @@ from obspy import UTCDateTime
 import matplotlib.pyplot as plt
 
 # project
-from flovopy.asl.map import plot_heatmap_colored
 from flovopy.enhanced.eventrate import EventRate, EventRateConfig
 from flovopy.enhanced.event import EnhancedEvent
 from flovopy.enhanced.catalog import EnhancedCatalog
