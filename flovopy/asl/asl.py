@@ -67,13 +67,17 @@ except Exception:
 #from flovopy.asl.ampcorr import AmpCorr, AmpCorrParams
 from flovopy.asl.distances import compute_azimuthal_gap #, geo_distance_3d_km, compute_distances, distances_signature, 
 from flovopy.utils.make_hash import make_hash
-from flovopy.asl.grid import NodeGrid, Grid
+#from flovopy.asl.grid import NodeGrid, Grid
 from flovopy.asl.utils import compute_spatial_connectedness, _grid_shape_or_none, _median_filter_indices, _viterbi_smooth_indices, _as_regular_view, _movavg_1d, _movmed_1d
 
 # plotting helpers (topo base, diagnostic heatmap)
 from flovopy.asl.map import topo_map
 from flovopy.asl.misfit import plot_misfit_heatmap_for_peak_DR, StdOverMeanMisfit #,  R2DistanceMisfit  # (import when needed)
 
+# for inverse locate
+from scipy.optimize import minimize
+from flovopy.core.mvo import dome_location
+from flovopy.asl.grid import _meters_per_degree
 
 # ----------------------------------------------------------------------
 # Main ASL class
@@ -1387,6 +1391,406 @@ class ASL:
 
         return self
         
+
+    def inverse_locate(
+        self,
+        *,
+        time_index: int | None = None,
+        reference_lonlat: tuple[float, float] | None = None,
+        init_lonlat: tuple[float, float] | None = None,
+        optimizer: str = "Nelder-Mead",
+        bounds_km: tuple[tuple[float, float], tuple[float, float]] | None = None,
+        clip_R_min_km: float = 0.05,
+        verbose: bool = True,
+        return_design: bool = True,   # NEW
+    ):
+        """
+        Hybrid inversion for amplitude source location.
+
+        log|A_i| = logA0 - N*log(R_i) - k*R_i + e_i
+                = [1, log(R_i), R_i] · [logA0, -N, -k]^T + e_i
+
+        Inner LSQ (β linear):   β = (XᵀX)⁻¹ Xᵀ y   at each (x,y)
+        Outer minimize (x,y):   SSE(β, x, y) = ||y - Xβ||²
+
+        Returns a dict with solution and, if return_design=True, the
+        design matrix and residual diagnostics at the optimum.
+        """
+
+        # ---- 1) pick time index (default = peak DR) ----
+        if time_index is None:
+            if getattr(self, "source", None) and "DR" in self.source:
+                time_index = int(np.nanargmax(self.source["DR"]))
+            else:
+                raise RuntimeError("time_index not given and no DR available to pick automatically.")
+
+        # ---- 2) pull amplitudes at that time ----
+        st = self.metric2stream()
+        seed_all = [tr.id for tr in st]
+        Y = np.vstack([np.asarray(tr.data, dtype=np.float64) for tr in st])
+        amps = Y[:, time_index]
+        ok_amp = np.isfinite(amps)
+
+        seed_ids = [sid for sid, ok in zip(seed_all, ok_amp) if ok]
+        amps = amps[ok_amp]
+        if len(amps) < 3:
+            raise RuntimeError("Need ≥3 finite station amplitudes.")
+
+        # ---- 3) station geometry (lon/lat) in the same order ----
+        if not getattr(self, "station_coordinates", None):
+            raise RuntimeError("ASL.station_coordinates missing; compute_or_load_distances() first.")
+        slon = np.array([self.station_coordinates[sid]["longitude"] for sid in seed_ids], float)
+        slat = np.array([self.station_coordinates[sid]["latitude"]  for sid in seed_ids], float)
+        ok_geo = np.isfinite(slon) & np.isfinite(slat)
+        if ok_geo.sum() < 3:
+            raise RuntimeError("Fewer than 3 stations with valid geometry.")
+        seed_ids = [sid for sid, ok in zip(seed_ids, ok_geo) if ok]
+        slon, slat, amps = slon[ok_geo], slat[ok_geo], amps[ok_geo]
+
+        # ---- 4) local tangent plane (km) ----
+        if reference_lonlat is None:
+            reference_lonlat = (dome_location["lon"], dome_location["lat"])
+        ref_lon, ref_lat = map(float, reference_lonlat)
+        m_per_deg_lat, m_per_deg_lon = _meters_per_degree(ref_lat)
+        X_sta = (slon - ref_lon) * (m_per_deg_lon / 1000.0)  # km
+        Y_sta = (slat - ref_lat) * (m_per_deg_lat  / 1000.0) # km
+        STA = np.column_stack([X_sta, Y_sta])
+
+        # ---- 5) initial guess (x,y) in km ----
+        if init_lonlat is None:
+            init_lonlat = reference_lonlat
+        x0 = np.array([
+            (init_lonlat[0] - ref_lon) * (m_per_deg_lon / 1000.0),
+            (init_lonlat[1] - ref_lat) * (m_per_deg_lat  / 1000.0),
+        ], dtype=float)
+
+        # ---- 6) inner LSQ at fixed (x,y) ----
+        y = np.log(np.clip(np.abs(amps), 1e-12, None))  # log|A|
+
+        def lsq_at_xy(xy_km: np.ndarray):
+            dx = STA[:, 0] - xy_km[0]
+            dy = STA[:, 1] - xy_km[1]
+            R = np.clip(np.hypot(dx, dy), clip_R_min_km, None)  # km
+            X = np.column_stack([np.ones_like(R), np.log(R), R])  # [1, logR, R]
+            beta, *_ = np.linalg.lstsq(X, y, rcond=None)          # β = [logA0, -N, -k]
+            yhat = X @ beta
+            r = y - yhat
+            sse = float(np.dot(r, r))
+            return beta, X, yhat, r, R, sse
+
+        def objective(xy):
+            _, _, _, _, _, sse = lsq_at_xy(np.asarray(xy, float))
+            return sse
+
+        # ---- 7) outer optimization over (x,y) ----
+        opt_kwargs = {}
+        if bounds_km is not None and optimizer in ("L-BFGS-B", "TNC", "Powell"):
+            opt_kwargs["bounds"] = bounds_km
+        res = minimize(objective, x0, method=optimizer, **opt_kwargs)
+
+        # ---- 8) final fit at optimum ----
+        beta, X, yhat, r, R, sse = lsq_at_xy(res.x)
+        logA0, negN, negk = map(float, beta)
+        N, k = -negN, -negk
+
+        lon = ref_lon + (res.x[0] * 1000.0) / m_per_deg_lon
+        lat = ref_lat + (res.x[1] * 1000.0) / m_per_deg_lat
+
+        if verbose:
+            print(f"[ASL:INV] success={res.success}  SSE={sse:.3g}")
+            print(f"          lon={lon:.6f}, lat={lat:.6f}, x={res.x[0]:.2f} km, y={res.x[1]:.2f} km")
+            print(f"          logA0={logA0:.3f}, N={N:.3f}, k={k:.4f} (1/km)  nsta={len(amps)}")
+
+        out = {
+            "lon": float(lon), "lat": float(lat),
+            "x_km": float(res.x[0]), "y_km": float(res.x[1]),
+            "logA0": float(logA0), "N": float(N), "k": float(k),
+            "sse": float(sse), "success": bool(res.success), "message": str(res.message),
+            "nsta": int(len(amps)), "time_index": int(time_index),
+        }
+
+        if return_design:
+            out["design"] = {
+                "X": X,               # shape (nsta, 3)  columns: [1, logR, R]
+                "y": y,               # log|A|
+                "yhat": yhat,
+                "residuals": r,
+                "R_km": R,
+                "seed_ids": tuple(seed_ids),
+                "columns": ("1", "logR", "R"),
+            }
+
+        return out
+    
+
+    def inverse_locate_nonlinear(
+        self,
+        *,
+        time_index: int | None = None,
+        reference_lonlat: tuple[float, float] | None = None,
+        init_lonlat: tuple[float, float] | None = None,   # seed for (x,y)
+        init_params: tuple[float, float, float] | None = None,  # (logA0, N, k) seed
+        use_3d: bool = False,
+        source_elev_mode: str = "zero",   # "zero" | "fixed" | "dem"
+        source_elev_m: float | None = None,  # used if mode=="fixed"
+        clip_R_min_km: float = 0.05,
+        bounds_xy_km: tuple[tuple[float,float], tuple[float,float]] | None = None,  # ((xmin,xmax),(ymin,ymax))
+        bounds_params: tuple[tuple[float,float], tuple[float,float], tuple[float,float]] = ((-np.inf, np.inf),(0,10),(0,5)),
+        robust_loss: str = "soft_l1",     # "linear"|"soft_l1"|"huber" ...
+        f_scale: float = 1.0,
+        verbose: bool = True,
+    ):
+        """
+        Full nonlinear ASL inversion:
+        unknowns = (x_km, y_km[, z_km], logA0, N, k)
+        model    = log|A_i| = logA0 - N*log(R_i) - k*R_i
+
+        - Distances R_i are km (2D or 3D).
+        - 3D uses station elevation and a source elevation from DEM/fixed/zero.
+        - Returns parameters, location (lon/lat), residuals, and diagnostics.
+
+        Notes
+        -----
+        * For speed/robustness, seed (x,y) with the hybrid solver you already have,
+        then pass that as init_lonlat.
+        * Keep units consistent: distances in km; k is 1/km; N is dimensionless.
+        """
+        import numpy as np
+        from scipy.optimize import least_squares
+        from flovopy.core.mvo import dome_location
+        from .grid import _meters_per_degree
+        from .distances import geo_distance_3d_km  # optional guard for 3D check
+
+        # ---- 0) choose time index (default: peak DR) ----
+        if time_index is None:
+            if getattr(self, "source", None) is not None and "DR" in self.source:
+                time_index = int(np.nanargmax(self.source["DR"]))
+            else:
+                raise RuntimeError("time_index not provided and no DR to auto-select.")
+
+        # ---- 1) amplitudes y_i = log|A_i| ----
+        st = self.metric2stream()
+        seed_all = [tr.id for tr in st]
+        Y = np.vstack([np.asarray(tr.data, dtype=np.float64) for tr in st])
+        amps = Y[:, time_index]
+        ok = np.isfinite(amps)
+        if ok.sum() < 3:
+            raise RuntimeError("Need at least 3 finite station amplitudes.")
+        amps = amps[ok]
+        seed_ids = [sid for sid, t in zip(seed_all, ok) if t]
+
+        y_obs = np.log(np.clip(np.abs(amps), 1e-12, None))
+
+        # ---- 2) station geometry ----
+        if not getattr(self, "station_coordinates", None):
+            raise RuntimeError("ASL.station_coordinates missing; compute distances first.")
+        slon = np.array([self.station_coordinates[sid]["longitude"] for sid in seed_ids], float)
+        slat = np.array([self.station_coordinates[sid]["latitude"]  for sid in seed_ids], float)
+        selev_m = np.array([self.station_coordinates[sid].get("elevation", 0.0) for sid in seed_ids], float)
+
+        ok_geo = np.isfinite(slon) & np.isfinite(slat)
+        if ok_geo.sum() < 3:
+            raise RuntimeError("Fewer than 3 stations with valid lon/lat.")
+        slon, slat, selev_m, y_obs, seed_ids = (
+            slon[ok_geo], slat[ok_geo], selev_m[ok_geo], y_obs[ok_geo], [sid for sid, g in zip(seed_ids, ok_geo) if g]
+        )
+
+        # ---- 3) local tangent plane (km) ----
+        if reference_lonlat is None:
+            reference_lonlat = (dome_location["lon"], dome_location["lat"])
+        ref_lon, ref_lat = map(float, reference_lonlat)
+        m_per_deg_lat, m_per_deg_lon = _meters_per_degree(ref_lat)
+        X_sta = (slon - ref_lon) * (m_per_deg_lon / 1000.0)  # km
+        Y_sta = (slat - ref_lat) * (m_per_deg_lat  / 1000.0) # km
+        STA_xy = np.column_stack([X_sta, Y_sta])
+
+        # Station z (km, positive up)
+        Z_sta_km = (selev_m / 1000.0) if use_3d else np.zeros_like(X_sta)
+
+        # ---- 4) source z (km) policy ----
+        def source_z_km_at(lon, lat):
+            if not use_3d:
+                return 0.0
+            if source_elev_mode == "zero":
+                return 0.0
+            if source_elev_mode == "fixed":
+                return float((source_elev_m or 0.0) / 1000.0)
+            if source_elev_mode == "dem":
+                # Try to pull from grid DEM if available; else 0
+                z_m = 0.0
+                try:
+                    g = getattr(self, "gridobj", None)
+                    if g is not None and getattr(g, "node_elev_m", None) is not None:
+                        # nearest-neighbor from grid (simple & robust)
+                        j = int(np.abs(g.lonrange - lon).argmin())
+                        i = int(np.abs(g.latrange - lat).argmin())
+                        z_m = float(g.node_elev_m[i, j])
+                except Exception:
+                    z_m = 0.0
+                return z_m / 1000.0
+            raise ValueError("source_elev_mode must be 'zero'|'fixed'|'dem'.")
+
+        # ---- 5) initial guess θ0 ----
+        if init_lonlat is None:
+            init_lonlat = reference_lonlat  # seed at center
+        x0_km = (init_lonlat[0] - ref_lon) * (m_per_deg_lon / 1000.0)
+        y0_km = (init_lonlat[1] - ref_lat) * (m_per_deg_lat  / 1000.0)
+        if use_3d:
+            z0_km = source_z_km_at(init_lonlat[0], init_lonlat[1])
+        else:
+            z0_km = 0.0
+
+        if init_params is None:
+            # modest, neutral seeds
+            logA0_0, N0, k0 = (np.nanmedian(y_obs), 1.0, 0.1)
+        else:
+            logA0_0, N0, k0 = map(float, init_params)
+
+        if use_3d:
+            theta0 = np.array([x0_km, y0_km, z0_km, logA0_0, N0, k0], float)
+        else:
+            theta0 = np.array([x0_km, y0_km, logA0_0, N0, k0], float)
+
+        # ---- 6) bounds ----
+        if bounds_xy_km is not None:
+            (xmin, xmax), (ymin, ymax) = bounds_xy_km
+        else:
+            # default ±10 km box
+            xmin, xmax, ymin, ymax = -10.0, 10.0, -10.0, 10.0
+
+        (logA0_bounds, N_bounds, k_bounds) = bounds_params
+        if use_3d:
+            # z is usually small near surface; allow, say, ±2 km
+            z_bounds = (-2.0, 2.0) if source_elev_mode != "fixed" else (z0_km, z0_km)
+            lb = [xmin, ymin, z_bounds[0], logA0_bounds[0], N_bounds[0], k_bounds[0]]
+            ub = [xmax, ymax, z_bounds[1], logA0_bounds[1], N_bounds[1], k_bounds[1]]
+        else:
+            lb = [xmin, ymin, logA0_bounds[0], N_bounds[0], k_bounds[0]]
+            ub = [xmax, ymax, logA0_bounds[1], N_bounds[1], k_bounds[1]]
+        bounds = (np.array(lb, float), np.array(ub, float))
+
+        # ---- 7) residuals and Jacobian ----
+        def residuals(theta):
+            if use_3d:
+                x, y, z_km, logA0, N, k = theta
+            else:
+                x, y, logA0, N, k = theta
+                z_km = 0.0
+
+            # source lon/lat for DEM z if needed
+            lon = ref_lon + (x * 1000.0) / m_per_deg_lon
+            lat = ref_lat + (y * 1000.0) / m_per_deg_lat
+            if use_3d and source_elev_mode == "dem":
+                z_km = source_z_km_at(lon, lat)
+
+            dx = X_sta - x
+            dy = Y_sta - y
+            dz = Z_sta_km - z_km
+            if use_3d:
+                R = np.sqrt(dx*dx + dy*dy + dz*dz)
+            else:
+                R = np.sqrt(dx*dx + dy*dy)
+
+            R = np.clip(R, clip_R_min_km, None)
+            yhat = logA0 - N * np.log(R) - k * R
+            return y_obs - yhat  # residuals
+
+        def jacobian(theta):
+            if use_3d:
+                x, y, z_km, logA0, N, k = theta
+            else:
+                x, y, logA0, N, k = theta
+                z_km = 0.0
+
+            # source lon/lat for DEM z if needed
+            lon = ref_lon + (x * 1000.0) / m_per_deg_lon
+            lat = ref_lat + (y * 1000.0) / m_per_deg_lat
+            if use_3d and source_elev_mode == "dem":
+                z_km = source_z_km_at(lon, lat)
+
+            dx = X_sta - x
+            dy = Y_sta - y
+            dz = Z_sta_km - z_km
+            if use_3d:
+                R = np.sqrt(dx*dx + dy*dy + dz*dz)
+            else:
+                R = np.sqrt(dx*dx + dy*dy)
+
+            R = np.clip(R, clip_R_min_km, None)
+            invR = 1.0 / R
+            # dR/dx = (x - x_i)/R = -dx/R   (since dx = x_i - x)
+            dRdx = -dx * invR
+            dRdy = -dy * invR
+            dRdz = (-dz * invR) if use_3d else None
+
+            # r = y - (logA0 - N logR - k R)  =>  ∂r/∂θ = [-∂f/∂θ]
+            # ∂r/∂logA0 = -1
+            # ∂r/∂N     = +logR
+            # ∂r/∂k     = +R
+            # ∂r/∂x     = +[ N*(1/R)*dRdx + k*dRdx ] = (N*invR + k)*dRdx
+            # similarly for y, (and z if 3D)
+            common = (N * invR + k)
+            Jx = common * dRdx
+            Jy = common * dRdy
+            cols = []
+            if use_3d:
+                Jz = common * dRdz
+                cols.extend([Jx, Jy, Jz, -np.ones_like(R), np.log(R), R])
+            else:
+                cols.extend([Jx, Jy, -np.ones_like(R), np.log(R), R])
+            return np.column_stack(cols)
+
+        # ---- 8) solve ----
+        res = least_squares(
+            residuals, theta0, jac=jacobian, bounds=bounds,
+            loss=robust_loss, f_scale=f_scale, xtol=1e-8, ftol=1e-8, gtol=1e-8,
+            max_nfev=2000, verbose=2 if verbose else 0,
+        )
+
+        # ---- 9) unpack solution ----
+        theta = res.x
+        if use_3d:
+            xk, yk, zk, logA0, N, k = theta
+        else:
+            xk, yk, logA0, N, k = theta
+            zk = 0.0
+
+        lon = ref_lon + (xk * 1000.0) / m_per_deg_lon
+        lat = ref_lat + (yk * 1000.0) / m_per_deg_lat
+
+        # final diagnostics
+        r = residuals(theta)
+        J = jacobian(theta)
+        sse = float(r @ r)
+        dof = max(1, r.size - J.shape[1])
+        sigma2 = sse / dof
+        try:
+            # covariance ~ (JᵀJ)⁻¹ σ² (approximate, at optimum)
+            JTJ = J.T @ J
+            cov = np.linalg.inv(JTJ) * sigma2
+        except np.linalg.LinAlgError:
+            cov = np.full((J.shape[1], J.shape[1]), np.nan)
+
+        out = {
+            "success": bool(res.success),
+            "message": str(res.message),
+            "cost": float(res.cost),
+            "sse": sse,
+            "dof": int(dof),
+            "sigma2": float(sigma2),
+            "x_km": float(xk), "y_km": float(yk), "z_km": float(zk),
+            "lon": float(lon), "lat": float(lat),
+            "logA0": float(logA0), "N": float(N), "k": float(k),
+            "nsta": int(y_obs.size),
+            "time_index": int(time_index),
+            "seed_ids": tuple(seed_ids),
+            "residuals": r,
+            "J": J,
+            "bounds": bounds,
+            "use_3d": bool(use_3d),
+            "source_elev_mode": source_elev_mode,
+        }
+        return out
 
     # ---------- plots ----------
     def plot(
