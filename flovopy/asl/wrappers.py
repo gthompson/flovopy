@@ -489,11 +489,13 @@ def asl_sausage(
             )
             vrmedian, vrcorrections = VR.examine_spread()
             #network_avg = vrmedian[cfg.sam_metric]['network_median']
+            print(vrmedian)
+            print(vrcorrections)
             
             for trace_id in [tr.id for tr in stream]:
                 #trace_avg = vrmedian[cfg.sam_metric][trace_id]
                 #if trace_avg > 10 * network_avg or trace_avg < network_avg/10:
-                trace_avg = vrcorrections[trace_id]
+                trace_avg = vrcorrections['mean'][trace_id]
                 if trace_avg > 10 or trace_avg < 0.1:
                     outlier_trace_ids.append(trace_id)
             VR.plot(outfile=os.path.join(event_dir, "VR_at_dome.png"))
@@ -514,10 +516,9 @@ def asl_sausage(
             for trace_id in [tr.id for tr in stream]:
                 #trace_avg = drmedian[cfg.sam_metric][trace_id]
                 #if trace_avg > 10 * network_avg or trace_avg < network_avg/10:
-                trace_avg = drcorrections[trace_id]
+                trace_avg = drcorrections['mean'][trace_id]
                 if trace_avg > 10 or trace_avg < 0.1:
                     outlier_trace_ids.append(trace_id)
-            VR.plot(outfile=os.path.join(event_dir, "VR_at_dome.png"))
             DR.plot(outfile=os.path.join(event_dir, "DR_at_dome.png"))
             
     if outlier_trace_ids:
