@@ -71,3 +71,13 @@ RSAMplots.zip
 *.rover
 .DS_Store
 test.out
+failed/
+obsolete/
+flovopy/dem/flip_geotiff.py
+flovopy/dem/merged_pts_hyp_trimmed.csv
+flovopy/dem/stations_from_stationxml.csv
+flovopy/dem/stations_with_channels_from_MV.xml.csv
+flovopy/dem/stations_with_channels_MontserratDigitalSeismicNetwork.xml.csv
+flovopy/dem/station0.hyp.csv
+flovopy/dem/flip_geotiff.py
+.gitignore.swp
