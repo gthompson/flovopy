@@ -179,7 +179,7 @@ def write_wavfile(
     filetime: UTCDateTime = st[0].stats.starttime
 
     # Build basename: YYYY-MM-DD-HHMM-SSS.DBSTRING_NUMCHANS
-    basename = "%4d-%02d-%02d-%02d%02d-%02dS.%s_%03d" % (
+    basename = "%4d-%02d-%02d-%02d%02d-%02dM.%s_%03d" % (
         filetime.year, filetime.month, filetime.day,
         filetime.hour, filetime.minute, filetime.second,
         dbstring, numchans
