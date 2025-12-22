@@ -195,7 +195,7 @@ def release_input_file_lock(cursor, conn, file_path):
     except Exception as e:
         print(f"⚠️ Failed to release input file lock for {file_path}: {e}", flush=True)
 
-
+'''
 def discover_files(sds_root, use_sds=True, filterdict=None, starttime=None, endtime=None):
 
 
@@ -224,6 +224,114 @@ def discover_files(sds_root, use_sds=True, filterdict=None, starttime=None, endt
                 if is_valid_sds_filename(fname):
                     file_list.append(full_path)
         return file_list
+'''    
+def discover_files(
+    sds_root,
+    use_sds=True,
+    filterdict=None,
+    starttime=None,
+    endtime=None,
+):
+    """
+    Discover SDS MiniSEED files, optionally filtering by NSLC and time.
+
+    Parameters
+    ----------
+    sds_root : str or Path
+        Root of SDS archive.
+    use_sds : bool
+        If True, use SDS structure awareness.
+    filterdict : dict, optional
+        Filtering parameters, e.g.:
+        {
+            'network': ['XA', 'FL'],
+            'station': ['ABC1'],
+            'channel': ['EHZ'],
+            'location': ['00', '--']
+        }
+    starttime, endtime : UTCDateTime, optional
+        Time window filter (inclusive).
+
+    Returns
+    -------
+    list of str
+        Valid SDS file paths.
+    """
+
+    sds_root = Path(sds_root)
+
+    if not use_sds:
+        # --- raw filesystem fallback ---
+        file_list = []
+        for root, _, files in os.walk(sds_root):
+            for fname in files:
+                if is_valid_sds_filename(fname):
+                    file_list.append(str(Path(root) / fname))
+        return sorted(file_list)
+
+    # --- SDS-aware discovery ---
+    from flovopy.sds.enhanced_sds_client import EnhancedSDSClient
+
+    client = EnhancedSDSClient(sds_root)
+    file_list = []
+
+    # Establish day range
+    if starttime is None and endtime is None:
+        # full archive scan (dangerous but backward-compatible)
+        years = sorted(p for p in sds_root.iterdir() if p.is_dir() and p.name.isdigit())
+        days = []
+        for y in years:
+            for d in range(1, 367):
+                try:
+                    days.append(UTCDateTime(int(y.name), julday=d))
+                except Exception:
+                    pass
+    else:
+        if starttime is None:
+            starttime = endtime
+        if endtime is None:
+            endtime = starttime
+        days = []
+        t = UTCDateTime(starttime.year, julday=starttime.julday)
+        while t <= endtime:
+            days.append(t)
+            t += 86400
+
+    for day in days:
+        try:
+            nslc_set = client.get_nslc_for_day(day, skip_low_rate=False)
+        except Exception:
+            continue
+
+        for net, sta, loc, chan in nslc_set:
+
+            # --- Apply NSLC filters ---
+            if filterdict:
+                if 'network' in filterdict and net not in filterdict['network']:
+                    continue
+                if 'station' in filterdict and sta not in filterdict['station']:
+                    continue
+                if 'channel' in filterdict and chan not in filterdict['channel']:
+                    continue
+                if 'location' in filterdict and loc not in filterdict['location']:
+                    continue
+
+            path = client.build_sds_filename(net, sta, loc, chan, day)
+            if not path.exists():
+                continue
+
+            # --- Time window refinement ---
+            if starttime or endtime:
+                file_day = UTCDateTime(day.year, julday=day.julday)
+                if starttime and file_day + 86400 < starttime:
+                    continue
+                if endtime and file_day > endtime:
+                    continue
+
+            file_list.append(str(path))
+
+    return sorted(set(file_list))
+
 
 def estimate_eta(start_time, done, total):
     now = UTCDateTime()
