@@ -32,4 +32,4 @@ then
 fi
 
 # Launch browser
-exec "$PYTHON_BIN" -m flovopy.sds.browser "$@"
+exec "$PYTHON_BIN" -m flovopy.sds.browser_obspy "$@"
