@@ -236,19 +236,24 @@ class EnhancedStream(Stream):
             # ----- branch by data type -----
             is_seismic = True
             units = tr.stats.get('units', None)
+            vel = disp = acc = None
+            print(f'ampengfft Trace {tr.id} units={units}')
             if units.lower() in [None, "counts"]:
                 print('[AMPENGFFT]: You must set tr.stats.units on {tr.id} before calling this function. Rejecting this Trace.')
                 self.remove(tr)
                 continue
             elif units.lower() == "m":
+                #print('processing as displacement')
                 disp = tr.copy()
                 vel  = tr.copy().differentiate()
                 acc  = vel.copy().differentiate()  
             elif units.lower() == "m/s":
+                #print('processing as velocity')
                 vel  = tr
                 disp = tr.copy().integrate().detrend('linear').filter('highpass', freq=0.2, corners=2)
                 acc  = tr.copy().differentiate()    
-            elif units.lower == 'pa':                       
+            elif units.lower() == 'pa':     
+                #print('processing as pressure')                  
                 # pressure series
                 self._td_stats(tr, y_raw)
                 pap, pap_bp = self._pressure_metrics(tr, band=(1.0, 20.0))
@@ -837,7 +842,26 @@ class EnhancedStream(Stream):
             If True, also save a Python pickle of the stream.
         """
         import os
-        import pandas as pd
+        def _flatten(obj, prefix=""):
+            """
+            Recursively flatten dict-like objects (including ObsPy AttribDict) into
+            { "a_b_c": value } pairs.
+            """
+            out = {}
+            if obj is None:
+                return out
+
+            # ObsPy AttribDict behaves like dict but isn't instance of dict
+            if hasattr(obj, "items"):
+                for k, v in obj.items():
+                    key = f"{prefix}{k}" if not prefix else f"{prefix}_{k}"
+                    if hasattr(v, "items"):
+                        out.update(_flatten(v, key))
+                    else:
+                        out[key] = v
+            else:
+                out[prefix] = obj
+            return out
 
         # strip .mseed if user passed it
         if basepath.endswith(".mseed"):
@@ -864,16 +888,13 @@ class EnhancedStream(Stream):
             }
 
             if hasattr(s, "spectrum"):
-                for item in ["medianF", "peakF", "peakA", "bw_min", "bw_max"]:
-                    row[item] = s.spectrum.get(item, None)
+                flat_spec = _flatten(s.spectrum, prefix="spectrum")
+                row.update(flat_spec)
 
             if hasattr(s, "metrics"):
-                for k, v in s.metrics.items():
-                    if isinstance(v, dict):
-                        for subk, subv in v.items():
-                            row[f"{k}_{subk}"] = subv
-                    else:
-                        row[k] = v
+                flat = _flatten(s.metrics, prefix="")
+                for k, v in flat.items():
+                    row[k] = v
 
             if hasattr(s, "coordinates"):
                 row["latitude"] = s.coordinates.latitude

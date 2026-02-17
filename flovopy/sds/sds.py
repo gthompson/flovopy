@@ -26,10 +26,11 @@ from tqdm import tqdm
 from obspy import Stream, Trace, UTCDateTime
 
 # --- flovopy ---
-from flovopy.enhanced.enhanced_sds_client import EnhancedSDSClient
+from flovopy.enhanced.sdsclient import EnhancedSDSClient
 from flovopy.core.miniseed_io import smart_merge, downsample_stream_to_common_rate
 from flovopy.core.trace_utils import remove_empty_traces
 from flovopy.stationmetadata.utils import build_dataframe_from_table
+from flovopy.enhanced.stream import EnhancedStream
 
 
 # =============================================================================
@@ -58,7 +59,7 @@ class SDSobj:
     ):
         self.basedir = Path(basedir).expanduser().resolve()
         self.client = EnhancedSDSClient(self.basedir, sds_type=sds_type, format=format)
-        self.stream: Stream = streamobj or Stream()
+        self.stream: Stream = streamobj or Stream() or EnhancedStream()
         self.metadata = metadata
 
     # ------------------------------------------------------------------

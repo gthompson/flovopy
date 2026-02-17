@@ -29,7 +29,7 @@ import matplotlib.dates as mdates
 
 from obspy import Stream, UTCDateTime
 
-from flovopy.enhanced.enhanced_sds_client import EnhancedSDSClient
+from flovopy.enhanced.sdsclient import EnhancedSDSClient
 
 plt.ion()
 

@@ -224,7 +224,9 @@ def handle_instrument_response(tr: Trace, inv, pre_filt, outputType: str, verbos
         elif tr.stats.channel[1] == 'D':
             tr.stats["units"] = 'Pa'
         else:
-            tr.stats["units"] = tr.stats.get("units", "")
+            if not hasattr(tr.stats, "units"):
+                tr.stats["units"] = "" 
+        print( f'{tr.id} units={tr.stats["units"]}')
         add_processing_step(tr, f"response_removed({out})")
         return True
     except Exception as e:

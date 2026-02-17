@@ -409,7 +409,10 @@ def read_mseed(
 
 
     # Downsample to consistent rate, capped by max_sampling_rate
-    downsample_stream_to_common_rate(stream, inplace=True, max_sampling_rate=max_sampling_rate)
+    if max_sampling_rate is not None:
+        max_sr = [float(tr.stats.sampling_rate) for tr in stream if hasattr(tr.stats, 'sampling_rate')]
+        if max_sr and max(max_sr) > max_sampling_rate:
+            downsample_stream_to_common_rate(stream, inplace=True, max_sampling_rate=max_sampling_rate)
 
     # Final optional stream-level sanitization
     try:
