@@ -3,35 +3,45 @@
 flovopy.bin.sds_browser
 ======================
 
-Interactive SDS MiniSEED Browser (merged feature set of browser.py + sds_browser2.py)
+RAW Interactive SDS MiniSEED Browser (ObsPy SDSClient ONLY)
 
-What you get (combined):
+Goals:
+- Show waveforms "as-is" from MiniSEED in an SDS archive.
+- NO signal processing:
+  - no merge
+  - no detrend
+  - no filter
+  - no resample
+  - no padding/fill
+- Windowing uses Stream.slice() (trim only, no fill).
+
+Features retained:
 - Config persistence (~/.config/flovopy/<scriptname>.json)
-- Prompts for SDS query (net/sta/loc/chan + year/jday + window length)
-- Day-based loading + [ / ] previous/next day navigation
-- Persistent interactive Matplotlib waveform window (no need to close)
+- Prompts: SDS root, net/sta/loc/chan, year/jday, start HH:MM, window length
+- Day load + [ / ] previous/next day navigation
+- Persistent interactive Matplotlib window
 - Keyboard:
     Left/Right  : scroll window by 1 window
     Up/Down     : increase/decrease window length
     [ / ]       : previous / next day
 - Mouse wheel: scroll window by 1 window
-- Channel family filters (modes):
-    all, high, seismic, infrasound, soh (location D0), soh_imp (important SOH)
-- Per-window channel statistics on each refresh:
-    min, max, mean, median, rms_dev (= std dev about mean; "Centaur-style")
-- SOH enhancements when SOH modes are active:
-    median GNSS lat/lon, clock quality, satellites, temperature
-    mean mass positions (VM1..VM6 table)
-    optional bar plot of mean VM1..VM6 for the current window
+- Modes:
+    all, high, seismic, infrasound, soh (location D0), soh_imp
+- Per-window channel stats:
+    p2p, median, std (std about mean)
+- SOH summaries (when in SOH modes):
+    GNSS lat/lon, clock quality, satellites, temperature
+    mean VM1..VM6 table
+    optional VM bar plot
 - Export:
-    save PNG of waveform figure
-    save CSV of current stats table
+    PNG of waveform figure
+    CSV of current stats table
+- Toggle:
+    same y-scale across traces
 
-Designed to live in flovopy/bin/ and replace the original browser.py entrypoint.
-
-Notes:
-- Prefers flovopy.enhanced.enhanced_sds_client.EnhancedSDSClient if available.
-  Falls back to ObsPy SDS Client otherwise.
+Important note on "raw":
+- ObsPy’s SDS client will read MiniSEED records and return Trace objects.
+- This script does NOT call Stream.merge() anywhere.
 """
 
 from __future__ import annotations
@@ -40,7 +50,6 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
 import json
-import sys
 
 import numpy as np
 import pandas as pd
@@ -48,8 +57,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 from obspy import Stream, UTCDateTime
-
-from flovopy.enhanced.sdsclient import EnhancedSDSClient
+from obspy.clients.filesystem.sds import Client as SDSClient
 
 plt.ion()
 
@@ -98,10 +106,6 @@ class BrowserConfig:
         import __main__
         script = Path(getattr(__main__, "__file__", "interactive")).stem
         return Path.home() / ".config" / "flovopy" / f"{script}.json"
-    
-
-
-
 
     @classmethod
     def load(cls) -> "BrowserConfig":
@@ -131,6 +135,7 @@ def _parse_year_jday(year: str, jday: str) -> Tuple[int, int]:
         raise ValueError("jday must be in 1..366")
     return y, jd
 
+
 def _parse_hhmm(hhmm: str) -> int:
     """
     Convert 'HH:MM' to seconds since midnight.
@@ -149,74 +154,42 @@ def _parse_hhmm(hhmm: str) -> int:
         raise ValueError("HH must be 0..23 and MM must be 0..59")
 
     return h * 3600 + m * 60
+
+
 # =============================================================================
-# SDS access abstraction (EnhancedSDSClient preferred)
+# SDS access: ObsPy SDSClient ONLY (no processing)
 # =============================================================================
 
-class SDSAccessor:
+class RawObsPySDSAccessor:
     """
-    Read a single day of waveform data from an SDS archive.
+    Read waveform data from an SDS archive using ObsPy's filesystem SDS Client.
 
-    Preference order:
-      1) flovopy EnhancedSDSClient (if importable)
-      2) ObsPy SDS Client (fallback)
+    IMPORTANT:
+    - NO merge
+    - NO detrend/filter/resample/taper
+    - No padding/fill
     """
 
     def __init__(self, sds_root: str):
-        self.sds_root = sds_root
-        self.backend = "unknown"
-        self._enh = None
-        self._obspy_client = None
-
-        # Try EnhancedSDSClient first
-        try:
-            from flovopy.enhanced.enhanced_sds_client import EnhancedSDSClient  # type: ignore
-            self._enh = EnhancedSDSClient(sds_root=sds_root)
-            self.backend = "EnhancedSDSClient"
-            return
-        except Exception:
-            self._enh = None
-
-        # Fallback to ObsPy SDS client
-        try:
-            from obspy.clients.filesystem.sds import Client as SDSClient  # type: ignore
-            self._obspy_client = SDSClient(sds_root)
-            self.backend = "ObsPySDSClient"
-        except Exception as e:
-            raise RuntimeError(
-                "Could not initialize any SDS backend. "
-                "Install/configure flovopy EnhancedSDSClient or ObsPy SDS client."
-            ) from e
-
-    def has_data_for_day(self, year: int, jday: int, net: str, sta: str, loc: str, chan: str) -> bool:
-        if self._enh is not None:
-            try:
-                return bool(self._enh.has_data_for_browser_day(year=str(year), jday=str(jday),
-                                                              net=net, sta=sta, loc=loc, chan=chan))
-            except Exception:
-                # If the helper method misbehaves, just attempt a read.
-                return True
-        # ObsPy SDS client doesn't have "has_data"; we just attempt to read.
-        return True
+        p = Path(sds_root).expanduser()
+        if not p.is_dir():
+            raise OSError(f"SDS root is not a local directory: {p}")
+        self.sds_root = str(p)
+        self.client = SDSClient(self.sds_root)
+        self.backend = "ObsPySDSClient"
 
     def read_day(self, year: int, jday: int, net: str, sta: str, loc: str, chan: str) -> Stream:
-        if self._enh is not None:
-            return self._enh.read_day(
-                net=net, sta=sta, loc=loc, chan=chan,
-                year=str(year), jday=str(jday),
-                merge=0,
-            )
-
-
-        # ObsPy SDS client
         t0 = UTCDateTime(year, julday=jday)
         t1 = t0 + 86400
-        st = self._obspy_client.get_waveforms(
-            network=net, station=sta, location=loc, channel=chan,
-            starttime=t0, endtime=t1
+        st = self.client.get_waveforms(
+            network=net,
+            station=sta,
+            location=loc,
+            channel=chan,
+            starttime=t0,
+            endtime=t1,
         )
-        #if merge:
-        #    st.merge(method=1, fill_value=None)   # or without fill_value if you prefer
+        # RAW: do not merge, do not split, do not detrend, do not filter
         return st
 
 
@@ -239,29 +212,32 @@ class ChannelClassifier:
 
     @staticmethod
     def is_soh(tr) -> bool:
-        # Keep existing convention: Centaur SOH commonly uses location code D0
+        # Centaur SOH commonly uses location code D0
         return getattr(tr.stats, "location", "") == "D0"
 
 
 class StatsComputer:
-    """Compute per-trace window statistics and SOH summaries."""
+    """Compute per-trace window statistics and SOH summaries (read-only)."""
 
     @staticmethod
     def compute_stats(st: Stream, add_soh_description: bool = False) -> pd.DataFrame:
         rows = []
         for tr in st:
-            data = tr.data.astype(float)
+            # Raw stats on raw samples
+            data = np.asarray(tr.data)
             if data.size == 0:
                 continue
+            # Use float for numerical stability only (does not change samples in tr.data)
+            x = data.astype(np.float64, copy=False)
 
             row = {
                 "NET.STA.LOC.CHAN": tr.id,
-                "min": float(np.min(data)),
-                "max": float(np.max(data)),
-                "mean": float(np.mean(data)),
-                "median": float(np.median(data)),
-                # "Centaur-style RMS": deviation from mean
-                "rms_dev": float(np.std(data, ddof=0)),
+                #"min": float(np.min(x)),
+                #"max": float(np.max(x)),
+                "p2p": int(np.max(x)-np.min(x)),
+                #"mean": float(np.mean(x)),
+                "median": int(np.median(x)),
+                "std": int(np.std(x, ddof=0)),  # std about mean
             }
             if add_soh_description:
                 ch = tr.stats.channel.upper()
@@ -279,14 +255,13 @@ class StatsComputer:
         sel = st.select(channel=channel)
         if not sel:
             return None
-        data = sel[0].data.astype(float)
+        data = np.asarray(sel[0].data)
         if data.size == 0:
             return None
-        return float(np.median(data))
+        return float(np.median(data.astype(np.float64, copy=False)))
 
     @classmethod
     def print_soh_human_lines(cls, st_soh_window: Stream) -> None:
-        # GNSS position (deg * 1e6 -> deg)
         med_gla = cls._median_channel_value(st_soh_window, "GLA")
         med_glo = cls._median_channel_value(st_soh_window, "GLO")
         if med_gla is not None and med_glo is not None:
@@ -294,28 +269,24 @@ class StatsComputer:
         else:
             print("Median GNSS position: (GLA/GLO not present in window)")
 
-        # Clock quality
         med_lcq = cls._median_channel_value(st_soh_window, "LCQ")
         if med_lcq is not None:
             print(f"Median clock quality (LCQ): {med_lcq:.2f} %")
         else:
             print("Median clock quality: (LCQ not present)")
 
-        # Satellites used
         med_gns = cls._median_channel_value(st_soh_window, "GNS")
         if med_gns is not None:
             print(f"Median satellites used (GNS): {int(round(med_gns))}")
         else:
             print("Median satellites used: (GNS not present)")
 
-        # Temperature (C*100 -> C)
         med_vdt = cls._median_channel_value(st_soh_window, "VDT")
         if med_vdt is not None:
             print(f"Median digitizer temperature (VDT): {med_vdt/100.0:.2f} °C")
         else:
             print("Median digitizer temperature: (VDT not present)")
 
-        # Mass positions: VM1..VM6 table
         vm_traces = []
         for k in ["VM1", "VM2", "VM3", "VM4", "VM5", "VM6"]:
             sel = st_soh_window.select(channel=k)
@@ -323,10 +294,8 @@ class StatsComputer:
                 vm_traces.append(sel[0])
 
         if len(vm_traces) >= 6:
-            means = [float(np.mean(tr.data.astype(float))) for tr in vm_traces[:6]]
-            # shape as 3x2 for a readable printout
+            means = [float(np.mean(np.asarray(tr.data).astype(np.float64, copy=False))) for tr in vm_traces[:6]]
             table = np.array(means).reshape(3, 2)
-            # Use first three VM channel codes as row labels (keeps it simple)
             idx = [tr.stats.channel for tr in vm_traces[:3]]
             df_vm = pd.DataFrame(table, index=idx, columns=["Sensor A", "Sensor B"])
             print("\nMean mass positions (VM*):")
@@ -340,7 +309,7 @@ class StatsComputer:
 # =============================================================================
 
 class PlotManager:
-    """Manages the persistent waveform plot and optional mass position plot."""
+    """Persistent waveform plot manager (read-only)."""
 
     def __init__(self):
         self.fig = plt.figure(figsize=(12, 8))
@@ -359,28 +328,25 @@ class PlotManager:
             self.fig.canvas.draw()
             self.fig.canvas.flush_events()
             return
-        
-        # Optional: global y scaling across all traces in this window
+
         global_min = None
         global_max = None
-        if same_y_scale and n > 0:
+        if same_y_scale:
             mins = []
             maxs = []
             for tr in st:
-                d = tr.data
-                if d is None or len(d) == 0:
+                d = np.asarray(tr.data)
+                if d.size == 0:
                     continue
                 mins.append(np.min(d))
                 maxs.append(np.max(d))
             if mins and maxs:
                 global_min = float(np.min(mins))
                 global_max = float(np.max(maxs))
-                # Protect against flat lines
                 if global_min == global_max:
                     pad = 1.0 if global_min == 0 else abs(global_min) * 0.1
                     global_min -= pad
                     global_max += pad
-
 
         axes = self.fig.subplots(n, 1, sharex=True)
         if n == 1:
@@ -389,12 +355,13 @@ class PlotManager:
         for ax, tr in zip(axes, st):
             t = tr.times("matplotlib")
             ax.plot(t, tr.data, linewidth=0.8)
-            label = f"{tr.stats.station}.{tr.stats.channel}"
-            ax.set_ylabel(label, rotation=0, labelpad=35, fontsize=9)
+
+            # Full SEED id label (net.sta.loc.chan)
+            ax.set_ylabel(tr.id, rotation=0, labelpad=35, fontsize=8)
+
             self._format_time_axis(ax)
             if same_y_scale and global_min is not None and global_max is not None:
                 ax.set_ylim(global_min, global_max)
-
 
         axes[-1].set_xlabel("Time (UTC)")
         self.fig.suptitle(title)
@@ -414,7 +381,7 @@ class PlotManager:
             print("No VM channels found in the current window.")
             return
 
-        means = {tr.stats.channel: float(np.mean(tr.data.astype(float))) for tr in vm}
+        means = {tr.stats.channel: float(np.mean(np.asarray(tr.data).astype(np.float64, copy=False))) for tr in vm}
 
         fig, ax = plt.subplots(figsize=(8, 4))
         ax.bar(list(means.keys()), list(means.values()))
@@ -456,24 +423,20 @@ class Exporter:
 class SDSBrowser:
     def __init__(self, cfg: BrowserConfig):
         self.cfg = cfg
-        #self.sds = SDSAccessor(cfg.sds_root)
-        self.sds = None
+        self.sds: Optional[RawObsPySDSAccessor] = None
         self.plot = PlotManager()
 
-        # data + state
         self.st_full = Stream()
         self.st_view = Stream()
         self.stats_df = pd.DataFrame()
-        self.day_start = None  # UTCDateTime
-        self.day_end = None    # UTCDateTime
-        self.win = None        # UTCDateTime
+
+        self.day_start: Optional[UTCDateTime] = None
+        self.day_end: Optional[UTCDateTime] = None
+        self.win: Optional[UTCDateTime] = None
         self.win_sec = float(cfg.window_sec)
 
-        # connect events
         self.plot.fig.canvas.mpl_connect("key_press_event", self._on_key)
         self.plot.fig.canvas.mpl_connect("scroll_event", self._on_scroll)
-
-    # ---------- lifecycle ----------
 
     def run(self) -> None:
         self._prompt_initial()
@@ -482,9 +445,10 @@ class SDSBrowser:
         self.menu()
 
     def _prompt_initial(self) -> None:
-        print("\n--- SDS Browser ---")
+        print("\n--- SDS Browser (RAW / ObsPy SDSClient only) ---")
         self.cfg.sds_root = prompt("SDS root", self.cfg.sds_root)
-        self._ensure_sds_accessor()
+        self._ensure_accessor()
+
         self.cfg.net = prompt("Network", self.cfg.net)
         self.cfg.sta = prompt("Station (wildcards ok)", self.cfg.sta)
         self.cfg.loc = prompt("Location (wildcards ok)", self.cfg.loc)
@@ -492,7 +456,6 @@ class SDSBrowser:
         self.cfg.year = prompt("Year (YYYY)", self.cfg.year)
         self.cfg.jday = prompt("Julian day (1-366)", self.cfg.jday)
         self.cfg.start_hhmm = prompt("Start time (HH:MM)", self.cfg.start_hhmm)
-
 
         ws = prompt("Window length (seconds)", str(int(self.cfg.window_sec)))
         try:
@@ -504,29 +467,20 @@ class SDSBrowser:
         if md:
             self.cfg.mode = md
 
-        # persist immediately
         try:
             self.cfg.save()
         except Exception as e:
             print(f"⚠️ Could not save config: {e}")
 
-    def _ensure_sds_accessor(self) -> None:
-        # Loop until we have a valid SDS root/backend
+    def _ensure_accessor(self) -> None:
         while True:
-            sds_root = self.cfg.sds_root
-            if not sds_root:
-                self.cfg.sds_root = prompt("SDS root", self.cfg.sds_root)
-                continue
-
-            p = Path(sds_root).expanduser()
+            p = Path(self.cfg.sds_root).expanduser()
             if not p.is_dir():
                 print(f"❌ SDS root is not a local directory: {p}")
                 self.cfg.sds_root = prompt("SDS root", str(p))
                 continue
-
             try:
-                self.sds = SDSAccessor(str(p))
-                # persist good root
+                self.sds = RawObsPySDSAccessor(str(p))
                 try:
                     self.cfg.save()
                 except Exception:
@@ -534,15 +488,12 @@ class SDSBrowser:
                 print(f"✅ Using SDS backend: {self.sds.backend} at {p}")
                 return
             except Exception as e:
-                print(f"❌ Failed to init SDS backend at {p}: {e}")
+                print(f"❌ Failed to init ObsPy SDSClient at {p}: {e}")
                 self.cfg.sds_root = prompt("SDS root", str(p))
-
-
-    # ---------- loading ----------
 
     def _load_day(self) -> None:
         if self.sds is None:
-            self._ensure_sds_accessor()
+            self._ensure_accessor()
 
         try:
             year, jday = _parse_year_jday(self.cfg.year, self.cfg.jday)
@@ -555,7 +506,6 @@ class SDSBrowser:
         self.day_start = UTCDateTime(year, julday=jday)
         self.day_end = self.day_start + 86400
 
-        # initialise window start from HH:MM (clamped within day)
         try:
             offset = _parse_hhmm(self.cfg.start_hhmm)
         except Exception as e:
@@ -563,46 +513,38 @@ class SDSBrowser:
             offset = 0
             self.cfg.start_hhmm = "00:00"
 
-        self.win = self.day_start + offset
         self.win_sec = max(10.0, float(self.cfg.window_sec))
+        self.win = self.day_start + offset
 
-        # clamp so the window stays within the day
         if self.win < self.day_start:
             self.win = self.day_start
         if self.win + self.win_sec > self.day_end:
             self.win = max(self.day_start, self.day_end - self.win_sec)
 
-
-        # Always attempt the read; don't rely on has_data_for_browser_day() returning True
         try:
             self.st_full = self.sds.read_day(
                 year, jday, self.cfg.net, self.cfg.sta, self.cfg.loc, self.cfg.chan
             )
             if len(self.st_full) == 0:
-                print("⚠️ Read succeeded but returned an empty Stream (check patterns + julday padding).")
+                print("⚠️ Read succeeded but returned an empty Stream (check patterns + jday padding).")
         except Exception as e:
             print(f"⚠️ Failed to read day from SDS ({self.sds.backend}): {e}")
             self.st_full = Stream()
 
-
-        # initialize window state
         if len(self.st_full) == 0:
             self._init_state_empty()
         else:
+            # Keep user's chosen start time; do NOT reset to earliest trace start.
+            # Only clamp to within actual data bounds if needed.
             t0 = min(tr.stats.starttime for tr in self.st_full)
             t1 = max(tr.stats.endtime for tr in self.st_full)
-            # clamp within the day bounds if possible
-            t0 = max(t0, self.day_start)
-            t1 = min(t1, self.day_end)
-            self.win = t0
-            # keep a sane window length
-            self.win_sec = max(10.0, float(self.cfg.window_sec))
-            # ensure the first window doesn't exceed t1
+
+            if self.win < t0:
+                self.win = t0
             if self.win + self.win_sec > t1:
                 self.win = max(t0, t1 - self.win_sec)
 
     def _init_state_empty(self) -> None:
-        # Default to the day boundaries; plotting will show "No channels selected"
         try:
             year, jday = _parse_year_jday(self.cfg.year, self.cfg.jday)
             self.day_start = UTCDateTime(year, julday=jday)
@@ -613,8 +555,6 @@ class SDSBrowser:
             self.day_end = self.day_start + 86400
             self.win = self.day_start
         self.win_sec = max(10.0, float(self.cfg.window_sec))
-
-    # ---------- filtering / refresh ----------
 
     def _filter_stream(self, st: Stream) -> Stream:
         m = (self.cfg.mode or "all").lower()
@@ -642,24 +582,20 @@ class SDSBrowser:
         win_start = self.win
         win_end = self.win + self.win_sec
 
-        # clamp within the day
-        if self.day_start is not None:
-            if win_start < self.day_start:
-                win_start = self.day_start
-                win_end = win_start + self.win_sec
-            if self.day_end is not None and win_end > self.day_end:
-                win_end = self.day_end
-                win_start = max(self.day_start, win_end - self.win_sec)
+        if self.day_start is not None and win_start < self.day_start:
+            win_start = self.day_start
+            win_end = win_start + self.win_sec
+        if self.day_end is not None and win_end > self.day_end:
+            win_end = self.day_end
+            win_start = max(self.day_start, win_end - self.win_sec)
 
-        # slice view
+        # Slice only (trim); no merge/pad/fill
         st_mode = self._filter_stream(self.st_full)
         self.st_view = st_mode.slice(win_start, win_end)
 
-        # stats
         add_desc = (self.cfg.mode.lower() in {"soh", "soh_imp"})
         self.stats_df = StatsComputer.compute_stats(self.st_view, add_soh_description=add_desc)
 
-        # print stats
         title = self._title_line(win_start, win_end)
         print("\n" + "=" * 90)
         print(title)
@@ -668,17 +604,14 @@ class SDSBrowser:
         else:
             print(self.stats_df.to_string(index=False))
 
-        # SOH human lines
         if self.cfg.mode.lower() in {"soh", "soh_imp"}:
             try:
                 StatsComputer.print_soh_human_lines(self.st_view)
             except Exception as e:
                 print(f"⚠️ SOH summary failed: {e}")
 
-        # redraw plot
         self.plot.redraw_waveforms(self.st_view, title, same_y_scale=bool(self.cfg.same_y_scale))
 
-        # keep config in sync
         self.cfg.window_sec = float(self.win_sec)
         try:
             self.cfg.save()
@@ -686,16 +619,15 @@ class SDSBrowser:
             pass
 
     def _title_line(self, win_start: UTCDateTime, win_end: UTCDateTime) -> str:
+        backend = self.sds.backend if self.sds else "ObsPySDSClient"
         return (
-            f"SDS={self.cfg.sds_root} ({self.sds.backend}) | "
+            f"SDS={self.cfg.sds_root} ({backend}) | "
             f"{self.cfg.net}.{self.cfg.sta}.{self.cfg.loc}.{self.cfg.chan} | "
             f"Y{self.cfg.year} J{self.cfg.jday} | "
             f"mode={self.cfg.mode} | "
             f"{win_start.isoformat()} .. {win_end.isoformat()} "
             f"({self.win_sec/60:.1f} min)"
         )
-
-    # ---------- navigation ----------
 
     def _shift_window(self, direction: int) -> None:
         if self.win is None:
@@ -719,8 +651,6 @@ class SDSBrowser:
         self._load_day()
         self.refresh()
 
-    # ---------- matplotlib events ----------
-
     def _on_key(self, event) -> None:
         k = (event.key or "").lower()
         if k in {"left", "right", "up", "down", "[", "]"}:
@@ -738,21 +668,19 @@ class SDSBrowser:
                 self._shift_day(+1)
 
     def _on_scroll(self, event) -> None:
-        # typical matplotlib: scroll up => event.step > 0
         step = getattr(event, "step", 0)
         if step > 0:
             self._shift_window(-1)
         elif step < 0:
             self._shift_window(+1)
 
-    # ---------- menu ----------
-
     def menu(self) -> None:
         outdir = Path.cwd() / "sds_browser_exports"
 
         while True:
+            state = "ON" if self.cfg.same_y_scale else "OFF"
             print(
-                """
+                f"""
 Menu:
   Modes:
     a  all channels
@@ -769,13 +697,13 @@ Menu:
     r  reload current day
 
   Start hour/minute:
-    t set start time (HH:MM)
+    t  set start time (HH:MM)
 
   Window:
     w  set window length (seconds)
 
   Fixed y-scale:
-    y toggle same y-scale (currently: on/off)
+    y  toggle same y-scale (currently: {state})
 
   Query:
     qy change net/sta/loc/chan (keeps year/jday)
@@ -816,7 +744,8 @@ Menu:
                 self.cfg.start_hhmm = prompt("Start time (HH:MM)", self.cfg.start_hhmm)
                 try:
                     offset = _parse_hhmm(self.cfg.start_hhmm)
-                    self.win = self.day_start + offset
+                    if self.day_start is not None:
+                        self.win = self.day_start + offset
                 except Exception as e:
                     print(f"⚠️ Invalid HH:MM: {e}")
                 self.refresh()
@@ -837,8 +766,7 @@ Menu:
                 self.refresh()
             elif c == "qs":
                 self.cfg.sds_root = prompt("SDS root", self.cfg.sds_root)
-                # recreate accessor
-                self.sds = SDSAccessor(self.cfg.sds_root)
+                self._ensure_accessor()
                 self._load_day()
                 self.refresh()
 
@@ -852,10 +780,8 @@ Menu:
 
             elif c == "y":
                 self.cfg.same_y_scale = not bool(self.cfg.same_y_scale)
-                state = "ON" if self.cfg.same_y_scale else "OFF"
-                print(f"Same y-scale: {state}")
+                print(f"Same y-scale: {'ON' if self.cfg.same_y_scale else 'OFF'}")
                 self.refresh()
-
 
             elif c in {"a", "h", "s", "i", "o", "O"}:
                 self.cfg.mode = {
@@ -897,10 +823,6 @@ Menu:
             else:
                 print("Unknown choice. Type '?' for help.")
 
-
-# =============================================================================
-# Main
-# =============================================================================
 
 def main() -> None:
     cfg = BrowserConfig.load()
