@@ -7,29 +7,41 @@
 name: flovopy_plus
 channels:
   - conda-forge
-  - defaults
 dependencies:
   - python=3.12
-  - jupyterlab
-  - obspy
+  - numpy
+  - scipy
   - pandas
-  - pygmt
-  - pytest
-  - sphinx
-  - sqlite
+  - matplotlib
+  - jupyterlab
+  - ipykernel
+
+  - obspy
+  - xarray
+  - netcdf4
+  - scikit-learn
   - tqdm
-  - seaborn
+  - packaging
   - plotly
   - dash
-  - netcdf4
-  - packaging
-  - xarray
-  - scikit-learn
   - mplcursors
-  - pip
+
+  - pygmt
+  - geopandas
   - rasterio
   - gdal
   - whitebox
-  - geopandas
+
+  - pytest
+  - sphinx
+
+  - pip
+  
+  # optional:
+  # - seaborn
+
+  # If you want editable install in one step, uncomment:
+  # - pip:
+  #     - -e .
   #- pip: Better to do this step manually, as in README
   #    - -e /home/thompsong/Developer/flovopy
