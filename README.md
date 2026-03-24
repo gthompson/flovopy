@@ -33,58 +33,6 @@ conda install whitebox
 conda install gdal
 conda install geopandas
 ```
----
-
-## 🚀 Available CLI Tools
-
-(THIS SECTION NEEDS UPDATTING) The following command-line tools are installed with the package:
-
-| Command            | Description                                                                 |
-|--------------------|-----------------------------------------------------------------------------|
-| `run-iceweb`       | Generate RSAM, DRS, and spectrograms from SDS or FDSN waveform sources      |
-| `run-asl`          | Amplitude-based source location (ASL) processing of Seisan database events |
-| `run-seisan2sds`   | Convert Seisan waveform files to SDS archive format                         |
-| `run-fdsn2sds`     | Download FDSN waveform data into SDS archive format                         |
-| `run-sds2rsam`     | Compute RSAM from SDS archive                                                |
-| `run-sds2disp`     | Compute displacement streams from SDS archive                               |
-
-Run any tool with `--help` for full usage.
-
----
-
-## 🧰 Example Usage
-
-(THIS SECTION NEEDS UPDATING)
-
-### `run-iceweb`
-
-```bash
-run-iceweb \
-  --config config/ \
-  --start 2023-01-01T00:00:00 \
-  --end 2023-01-02T00:00:00 \
-  --subnet SHV \
-  --inventory metadata/station.xml \
-  --trace_ids XX.STA..BHZ XX.STA..HHZ
-```
-
-### `run-asl`
-
-```bash
-run-asl \
-  --start 2001-01-01T00:00:00 \
-  --end 2001-01-02T00:00:00 \
-  --subnet SHV \
-  --db MVOE_ \
-  --seisan /data/SEISAN_DB \
-  --inventory metadata/station.xml \
-  --outdir ASL_DB \
-  --Q 23 \
-  --peakf 8.0 \
-  --metric rms \
-  --surfaceWaveSpeed_kms 1.5 \
-  --interactive False
-```
 
 ---
 
@@ -93,16 +41,22 @@ run-asl \
 (SECTION NEEDS UPDATING)
 
 ```text
+bin/                      # Bash scripts
 flovopy/
-├── analysis/             # Amplitude-based source location (ASL)
-├── core/                 # Core utilities: inventory, plotting, simulation
-├── processing/           # RSAM/DRS and signal metrics (SAM)
-├── seisanio/             # Seisan format support and waveform parsing
+├── analysis/             # Miscellaneous analysis tools
+├── asl/                  # Amplitude-based source location (ASL)
+├── core/                 # Core utilities: data pre-processing, robust data loading and saving, response removal, physics
+├── dem/                  # DEM tools mostly for ASL on Montserrat
+├── enhanced/             # Enhanced versions of Trace, Stream, Event, Catalog, sdsclient, plus new EventRate class.
+├── processing/           # Seismic Amplitude Measurement, classification, detection, spectrograms
 ├── sds/                  # SDS archive handling
-├── wrappers/             # CLI entry points and batch wrappers
-├── obsolete/             # Deprecated modules
-├── utils.py              # Shared utility functions
-└── tests/                # Unit tests
+├── seisanio/             # Seisan format support and waveform parsing
+├── stationmetadata/      # Tools for building Inventory objects from NRL and local files for USF or MVO equipment
+├── tutorials/            # Mostly ASL tutorials
+├── sds/                  # SDS archive handling
+├── utils/                # Miscellaneous helper packages
+├── wrappers/             # Various wrappers designed for running FLOVOPY tools on archives
+tests/                    # Unit tests
 ```
 
 ---
@@ -116,18 +70,6 @@ flovopy/
   - `numpy`
   - `pandas`
   - (plus others depending on specific modules)
-
----
-
-## 📖 Documentation
-
-(SECTION NEEDS UPDATING)
-
-Full documentation (under construction) is being developed using Sphinx and will include:
-- API reference
-- Tutorials for real-time observatory pipelines
-- Guides for legacy Seisan data conversion
-- Tools for ASL modeling and seismic/infrasound visualization
 
 ---
 
