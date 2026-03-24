@@ -4,9 +4,9 @@ FLOVOpy is a Python package providing advanced tools for volcano observatories a
 
 ---
 
-## 📦 Installation (via Conda)
+## 📦 Installation (via Conda) on Linux/MacOS
 
-To install FLOVOpy in **editable mode** using a Conda environment:
+To install FLOVOpy and make it available, you can clone the repository, and then build the flovopy_env Conda environment, and then add to your Python path using pip:
 
 ```bash
 # 1. Clone the repository
@@ -15,23 +15,14 @@ cd flovopy
 
 # 2. Create the conda environment from YML. 
 # The flovopy_plus environment contains more packages than we need, but these are generally useful for seismology
-conda env create --name flovopy_plus --file flovopy_plus.yml
-conda activate flovopy_plus
+conda env create --name flovopy_env --file environment.yml
+conda activate flovopy_env
 
 # 3. Install dependencies and the package in editable mode (make sure you are still in the flovopy top directory)
-pip install -e .
+pip install .
 
 # 4. Optionally add this to your .bashrc or .zshrc file:
-conda activate flovopy_plus
-```
-
-Other packages to consider installing for DEMs:
-
-```
-conda install rasterio
-conda install whitebox
-conda install gdal
-conda install geopandas
+conda activate flovopy_env
 ```
 
 ---
