@@ -2,13 +2,33 @@ name: flovopy-env
 channels:
   - conda-forge
 dependencies:
-  - python=3.10
-  - jupyterlab
-  - obspy
-  - pandas
-  - pip
-  - pygmt
-  - pytest
-  - sphinx
-  - sqlite
+  - python=3.12
 
+  # Core scientific stack
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+
+  # Jupyter environment
+  - jupyterlab
+  - ipykernel
+
+  # Seismology
+  - obspy
+
+  # Mapping / geospatial (lightweight baseline)
+  - pygmt
+
+  # Visualization
+  - plotly
+  - seaborn        # if you want quick stats plots
+  - mplcursors     # nice for interactive matplotlib picking
+  - cartopy        # used for Inventory plots but it is heavy
+
+  
+  # Utilities
+  - tqdm
+  - packaging
+
+  - pip
