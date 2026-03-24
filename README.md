@@ -19,7 +19,7 @@ conda env create --name flovopy_env --file environment.yml
 conda activate flovopy_env
 
 # 3. Install dependencies and the package in editable mode (make sure you are still in the flovopy top directory)
-pip install .
+pip install -e .
 
 # 4. Optionally add this to your .bashrc or .zshrc file:
 conda activate flovopy_env
