@@ -25,7 +25,7 @@ pip install -e .
 conda activate flovopy_plus
 ```
 
-Other packages to consider installing, e.g. for DEMs:
+Other packages to consider installing for DEMs:
 
 ```
 conda install rasterio
@@ -37,8 +37,6 @@ conda install geopandas
 ---
 
 ## 📂 Project Structure
-
-(SECTION NEEDS UPDATING)
 
 ```text
 bin/                      # Bash scripts
