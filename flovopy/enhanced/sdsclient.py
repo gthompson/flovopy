@@ -7,7 +7,6 @@ from typing import Iterable, List, Optional, Sequence, Tuple, Set
 from obspy import read, Stream, UTCDateTime
 from obspy.clients.filesystem.sds import Client
 
-
 class EnhancedSDSClient(Client):
     """
     Enhanced SDS Client extending ObsPy's filesystem SDS Client.
@@ -206,7 +205,10 @@ class EnhancedSDSClient(Client):
         merge: int = 0,
     ) -> Stream:
         """
-        Read a full SDS day using ObsPy client.
+        Read one full UTC day from SDS for the given selectors.
+
+        Parameters may include wildcards if supported by the underlying
+        ObsPy SDS client get_waveforms().
         """
         day = UTCDateTime(int(year), julday=int(jday))
         t0, t1 = self.day_bounds(day)
@@ -397,3 +399,186 @@ class EnhancedSDSClient(Client):
         for tr in stream:
             paths.append(self.write_trace(tr, overwrite=overwrite))
         return paths
+
+
+
+    
+    def read_days(
+        self,
+        net: str | Sequence[str] = "*",
+        sta: str | Sequence[str] = "*",
+        loc: str | Sequence[str] = "*",
+        chan: str | Sequence[str] = "*",
+        startday: UTCDateTime | str = None,
+        endday: UTCDateTime | str = None,
+        merge: int = 0,
+        verbose: bool = False,
+    ) -> Stream:
+        """
+        Read one or more full UTC days for the given selectors.
+        """
+        startday = UTCDateTime(startday)
+        endday = UTCDateTime(endday)
+
+        t0 = UTCDateTime(startday.year, julday=startday.julday)
+        t1 = UTCDateTime(endday.year, julday=endday.julday) + 86400
+
+        return self.read(
+            starttime=t0,
+            endtime=t1,
+            net=net,
+            sta=sta,
+            loc=loc,
+            chan=chan,
+            merge=merge,
+            trim=False,     # full days
+            daywise=True,   # explicit
+            verbose=verbose,
+        )
+    
+
+    def read(
+        self,
+        starttime: UTCDateTime | str,
+        endtime: UTCDateTime | str,
+        net: str | Sequence[str] = "*",
+        sta: str | Sequence[str] = "*",
+        loc: str | Sequence[str] = "*",
+        chan: str | Sequence[str] = "*",
+        merge: int = 0,
+        trim: bool = True,
+        daywise: Optional[bool] = None,
+        verbose: bool = False,
+    ) -> Stream:
+        """
+        Read waveform data for an arbitrary time window.
+
+        This is a flexible wrapper around ObsPy SDSClient.get_waveforms() that
+        additionally supports selector lists (e.g. multiple stations) and optional
+        day-wise reading across UTC day boundaries.
+
+        Parameters
+        ----------
+        starttime, endtime
+            Requested time window.
+        net, sta, loc, chan
+            Selectors. Each may be:
+                - a string, including wildcards supported by ObsPy
+                - or a sequence of strings
+            Sequences are expanded as a cartesian product.
+        merge
+            If 0, do not merge after reading.
+            If nonzero, call Stream.merge(method=merge) after concatenation.
+        trim
+            If True, trim final output to exactly [starttime, endtime].
+        daywise
+            If True, read by looping over UTC days and concatenating results.
+            If False, call get_waveforms() directly for the full interval.
+            If None, automatically use day-wise reading only when the request
+            crosses a UTC day boundary.
+        verbose
+            If True, print warnings for failed reads/merges.
+
+        Returns
+        -------
+        Stream
+            Combined Stream of all matching traces.
+        """
+        starttime = UTCDateTime(starttime)
+        endtime = UTCDateTime(endtime)
+
+        if endtime <= starttime:
+            return Stream()
+
+        nets = self._as_list(net)
+        stas = self._as_list(sta)
+        locs = self._as_list(loc)
+        chans = self._as_list(chan)
+
+        if daywise is None:
+            daywise = self._crosses_day_boundary(starttime, endtime)
+
+        st = Stream()
+
+        for n in nets:
+            for s in stas:
+                for l in locs:
+                    for c in chans:
+                        try:
+                            if daywise:
+                                day = UTCDateTime(starttime.year, julday=starttime.julday)
+                                lastday = UTCDateTime(endtime.year, julday=endtime.julday)
+
+                                while day <= lastday:
+                                    try:
+                                        day_st = self.read_day(
+                                            net=n,
+                                            sta=s,
+                                            loc=l,
+                                            chan=c,
+                                            year=day.year,
+                                            jday=day.julday,
+                                            merge=0,
+                                        )
+                                        st += day_st
+                                    except Exception as e:
+                                        if verbose:
+                                            print(
+                                                f"⚠️ Failed {n}.{s}.{l}.{c} "
+                                                f"for {day.year}:{day.julday:03d}: {e}"
+                                            )
+                                    day += 86400
+                            else:
+                                st += self.get_waveforms(
+                                    network=n,
+                                    station=s,
+                                    location=l,
+                                    channel=c,
+                                    starttime=starttime,
+                                    endtime=endtime,
+                                    merge=0,
+                                )
+
+                        except Exception as e:
+                            if verbose:
+                                print(
+                                    f"⚠️ Failed to read {n}.{s}.{l}.{c} "
+                                    f"from {starttime} to {endtime}: {e}"
+                                )
+
+        if trim and len(st):
+            try:
+                st.trim(starttime, endtime)
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️ Trim failed: {e}")
+
+        if len(st) and merge is not None:
+            try:
+                st.merge(method=merge)
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️ Merge failed: {e}")
+
+        return st
+    
+    @staticmethod
+    def _as_list(x) -> List[str]:
+        """
+        Normalize selector input to a list of strings.
+        """
+        if x is None:
+            return ["*"]
+        if isinstance(x, str):
+            return [x]
+        return [str(v) for v in x]
+
+
+    @staticmethod
+    def _crosses_day_boundary(starttime: UTCDateTime, endtime: UTCDateTime) -> bool:
+        """
+        Return True if the time window spans more than one UTC day.
+        """
+        s0 = UTCDateTime(starttime.year, julday=starttime.julday)
+        e0 = UTCDateTime(endtime.year, julday=endtime.julday)
+        return e0 > s0

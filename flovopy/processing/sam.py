@@ -307,22 +307,70 @@ class SAM:
 
             # Base copy once per trace: handle masking, detrend, optional clip
             tr_base = tr.copy()
-            if isinstance(tr_base.data, np.ma.MaskedArray):
-                tr_base.data = tr_base.data.filled(fill_value=0)
+            x = tr_base.data
+
+            # Handle masked data by interpolation, not zero-fill
+            if isinstance(x, np.ma.MaskedArray):
+                x = x.astype(float)
+                mask = np.ma.getmaskarray(x)
+                x = x.filled(np.nan)
+
+                if np.any(mask):
+                    good = ~np.isnan(x)
+                    if np.sum(good) >= 2:
+                        x[mask] = np.interp(np.flatnonzero(mask),
+                                            np.flatnonzero(good),
+                                            x[good])
+                    elif np.sum(good) == 1:
+                        x[mask] = x[good][0]
+                    else:
+                        x[:] = 0.0
+            else:
+                x = np.asarray(x, dtype=float)
+
+            # Optional clipping / despiking
+            if clip is not None:
+                if isinstance(clip, (int, float)):
+                    x = np.clip(x, -clip, clip)
+
+                elif isinstance(clip, (list, tuple)) and len(clip) == 2:
+                    x = np.clip(x, clip[0], clip[1])
+
+                elif isinstance(clip, str):
+                    if clip.lower() == 'mad':
+                        med = np.median(x)
+                        mad = np.median(np.abs(x - med))
+                        if mad > 0:
+                            modified_z = 0.6745 * (x - med) / mad
+                            bad = np.abs(modified_z) > 3.5
+                            if np.any(bad):
+                                good = ~bad
+                                if np.sum(good) >= 2:
+                                    x[bad] = np.interp(np.flatnonzero(bad),
+                                                    np.flatnonzero(good),
+                                                    x[good])
+                                elif np.sum(good) == 1:
+                                    x[bad] = x[good][0]
+                                else:
+                                    x[:] = med
+
+                    elif clip.lower() == 'auto':
+                        upper = np.percentile(x, 99.9)
+                        lower = np.percentile(x, 0.1)
+                        x = np.clip(x, lower, upper)
+
+            tr_base.data = x
+
+            # Detrend after despiking
             try:
                 tr_base.detrend('demean')
             except Exception as e:
                 if verbose:
                     print(f"{tr.id}: detrend failed ({e})")
                 continue
-            if clip is not None:
-                try:
-                    tr_base.data = np.clip(tr_base.data, a_min=-clip, a_max=clip)
-                except Exception as e:
-                    if verbose:
-                        print(f"{tr.id}: clip failed ({e})")
-                    continue
-            tr_base.data = np.asarray(tr_base.data, dtype=float)
+
+            # Small taper helps prevent filter startup artifacts
+            tr_base.taper(max_percentage=0.01, type='cosine')
 
             # Window timestamps (left edge = min timestamp per window)
             t_epoch = tr.times('timestamp')
