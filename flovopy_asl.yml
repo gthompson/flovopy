@@ -1,0 +1,102 @@
+name: flovopy_asl
+
+channels:
+  - conda-forge
+
+dependencies:
+  # ---------------------------------------------------------------------------
+  # Python and packaging
+  # Core interpreter plus packaging/build utilities needed by some libraries
+  # and for local development / editable installs.
+  # ---------------------------------------------------------------------------
+  - python=3.12
+  - pip
+  - setuptools
+  - packaging
+  - pyyaml
+
+  # ---------------------------------------------------------------------------
+  # General utilities
+  # Lightweight helper libraries for HTTP requests, progress bars, system
+  # monitoring, and nicer terminal table output.
+  # ---------------------------------------------------------------------------
+  - requests
+  - tqdm
+  - psutil
+  - tabulate
+
+  # ---------------------------------------------------------------------------
+  # Core scientific Python stack
+  # Numerical arrays, scientific routines, tabular data handling, standard
+  # plotting, labeled N-D arrays, and NetCDF support.
+  # ---------------------------------------------------------------------------
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - xarray
+  - netcdf4
+
+  # ---------------------------------------------------------------------------
+  # Statistics and machine learning
+  # Useful for feature analysis, regression, clustering, classification,
+  # and exploratory modelling.
+  # ---------------------------------------------------------------------------
+  - statsmodels
+  - scikit-learn
+
+  # ---------------------------------------------------------------------------
+  # Jupyter and interactive notebook environment
+  # Tools for notebooks, kernels, and interactive widgets in JupyterLab.
+  # ---------------------------------------------------------------------------
+  - jupyterlab
+  - notebook
+  - ipykernel
+  - ipywidgets
+
+  # ---------------------------------------------------------------------------
+  # Seismology / waveform processing
+  # Primary seismological toolkit used by FLOVOpy.
+  # ---------------------------------------------------------------------------
+  - obspy=1.5.*
+
+  # ---------------------------------------------------------------------------
+  # Mapping and geospatial analysis
+  # PyGMT/GMT for cartographic output; Cartopy and the GeoPandas stack for
+  # vector/raster geospatial analysis and map-based workflows.
+  # ---------------------------------------------------------------------------
+  - pygmt
+  - gmt
+  - cartopy
+  - geopandas
+  - shapely
+  - pyproj
+  - rasterio
+  - rioxarray
+  - gdal
+  - fiona
+  - whitebox
+
+  # ---------------------------------------------------------------------------
+  # Visualization and dashboarding
+  # Interactive plotting, dashboard apps, statistical graphics, and cursor
+  # tools for interactive matplotlib work.
+  # ---------------------------------------------------------------------------
+  - plotly
+  - dash
+  - seaborn
+  - mplcursors
+
+  # ---------------------------------------------------------------------------
+  # File I/O and spreadsheet support
+  # Useful for reading/writing Excel files and working with tabular metadata.
+  # ---------------------------------------------------------------------------
+  - openpyxl
+
+  # ---------------------------------------------------------------------------
+  # Testing and documentation
+  # Tools for unit testing and building package documentation.
+  # ---------------------------------------------------------------------------
+  - pytest
+  - sphinx
+  - myst-parser

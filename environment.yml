@@ -1,34 +1,38 @@
-name: flovopy_env
+name: flovopy_core
 channels:
   - conda-forge
 dependencies:
+  # ---------------------------------------------------------------------------
+  # Python and packaging
+  # ---------------------------------------------------------------------------
   - python=3.12
+  - pip
+  - setuptools
+  - packaging
+  - pyyaml
 
+  # ---------------------------------------------------------------------------
   # Core scientific stack
+  # Essential numerical + data handling tools
+  # ---------------------------------------------------------------------------
   - numpy
   - scipy
   - pandas
   - matplotlib
 
-  # Jupyter environment
+  # ---------------------------------------------------------------------------
+  # Seismology
+  # Primary dependency for waveform processing
+  # ---------------------------------------------------------------------------
+  - obspy=1.5.*
+
+  # ---------------------------------------------------------------------------
+  # Jupyter (for teaching + notebooks)
+  # ---------------------------------------------------------------------------
   - jupyterlab
   - ipykernel
 
-  # Seismology
-  - obspy
-
-  # Mapping / geospatial (lightweight baseline)
-  - pygmt
-
-  # Visualization
-  - plotly
-  - seaborn        # if you want quick stats plots
-  - mplcursors     # nice for interactive matplotlib picking
-  - cartopy        # used for Inventory plots but it is heavy
-
-  
-  # Utilities
+  # ---------------------------------------------------------------------------
+  # Utilities (lightweight, widely useful)
+  # ---------------------------------------------------------------------------
   - tqdm
-  - packaging
-
-  - pip
