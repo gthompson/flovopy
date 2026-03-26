@@ -1,149 +1,48 @@
+# =============================================================================
+# Standard library
+# =============================================================================
 import os
 import glob
+import fnmatch
 import math
 import struct
+import re
+#import argparse
+
+# =============================================================================
+# Scientific Python stack
+# =============================================================================
 import numpy as np
 import pandas as pd
+
+# =============================================================================
+# Plotting
+# =============================================================================
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from obspy.geodetics.base import gps2dist_azimuth
-import fnmatch
-from obspy import Trace, Stream, UTCDateTime
 
+# =============================================================================
+# ObsPy
+# =============================================================================
+from obspy.core import Stream, Trace, UTCDateTime
+#from obspy.clients.fdsn import Client
+from obspy.geodetics.base import gps2dist_azimuth
+
+# =============================================================================
+# flovopy core utilities
+# =============================================================================
+from flovopy.core.trace_utils import sanitize_stream, fix_trace_id
+
+# =============================================================================
+# flovopy physics (magnitude & energy conversions)
+# =============================================================================
+from flovopy.core.physics import (
+    magnitude2Eseismic, Eseismic2magnitude, # magnitude & energy conversions
+    geom_spread_amp, inelastic_amp, total_amp_correction, # amplitude corrections
+    geom_spread_energy, inelastic_energy, total_energy_correction, # energy corrections
+)
 
 class SAM:
-    '''
-    def __init__(self, dataframes=None, stream=None, sampling_interval=60.0, filter=[0.5, 18.0], bands = {'VLP': [0.02, 0.2], 'LP':[0.5, 4.0], 'VT':[4.0, 18.0]}, corners=4, clip=None, verbose=False, squash_nans=False):
-        """ Create an SAM object 
-        
-            Optional name-value pairs:
-                dataframes: Create an SAM object using these dataframes. Used by downsample() method, for example. Default: None.
-                stream: Create an SAM object from this ObsPy.Stream object.
-                sampling_interval: Compute SAM data using this sampling interval (in seconds). Default: 60
-                filter: list of two floats, representing fmin and fmax. Default: [0.5, 18.0]. Set to None if no filter wanted.
-                bands: a dictionary of filter bands and corresponding column names. Default: {'VLP': [0.02, 0.2], 'LP':[0.5, 4.0], 
-                    'VT':[4.0, 18.0]}. For example, the default setting creates 3 additional columns for each DataFrame called 
-                    'VLP', 'LP', and 'VT', which contain the mean value for each sampling_interval within the specified filter band
-                    (e.g. 0.02-0.2 Hz for VLP). If 'LP' and 'VT' are in this dictionary, an extra column called 'fratio' will also 
-                    be computed, which is the log2 of the ratio of the 'VT' column to the 'LP' column, following the definition of
-                    frequency ratio by Rodgers et al. (2015).
-                corners: number of corners to use in filters
-                clip: [min, max] level to use for clipping data. default: None
-                verbose: default False
-                squash_nans: new behaviour is that if any time window contains a NaN, the whole time window for all metrics will be NaN.
-                             if squash_nans=True, then old behaviour restored, where NaNs stripped before computing each metric by using nan-aware averaging functions
-        """
-        self.dataframes = {} 
-
-        if isinstance(dataframes, dict):
-            good_dataframes = {}
-            for id, df in dataframes.items():
-                if isinstance(df, pd.DataFrame):
-                    good_dataframes[id]=df
-            if len(good_dataframes)>0:
-                self.dataframes = good_dataframes
-                #print('dataframes found. ignoring other arguments.')
-                return
-            else:
-                #print('no valid dataframes found')
-                pass
-
-        if not isinstance(stream, Stream):
-            # empty SAM object
-            print('creating blank SAM object')
-            return
-        
-        #good_stream = self.check_units(stream)
-        good_stream = stream
-        if verbose:
-            print('good_stream:\n',good_stream)
-
-        if len(good_stream)>0:
-            if good_stream[0].stats.sampling_rate == 1/sampling_interval:
-                # no downsampling to do
-                for tr in good_stream:
-                    df = pd.DataFrame()
-                    df['time'] = pd.Series(tr.times('timestamp'))
-                    df['mean'] = pd.Series(tr.data) 
-                    self.dataframes[tr.id] = df
-                return 
-            elif good_stream[0].stats.sampling_rate < 1/sampling_interval:
-                print('error: cannot compute SAM for a Stream with a tr.stats.delta bigger than requested sampling interval')
-                return
-            
-        for tr in good_stream:
-            if tr.stats.npts < tr.stats.sampling_rate * sampling_interval:
-                print('Not enough samples for ',tr.id,'. Skipping.')
-                continue
-            #print(tr.id, 'absolute=',absolute)
-            df = pd.DataFrame()
-            
-            t = tr.times('timestamp') # Unix epoch time
-            sampling_rate = tr.stats.sampling_rate
-            t = self.reshape_trace_data(t, sampling_rate, sampling_interval)
-            df['time'] = pd.Series(np.nanmin(t,axis=1))
-
-            if filter:
-                if tr.stats.sampling_rate<filter[1]*2.2:
-                    print(f"{tr}: bad sampling rate. Skipping.")
-                    continue
-                tr2 = tr.copy()
-                try:
-                    tr2.detrend('demean')
-                except Exception as e: # sometimes crashes here because tr2.data is a masked array
-                    print(e)
-                    if isinstance(tr2.data, np.ma.MaskedArray):
-                        try:
-                            m = np.ma.getmask(tr2.data)
-                            tr2.data = tr2.data.filled(fill_value=0)
-                            tr2.detrend('demean')
-                            tr2.data = tr2.data.filled(fill_value=0)
-                        except Exception as e2:
-                            print(e2)
-                            continue
-                    else: # not a masked array
-                        continue
-                        
-                if clip:
-                    tr2.data = np.clip(tr2.data, a_max=clip, a_min=-clip)    
-                tr2.filter('bandpass', freqmin=filter[0], freqmax=filter[1], corners=corners)
-                y = tr2.data
-                #y = self.reshape_trace_data(np.absolute(tr2.data), sampling_rate, sampling_interval)
-            else:
-                y = tr.data
-            y = y.astype('float')
-            y[y == 0.0] = np.nan
-            y = self.reshape_trace_data(np.absolute(y), sampling_rate, sampling_interval)
-
-            if squash_nans:
-                df['min'] = pd.Series(np.nanmin(y,axis=1))   
-                df['mean'] = pd.Series(np.nanmean(y,axis=1)) 
-                df['max'] = pd.Series(np.nanmax(y,axis=1))
-                df['median'] = pd.Series(np.nanmedian(y,axis=1))
-                df['rms'] = pd.Series(np.nanstd(y,axis=1))
-            else:
-                df['min'] = pd.Series(np.min(y,axis=1))   
-                df['mean'] = pd.Series(np.mean(y,axis=1)) 
-                df['max'] = pd.Series(np.max(y,axis=1))
-                df['median'] = pd.Series(np.median(y,axis=1))
-                df['rms'] = pd.Series(np.std(y,axis=1))
-            if bands:
-                for key in bands:
-                    tr2 = tr.copy()
-                    [flow, fhigh] = bands[key]
-                    tr2.filter('bandpass', freqmin=flow, freqmax=fhigh, corners=corners)
-                    y = self.reshape_trace_data(np.absolute(tr2.data), sampling_rate, sampling_interval)
-                    if squash_nans:
-                        df[key] = pd.Series(np.nanmean(y,axis=1))
-                    else:
-                        df[key] = pd.Series(np.mean(y,axis=1))
-                if 'LP' in bands and 'VT' in bands:
-                    df['fratio'] = np.log2(df['VT']/df['LP'])
-
-            df.replace(0.0, np.nan, inplace=True)
-            self.dataframes[tr.id] = df
-    '''
-
 
     def __init__(self,
                  dataframes=None,
@@ -152,9 +51,9 @@ class SAM:
                  filter=[0.5, 18.0],
                  bands={'VLP': [0.02, 0.2], 'LP': [0.5, 4.0], 'VT': [4.0, 18.0]},
                  corners: int = 4,
-                 clip=None,
+                 despike: bool = False,
                  verbose: bool = False,
-                 squash_nans: bool = False):
+                 ):
         """
         Initialize a Seismic Amplitude Measurement (SAM) object.
 
@@ -184,13 +83,10 @@ class SAM:
             Set to None or empty dict to skip band-specific metrics.
         corners : int, default=4
             Number of corners for all bandpass filters (Butterworth design).
-        clip : float or None, optional
-            If given, clip all trace data to ±`clip` before filtering/metrics.
+        despike: bool, default=False
+            If True, apply despiking to all trace data before filtering/metrics.
         verbose : bool, default=False
             If True, print progress messages and diagnostic information.
-        squash_nans : bool, optional (deprecated)
-            Ignored; retained for backward compatibility. All metrics are always
-            computed using NaN-aware reducers (`np.nanmin`, `np.nanmean`, etc.).
 
         Notes
         -----
@@ -248,11 +144,6 @@ class SAM:
             print('creating blank SAM object')
             return
 
-        # Deprecation notice (printed once per call)
-        if 'squash_nans' in SAM.__init__.__code__.co_varnames:
-            if squash_nans is not None:
-                print("NOTE: 'squash_nans' is deprecated; SAM now always uses NaN-aware reducers.")
-
         # Defensive copy of mutable defaults
         filt = None if filter is None else [float(filter[0]), float(filter[1])]
         band_dict = None if bands is None else {str(k): [float(v[0]), float(v[1])] for k, v in bands.items()}
@@ -268,7 +159,6 @@ class SAM:
                 break
         if not has_tag:
             try:
-                from flovopy.core.trace_utils import sanitize_stream
                 sanitize_stream(st, drop_empty=True, drop_duplicates=True,
                                 unmask_short_zeros=True, min_gap_duration_s=1.0)
             except Exception as e:
@@ -328,36 +218,19 @@ class SAM:
             else:
                 x = np.asarray(x, dtype=float)
 
-            # Optional clipping / despiking
-            if clip is not None:
-                if isinstance(clip, (int, float)):
-                    x = np.clip(x, -clip, clip)
+            # Optional despiking
+            if despike:
+                x, despike_info = self._apply_despike(
+                    x,
+                    despike=despike,
+                    z=6.0,
+                    window=9,
+                    max_run=2,
+                    fill_method='interp',
+                )
 
-                elif isinstance(clip, (list, tuple)) and len(clip) == 2:
-                    x = np.clip(x, clip[0], clip[1])
-
-                elif isinstance(clip, str):
-                    if clip.lower() == 'mad':
-                        med = np.median(x)
-                        mad = np.median(np.abs(x - med))
-                        if mad > 0:
-                            modified_z = 0.6745 * (x - med) / mad
-                            bad = np.abs(modified_z) > 3.5
-                            if np.any(bad):
-                                good = ~bad
-                                if np.sum(good) >= 2:
-                                    x[bad] = np.interp(np.flatnonzero(bad),
-                                                    np.flatnonzero(good),
-                                                    x[good])
-                                elif np.sum(good) == 1:
-                                    x[bad] = x[good][0]
-                                else:
-                                    x[:] = med
-
-                    elif clip.lower() == 'auto':
-                        upper = np.percentile(x, 99.9)
-                        lower = np.percentile(x, 0.1)
-                        x = np.clip(x, lower, upper)
+                if verbose:
+                    print(f"{tr_base.id}: {despike_info}")
 
             tr_base.data = x
 
@@ -447,124 +320,7 @@ class SAM:
         selfcopy = self.__class__(stream=Stream())
         selfcopy.dataframes = self.dataframes.copy()
         return selfcopy
-    
-    def despike_old(self, metrics=['mean'], thresh=1.5, reps=1, verbose=False):
-        if not isinstance(metrics, list):
-            metrics = [metrics]
-        if metrics=='all':
-            metrics = self.get_metrics()
-        for metric in metrics:
-            st = self.to_stream(metric=metric)
-            for tr in st:
-                x = tr.data
-                count1 = 0
-                count2 = 0
-                for i in range(len(x)-3): # remove spikes on length 2
-                    if x[i+1]>x[i]*thresh and x[i+2]>x[i]*thresh and x[i+1]>x[i+3]*thresh and x[i+2]>x[i+3]*thresh:
-                        count2 += 1
-                        x[i+1] = (x[i] + x[i+3])/2
-                        x[i+2] = x[i+1]
-                for i in range(len(x)-2): # remove spikes of length 1
-                    if x[i+1]>x[i]*thresh and x[i+1]>x[i+2]*thresh:
-                        x[i+1] = (x[i] + x[i+2])/2  
-                        count1 += 1  
-                if verbose:
-                    print(f'{tr.id}: removed {count2} length-2 spikes and {count1} length-1 spikes')           
-                self.dataframes[tr.id][metric]=x
-        if reps>1:
-            self.despike(metrics=metrics, thresh=thresh, reps=reps-1)     
 
-    def despike(self, metrics=['mean'], z=6.0, window=9, inplace=True, verbose=False):
-        """
-        MAD-based despike on SAM time-series metrics.
-        - metrics: list or 'all' to target all numeric metric columns present in dataframes
-        - z: modified z-score threshold (typical: 5–8)
-        - window: odd integer rolling window length (samples)
-        - inplace: modify this SAM or return a new one
-        """
-        if not isinstance(metrics, list):
-            metrics = [metrics]
-
-        out = {} if not inplace else self.dataframes
-        for tid, df in self.dataframes.items():
-            d = df.copy() if not inplace else df
-
-            # figure out which columns to touch
-            if metrics == ['all']:
-                cols = [c for c in d.columns if c not in ('time', 'date')]
-            else:
-                cols = [c for c in metrics if c in d.columns]
-
-            if not cols:
-                if verbose:
-                    print(f"{tid}: no matching metric columns")
-                if not inplace:
-                    out[tid] = d
-                continue
-
-            # ensure datetime for resampling use elsewhere
-            if 'date' not in d.columns:
-                d['date'] = pd.to_datetime(d['time'], unit='s')
-
-            # rolling center median/MAD
-            for col in cols:
-                x = d[col].astype(float).values
-                if np.all(np.isnan(x)) or len(x) < max(5, window):
-                    continue
-
-                s = pd.Series(x)
-                med = s.rolling(window=window, center=True, min_periods=3).median()
-                # MAD with rolling window
-                abs_dev = (s - med).abs()
-                mad = abs_dev.rolling(window=window, center=True, min_periods=3).median()
-
-                # modified z-score (0.6745 * |x - med| / MAD)
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    mz = 0.6745 * abs_dev / mad
-                spikes = mz > z
-
-                # replace spikes with rolling median
-                x_new = x.copy()
-                x_new[spikes.values] = med.values[spikes.values]
-                d[col] = x_new
-
-                if verbose:
-                    n_spikes = int(np.nansum(spikes.values))
-                    print(f"{tid}.{col}: replaced {n_spikes} spikes (z>{z})")
-
-            if not inplace:
-                out[tid] = d
-
-        if inplace:
-            return self
-        else:
-            return self.__class__(dataframes=out)   
-
-    def downsample_old(self, new_sampling_interval=3600):
-        ''' downsample an SAM object to a larger sampling interval(e.g. from 1 minute to 1 hour). Returns a new SAM object.
-         
-            Optional name-value pair:
-                new_sampling_interval: the new sampling interval (in seconds) to downsample to. Default: 3600
-        '''
-
-        dataframes = {}
-        for id in self.dataframes:
-            df = self.dataframes[id]
-            df['date'] = pd.to_datetime(df['time'], unit='s')
-            old_sampling_interval = self.get_sampling_interval(df)
-            if new_sampling_interval > old_sampling_interval:
-                freq = '%.0fmin' % (new_sampling_interval/60)
-                try:
-                    new_df = df.groupby(pd.Grouper(key='date', freq=freq)).mean()
-                    new_df.reset_index(drop=True)
-                except:
-                    print(f'Could not downsample dataframe for {id}')
-                else:
-                    dataframes[id] = new_df
-            else:
-                print('Cannot downsample to a smaller sampling interval')
-        return self.__class__(dataframes=dataframes) 
-    
     def downsample(self, new_sampling_interval=3600, inplace=False):
         """
         Downsample SAM metrics to a coarser interval (seconds).
@@ -587,7 +343,7 @@ class SAM:
                     result[tid] = d
                 continue
             # resample
-            freq = f"{int(new_sampling_interval)}S"  # seconds
+            freq = f"{int(new_sampling_interval)}s"  # seconds
             # numeric aggregation only; leave non-numeric alone
             numeric = d.select_dtypes(include='number').copy()
             # Ensure 'time' isn't used as numeric input
@@ -623,8 +379,6 @@ class SAM:
     def ffm(self):
         # To do. 1/RSAM plots and work out where intersect y-axis.
         pass
-
-
 
     def get_distance_km(self, inventory, source, use_elevation: bool = True):
         """
@@ -700,148 +454,204 @@ class SAM:
             distance_km[seed_id] = dist_m / 1000.0
 
         return distance_km, coordinates
+    
 
-    def __len__(self):
-        return len(self.dataframes)
-    '''
-    def plot(self, metrics=['mean'], kind='stream', logy=False, equal_scale=False, outfile=None, ylims=None):
-        """ plot a SAM object 
-
-            Optional name-value pairs:
-                metrics: The columns of each SAM DataFrame to plot. Can be one (scalar), or many (a list)
-                         If metrics='bands', this is shorthand for metrics=['VLP', 'LP', 'VT', 'specratio']
-                         Default: metrics='mean'
-                kind:    The kind of plot to make. kind='stream' (default) will convert each of the request 
-                         DataFrame columns into an ObsPy.Stream object, and then use the ObsPy.Stream.plot() method.
-                         kind='line' will render plots directly using matplotlib.pyplot, with all metrics requested 
-                         on a single plot.
-                logy:    In combination with kind='line', will make the y-axis logarithmic. No effect if kind='stream'.
-                equal_scale: If True, y-axes for each plot will have same limits. Default: False.
-        
+    @staticmethod
+    def _apply_clip(x, clip=None):
         """
-        self.__remove_empty()
-        if isinstance(metrics, str):
-            metrics = [metrics]
-        if kind == 'stream':
-            if metrics == ['bands']:
-                metrics = ['VLP', 'LP', 'VT', 'fratio']
-            for m in metrics:
-                print('METRIC: ',m)
-                st = self.to_stream(metric=m, ylims=ylims)
-                if outfile:
-                    if not m in outfile:
-                        this_outfile = outfile.replace('.png', f"_{m}.png")
-                        st.plot(equal_scale=equal_scale, outfile=this_outfile);
-                    else:
-                        st.plot(equal_scale=equal_scale, outfile=outfile);
-                else:
-                    st.plot(equal_scale=equal_scale);
-            return
-        for key in self.dataframes:
-            df = self.dataframes[key]
-            this_df = df.copy()
-            this_df['time'] = pd.to_datetime(df['time'], unit='s')
-            if isinstance(ylims, list) or isinstance(ylims, tuple):
-                for m in metrics:
-                    this_df[m] = this_df[m].clip(lower=ylims[0], upper=ylims[1])
-            if metrics == ['bands']:
-                # plot f-bands only
-                if not 'VLP' in this_df.columns:
-                    print('no frequency bands data for ',key)
-                    continue
-                ph2 = this_df.plot(x='time', y=['VLP', 'LP', 'VT'], kind=kind, title=f"{key}, f-bands", logy=logy, rot=45)
-                if outfile:
-                    this_outfile = outfile.replace('.png', "_bands.png")
-                    plt.savefig(this_outfile)
-                else:
-                    plt.show()
-            else:
-                for m in metrics:
-                    got_all_metrics = True
-                    if not m in this_df.columns:
-                        print(f'no {m} column for {key}')
-                        got_all_metrics = False
-                if not got_all_metrics:
-                    continue
-                if kind == 'line':
-                    ph = this_df.plot(x='time', y=metrics, kind=kind, title=key, logy=logy, rot=45)
-                elif kind  == 'scatter':
-                    fh, ax = plt.subplots(nrows=2, ncols=1, sharex=True, sharey=False)
-                    for i, m in enumerate(metrics):
-                        this_df.plot(x='time', y=m, kind=kind, ax=ax[i], title=key, logy=logy, rot=45)
-                if outfile:
-                    this_outfile = outfile.replace('.png', "_metrics.png")
-                    plt.savefig(this_outfile)
-                else:
-                    plt.show()
-            plt.close('all')
+        Apply explicit hard clipping only.
+        """
+        import numpy as np
+
+        x = np.asarray(x, dtype=float).copy()
+
+        if clip is None:
+            return x, {'mode': None, 'changed': False}
+
+        if isinstance(clip, (int, float)):
+            lo, hi = -float(clip), float(clip)
+            x2 = np.clip(x, lo, hi)
+            return x2, {'mode': 'scalar', 'changed': np.any(x2 != x), 'clip': (lo, hi)}
+
+        if isinstance(clip, (list, tuple)) and len(clip) == 2:
+            lo, hi = float(clip[0]), float(clip[1])
+            x2 = np.clip(x, lo, hi)
+            return x2, {'mode': 'tuple', 'changed': np.any(x2 != x), 'clip': (lo, hi)}
+
+        raise ValueError("clip must be None, scalar, or (lo, hi)")
     
     @classmethod
-    def read(classref, startt, endt, SAM_DIR, trace_ids=None, network='*', sampling_interval=60, ext='pickle', verbose=False):
-        """ read one or many SAM files from folder specified by SAM_DIR for date/time range specified by startt, endt
-            return corresponding SAM object
-
-            startt and endt must be ObsPy.UTCDateTime data types
-
-            Optional name-value pairs:
-                trace_ids (list): only load SAM files corresponding to these trace IDs.
-                network (str): only load SAM files matching this network code. Ignored if trace_ids given.
-                sampling_interval (int): seconds of raw seismic data corresponding to each SAM sample. Default: 60
-                ext (str): should be 'csv' or 'pickle' (default). Indicates what type of file format to open.
-
+    def _apply_despike(cls, x, despike=None, **kwargs):
         """
-        #self = classref() # blank SAM object
-        dataframes = {}
+        Apply despiking to a 1-D array.
 
-        if not trace_ids: # make a list of possible trace_ids, regardless of year
-            trace_ids = []
-            for year in range(startt.year, endt.year+1):
-                samfilepattern = classref.get_filename(SAM_DIR, network, year, sampling_interval, ext)
-                #print(samfilepattern)
-                samfiles = glob.glob(samfilepattern)
-                if len(samfiles)==0:
-                    if verbose:
-                        print(f'No files found matching {samfilepattern}')
-                #samfiles = glob.glob(os.path.join(SAM_DIR,'SAM_*_[0-9][0-9][0-9][0-9]_%ds.%s' % (sampling_interval, ext )))
-                for samfile in samfiles:
-                    parts = samfile.split('_')
-                    trace_ids.append(parts[-3])
-            trace_ids = list(set(trace_ids)) # makes unique
-            #print(trace_ids)
-        
-        for id in trace_ids:
-            df_list = []
-            for yyyy in range(startt.year, endt.year+1):
-                samfile = classref.get_filename(SAM_DIR, id, yyyy, sampling_interval, ext)
-                #samfile = os.path.join(SAM_DIR,'SAM_%s_%4d_%ds.%s' % (id, yyyy, sampling_interval, ext))
-                if os.path.isfile(samfile):
-                    if verbose:
-                        print('Reading ',samfile)
-                    if ext=='csv':
-                        df = pd.read_csv(samfile, index_col=False)
-                    elif ext=='pickle':
-                        df = pd.read_pickle(samfile)
-                    if df.empty:
-                        continue
-                    if 'std' in df.columns:
-                        df.rename(columns={'std':'rms'}, inplace=True)
-                    df['pddatetime'] = pd.to_datetime(df['time'], unit='s')
-                    # construct Boolean mask
-                    mask = df['pddatetime'].between(startt.isoformat(), endt.isoformat())
-                    # apply Boolean mask
-                    subset_df = df[mask]
-                    subset_df = subset_df.drop(columns=['pddatetime'])
-                    df_list.append(subset_df)
-                else:
-                    print(f"Cannot find {samfile}")
-            if len(df_list)==1:
-                dataframes[id] = df_list[0]
-            elif len(df_list)>1:
-                dataframes[id] = pd.concat(df_list)
-                
-        samObj = classref(dataframes=dataframes) # create SAM object         
-        return samObj
-    '''
+        Parameters
+        ----------
+        x : array-like
+            Input data.
+        despike : None, bool, str, or dict
+            Supported values:
+            - None / False : do nothing
+            - True / 'rolling_mad' : use rolling MAD despiker
+            - 'global_mad' : use global MAD despiker
+            - dict : must include key 'method'
+
+        Returns
+        -------
+        x_out : np.ndarray
+        info : dict
+        """
+        if despike is None or despike is False:
+            return x, {'mode': None, 'changed': False}
+
+        if despike is True:
+            x_out, info = cls._despike_array(x, **kwargs)
+            info['mode'] = 'rolling_mad'
+            return x_out, info
+
+        if isinstance(despike, str):
+            mode = despike.lower()
+
+            if mode == 'rolling_mad':
+                x_out, info = cls._despike_array(x, **kwargs)
+                info['mode'] = 'rolling_mad'
+                return x_out, info
+
+            if mode == 'global_mad':
+                x_out, info = cls._despike_array_global_mad(x, **kwargs)
+                info['mode'] = 'global_mad'
+                return x_out, info
+
+            raise ValueError("despike must be None, True, 'rolling_mad', 'global_mad', or dict")
+
+        if isinstance(despike, dict):
+            params = despike.copy()
+            mode = params.pop('method', 'rolling_mad').lower()
+
+            if mode == 'rolling_mad':
+                x_out, info = cls._despike_array(x, **params)
+                info['mode'] = 'rolling_mad'
+                return x_out, info
+
+            if mode == 'global_mad':
+                x_out, info = cls._despike_array_global_mad(x, **params)
+                info['mode'] = 'global_mad'
+                return x_out, info
+
+            raise ValueError("despike['method'] must be 'rolling_mad' or 'global_mad'")
+
+        raise ValueError("despike must be None, True, str, or dict")
+
+    @staticmethod
+    def _despike_array(x, z=6.0, window=9, max_run=2,
+                    fill_method='interp', mad_floor=1e-12):
+        """
+        Despike a 1-D array using a rolling median + rolling MAD.
+
+        Parameters
+        ----------
+        x : array-like
+            Input 1-D data.
+        z : float
+            Modified z-score threshold. Typical values: 5-8.
+        window : int
+            Rolling window length in samples. Will be forced odd.
+        max_run : int
+            Maximum consecutive flagged samples to replace. Longer runs are left
+            alone, since they may represent real transient signal.
+        fill_method : {'interp', 'median'}
+            How to replace flagged samples.
+        mad_floor : float
+            Minimum MAD to avoid division by zero.
+
+        Returns
+        -------
+        x_out : np.ndarray
+            Despiked copy of x.
+        info : dict
+            Diagnostics.
+        """
+        import numpy as np
+        import pandas as pd
+
+        x = np.asarray(x, dtype=float).copy()
+
+        if x.ndim != 1:
+            raise ValueError("x must be 1-D")
+
+        if x.size < max(window, 5):
+            return x, {'changed': False, 'n_bad': 0, 'reason': 'too_short'}
+
+        if window % 2 == 0:
+            window += 1
+
+        s = pd.Series(x)
+
+        med = s.rolling(window=window, center=True, min_periods=3).median()
+        abs_dev = (s - med).abs()
+        mad = abs_dev.rolling(window=window, center=True, min_periods=3).median()
+        mad = mad.bfill().ffill().clip(lower=mad_floor)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            mz = 0.6745 * abs_dev / mad
+
+        bad = (mz > z).fillna(False).to_numpy()
+        bad &= np.isfinite(x)
+
+        # Do not replace long runs; they may be real signal
+        if max_run is not None and max_run > 0 and np.any(bad):
+            runs = []
+            start = None
+            for i, flag in enumerate(bad):
+                if flag and start is None:
+                    start = i
+                elif not flag and start is not None:
+                    runs.append((start, i))
+                    start = None
+            if start is not None:
+                runs.append((start, len(bad)))
+
+            for i0, i1 in runs:
+                if (i1 - i0) > max_run:
+                    bad[i0:i1] = False
+
+        if not np.any(bad):
+            return x, {'changed': False, 'n_bad': 0}
+
+        x_out = x.copy()
+
+        if fill_method == 'interp':
+            good = (~bad) & np.isfinite(x)
+            if np.sum(good) >= 2:
+                x_out[bad] = np.interp(
+                    np.flatnonzero(bad),
+                    np.flatnonzero(good),
+                    x[good]
+                )
+            elif np.sum(good) == 1:
+                x_out[bad] = x[good][0]
+            else:
+                x_out[:] = np.nanmedian(x)
+
+        elif fill_method == 'median':
+            medv = med.to_numpy()
+            x_out[bad] = medv[bad]
+
+        else:
+            raise ValueError("fill_method must be 'interp' or 'median'")
+
+        return x_out, {
+            'changed': True,
+            'n_bad': int(np.sum(bad)),
+            'fraction_bad': float(np.mean(bad)),
+            'z': z,
+            'window': window,
+            'max_run': max_run,
+            'fill_method': fill_method,
+        }
+    def __len__(self):
+        return len(self.dataframes)
+    
 
     def plot(self, metrics=['mean'], kind='stream', logy=False, equal_scale=False, outfile=None, ylims=None):
         """Plot a SAM object.
@@ -869,7 +679,7 @@ class SAM:
         ylims : (low, high) or None
             Optional clipping bounds applied before plotting (non-stream).
         """
-        import matplotlib.pyplot as plt
+        
         self.__remove_empty()
 
         # Normalize metrics input
@@ -1609,13 +1419,6 @@ class RSAM(SAM):
         - provide `SAM_DIR`, `station`, `stime`, and `etime` to read from structured archive.
         `station` may be a string or list.
         """
-        
-        #from obspy import Trace, Stream, UTCDateTime
-        #import os
-        import struct
-        #import numpy as np
-        import re
-        from flovopy.core.preprocessing import fix_trace_id #_get_band_code
 
         def read_single_file(filepath, stime, etime):
             if not os.path.isfile(filepath):
@@ -1650,7 +1453,6 @@ class RSAM(SAM):
             tr.data[tr.data == -998.0] = np.nan
             tr.trim(stime, etime)
             if convert_legacy_ids_using_this_network and not tr.stats.network:
-                from flovopy.core.trace_utils import _fix_legacy_id
                 fix_trace_id(tr, legacy=True, netcode=convert_legacy_ids_using_this_network)
 
             return tr
@@ -1680,7 +1482,7 @@ class RSAM(SAM):
             tr.data[tr.data == -998.0] = np.nan
             tr.trim(stime, etime)
             if convert_legacy_ids_using_this_network and not tr.stats.network:
-                from flovopy.core.trace_utils import _fix_legacy_id
+                
                 fix_trace_id(tr, legacy=True, netcode=convert_legacy_ids_using_this_network)
             return tr
 
@@ -1717,11 +1519,6 @@ class RSAM(SAM):
 
         raise ValueError("Invalid arguments provided to readRSAMbinary.")
 
-#############################################################################################
-# flovopy/processing/sam.py (inside class VSAM)
-from flovopy.core.physics import (
-    geom_spread_amp, inelastic_amp, total_amp_correction
-)
 
 ########################################################################################################################
 
@@ -1849,10 +1646,6 @@ class DSAM(VSAM):
 
 
 
-
-from flovopy.core.physics import (
-    geom_spread_energy, inelastic_energy, total_energy_correction
-)
 class VSEM(VSAM):
 
     def __init__(self, dataframes=None, stream=None, sampling_interval=60.0, filter=[0.5, 18.0], bands = {'VLP': [0.02, 0.2], 'LP':[0.5, 4.0], 'VT':[4.0, 18.0]}, corners=4, verbose=False):
@@ -2302,15 +2095,10 @@ class ER(DR):
         lod.append(thisDict)
         df = pd.DataFrame(lod)  
         return medianE, medianM
-
-    #def plot():
-    #    pass
     
     @staticmethod
     def get_filename(SAM_DIR, id, year, sampling_interval, ext, name='ER'):
 	    return os.path.join(SAM_DIR,'%s_%s_%4d_%ds.%s' % (name, id, year, sampling_interval, ext))	   
-
-from flovopy.core.physics import magnitude2Eseismic, Eseismic2magnitude
 
 def magnitude2energy(ME, a: float = -3.2, b: float = 2/3):
     """
@@ -2341,9 +2129,7 @@ def energy2magnitude(E, a: float = -3.2, b: float = 2/3):
     out[valid] = b * np.log10(E[valid]) + a
     return out
 
-import argparse
-from obspy.clients.fdsn import Client
-from obspy import Stream, UTCDateTime
+'''
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -2479,3 +2265,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+'''
