@@ -27,7 +27,11 @@ def decompose_sam(sam_obj, metric='mean', trigger_type='classicstalta', sta=1200
     startt = min(tr.stats.starttime for tr in raw_st)
     endt = max(tr.stats.endtime for tr in raw_st)
 
-    sanitized_st = sanitize_stream(raw_st)
+    try:
+        sanitized_st = sanitize_stream(raw_st)
+    except Exception as e:
+        print(f"Error during sanitization: {e}")
+        return
     if len(sanitized_st) == 0:
         print(f"No data found after sanitization for {startt} to {endt}")
         return
@@ -193,10 +197,15 @@ def sanitize_stream(st, expected_sampling_rate=1 / 60.0):
 
         # Remove low-diversity segments
         noise_indices = set()
-        for i in range(0, len(data) - 20 + 1, 10):
-            window = data[i:i + 20]
-            if len(np.unique(np.round(window, 0))) <= 4:
-                noise_indices.update(range(i, i + 21))
+        win_len = 20
+        step = 10
+
+        for i in range(0, len(data) - win_len + 1, step):
+            window = data[i:i + win_len]
+            valid = window[np.isfinite(window)]
+            if len(valid) > 0 and len(np.unique(np.round(valid, 0))) <= 4:
+                noise_indices.update(range(i, min(i + win_len, len(data))))
+
         if noise_indices:
             print(f"{tr.id} has low diversity — flagging.")
             data[list(noise_indices)] = np.nan

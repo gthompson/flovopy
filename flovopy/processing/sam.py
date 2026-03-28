@@ -31,7 +31,11 @@ from obspy.geodetics.base import gps2dist_azimuth
 # =============================================================================
 # flovopy core utilities
 # =============================================================================
-from flovopy.core.trace_utils import sanitize_stream, fix_trace_id
+from flovopy.core.trace_utils import (
+    sanitize_stream, 
+    #fix_trace_id,
+    _fix_legacy_id,
+)
 
 # =============================================================================
 # flovopy physics (magnitude & energy conversions)
@@ -323,8 +327,12 @@ class SAM:
 
     def downsample(self, new_sampling_interval=3600, inplace=False):
         """
-        Downsample SAM metrics to a coarser interval (seconds).
-        Returns a new SAM unless inplace=True.
+        Downsample SAM/RSAM metrics to a coarser interval in seconds.
+
+        Assumes dataframe has:
+        - 'time' column in Unix epoch seconds
+        - optional 'date' column
+        - one or more numeric metric columns (e.g. 'mean')
         """
         if new_sampling_interval <= 0:
             raise ValueError("new_sampling_interval must be positive")
@@ -332,35 +340,41 @@ class SAM:
         result = {} if not inplace else self.dataframes
 
         for tid, df in self.dataframes.items():
-            d = df.copy() if not inplace else df
+            d = df.copy()
 
-            if 'date' not in d.columns:
-                d['date'] = pd.to_datetime(d['time'], unit='s')
+            # Build proper datetime column from Unix epoch seconds
+            if 'time' not in d.columns:
+                raise ValueError(f"{tid}: dataframe has no 'time' column")
 
-            # current cadence (best effort)
+            d['date'] = pd.to_datetime(d['time'], unit='s')
+
             if len(d) < 2:
-                if not inplace:
+                if inplace:
+                    self.dataframes[tid] = d
+                else:
                     result[tid] = d
                 continue
-            # resample
-            freq = f"{int(new_sampling_interval)}s"  # seconds
-            # numeric aggregation only; leave non-numeric alone
-            numeric = d.select_dtypes(include='number').copy()
-            # Ensure 'time' isn't used as numeric input
-            numeric = numeric.drop(columns=[c for c in ['time'] if c in numeric.columns], errors='ignore')
 
-            agg = numeric.set_index(d['date']).resample(freq, origin='epoch', label='left').mean()
+            # Select only numeric metric columns, but exclude time itself
+            metric_cols = [c for c in d.select_dtypes(include='number').columns if c != 'time']
 
-            # rebuild 'time' and 'date'
-            agg['date'] = agg.index
-            agg['time'] = (agg['date'].view('int64') // 10**9).astype(float)
+            if not metric_cols:
+                raise ValueError(f"{tid}: no numeric metric columns found to downsample")
 
-            # Put 'time' first, then others (stable order)
-            ordered = ['time'] + [c for c in d.columns if c not in ('time', 'date')] + ['date']
-            # Some columns might be absent (e.g., non-numeric); filter existing
-            ordered = [c for c in ordered if c in agg.columns]
+            # Set datetime index and resample
+            tmp = d.set_index('date')[metric_cols]
+            agg = tmp.resample(f"{int(new_sampling_interval)}s").mean()
 
-            d2 = agg[ordered].reset_index(drop=True)
+            # Drop empty bins
+            agg = agg.dropna(how='all')
+
+            # Rebuild Unix epoch seconds and datetime column
+            d2 = agg.reset_index()
+            d2['time'] = d2['date'].astype('int64')
+
+            # Put columns in expected order
+            ordered = ['time'] + [c for c in df.columns if c not in ('time', 'date') and c in d2.columns] + ['date']
+            d2 = d2[ordered]
 
             if inplace:
                 self.dataframes[tid] = d2
@@ -368,10 +382,11 @@ class SAM:
                 result[tid] = d2
 
         if inplace:
+            self.sampling_interval = float(new_sampling_interval)
             return self
         else:
-            return self.__class__(dataframes=result)
-        
+            return self.__class__(dataframes=result, sampling_interval=float(new_sampling_interval))
+            
     def drop(self, id):
         if id in self.__get_trace_ids():
             del self.dataframes[id]
@@ -1157,6 +1172,14 @@ class SAM:
                     st.append(tr)
         return st
     
+    def select_ids(self, ids):
+        """
+        Return a new object containing only the requested SEED ids.
+        """
+        ids_set = set(ids)
+        selected = {k: v for k, v in self.dataframes.items() if k in ids_set}
+        return self.__class__(dataframes=selected)
+
     def trim(self, starttime=None, endtime=None, pad=False, keep_empty=False, fill_value=None):
         ''' trim SAM object based on starttime and endtime. Both must be of type obspy.UTCDateTime 
 
@@ -1269,16 +1292,47 @@ class SAM:
     @staticmethod
     def get_sampling_interval(df):
         ''' return the sampling interval of an SAM dataframe in seconds '''
-        if len(df)>1:
-            return df.iloc[1]['time'] - df.iloc[0]['time']  
-        else:
-            #print(UTCDateTime(df.iloc[0]['time']))
-            return 60
+        if df is None or df.empty or "time" not in df.columns or len(df) < 2:
+            return np.nan
+        t = pd.to_numeric(df["time"], errors="coerce").to_numpy(dtype=float)
+        t = t[np.isfinite(t)]
+        if len(t) < 2:
+            return np.nan
+        return float(np.nanmedian(np.diff(t)))
 
     @staticmethod
     def __get_starttime(df):
         ''' return the start time of an SAM dataframe as an ObsPy UTCDateTime'''
-        return UTCDateTime(df.iloc[0]['time'])
+        if df is None or df.empty:
+            return UTCDateTime(0)
+
+        if "time" in df.columns:
+            t = pd.to_numeric(df["time"], errors="coerce").iloc[0]
+            if pd.notna(t):
+                return UTCDateTime(float(t))
+
+        if "date" in df.columns:
+            dt = pd.to_datetime(df["date"].iloc[0])
+            return UTCDateTime(dt.to_pydatetime())
+
+        return UTCDateTime(0)
+    
+    @staticmethod
+    def __get_endtime(df):
+        """Return the end time of an SAM dataframe as an ObsPy UTCDateTime."""
+        if df is None or df.empty:
+            return UTCDateTime(0)
+
+        if "time" in df.columns:
+            t = pd.to_numeric(df["time"], errors="coerce").iloc[-1]
+            if pd.notna(t):
+                return UTCDateTime(float(t))
+
+        if "date" in df.columns:
+            dt = pd.to_datetime(df["date"].iloc[-1])
+            return UTCDateTime(dt.to_pydatetime())
+
+        return UTCDateTime(0)
     
     def __get_trace_ids(self):
         return [id for id in self.dataframes]
@@ -1314,15 +1368,14 @@ class SAM:
     def get_seed_ids(self):
         seed_ids = list(self.dataframes.keys())
         return seed_ids
-        
+
     def get_metrics(self, df=None):
         if isinstance(df, pd.DataFrame):
-            metrics = df.columns[1:]
+            cols = df.columns
         else:
             seed_ids = self.get_seed_ids()
-            metrics = self.dataframes[seed_ids[0]].columns[1:]
-        return metrics
-        
+            cols = self.dataframes[seed_ids[0]].columns
+        return [c for c in cols if c not in ("time", "date")]        
 
     def __str__(self):
         keys = self.get_seed_ids()
@@ -1338,7 +1391,7 @@ class SAM:
 
             if first:
                 si = self.get_sampling_interval(df)
-                metric_cols = [c for c in df.columns if c != "time"]
+                metric_cols = [c for c in df.columns if c not in ("time", "date")]
                 lines.append(f"Sampling Interval = {si} s")
                 lines.append(f"Metrics: {', '.join(metric_cols)}")
                 lines.append("")
@@ -1350,7 +1403,8 @@ class SAM:
             lines.append(f"{trid}: {startt.isoformat()} to {endt.isoformat()}")
 
             # Summary stats on numeric columns, excluding 'time'
-            num_df = df.drop(columns=["time"], errors="ignore")
+            num_df = df[[c for c in df.columns if c not in ("time", "date")
+             and pd.api.types.is_numeric_dtype(df[c])]]
             if not num_df.empty:
                 desc = num_df.describe().transpose()
                 with pd.option_context("display.float_format", lambda v: f"{v:.3g}"):
@@ -1364,29 +1418,28 @@ class SAM:
     
     @property
     def starttime(self):
-        """Return the start time of the first non-empty dataframe (ObsPy UTCDateTime)."""
+        """Return the start time of the first non-empty dataframe."""
         for df in self.dataframes.values():
-            if not df.empty:
-                return UTCDateTime(df.iloc[0]["time"])
+            if df is not None and not df.empty:
+                return self.__get_starttime(df)
         return None
 
     @property
     def endtime(self):
-        """Return the end time of the first non-empty dataframe (ObsPy UTCDateTime)."""
+        """Return the end time of the first non-empty dataframe."""
         for df in self.dataframes.values():
-            if not df.empty:
-                return UTCDateTime(df.iloc[-1]["time"])
+            if df is not None and not df.empty:
+                return self.__get_endtime(df)
         return None
 
     @property
     def duration(self):
         """Return the duration of the first non-empty dataframe in seconds."""
-        for df in self.dataframes.values():
-            if not df.empty:
-                start = UTCDateTime(df.iloc[0]["time"])
-                end   = UTCDateTime(df.iloc[-1]["time"])
-                return end - start
-        return None   # <- keep consistent with starttime/endtime
+        st = self.starttime
+        et = self.endtime
+        if st is None or et is None:
+            return None
+        return et - st
     
 class RSAM(SAM):
         
@@ -1411,50 +1464,86 @@ class RSAM(SAM):
     @classmethod
     def readRSAMbinary(cls, SAM_DIR=None, station=None, stime=None, etime=None,
                     filepath=None, sampling_interval=60, verbose=False,
-                    convert_legacy_ids_using_this_network=None):
+                    convert_legacy_ids_using_this_network=None,
+                    fill_missing_with=0.0):
         """
         Read RSAM binary file(s) and return an RSAM object.
+
         Either:
         - provide `filepath`, `stime`, and `etime` to read a single file, or
         - provide `SAM_DIR`, `station`, `stime`, and `etime` to read from structured archive.
+
         `station` may be a string or list.
+
+        Parameters
+        ----------
+        fill_missing_with : float or None
+            Value used to replace missing RSAM samples. Use 0.0 to replace NaNs
+            with zero, or None to preserve NaNs.
         """
+
+        def _sanitize_rsam_values(values, missing_sentinel=-998.0, fill_value=0.0):
+            data = np.asarray(values, dtype=np.float32)
+
+            # Legacy missing-value marker
+            data[data == missing_sentinel] = np.nan
+
+            # Catch actual NaNs/Infs that may already exist in the binary file
+            data[~np.isfinite(data)] = np.nan
+
+            # Optionally replace all missing values
+            if fill_value is not None:
+                data = np.nan_to_num(
+                    data,
+                    nan=fill_value,
+                    posinf=fill_value,
+                    neginf=fill_value
+                )
+
+            return data
 
         def read_single_file(filepath, stime, etime):
             if not os.path.isfile(filepath):
                 raise FileNotFoundError(f"File not found: {filepath}")
             if verbose:
                 print(f"Reading {filepath}")
+
             records_per_day = int(86400 / sampling_interval)
             values = []
+
             with open(filepath, "rb") as f:
-                f.seek(4 * records_per_day)
+                f.seek(4 * records_per_day)  # skip first day?
                 while True:
                     bytes_read = f.read(4)
-                    if not bytes_read:
+                    if len(bytes_read) < 4:
                         break
                     v = struct.unpack("f", bytes_read)[0]
                     values.append(v)
 
-            tr = Trace(data=np.array(values))
+            data = _sanitize_rsam_values(values, fill_value=fill_missing_with)
+            tr = Trace(data=data)
+
             filename = os.path.basename(filepath)
             station_code = ''.join(filter(str.isalpha, filename))
 
             match = re.search(r'(\d{2,4})', filename)
             if match:
                 ystr = match.group(1)
-                year = int(ystr) if len(ystr) == 4 else (2000 + int(ystr) if int(ystr) < 50 else 1900 + int(ystr))
+                year = int(ystr) if len(ystr) == 4 else (
+                    2000 + int(ystr) if int(ystr) < 50 else 1900 + int(ystr)
+                )
             else:
                 raise ValueError("No year found in filename")
 
             tr.stats.starttime = UTCDateTime(year, 1, 1)
             tr.stats.station = station_code
             tr.stats.delta = sampling_interval
-            tr.data[tr.data == -998.0] = np.nan
-            tr.trim(stime, etime)
-            if convert_legacy_ids_using_this_network and not tr.stats.network:
-                fix_trace_id(tr, legacy=True, netcode=convert_legacy_ids_using_this_network)
 
+            tr.trim(stime, etime, pad=False)
+
+            if convert_legacy_ids_using_this_network and not tr.stats.network:
+                #fix_trace_id(tr, legacy=True, netcode=convert_legacy_ids_using_this_network)
+                _fix_legacy_id(tr, network=convert_legacy_ids_using_this_network, add_T=False)
             return tr
 
         def read_structured_file(station, year):
@@ -1467,23 +1556,28 @@ class RSAM(SAM):
             days = 366 if year % 4 == 0 else 365
             records = days * int(86400 / sampling_interval)
             values = []
+
             with open(file_path, "rb") as f:
-                f.seek(4 * int(86400 / sampling_interval))
+                f.seek(4 * int(86400 / sampling_interval))  # skip first day?
                 for _ in range(records):
                     bytes_read = f.read(4)
-                    if not bytes_read:
+                    if len(bytes_read) < 4:
                         break
                     v = struct.unpack("f", bytes_read)[0]
                     values.append(v)
-            tr = Trace(data=np.array(values))
+
+            data = _sanitize_rsam_values(values, fill_value=fill_missing_with)
+            tr = Trace(data=data)
+
             tr.stats.starttime = UTCDateTime(year, 1, 1)
             tr.stats.station = station
             tr.stats.delta = sampling_interval
-            tr.data[tr.data == -998.0] = np.nan
-            tr.trim(stime, etime)
+
+            tr.trim(stime, etime, pad=False)
+
             if convert_legacy_ids_using_this_network and not tr.stats.network:
-                
-                fix_trace_id(tr, legacy=True, netcode=convert_legacy_ids_using_this_network)
+                #fix_trace_id(tr, legacy=True, netcode=convert_legacy_ids_using_this_network)
+                _fix_legacy_id(tr, network=convert_legacy_ids_using_this_network)  
             return tr
 
         if filepath:
@@ -1494,14 +1588,21 @@ class RSAM(SAM):
             traces = []
             for sta in station:
                 try:
-                    obj = cls.readRSAMbinary(SAM_DIR=SAM_DIR, station=sta, stime=stime, etime=etime,
-                                            sampling_interval=sampling_interval, verbose=verbose,
-                                            convert_legacy_ids_using_this_network=convert_legacy_ids_using_this_network)
-                    if obj and len(obj)>0:
-                        sta_stream = obj.to_stream() # empty if RSAM object contains only  NaN data
-                        if len(sta_stream) > 0:    
+                    obj = cls.readRSAMbinary(
+                        SAM_DIR=SAM_DIR,
+                        station=sta,
+                        stime=stime,
+                        etime=etime,
+                        sampling_interval=sampling_interval,
+                        verbose=verbose,
+                        convert_legacy_ids_using_this_network=convert_legacy_ids_using_this_network,
+                        fill_missing_with=fill_missing_with
+                    )
+                    if obj and len(obj) > 0:
+                        sta_stream = obj.to_stream()
+                        if len(sta_stream) > 0:
                             tr = sta_stream[0]
-                            if tr.data.size > np.count_nonzero(np.isnan(tr.data)):
+                            if np.any(np.isfinite(tr.data)) and np.any(tr.data != 0):
                                 traces.append(tr)
                 except Exception as e:
                     print(f"Error reading station {sta}: {e}")
@@ -1511,13 +1612,14 @@ class RSAM(SAM):
             traces = []
             for year in range(stime.year, etime.year + 1):
                 tr = read_structured_file(station, year)
-                if tr:
+                if tr is not None:
                     traces.append(tr)
+
             if traces:
-                stream = Stream(traces).merge(method=0, fill_value=np.nan)
+                stream = Stream(traces).merge(method=0, fill_value=fill_missing_with)
                 return cls(stream=stream, sampling_interval=sampling_interval)
 
-        raise ValueError("Invalid arguments provided to readRSAMbinary.")
+        raise ValueError("Invalid arguments provided to readRSAMbinary.")    
 
 
 ########################################################################################################################
