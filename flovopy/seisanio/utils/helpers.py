@@ -3,6 +3,8 @@ from glob import glob
 #import datetime as dt
 from obspy import UTCDateTime, Stream
 from flovopy.core.miniseed_io import write_mseed
+from pathlib import Path
+
 
 # need to leave this here to prevent circular imports between Wavfile and Sfile
 def filetime2spath(filetime, mainclass='L', db=None, seisan_top=None, fullpath=True):
@@ -141,60 +143,101 @@ def find_matching_wavfiles(filetime, sfilepath, y2kfix=False):
 
 
 
-
 def write_wavfile(
     st: Stream,
-    out_root: str,
+    out_root: str | Path,
     dbstring: str,
-    numchans: int,
+    numchans: int | None = None,
+    *,
     year_month_dirs: bool = True,
-    fmt: str = "MSEED"
+    fmt: str = "MSEED",
+    y2kfix: bool = True,
+    preprocess: bool = False,
+    preprocess_fn=None,
+    preprocess_kwargs: dict | None = None,
+    write_kwargs: dict | None = None,
 ) -> str:
     """
-    Write a detected event stream into a year/month subdir with a SEISAN-like basename.
+    Write a Stream using a SEISAN-style waveform filename.
+
+    Optionally applies preprocessing before writing.
 
     Parameters
     ----------
-    st : obspy.Stream
-        The event waveform (assumed non-empty).
-    out_root : str
-        Root output directory.
-    dbstring : str
-        Database identifier string to append to filename.
-    numchans : int
-        Number of channels in the event (often len(st)).
-    year_month_dirs : bool
-        If True, output into <out_root>/<YYYY>/<MM>/, else directly under out_root.
-    fmt : str
-        ObsPy write format (default: "MSEED").
-
-    Returns
-    -------
-    str
-        Full path to the written MiniSEED file.
+    st
+        Input waveform stream.
+    preprocess : bool
+        If True, apply preprocess_fn before writing.
+    preprocess_fn : callable or None
+        Signature: preprocess_fn(stream, **kwargs) -> stream
+    preprocess_kwargs : dict or None
+        Passed to preprocess_fn.
     """
-    if not st or len(st) == 0:
-        raise ValueError("Empty stream given to write_event_stream")
 
+    if not st or len(st) == 0:
+        raise ValueError("Empty stream given to write_wavfile")
+
+    out_root = Path(out_root)
+    write_kwargs = write_kwargs or {}
+
+    # -------------------------------------------------
+    # Preprocessing stage (NEW)
+    # -------------------------------------------------
+    if preprocess:
+        if preprocess_fn is None:
+            raise ValueError("preprocess=True but no preprocess_fn provided")
+
+        try:
+            kwargs = preprocess_kwargs or {}
+            st = preprocess_fn(st, **kwargs)
+        except Exception as e:
+            raise RuntimeError(f"Preprocessing failed: {e}")
+
+        if not st or len(st) == 0:
+            raise ValueError("Stream empty after preprocessing")
+
+    # -------------------------------------------------
+    # Filename construction
+    # -------------------------------------------------
     filetime: UTCDateTime = st[0].stats.starttime
 
-    # Build basename: YYYY-MM-DD-HHMM-SSS.DBSTRING_NUMCHANS
-    basename = "%4d-%02d-%02d-%02d%02d-%02dM.%s_%03d" % (
-        filetime.year, filetime.month, filetime.day,
-        filetime.hour, filetime.minute, filetime.second,
-        dbstring, numchans
-    )
+    if numchans is None:
+        numchans = len(st)
 
-    # Year/month subdir
+    dbstring = str(dbstring)
+    if len(dbstring) < 5:
+        dbstring = dbstring + "_" * (5 - len(dbstring))
+
+    if not y2kfix and filetime.year < 2000:
+        basename = (
+            f"{filetime.year - 1900:02d}{filetime.month:02d}-"
+            f"{filetime.day:02d}-{filetime.hour:02d}{filetime.minute:02d}-"
+            f"{filetime.second:02d}M.{dbstring}_{numchans:03d}"
+        )
+    else:
+        basename = (
+            f"{filetime.year:04d}-{filetime.month:02d}-{filetime.day:02d}-"
+            f"{filetime.hour:02d}{filetime.minute:02d}-{filetime.second:02d}"
+            f"M.{dbstring}_{numchans:03d}"
+        )
+
+    # -------------------------------------------------
+    # Output directory
+    # -------------------------------------------------
     if year_month_dirs:
-        out_dir = os.path.join(out_root, f"{filetime.year:04d}", f"{filetime.month:02d}")
+        out_dir = out_root / f"{filetime.year:04d}" / f"{filetime.month:02d}"
     else:
         out_dir = out_root
-    os.makedirs(out_dir, exist_ok=True)
 
-    out_path = os.path.join(out_dir, basename)
-    if fmt.lower()=='mseed':
-        write_mseed(st, out_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / basename
+
+    # -------------------------------------------------
+    # Write
+    # -------------------------------------------------
+    if fmt.lower() == "mseed":
+        write_mseed(st, str(out_path), **write_kwargs)
     else:
-        st.write(out_path, format=fmt)
-    return out_path
+        st.write(str(out_path), format=fmt, **write_kwargs)
+
+    return str(out_path)
