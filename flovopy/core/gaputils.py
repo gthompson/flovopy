@@ -5,519 +5,893 @@ from obspy import Trace, Stream, UTCDateTime
 from typing import Literal
 import re
 
-def smart_fill(tr: Trace, short_thresh=5.0, long_fill_value=0.0):
+
+
+def fill_gaps_with_linear_interpolation(trace: Trace, *, inplace: bool = False) -> Trace:
     """
-    Interpolate short masked gaps (<= short_thresh s) and fill long gaps with a constant.
-    Returns a new Trace with plain ndarray (no mask).
-    """
-    data = tr.data
-    if not isinstance(data, np.ma.MaskedArray) or not np.any(data.mask):
-        return tr.copy()
-
-    sr = float(tr.stats.sampling_rate or 0.0)
-    short, long = classify_gaps(tr, threshold_seconds=short_thresh)
-    out = tr.copy()
-    arr = data.filled(long_fill_value).astype(np.float32, copy=True)
-    mask = np.asarray(data.mask, dtype=bool)
-    x = np.arange(arr.size)
-
-    if short:
-        valid = ~mask
-        for s, e in short:
-            # Find nearest valid on each side; handle edge gaps gracefully
-            left = s - 1
-            while left >= 0 and not valid[left]:
-                left -= 1
-            right = e
-            while right < arr.size and not valid[right]:
-                right += 1
-
-            if left >= 0 and right < arr.size:
-                # strict linear interp using the two neighbors
-                arr[s:e] = np.interp(x[s:e], [left, right], [arr[left], arr[right]])
-            elif left >= 0:
-                arr[s:e] = arr[left]
-            elif right < arr.size:
-                arr[s:e] = arr[right]
-            else:
-                # all masked (degenerate)
-                arr[s:e] = long_fill_value
-
-    # Long gaps already filled by .filled(long_fill_value) above
-    out.data = arr
-    return out
-
-
-
-def classify_gaps(tr: Trace, sampling_rate=None, threshold_seconds=5.0):
-    """
-    Return (short, long) masked spans as index pairs [start, end),
-    split by duration threshold (seconds).
-    """
-    data = tr.data
-    if not isinstance(data, np.ma.MaskedArray):
-        return [], []
-    mask = np.asarray(data.mask, dtype=bool)
-    if not mask.any():
-        return [], []
-
-    sr = float(sampling_rate or tr.stats.sampling_rate or 0.0)
-    if sr <= 0:
-        # fall back: treat all gaps as "long"
-        p = np.concatenate(([False], mask, [False]))
-        idx = np.flatnonzero(p[1:] != p[:-1])
-        starts, ends = idx[0::2], idx[1::2]
-        return [], [(int(s), int(e)) for s, e in zip(starts, ends)]
-
-    # runs of True (masked)
-    p = np.concatenate(([False], mask, [False]))
-    idx = np.flatnonzero(p[1:] != p[:-1])
-    starts, ends = idx[0::2], idx[1::2]
-    durs = (ends - starts) / sr
-
-    short = [(int(s), int(e)) for (s, e), d in zip(zip(starts, ends), durs) if d <= threshold_seconds]
-    long  = [(int(s), int(e)) for (s, e), d in zip(zip(starts, ends), durs) if d >  threshold_seconds]
-    return short, long
-
-
-def fill_stream_gaps(stream, method="constant", **kwargs):
-    """
-    Apply a gap-filling method to all Traces in a Stream.
+    Fill masked gaps in a trace by linear interpolation.
 
     Parameters
     ----------
-    stream : Stream
-        ObsPy Stream with (preferably) masked gaps.
-    method : {"constant", "linear", "previous", "noise"}
-        Gap filling method.
-    **kwargs :
-        - constant: fill_value (float)
-        - noise: taper_percentage (float)
-        - others: reserved for future options
-    """
+    trace
+        Input ObsPy Trace. Data may be a masked array.
+    inplace
+        If True, modify the input trace in place.
 
+    Returns
+    -------
+    Trace
+        Trace with masked gaps filled by interpolation.
+
+    Notes
+    -----
+    - If there are no masked samples, the trace is returned unchanged.
+    - If all samples are masked, the data are filled with zeros.
+    - If only one sample is unmasked, all masked samples are filled with that value.
+    """
+    tr = trace if inplace else trace.copy()
+
+    data = np.asanyarray(tr.data)
+    if not np.ma.isMaskedArray(data):
+        return tr
+
+    data = np.ma.array(data, copy=True)
+    mask = np.ma.getmaskarray(data)
+
+    if not mask.any():
+        tr.data = np.asarray(data, dtype=np.float32)
+        return tr
+
+    x = np.arange(data.size)
+    valid = ~mask
+
+    out = data.filled(np.nan).astype(np.float32, copy=False)
+
+    if not valid.any():
+        out[:] = 0.0
+    elif valid.sum() == 1:
+        out[mask] = out[valid][0]
+    else:
+        out[mask] = np.interp(x[mask], x[valid], out[valid])
+
+    tr.data = out
+    tr.stats.npts = len(tr.data)
+    return tr
+
+
+def mask_gaps(
+    trace: Trace,
+    *,
+    null_values=(0.0,),
+    use_null_values: bool = True,
+    inplace: bool = False,
+) -> Trace:
+    """
+    Convert trace data to a masked array, masking NaNs and optionally null values.
+
+    Parameters
+    ----------
+    trace
+        Input ObsPy Trace.
+    null_values
+        Values to treat as missing when `use_null_values=True`.
+    use_null_values
+        If True, mask samples equal to any value in `null_values`.
+    inplace
+        If True, modify the input trace in place.
+
+    Returns
+    -------
+    Trace
+        Trace whose data are stored as a masked array.
+    """
+    tr = trace if inplace else trace.copy()
+
+    data = np.asarray(tr.data, dtype=np.float32)
+    mask = ~np.isfinite(data)
+
+    if use_null_values and null_values is not None:
+        for v in null_values:
+            mask |= (data == v)
+
+    tr.data = np.ma.masked_array(data, mask=mask, copy=False)
+    tr.stats.npts = len(tr.data)
+    return tr
+
+
+def unmask_gaps(
+    trace: Trace,
+    *,
+    fill_value: float = 0.0,
+    inplace: bool = False,
+) -> Trace:
+    """
+    Replace masked samples in a trace with a constant fill value.
+
+    Parameters
+    ----------
+    trace
+        Input ObsPy Trace. If data are not masked, the trace is returned unchanged.
+    fill_value
+        Value used to replace masked samples.
+    inplace
+        If True, modify the input trace in place.
+
+    Returns
+    -------
+    Trace
+        Trace with plain ndarray data and no mask.
+    """
+    tr = trace if inplace else trace.copy()
+
+    data = tr.data
+    if np.ma.isMaskedArray(data):
+        tr.data = np.asarray(data.filled(fill_value), dtype=np.float32)
+    else:
+        tr.data = np.asarray(data, dtype=np.float32)
+
+    tr.stats.npts = len(tr.data)
+    return tr
+
+
+def piecewise_detrend(
+    trace: Trace,
+    *,
+    null_values=(0.0,),
+    use_null_values: bool = True,
+    keep_mask: bool = True,
+    mode: str = "simple",
+    inplace: bool = False,
+) -> Trace:
+    """
+    Detrend contiguous valid segments of a trace independently.
+
+    Parameters
+    ----------
+    trace
+        Input ObsPy Trace.
+    null_values
+        Values to treat as missing when `use_null_values=True`.
+    use_null_values
+        If True, mask samples equal to values in `null_values`.
+    keep_mask
+        If True, return masked data where gaps remain masked.
+        If False, return plain ndarray data with masked samples filled by zero.
+    mode
+        Detrending mode:
+            - "simple": subtract segment mean
+            - "linear": remove best-fit linear trend from each segment
+    inplace
+        If True, modify the input trace in place.
+
+    Returns
+    -------
+    Trace
+        Piecewise-detrended trace.
+
+    Notes
+    -----
+    - Gaps are identified using masked samples.
+    - Each contiguous unmasked segment is detrended independently.
+    - If a segment has fewer than 2 samples, it is only mean-centered in
+      "linear" mode.
+    """
+    tr = trace if inplace else trace.copy()
+
+    # First ensure gaps are masked consistently
+    tr = mask_gaps(
+        tr,
+        null_values=null_values,
+        use_null_values=use_null_values,
+        inplace=True,
+    )
+
+    data = np.ma.array(tr.data, copy=True)
+    mask = np.ma.getmaskarray(data)
+
+    if data.size == 0:
+        return tr
+
+    valid = ~mask
+    if not valid.any():
+        if keep_mask:
+            tr.data = data.astype(np.float32, copy=False)
+        else:
+            tr.data = np.asarray(data.filled(0.0), dtype=np.float32)
+        tr.stats.npts = len(tr.data)
+        return tr
+
+    # Find contiguous valid runs
+    valid_idx = np.where(valid)[0]
+    breaks = np.where(np.diff(valid_idx) > 1)[0]
+    starts = np.r_[0, breaks + 1]
+    ends = np.r_[breaks, len(valid_idx) - 1]
+
+    out = data.astype(np.float32, copy=True)
+
+    for s, e in zip(starts, ends):
+        seg_idx = valid_idx[s : e + 1]
+        y = np.asarray(out[seg_idx], dtype=np.float32)
+
+        if y.size == 0:
+            continue
+
+        if mode == "simple":
+            y = y - np.nanmean(y)
+
+        elif mode == "linear":
+            if y.size < 2:
+                y = y - np.nanmean(y)
+            else:
+                x = np.arange(y.size, dtype=np.float32)
+                coeffs = np.polyfit(x, y, 1)
+                trend = coeffs[0] * x + coeffs[1]
+                y = y - trend
+
+        else:
+            raise ValueError(f"Unknown piecewise_detrend mode: {mode!r}")
+
+        out[seg_idx] = y
+
+    if keep_mask:
+        tr.data = np.ma.masked_array(
+            np.asarray(out.filled(0.0), dtype=np.float32),
+            mask=mask,
+            copy=False,
+        )
+    else:
+        tr.data = np.asarray(out.filled(0.0), dtype=np.float32)
+
+    tr.stats.npts = len(tr.data)
+    return tr
+
+
+
+
+
+def smart_fill(
+    trace: Trace,
+    *,
+    short_gap_threshold_samples: int = 5,
+    long_gap_method: str = "noise",
+    fill_value: float = 0.0,
+    null_values=(0.0,),
+    use_null_values: bool = True,
+    inplace: bool = False,
+) -> Trace:
+    """
+    Fill masked/null gaps in a trace using different strategies for short and long gaps.
+
+    Parameters
+    ----------
+    trace
+        Input ObsPy Trace.
+    short_gap_threshold_samples
+        Gaps of length <= this threshold are treated as short gaps and filled
+        by linear interpolation.
+    long_gap_method
+        Method used for longer gaps. One of:
+            - "noise": fill with spectrally matched / filtered noise
+            - "previous": fill with previous valid value
+            - "constant": fill with `fill_value`
+            - "linear": fill with linear interpolation
+    fill_value
+        Constant fill value used when `long_gap_method="constant"`.
+    null_values
+        Values to treat as missing when `use_null_values=True`.
+    use_null_values
+        If True, values in `null_values` are first masked as gaps.
+    inplace
+        If True, modify the input trace in place.
+
+    Returns
+    -------
+    Trace
+        Trace with plain ndarray data and gaps filled.
+
+    Notes
+    -----
+    This function expects the supporting helpers:
+    - `mask_gaps()`
+    - `fill_gaps_with_linear_interpolation()`
+    - `fill_gaps_with_previous_value()`
+    - `fill_gaps_with_filtered_noise()`
+    """
+    tr = trace if inplace else trace.copy()
+
+    # Start by masking invalid/null samples consistently
+    tr = mask_gaps(
+        tr,
+        null_values=null_values,
+        use_null_values=use_null_values,
+        inplace=True,
+    )
+
+    data = tr.data
+    if not np.ma.isMaskedArray(data):
+        tr.data = np.asarray(data, dtype=np.float32)
+        tr.stats.npts = len(tr.data)
+        return tr
+
+    mask = np.ma.getmaskarray(data)
+    if not mask.any():
+        tr = unmask_gaps(tr, fill_value=fill_value, inplace=True)
+        tr.stats.npts = len(tr.data)
+        return tr
+
+    # If everything is masked, fall back to constant fill
+    if mask.all():
+        tr.data = np.full(data.shape, fill_value, dtype=np.float32)
+        tr.stats.npts = len(tr.data)
+        return tr
+
+    # Identify contiguous masked runs
+    masked_idx = np.where(mask)[0]
+    d = np.diff(masked_idx)
+    gap_starts = np.where(np.insert(d, 0, 2) > 1)[0]
+    gap_ends = np.where(np.append(d, 2) > 1)[0] - 1
+
+    # Work on a copy so each gap fill can update later context
+    work = tr.copy()
+
+    for i in range(len(gap_starts)):
+        s = masked_idx[gap_starts[i]]
+        e = masked_idx[gap_ends[i]] + 1
+        gap_len = e - s
+
+        gap_tr = work.copy()
+        submask = np.zeros(gap_tr.stats.npts, dtype=bool)
+        submask[s:e] = True
+
+        # Keep only the current gap masked in this temporary trace
+        if np.ma.isMaskedArray(gap_tr.data):
+            base = gap_tr.data.filled(np.nan)
+        else:
+            base = np.asarray(gap_tr.data, dtype=np.float32)
+
+        gap_tr.data = np.ma.masked_array(
+            np.asarray(base, dtype=np.float32),
+            mask=submask,
+            copy=False,
+        )
+
+        if gap_len <= short_gap_threshold_samples:
+            filled = fill_gaps_with_linear_interpolation(gap_tr, inplace=False)
+        else:
+            method = long_gap_method.lower()
+            if method == "noise":
+                filled = fill_gaps_with_filtered_noise(gap_tr, inplace=False)
+            elif method == "previous":
+                filled = fill_gaps_with_previous_value(gap_tr, inplace=False)
+            elif method == "constant":
+                filled = unmask_gaps(gap_tr, fill_value=fill_value, inplace=False)
+            elif method == "linear":
+                filled = fill_gaps_with_linear_interpolation(gap_tr, inplace=False)
+            else:
+                raise ValueError(f"Unknown long_gap_method: {long_gap_method!r}")
+
+        # Update only the current gap in the working trace
+        work_data = np.asarray(
+            work.data.filled(np.nan) if np.ma.isMaskedArray(work.data) else work.data,
+            dtype=np.float32,
+        )
+        filled_data = np.asarray(filled.data, dtype=np.float32)
+        work_data[s:e] = filled_data[s:e]
+        work.data = np.ma.masked_array(work_data, mask=np.ma.getmaskarray(work.data), copy=False)
+        work.data.mask[s:e] = False
+
+    # Return plain ndarray output
+    work = unmask_gaps(work, fill_value=fill_value, inplace=True)
+    work.stats.npts = len(work.data)
+
+    if inplace:
+        trace.data = work.data
+        trace.stats = work.stats
+        return trace
+
+    return work
+
+
+def normalize_stream_gaps(
+    stream: Stream,
+    *,
+    detrend_first: bool = True,
+    detrend_mode: str = "simple",
+    mask_null_values: bool = True,
+    null_values=(0.0,),
+    fill_gaps: bool = False,
+    short_gap_threshold_samples: int = 5,
+    long_gap_method: str = "noise",
+    fill_value: float = 0.0,
+    keep_mask: bool = False,
+    inplace: bool = False,
+) -> Stream:
+    """
+    Normalize gaps across all traces in a stream.
+
+    Parameters
+    ----------
+    stream
+        Input ObsPy Stream.
+    detrend_first
+        If True, apply piecewise detrending before optional gap filling.
+    detrend_mode
+        Passed to `piecewise_detrend()`. One of:
+            - "simple"
+            - "linear"
+    mask_null_values
+        If True, values in `null_values` are treated as missing.
+    null_values
+        Values to mask as gaps when `mask_null_values=True`.
+    fill_gaps
+        If True, fill gaps using `smart_fill()`.
+        If False, leave gaps masked unless `keep_mask=False`, in which case
+        they are converted to plain arrays using `fill_value`.
+    short_gap_threshold_samples
+        Passed to `smart_fill()`.
+    long_gap_method
+        Passed to `smart_fill()`.
+    fill_value
+        Constant used when unmasking or constant-filling gaps.
+    keep_mask
+        If True and `fill_gaps=False`, leave masked arrays in output.
+        If False, convert masked arrays to plain arrays using `fill_value`.
+    inplace
+        If True, modify the input stream in place.
+
+    Returns
+    -------
+    Stream
+        Stream with normalized gap handling.
+
+    Notes
+    -----
+    Typical usage patterns:
+    - `fill_gaps=False, keep_mask=True`:
+        preserve gaps as masks for later processing
+    - `fill_gaps=False, keep_mask=False`:
+        preserve gaps structurally, but output plain arrays
+    - `fill_gaps=True`:
+        produce gap-filled plain arrays
+    """
+    st = stream if inplace else stream.copy()
+
+    out = Stream()
+
+    for tr in st:
+        work = tr.copy()
+
+        # Step 1: detrend piecewise across valid segments
+        if detrend_first:
+            work = piecewise_detrend(
+                work,
+                null_values=null_values,
+                use_null_values=mask_null_values,
+                keep_mask=True,
+                mode=detrend_mode,
+                inplace=False,
+            )
+        else:
+            work = mask_gaps(
+                work,
+                null_values=null_values,
+                use_null_values=mask_null_values,
+                inplace=False,
+            )
+
+        # Step 2: optional gap fill
+        if fill_gaps:
+            work = smart_fill(
+                work,
+                short_gap_threshold_samples=short_gap_threshold_samples,
+                long_gap_method=long_gap_method,
+                fill_value=fill_value,
+                null_values=null_values,
+                use_null_values=mask_null_values,
+                inplace=False,
+            )
+        else:
+            if not keep_mask:
+                work = unmask_gaps(work, fill_value=fill_value, inplace=False)
+
+        work.stats.npts = len(work.data)
+        out.append(work)
+
+    if inplace:
+        stream.clear()
+        stream.extend(out)
+        return stream
+
+    return out
+
+
+import numpy as np
+from obspy import Trace
+
+
+def classify_gaps(trace: Trace) -> list[tuple[int, int]]:
+    """
+    Return contiguous masked-gap intervals in a trace.
+
+    Parameters
+    ----------
+    trace
+        Input ObsPy Trace. Data should preferably be a masked array.
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        List of `(start_index, end_index)` intervals, where `end_index` is exclusive.
+
+    Notes
+    -----
+    If the trace has no masked samples, an empty list is returned.
+    """
+    data = trace.data
+    if not np.ma.isMaskedArray(data):
+        return []
+
+    mask = np.ma.getmaskarray(data)
+    if not mask.any():
+        return []
+
+    masked_idx = np.where(mask)[0]
+    d = np.diff(masked_idx)
+
+    gap_starts = np.where(np.insert(d, 0, 2) > 1)[0]
+    gap_ends = np.where(np.append(d, 2) > 1)[0] - 1
+
+    return [(masked_idx[s], masked_idx[e] + 1) for s, e in zip(gap_starts, gap_ends)]
+
+
+def fill_gaps_with_constant(
+    trace: Trace,
+    *,
+    fill_value: float = 0.0,
+    inplace: bool = False,
+) -> Trace:
+    """
+    Fill masked gaps in a trace with a constant value.
+
+    Parameters
+    ----------
+    trace
+        Input ObsPy Trace.
+    fill_value
+        Constant value used to fill masked samples.
+    inplace
+        If True, modify the input trace in place.
+
+    Returns
+    -------
+    Trace
+        Trace with plain ndarray data and gaps filled by `fill_value`.
+    """
+    tr = trace if inplace else trace.copy()
+
+    data = tr.data
+    if np.ma.isMaskedArray(data):
+        tr.data = np.asarray(data.filled(fill_value), dtype=np.float32)
+    else:
+        tr.data = np.asarray(data, dtype=np.float32)
+
+    tr.stats.npts = len(tr.data)
+    return tr
+
+
+def fill_gaps_with_previous_value(
+    trace: Trace,
+    *,
+    fallback_value: float = 0.0,
+    inplace: bool = False,
+) -> Trace:
+    """
+    Fill masked gaps using the previous valid sample value.
+
+    Parameters
+    ----------
+    trace
+        Input ObsPy Trace. Data should preferably be a masked array.
+    fallback_value
+        Value used when a gap occurs before any valid sample exists.
+    inplace
+        If True, modify the input trace in place.
+
+    Returns
+    -------
+    Trace
+        Trace with plain ndarray data and gaps filled.
+
+    Notes
+    -----
+    - If the trace is not masked, it is returned unchanged (except for dtype normalization).
+    - Leading masked samples are filled with `fallback_value`.
+    """
+    tr = trace if inplace else trace.copy()
+
+    data = tr.data
+    if not np.ma.isMaskedArray(data):
+        tr.data = np.asarray(data, dtype=np.float32)
+        tr.stats.npts = len(tr.data)
+        return tr
+
+    filled = np.asarray(data.filled(np.nan), dtype=np.float32)
+    mask = np.ma.getmaskarray(data)
+
+    if not mask.any():
+        tr.data = filled
+        tr.stats.npts = len(tr.data)
+        return tr
+
+    last_value = fallback_value
+    for i in range(len(filled)):
+        if mask[i]:
+            filled[i] = last_value
+        else:
+            if np.isfinite(filled[i]):
+                last_value = filled[i]
+            else:
+                filled[i] = last_value
+
+    tr.data = filled
+    tr.stats.npts = len(tr.data)
+    return tr
+
+
+def _generate_spectrally_matched_noise(
+    valid_data: np.ndarray,
+    n_samples: int,
+    *,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """
+    Generate approximate spectrally matched noise from a valid data segment.
+
+    Parameters
+    ----------
+    valid_data
+        1D array of valid data samples.
+    n_samples
+        Number of noise samples to generate.
+    rng
+        Optional NumPy random generator.
+
+    Returns
+    -------
+    numpy.ndarray
+        Generated noise as float32.
+
+    Notes
+    -----
+    This is a lightweight heuristic:
+    - if there are too few valid samples, falls back to Gaussian noise
+    - otherwise attempts to match the amplitude spectrum of the valid data
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    valid_data = np.asarray(valid_data, dtype=np.float32)
+
+    if n_samples <= 0:
+        return np.array([], dtype=np.float32)
+
+    finite = np.isfinite(valid_data)
+    valid_data = valid_data[finite]
+
+    if valid_data.size < 8:
+        scale = float(np.nanstd(valid_data)) if valid_data.size else 1.0
+        if not np.isfinite(scale) or scale == 0.0:
+            scale = 1.0
+        return rng.normal(0.0, scale, n_samples).astype(np.float32)
+
+    # Remove mean
+    valid_data = valid_data - np.nanmean(valid_data)
+
+    # FFT amplitude from valid data
+    spec = np.fft.rfft(valid_data)
+    amp = np.abs(spec)
+
+    # Random phases
+    phase = rng.uniform(0.0, 2.0 * np.pi, size=amp.shape)
+    synth_spec = amp * np.exp(1j * phase)
+
+    noise = np.fft.irfft(synth_spec, n=n_samples)
+
+    # Match standard deviation roughly to valid data
+    target_std = float(np.nanstd(valid_data))
+    current_std = float(np.nanstd(noise))
+
+    if np.isfinite(target_std) and target_std > 0 and np.isfinite(current_std) and current_std > 0:
+        noise = noise * (target_std / current_std)
+
+    return np.asarray(noise, dtype=np.float32)
+
+
+def fill_gaps_with_filtered_noise(
+    trace: Trace,
+    *,
+    taper_fraction: float = 0.1,
+    fallback_value: float = 0.0,
+    rng: np.random.Generator | None = None,
+    inplace: bool = False,
+) -> Trace:
+    """
+    Fill masked gaps with approximate spectrally matched noise.
+
+    Parameters
+    ----------
+    trace
+        Input ObsPy Trace. Data should preferably be a masked array.
+    taper_fraction
+        Fraction of each gap length used for cosine tapering at gap edges.
+        Should be between 0 and 0.5.
+    fallback_value
+        Value used if the trace has no valid samples at all.
+    rng
+        Optional NumPy random generator.
+    inplace
+        If True, modify the input trace in place.
+
+    Returns
+    -------
+    Trace
+        Trace with plain ndarray data and gaps filled.
+
+    Notes
+    -----
+    - Uses the valid (unmasked) samples in the trace to estimate a rough spectrum.
+    - Applies a light cosine taper to the generated noise inside each gap to reduce edge artifacts.
+    - If no valid data exist, gaps are filled with `fallback_value`.
+    """
+    tr = trace if inplace else trace.copy()
+
+    data = tr.data
+    if not np.ma.isMaskedArray(data):
+        tr.data = np.asarray(data, dtype=np.float32)
+        tr.stats.npts = len(tr.data)
+        return tr
+
+    arr = np.asarray(data.filled(np.nan), dtype=np.float32)
+    mask = np.ma.getmaskarray(data)
+
+    if not mask.any():
+        tr.data = arr
+        tr.stats.npts = len(tr.data)
+        return tr
+
+    valid = arr[~mask]
+    if valid.size == 0:
+        tr.data = np.where(mask, fallback_value, arr).astype(np.float32)
+        tr.stats.npts = len(tr.data)
+        return tr
+
+    out = arr.copy()
+    gaps = classify_gaps(tr)
+
+    taper_fraction = max(0.0, min(float(taper_fraction), 0.5))
+    rng = np.random.default_rng() if rng is None else rng
+
+    for start, end in gaps:
+        n = end - start
+        if n <= 0:
+            continue
+
+        noise = _generate_spectrally_matched_noise(valid, n, rng=rng)
+
+        # Optional taper to reduce edge discontinuities
+        n_taper = int(round(n * taper_fraction))
+        if n_taper > 0 and n >= 2:
+            taper = np.ones(n, dtype=np.float32)
+
+            left = 0.5 * (1.0 - np.cos(np.linspace(0, np.pi, n_taper, dtype=np.float32)))
+            right = left[::-1]
+
+            taper[:n_taper] *= left
+            taper[-n_taper:] *= right
+            noise *= taper
+
+        out[start:end] = noise
+
+    # Keep any remaining non-finite values under control
+    out = np.nan_to_num(out, nan=fallback_value, posinf=fallback_value, neginf=fallback_value).astype(np.float32)
+
+    tr.data = out
+    tr.stats.npts = len(tr.data)
+    return tr
+
+def _interp_short_gaps_only(tr: Trace, short_gap_sec: float) -> Trace:
+    """
+    Interpolate short masked gaps and keep long gaps masked.
+
+    Parameters
+    ----------
+    tr
+        Input trace with masked gaps.
+    short_gap_sec
+        Maximum gap duration (seconds) treated as short.
+
+    Returns
+    -------
+    Trace
+        Trace in which short gaps are interpolated and long gaps remain masked.
+    """
+    data = tr.data
+    if not np.ma.isMaskedArray(data) or not np.any(np.ma.getmaskarray(data)):
+        return tr.copy()
+
+    sr = float(tr.stats.sampling_rate)
+    short_gap_samples = max(1, int(round(short_gap_sec * sr)))
+
+    tmp = smart_fill(
+        tr,
+        short_gap_threshold_samples=short_gap_samples,
+        long_gap_method="constant",
+        fill_value=np.nan,
+        inplace=False,
+    )
+
+    arr = np.asarray(tmp.data, dtype=np.float32)
+    mask = ~np.isfinite(arr)
+
+    out = tr.copy()
+    out.data = np.ma.masked_array(arr, mask=mask, copy=False)
+    out.stats.npts = len(out.data)
+    return out
+
+def _next_pow2(n: int) -> int:
+    """
+    Return the next power of two greater than or equal to n.
+    """
+    n = int(n)
+    if n < 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+def fill_stream_gaps(
+    stream: Stream,
+    *,
+    method: str = "constant",
+    inplace: bool = False,
+    **kwargs,
+) -> Stream:
+    """
+    Apply a gap-filling method to all traces in a Stream.
+
+    Parameters
+    ----------
+    stream
+        Input ObsPy Stream, preferably with masked gaps.
+    method
+        Gap-filling method. One of:
+            - "constant"
+            - "linear"
+            - "previous"
+            - "noise"
+    inplace
+        If True, modify the input stream in place.
+
+    Returns
+    -------
+    Stream
+        Stream with gaps filled trace by trace.
+    """
     methods = {
         "constant": fill_gaps_with_constant,
         "linear": fill_gaps_with_linear_interpolation,
         "previous": fill_gaps_with_previous_value,
-        "noise": fill_gaps_with_filtered_noise
+        "noise": fill_gaps_with_filtered_noise,
     }
+
     if method not in methods:
-        raise ValueError(f"Unknown method '{method}'. Valid options: {list(methods.keys())}")
+        raise ValueError(f"Unknown method {method!r}. Valid options: {list(methods)}")
 
-    filled_stream = Stream()
-    for tr in stream:
-        filled_stream.append(methods[method](tr, **kwargs))
-    return filled_stream
-
-
-def fill_gaps_with_constant(tr: Trace, fill_value: float = 0.0, dtype_out=None, **kwargs) -> Trace:
-    """
-    Fill masked gaps in a Trace with a constant value (default is 0.0).
-
-    Parameters:
-    -----------
-    tr : obspy.Trace
-        Trace with masked gaps in tr.data.
-    fill_value : float
-        Value to fill the gaps with.
-
-    Returns:
-    --------
-    obspy.Trace
-        Trace with gaps filled and no masked array.
-    """
-    if not isinstance(tr.data, np.ma.MaskedArray):
-        return tr.copy()
-
-    new_tr = tr.copy()
-    arr = tr.data.filled(fill_value)
-    if dtype_out is not None:
-        arr = arr.astype(dtype_out, copy=False)
-    new_tr.data = arr
-    return new_tr
-
-def fill_gaps_with_linear_interpolation(tr: Trace, **kwargs) -> Trace:
-    """
-    Fill masked gaps in a Trace using linear interpolation.
-    """
-    if not isinstance(tr.data, np.ma.MaskedArray):
-        return tr.copy()
-
-    new_tr = tr.copy()
-    data = new_tr.data.astype(np.float32)
-    mask = data.mask
-
-    if not np.any(mask):
-        return new_tr
-
-    x = np.arange(len(data))
-    data[mask] = np.interp(x[mask], x[~mask], data[~mask])
-    new_tr.data = data.data  # strip the mask
-    return new_tr
-
-
-def fill_gaps_with_previous_value(tr: Trace, **kwargs) -> Trace:
-    """
-    Fill masked gaps by repeating the previous valid value (forward-fill).
-    """
-    if not isinstance(tr.data, np.ma.MaskedArray):
-        return tr.copy()
-
-    new_tr = tr.copy()
-    data = new_tr.data.astype(np.float32)
-    mask = np.asarray(data.mask, dtype=bool)
-    if not mask.any():
-        return new_tr
-
-    y = data.filled(np.nan)
-    # Build forward-fill indices
-    idx = np.arange(y.size)
-    valid = ~np.isnan(y)
-    if not valid.any():
-        # nothing valid; return zeros
-        new_tr.data = np.zeros_like(data, dtype=np.float32)
-        return new_tr
-
-    # last valid index up to i (forward fill)
-    last = np.maximum.accumulate(np.where(valid, idx, -1))
-    # For initial NaNs with no prior valid, back-fill from first valid
-    first_valid = np.flatnonzero(valid)[0]
-    last[last < 0] = first_valid
-    y = y[last].astype(np.float32, copy=False)
-
-    new_tr.data = y  # plain ndarray
-    return new_tr
-
-
-def fill_gaps_with_filtered_noise(tr: Trace, taper_percentage=0.2, **kwargs) -> Trace:
-    """
-    Fill masked gaps using spectrally matched noise.
-    """
-    if not isinstance(tr.data, np.ma.MaskedArray):
-        return tr.copy()
-
-    new_tr = tr.copy()
-    data = new_tr.data.astype(np.float32)
-    mask = data.mask
-
-    if not np.any(mask):
-        return new_tr
-
-    noise = _generate_spectrally_matched_noise(new_tr, taper_percentage=taper_percentage)
-    data[mask] = noise[mask]
-    new_tr.data = data.data
-    return new_tr
-
-
-def _next_pow2(n: int) -> int:
-    """Small helper used by _generate_spectrally_matched_noise."""
-    n = int(n)
-    if n < 1: 
-        return 1
-    return 1 << (n - 1).bit_length()
-
-def _generate_spectrally_matched_noise(tr: Trace, taper_percentage=0.2, **kwargs):
-    """
-    Generate noise matched to the magnitude spectrum of the (zero-mean) valid samples.
-    If valid samples are scarce, fall back to white noise.
-    """
-    data = tr.data
-    if not isinstance(data, np.ma.MaskedArray):
-        data = np.ma.masked_array(data)
-
-    valid = ~data.mask
-    y = np.asarray(data[valid], dtype=np.float64)
-    n_total = data.size
-    if y.size < 8:
-        # too little to estimate spectrum
-        noise = np.random.randn(n_total).astype(np.float64)
-    else:
-        y = y - y.mean()
-        nfft = _next_pow2(max(n_total, y.size))
-        amp = np.abs(np.fft.rfft(y, n=nfft))
-        # avoid zeros to prevent total silence
-        amp = np.maximum(amp, np.percentile(amp, 5) * 0.1)
-        phases = np.exp(2j * np.pi * np.random.rand(amp.size))
-        spec = amp * phases
-        synth = np.fft.irfft(spec, n=nfft).real[:n_total]
-        noise = synth
-
-    # Taper edges to avoid sharp starts/ends
-    npts = n_total
-    if 0.0 < taper_percentage < 1.0:
-        tl = max(1, int(npts * taper_percentage / 2))
-        if tl * 2 < npts:
-            taper = np.ones(npts, dtype=np.float64)
-            ramp = np.linspace(0, 1, tl, dtype=np.float64)
-            taper[:tl] = ramp
-            taper[-tl:] = ramp[::-1]
-            noise *= taper
-
-    return noise
-
-def piecewise_detrend(tr: Trace,
-                      mode: str = "linear",         # "linear" or "simple"
-                      null_values=(0.0, np.nan),
-                      use_null_values: bool = True,
-                      keep_mask: bool = True) -> Trace:
-    """
-    Piecewise detrend by contiguous valid spans:
-      - mode="linear": remove a*x + b per span (same as piecewise_detrend)
-      - mode="simple": remove mean per span
-    """
-    if mode == "linear":
-        from flovopy.core.gaputils import piecewise_detrend
-        return piecewise_detrend(tr, null_values, use_null_values, keep_mask)
-
-    # simple (mean removal)
-    out = tr.copy()
-    data = out.data
-    if isinstance(data, np.ma.MaskedArray):
-        mask = np.asarray(data.mask, dtype=bool)
-        y = np.asarray(data.filled(0.0), dtype=np.float64)
-        had_mask = True
-    else:
-        had_mask = False
-        y = np.asarray(data, dtype=np.float64)
-        if use_null_values:
-            mask = ~np.isfinite(y)
-            for nv in null_values:
-                if isinstance(nv, float) and np.isnan(nv): continue
-                mask |= (y == nv)
-            mask = np.asarray(mask, dtype=bool)
-        else:
-            mask = np.zeros_like(y, dtype=bool)
-
-    n = y.size
-    if n < 1:
-        return out
-
-    # find valid segments vectorized
-    valid = ~mask
-    p = np.concatenate(([False], valid, [False]))
-    changes = np.flatnonzero(p[1:] != p[:-1])
-    starts, ends = changes[0::2], changes[1::2]
-
-    for s, e in zip(starts, ends):
-        seg = y[s:e]
-        if seg.size:
-            seg -= seg.mean()
-
-    if had_mask and keep_mask:
-        out.data = np.ma.masked_array(y.astype(data.dtype, copy=False), mask=mask)
-    else:
-        out.data = y.astype(data.dtype, copy=False)
-
-    try:
-        proc = getattr(out.stats, "processing", None)
-        if proc is None: out.stats.processing = []
-        out.stats.processing.append(f"piecewise_detrend(mode={mode})")
-    except Exception:
-        pass
-    return out
-
-
-
-
-
-import re
-_GAP_RE = re.compile(r"GAP\\s+(?P<dur>[^\\s]+)s\\s+from\\s+(?P<t1>[^\\s]+)\\s+to\\s+(?P<t2>[^\\s]+)")
-
-def mask_gaps(trace, fill_value=0.0, inplace=True, validate_fill_value=False):
-    """
-    Re-applies a mask to gap regions recorded in trace.stats.processing.
-
-    Parameters
-    ----------
-    trace : obspy.Trace
-        The trace with previously unmasked gaps.
-    fill_value : float, optional
-        Expected value used to fill gaps. Only used if `validate_fill_value=True`.
-    inplace : bool, optional
-        If True, modify in-place. If False, return a copy.
-    validate_fill_value : bool, optional
-        If True, only mask gaps where values match `fill_value`. Slower but safer.
-    """
-
-    if not inplace:
-        trace = trace.copy()
-
-    if not hasattr(trace.stats, "processing"):
-        return trace if not inplace else None
-
-    processing_lines = [p for p in trace.stats.processing if p.startswith("GAP")]
-    if not processing_lines:
-        return trace if not inplace else None
-
-    sr = trace.stats.sampling_rate
-    start = trace.stats.starttime
-    npts = trace.stats.npts
-
-    mask = np.zeros(npts, dtype=bool)
-
-    for line in processing_lines:
-        try:
-            m = _GAP_RE.search(line)
-            if not m:
-                print(f"✘ Could not parse gap line '{line}'")
-                continue
-            t1 = UTCDateTime(m.group("t1"))
-            t2 = UTCDateTime(m.group("t2"))
-            idx1 = max(0, int((t1 - start) * sr))
-            idx2 = min(npts, int((t2 - start) * sr))
-            if idx2 > idx1:
-                if validate_fill_value:
-                    segment = trace.data[idx1:idx2]
-                    if np.allclose(segment, fill_value, equal_nan=True):
-                        mask[idx1:idx2] = True
-                else:
-                    mask[idx1:idx2] = True
-        except Exception as e:
-            print(f"✘ Could not parse gap line '{line}': {e}")
-
-    trace.data = np.ma.masked_array(trace.data, mask=mask)
-    return trace if not inplace else None
-
-def unmask_gaps(trace, fill_value=0.0, inplace=True, verbose=False, log_gaps=False):
-    if not inplace:
-        trace = trace.copy()
-
-    if not isinstance(trace.data, np.ma.MaskedArray) or trace.data.mask is np.ma.nomask:
-        return trace if not inplace else None
-
-    sr = trace.stats.sampling_rate
-    start = trace.stats.starttime
-    mask = trace.data.mask
-
-    if isinstance(mask, np.ndarray):
-        gap_idxs = np.where(mask)[0]
-    else:
-        gap_idxs = np.arange(trace.stats.npts) if mask else []
-
-    n_gaps = 0
-    if gap_idxs.size:
-        if log_gaps:
-            split_idx = np.where(np.diff(gap_idxs) != 1)[0] + 1
-            gap_groups = np.split(gap_idxs, split_idx)
-            n_gaps = len(gap_groups)
-
-            if not hasattr(trace.stats, "processing"):
-                trace.stats.processing = []
-            trace.stats.processing.append(f"Filled {n_gaps} gaps with {fill_value}")
-
-            for group in gap_groups:
-                t1 = start + group[0] / sr
-                t2 = start + (group[-1] + 1) / sr
-                trace.stats.processing.append(f"GAP {t2 - t1:.2f}s from {t1} to {t2}")
-
-    trace.data = trace.data.filled(fill_value)
-
-    if verbose and n_gaps > 500:
-        print(f"⚠️ Large number of GAP lines added to trace.stats.processing: {n_gaps}")
-
-    return trace if not inplace else None
-
-
-
-def _interp_short_gaps_only(tr: Trace, short_gap_sec: float) -> Trace:
-    """
-    Interpolate short masked gaps (<= short_gap_sec) and keep *long* gaps masked.
-    Implemented via smart_fill(long_fill_value=np.nan) + re-masking NaNs.
-    """
-    data = tr.data
-    if not isinstance(data, np.ma.MaskedArray) or not np.any(data.mask):
-        return tr.copy()
-    tmp = smart_fill(tr, short_thresh=short_gap_sec, long_fill_value=np.nan)  # ndarray
-    arr = np.asarray(tmp.data)
-    mask = ~np.isfinite(arr)  # re-mask NaNs (long gaps)
-    out = tr.copy()
-    out.data = np.ma.masked_array(arr, mask=mask)
-    return out
-
-
-def normalize_stream_gaps(
-    st: Stream,
-    *,
-    small_gap_sec: float = 2.0,
-    long_gap_fill: Literal["leave", "zero", "previous", "noise", "linear"] = "zero",
-    piecewise: bool = True,
-    force_unmasked: bool = True,
-) -> Stream:
-    """
-    Normalize a Stream for downstream processing (no filtering, no global taper).
-
-    Steps per Trace:
-      1) Interpolate short masked gaps (<= small_gap_sec); keep long gaps masked.
-      2) (Optional) piecewise linear detrend over valid spans only (mask-aware).
-      3) Fill long gaps using `long_gap_fill` policy (or leave masked).
-      4) If `force_unmasked`, convert remaining masks to a plain ndarray.
-
-    Parameters
-    ----------
-    st : obspy.Stream
-        Input stream (may contain masked arrays).
-    small_gap_sec : float
-        Threshold (seconds) for short gap interpolation.
-    long_gap_fill : {"leave","zero","previous","noise","linear"}
-        Long-gap policy after detrend:
-          - "leave"   : keep masked (only valid if force_unmasked=False)
-          - "zero"    : fill with 0.0
-          - "previous": forward-fill from last valid
-          - "noise"   : spectrally matched noise
-          - "linear"  : linear interpolation across all masked samples
-    piecewise : bool
-        If True, apply piecewise linear detrend on valid spans.
-    force_unmasked : bool
-        If True, ensure plain ndarray (no masked arrays) in output.
-
-    Returns
-    -------
-    obspy.Stream
-        Stream with gaps normalized and (optionally) detrended, ready for
-        algorithms that don’t accept masked arrays.
-    """
-    wip = st.copy()
-
-    # 0) Optional front-door sanitation/merge (usually unnecessary if MiniSEED is clean)
+    st = stream if inplace else stream.copy()
 
     out = Stream()
-    for tr in wip:
-        work = tr.copy()
+    for tr in st:
+        out.append(methods[method](tr, inplace=False, **kwargs))
 
-        # 1) Interpolate only short gaps; leave long masked for detrend
-        if isinstance(work.data, np.ma.MaskedArray) and np.any(work.data.mask) and small_gap_sec > 0:
-            work = _interp_short_gaps_only(work, short_gap_sec=small_gap_sec)
-
-        # 2) Piecewise detrend over valid spans (no split/merge, no taper)
-        if piecewise:
-            # use_null_values=False because we already carry masks for long gaps
-            work = piecewise_detrend(
-                work,
-                null_values=None,
-                use_null_values=False,
-                keep_mask=False,
-            )
-
-        # 3) Fill long gaps according to policy
-        if isinstance(work.data, np.ma.MaskedArray) and np.any(work.data.mask):
-            if long_gap_fill == "leave":
-                pass  # keep masks (only meaningful if force_unmasked=False)
-            elif long_gap_fill == "zero":
-                work = fill_gaps_with_constant(work, fill_value=0.0)
-            elif long_gap_fill == "previous":
-                work = fill_gaps_with_previous_value(work)
-            elif long_gap_fill == "noise":
-                work = fill_gaps_with_filtered_noise(work, taper_percentage=0.2)
-            elif long_gap_fill == "linear":
-                work = fill_gaps_with_linear_interpolation(work)
-            else:
-                work = fill_gaps_with_constant(work, fill_value=0.0)
-
-        # 4) Ensure plain ndarray if requested
-        if force_unmasked and isinstance(work.data, np.ma.MaskedArray):
-            work = fill_gaps_with_constant(work, fill_value=0.0)
-
-        out.append(work)
+    if inplace:
+        stream.clear()
+        stream.extend(out)
+        return stream
 
     return out

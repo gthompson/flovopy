@@ -141,3 +141,39 @@ def syngine2stream(station, lat, lon, GCMTeventID, mseedfile):
             synth_disp[c].stats.centerlon = lon
         synth_disp.write(mseedfile)
     return synth_disp
+
+
+def fake_trace(id, sampling_rate=100.0, npts=1000, starttime=UTCDateTime(), data=None):
+    """
+    Create a fake ObsPy Trace with specified parameters.
+
+    Parameters
+    ----------
+    id : str
+        Trace ID in the format 'NET.STA.LOC.CHAN'.
+    sampling_rate : float
+        Sampling rate in Hz (default: 100.0).
+    npts : int
+        Number of data points (default: 1000).
+    starttime : obspy.UTCDateTime or None
+        Start time of the trace (default: None, uses current time).
+    data : array-like or None
+        Data values for the trace (default: None, generates random data).
+
+    Returns
+    -------
+    obspy.Trace
+        The created trace object.
+    """
+
+    if data is None:
+        data = np.random.randn(npts).astype(np.float32)
+
+    tr = Trace()
+    tr.id = id
+    tr.stats.network, tr.stats.station, tr.stats.location, tr.stats.channel = id.split('.')
+    tr.stats.sampling_rate = sampling_rate
+    tr.stats.starttime = starttime
+    tr.data = np.array(data, dtype=np.float32)
+
+    return tr

@@ -37,76 +37,8 @@ def spath2datetime(spath):
     else:
         return None    
 
-def legacy_or_not(fname):
-    fnamelower = os.path.basename(fname).lower()
-    """ This part fails because of 1997 files like /data/SEISAN_DB/REA/MVOE_/1997/04/04-0231-34L.S199704 
-    if 'mvo' in fnamelower or 'asne' in fnamelower or 'dsne' in fnamelower or 'spn' in fnamelower:
-        print(f'Processing {fname}')
-    else:
-        print(f'Not processing {fname}')          
-        return None, None
-    """
-    legacy = False
-    network = 'DSN'
-    if 'asne' in fnamelower or 'spn' in fnamelower:
-        legacy = True # WAV file from the analog network
-        network = 'ASN'
-    return legacy, network
 
 
-def parse_string(line, pos0, pos1, astype='float', stripstr=True, default=None):
-    """Safely extract a substring from a line and convert to int/float/str."""
-    _s = line[pos0:pos1]
-    if stripstr:
-        _s = _s.strip()
-    if not _s:
-        return default
-    try:
-        if astype == 'float':
-            return float(_s)
-        elif astype == 'int':
-            return int(_s)
-        return _s
-    except ValueError:
-        return default
-
-'''
-def correct_nslc(traceID, sampling_rate=100.0, shortperiod=False):
-    """
-    Fix NSLC code for a waveform based on sampling rate and whether it's shortperiod.
-    Returns a waveform_id dict suitable for ObsPy Pick.
-    """
-    try:
-        parts = traceID.strip().split('.')
-        if len(parts) == 4:
-            network, station, location, channel = parts
-        else:
-            station = parts[1] if len(parts) > 1 else ""
-            channel = parts[-1]
-            network, location = "", ""
-
-        if not channel:
-            channel = "???"  # Fallback
-
-        band_code = 'H' if sampling_rate >= 80 else 'S' if shortperiod else 'B'
-        comp_code = channel[-1] if len(channel) > 0 else '?'
-        chan_code = band_code + 'H' + comp_code  # e.g., 'HHZ', 'SHZ', 'BHZ'
-
-        return {
-            "network_code": network,
-            "station_code": station,
-            "location_code": location,
-            "channel_code": chan_code
-        }
-    except Exception as e:
-        print(f"[correct_nslc] Failed to parse traceID '{traceID}': {e}")
-        return {
-            "network_code": "",
-            "station_code": "",
-            "location_code": "",
-            "channel_code": "???"
-        }
-'''
 
 def filetime2wavpath(filetime, sfilepath, y2kfix=False, numchans=0, dbstring='MVO__'):
     """Create full path to a WAV file from datetime object."""

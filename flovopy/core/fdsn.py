@@ -1,150 +1,350 @@
 ######################################################################
 ##   Additional tools for ObsPy FDSN client                         ##
 ######################################################################
-import os
-import numpy as np
 
-import obspy
-from obspy import Stream, read, UTCDateTime
-from obspy.core.inventory import read_inventory
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Iterable
+
+from obspy import Stream, UTCDateTime, read
+from obspy.core.inventory import Inventory, read_inventory
 from obspy.clients.fdsn import Client
 
-
-#CACHE_DIR = os.path.join(os.getcwd(), 'cache')
-CACHE_DIR = os.path.join('.', 'cache')
-
-def _check_client_or_string(fdsnThing):
-    from obspy.clients.fdsn import Client
-    if isinstance(fdsnThing, Client):
-        return fdsnThing
-    if isinstance(fdsnThing, str):
-        return Client(base_url=fdsnThing)
-    
-def _make_cache_dir(cachedir):
-    if not os.path.isdir(cachedir):
-        os.mkdir(cachedir)
-
-def _get_stationXML_filename(startt, endt, centerlat, centerlon, searchRadiusDeg, cachedir=CACHE_DIR):
-    _make_cache_dir(cachedir)
-    return os.path.join(cachedir, '%s_%s_%.4f_%.4f_%.2f.SML' % (startt.strftime('%Y%m%d%H%M'),endt.strftime('%Y%m%d%H%M'),centerlat,centerlon,searchRadiusDeg))
-
-def _get_MSEED_filename(startt, endt, trace_ids, cachedir=CACHE_DIR):
-    _make_cache_dir(cachedir)
-    return os.path.join(cachedir, '%s_%s_%s_%s.MSEED' % (startt.strftime('%Y%m%d%H%M'),endt.strftime('%Y%m%d%H%M'),trace_ids[0],trace_ids[-1]))
+from flovopy.core.miniseed_io import smart_merge
 
 
-def get_inventory(fdsnClient, startt, endt, centerlat, centerlon, searchRadiusDeg, network='*', station='*', channel='*', overwrite=False, cache=False ):
-    """ 
-    Get inventory of stations/channels available. Cache locally using fixed filenam, if cache==True. Default is to download each time.
+CACHE_DIR = Path(".") / "cache"
+
+
+# -------------------------------------------------------------------
+# Internal helpers
+# -------------------------------------------------------------------
+
+def _check_client_or_string(fdsn_thing) -> Client:
     """
-    stationXmlFile = _get_stationXML_filename(startt, endt, centerlat, centerlon, searchRadiusDeg)
+    Return an ObsPy FDSN Client from either an existing Client or a base URL.
+    """
+    if isinstance(fdsn_thing, Client):
+        return fdsn_thing
+    if isinstance(fdsn_thing, str):
+        return Client(base_url=fdsn_thing)
+    raise TypeError("fdsn_thing must be an ObsPy FDSN Client or a base URL string")
 
-    if os.path.isfile(stationXmlFile) and not overwrite:
-        # load inv from file
-        inv = obspy.core.inventory.read_inventory(stationXmlFile)
-    else:
-        # load inv from Client & save it        
-        print('Trying to load inventory from %s to %s' % (startt.strftime('%Y/%m/%d %H:%M'), endt.strftime('%Y/%m/%d %H:%M')))
-        fdsnClient = _check_client_or_string(fdsnClient)
+
+def _make_cache_dir(cachedir) -> Path:
+    """
+    Ensure a cache directory exists and return it as a Path.
+    """
+    cachedir = Path(cachedir)
+    cachedir.mkdir(parents=True, exist_ok=True)
+    return cachedir
+
+
+def _safe_trace_id_for_filename(trace_id: str) -> str:
+    """
+    Make a trace ID safer for use in cache filenames.
+    """
+    return trace_id.replace("*", "X").replace("?", "X").replace("/", "_")
+
+
+def _get_stationxml_filename(
+    startt,
+    endt,
+    centerlat,
+    centerlon,
+    search_radius_deg,
+    cachedir=CACHE_DIR,
+) -> Path:
+    """
+    Return a cache filename for a station query.
+    """
+    cachedir = _make_cache_dir(cachedir)
+    return cachedir / (
+        f"{UTCDateTime(startt).strftime('%Y%m%d%H%M')}_"
+        f"{UTCDateTime(endt).strftime('%Y%m%d%H%M')}_"
+        f"{centerlat:.4f}_{centerlon:.4f}_{search_radius_deg:.2f}.SML"
+    )
+
+
+def _get_mseed_filename(
+    startt,
+    endt,
+    trace_ids: Iterable[str],
+    cachedir=CACHE_DIR,
+) -> Path:
+    """
+    Return a cache filename for a waveform query.
+    """
+    trace_ids = list(trace_ids)
+    if not trace_ids:
+        raise ValueError("trace_ids must not be empty")
+
+    cachedir = _make_cache_dir(cachedir)
+    return cachedir / (
+        f"{UTCDateTime(startt).strftime('%Y%m%d%H%M')}_"
+        f"{UTCDateTime(endt).strftime('%Y%m%d%H%M')}_"
+        f"{_safe_trace_id_for_filename(trace_ids[0])}_"
+        f"{_safe_trace_id_for_filename(trace_ids[-1])}.MSEED"
+    )
+
+
+# -------------------------------------------------------------------
+# Public API
+# -------------------------------------------------------------------
+
+def get_inventory(
+    fdsn_client,
+    startt,
+    endt,
+    centerlat,
+    centerlon,
+    search_radius_deg,
+    network="*",
+    station="*",
+    channel="*",
+    overwrite: bool = False,
+    cache: bool = False,
+    cachedir=CACHE_DIR,
+    verbose: bool = True,
+) -> Inventory | None:
+    """
+    Get an inventory of available stations/channels for a circular query.
+
+    Parameters
+    ----------
+    fdsn_client
+        ObsPy FDSN Client or base URL string.
+    startt, endt
+        Query time range.
+    centerlat, centerlon
+        Query center coordinates in decimal degrees.
+    search_radius_deg
+        Maximum radius in degrees.
+    network, station, channel
+        FDSN selectors.
+    overwrite
+        If True, ignore any cached StationXML file.
+    cache
+        If True, cache downloaded inventory to StationXML.
+    cachedir
+        Cache directory.
+    verbose
+        If True, print progress and warnings.
+
+    Returns
+    -------
+    Inventory or None
+        ObsPy Inventory, or None if unavailable.
+    """
+    startt = UTCDateTime(startt)
+    endt = UTCDateTime(endt)
+
+    stationxml_file = _get_stationxml_filename(
+        startt,
+        endt,
+        centerlat,
+        centerlon,
+        search_radius_deg,
+        cachedir=cachedir,
+    )
+
+    if stationxml_file.is_file() and not overwrite:
         try:
-            inv = fdsnClient.get_stations(
-                network = network,
-                station = station,
-                channel = channel,
-                latitude = centerlat,
-                longitude = centerlon,
-                maxradius = searchRadiusDeg,
-                starttime = startt,
-                endtime = endt,
-                level = 'response'
-            )
-        except Exception as e: 
-            print(e)
-            print('-  no inventory available')
-            return None
-        else:
-            if cache:         
-                # Save the inventory to a stationXML file
-                inv.write(stationXmlFile, format='STATIONXML')
-                print('inventory saved to %s' % stationXmlFile)
-            
+            inv = read_inventory(str(stationxml_file))
+            if verbose:
+                print(f"Loaded cached inventory from {stationxml_file}")
             return inv
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Failed to read cached inventory {stationxml_file}: {e}")
+
+    if verbose:
+        print(
+            "Trying to load inventory from "
+            f"{startt.strftime('%Y/%m/%d %H:%M')} to {endt.strftime('%Y/%m/%d %H:%M')}"
+        )
+
+    client = _check_client_or_string(fdsn_client)
+
+    try:
+        inv = client.get_stations(
+            network=network,
+            station=station,
+            channel=channel,
+            latitude=centerlat,
+            longitude=centerlon,
+            maxradius=search_radius_deg,
+            starttime=startt,
+            endtime=endt,
+            level="response",
+        )
+    except Exception as e:
+        if verbose:
+            print(e)
+            print("- no inventory available")
+        return None
+
+    if cache:
+        try:
+            inv.write(str(stationxml_file), format="STATIONXML")
+            if verbose:
+                print(f"Inventory saved to {stationxml_file}")
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Failed to cache inventory to {stationxml_file}: {e}")
+
+    return inv
 
 
-
-def get_stream(fdsnClient, trace_ids, startt, endt, overwrite=False, cache=False):
-    """ 
-    Load waveform data for all trace ids for this time range. Cache locally using fixed filename, if cache==True. Default is to download each time.
+def get_stream(
+    fdsn_client,
+    trace_ids,
+    startt,
+    endt,
+    overwrite: bool = False,
+    cache: bool = False,
+    cachedir=CACHE_DIR,
+    attach_response: bool = True,
+    merge_strategy: str = "both",
+    force_close_sampling_rates_on_merge_failure: bool = True,
+    sampling_rate_tolerance_hz: float = 0.1,
+    verbose: bool = True,
+) -> Stream:
     """
-    import numpy as np
-    mseedfile = _get_MSEED_filename(startt, endt, trace_ids)
-    if os.path.isfile(mseedfile) and not overwrite:
-        # load raw data from file
-        st = obspy.core.read(mseedfile)
-        
-    else:
-        # load raw data from FDSN client
-        st = obspy.core.Stream()
-        fdsnClient = _check_client_or_string(fdsnClient)
-        for trace_id in trace_ids:
-            network, station, location, chancode = trace_id.split('.')
-            print("net=%s, station=%s, location=%s, chancode=%s" % (network, station, location, chancode))
-            try:
-                this_st = fdsnClient.get_waveforms(
-                    network,
-                    station,
-                    location,
-                    chancode,
-                    starttime=startt,
-                    endtime=endt,
-                    attach_response=True
-                )
+    Load waveform data for all requested trace IDs over a time range.
 
-            except:
-                print("- No waveform data available for %s for this event %s" % (trace_id, mseedfile))
-                this_st = obspy.core.Stream()
-                
-            else: #SCAFFOLD - Replace with smart merge?
-                if this_st:
-                    try:
-                        this_st.merge(fill_value=0, method=1)
-                        st += this_st 
-                    except:
-                        #this_st = smart_merge(this_st) 
-                        fsamp = np.nanmean([tr2.stats.sampling_rate for tr2 in this_st])
-                        for tr2 in this_st:
-                            tr2.stats.sampling_rate = fsamp
-                        this_st.merge(fill_value=0, method=1)
+    Parameters
+    ----------
+    fdsn_client
+        ObsPy FDSN Client or base URL string.
+    trace_ids
+        Iterable of NET.STA.LOC.CHA trace IDs.
+    startt, endt
+        Query time range.
+    overwrite
+        If True, ignore cached MiniSEED and redownload.
+    cache
+        If True, cache downloaded waveform data as MiniSEED.
+    cachedir
+        Cache directory.
+    attach_response
+        Passed to ObsPy FDSN get_waveforms().
+    merge_strategy
+        Strategy passed to ``smart_merge()``.
+    force_close_sampling_rates_on_merge_failure
+        If True, allow smart_merge() to retry ObsPy merge after forcing
+        near-equal sampling rates to a weighted mean.
+    sampling_rate_tolerance_hz
+        Tolerance used by the above fallback.
+    verbose
+        If True, print progress and warnings.
 
-                #for tr0 in st0:
-                #    st.append(tr0)
-                #st.merge(method=1,fill_value=0)                             
-    
-        if not st:
-            print("- No waveform data available for this event %s" % mseedfile)
-        else:
-            try:
-                st.merge(fill_value=0, method=1) #SCAFFOLD - Replace with smart merge?
-            except:
-                #st = smart_merge(this_st)
-                fsamp = np.nanmean([tr2.stats.sampling_rate for tr2 in this_st])
-                for tr2 in st:
-                    tr2.stats.sampling_rate = fsamp
-                st.merge(fill_value=0, method=1)
-            # Save raw waveform data to miniseed
-            if cache:
-                st.write(mseedfile, format="MSEED") # write RAW data
-    
+    Returns
+    -------
+    Stream
+        ObsPy Stream, possibly empty.
+    """
+    startt = UTCDateTime(startt)
+    endt = UTCDateTime(endt)
+    trace_ids = list(trace_ids)
+
+    if not trace_ids:
+        return Stream()
+
+    mseedfile = _get_mseed_filename(startt, endt, trace_ids, cachedir=cachedir)
+
+    if mseedfile.is_file() and not overwrite:
+        try:
+            st = read(str(mseedfile))
+            if verbose:
+                print(f"Loaded cached waveform data from {mseedfile}")
+            return st
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Failed to read cached waveform file {mseedfile}: {e}")
+
+    client = _check_client_or_string(fdsn_client)
+    st = Stream()
+
+    for trace_id in trace_ids:
+        try:
+            network, station, location, chancode = trace_id.split(".")
+        except ValueError:
+            if verbose:
+                print(f"[WARN] Invalid trace ID skipped: {trace_id}")
+            continue
+
+        if verbose:
+            print(
+                f"net={network}, station={station}, "
+                f"location={location}, chancode={chancode}"
+            )
+
+        try:
+            this_st = client.get_waveforms(
+                network,
+                station,
+                location,
+                chancode,
+                starttime=startt,
+                endtime=endt,
+                attach_response=attach_response,
+            )
+        except Exception as e:
+            if verbose:
+                print(f"- No waveform data available for {trace_id}: {e}")
+            continue
+
+        if len(this_st):
+            this_st = smart_merge(
+                this_st,
+                strategy=merge_strategy,
+                sanitize_before_merge=True,
+                force_close_sampling_rates_on_merge_failure=force_close_sampling_rates_on_merge_failure,
+                sampling_rate_tolerance_hz=sampling_rate_tolerance_hz,
+                return_stream_only=True,
+                verbose=verbose,
+            )
+            st += this_st
+
+    if not len(st):
+        if verbose:
+            print(f"- No waveform data available for request {mseedfile.name}")
+        return st
+
+    st = smart_merge(
+        st,
+        strategy=merge_strategy,
+        sanitize_before_merge=True,
+        force_close_sampling_rates_on_merge_failure=force_close_sampling_rates_on_merge_failure,
+        sampling_rate_tolerance_hz=sampling_rate_tolerance_hz,
+        return_stream_only=True,
+        verbose=verbose,
+    )
+
+    if cache:
+        try:
+            st.write(str(mseedfile), format="MSEED")
+            if verbose:
+                print(f"Waveform cache written to {mseedfile}")
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Failed to cache waveform data to {mseedfile}: {e}")
+
     return st
 
 
+def get_fdsn_identifier(fdsn_url: str) -> str:
+    """
+    Return a short prefix for a known FDSN service URL.
+    """
+    fdsn_url = fdsn_url.lower()
 
-def get_fdsn_identifier(fdsnURL):
-    prepend=''
-    if 'iris' in fdsnURL:
-        prepend='iris_'
-    if 'shake' in fdsnURL:
-        prepend='rboom_'
-    if 'geonet' in fdsnURL:
-        prepend='nz_'  
-    return prepend
+    if "iris" in fdsn_url:
+        return "iris_"
+    if "shake" in fdsn_url:
+        return "rboom_"
+    if "geonet" in fdsn_url:
+        return "nz_"
+    return ""

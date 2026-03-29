@@ -176,10 +176,16 @@ def smart_merge(
     *,
     strategy: str = "obspy",
     sanitize_before_merge: bool = True,
+    harmonize_rates: bool = False,
+    max_sampling_rate: float | None = None,
+    skip_low_rate_channels: bool = False,
     allow_timeshift: bool = False,
     max_shift_seconds: int = 2,
+    force_close_sampling_rates_on_merge_failure: bool = True,
+    sampling_rate_tolerance_hz: float = 0.1,
+    return_stream_only: bool = True,
     verbose: bool = False,
-) -> dict:
+) -> dict | Stream:
     """
     Merge traces in a stream using a selected strategy.
 
@@ -193,37 +199,160 @@ def smart_merge(
             - "max": merge overlaps using sample-wise maximum
             - "both": try ObsPy first, fall back to max merge if needed
     sanitize_before_merge
-        If True, run `sanitize_stream()` on each grouped substream before merge.
+        If True, run ``sanitize_stream()`` on each grouped substream before merge.
+        This may remove empty traces and duplicates, depending on the current
+        behavior of ``sanitize_stream()``.
+    harmonize_rates
+        If True, downsample each grouped substream to a common sampling rate
+        before merge.
+    max_sampling_rate
+        Optional cap passed to ``downsample_stream_to_common_rate()`` when
+        ``harmonize_rates=True``.
+    skip_low_rate_channels
+        Passed to ``downsample_stream_to_common_rate()`` when
+        ``harmonize_rates=True``.
     allow_timeshift
         Reserved for future logic allowing small timing shifts before merge.
         Currently accepted for API compatibility but not actively used.
     max_shift_seconds
         Reserved for future timing-shift logic.
+    force_close_sampling_rates_on_merge_failure
+        If True, and an ObsPy merge fails, check whether all sampling rates in
+        the grouped substream lie within ``sampling_rate_tolerance_hz`` of their
+        weighted mean. If so, reset all trace sampling rates to that weighted
+        mean and retry the ObsPy merge.
+    sampling_rate_tolerance_hz
+        Maximum allowed absolute deviation from the weighted mean sampling rate
+        for the fallback rate-forcing logic to apply.
+    return_stream_only
+        If True, return only the merged stream. If False, return a report dict.
     verbose
         If True, print diagnostics.
 
     Returns
     -------
-    dict
-        Summary report containing:
+    dict or Stream
+        If ``return_stream_only=False`` (default), returns a summary report
+        containing:
             - merged_stream
             - n_input_traces
             - n_output_traces
             - strategy
             - ids
+            - harmonize_rates
+            - allow_timeshift
+            - force_close_sampling_rates_on_merge_failure
+            - sampling_rate_tolerance_hz
+        If ``return_stream_only=True``, returns only the merged Stream.
+
+    Notes
+    -----
+    - Traces are merged independently by SEED id.
+    - ``allow_timeshift`` / ``max_shift_seconds`` are currently placeholders;
+      they are retained for API compatibility but are not yet implemented.
     """
-    def log(msg):
+
+    from collections import defaultdict
+
+    def log(msg: str):
         if verbose:
             print(msg)
 
-    if len(stream_in) == 0:
+    def _finalize(result_stream: Stream):
+        if return_stream_only:
+            return result_stream
         return {
-            "merged_stream": Stream(),
-            "n_input_traces": 0,
-            "n_output_traces": 0,
+            "merged_stream": result_stream,
+            "n_input_traces": len(stream_in),
+            "n_output_traces": len(result_stream),
             "strategy": strategy,
-            "ids": [],
+            "ids": sorted(set(tr.id for tr in result_stream)),
+            "harmonize_rates": harmonize_rates,
+            "allow_timeshift": allow_timeshift,
+            "force_close_sampling_rates_on_merge_failure": force_close_sampling_rates_on_merge_failure,
+            "sampling_rate_tolerance_hz": sampling_rate_tolerance_hz,
         }
+
+    def _weighted_mean_sampling_rate(st: Stream) -> float | None:
+        rates = []
+        weights = []
+        for tr in st:
+            try:
+                sr = float(tr.stats.sampling_rate)
+                npts = int(getattr(tr.stats, "npts", len(tr.data)))
+            except Exception:
+                continue
+            if np.isfinite(sr) and npts > 0:
+                rates.append(sr)
+                weights.append(npts)
+
+        if not rates:
+            return None
+
+        return float(np.average(rates, weights=weights))
+
+    def _can_force_sampling_rates_to_weighted_mean(
+        st: Stream,
+        tol_hz: float,
+    ) -> tuple[bool, float | None]:
+        mean_sr = _weighted_mean_sampling_rate(st)
+        if mean_sr is None:
+            return False, None
+
+        for tr in st:
+            try:
+                sr = float(tr.stats.sampling_rate)
+            except Exception:
+                return False, None
+            if not np.isfinite(sr):
+                return False, None
+            if abs(sr - mean_sr) > tol_hz:
+                return False, mean_sr
+
+        return True, mean_sr
+
+    def _try_obspy_merge_with_optional_rate_fix(st: Stream, seed_id: str) -> Stream:
+        tmp = st.copy()
+        try:
+            tmp.merge(method=1, fill_value=np.nan)
+            return tmp
+        except Exception as e:
+            log(f"ObsPy merge failed for {seed_id}: {e}")
+
+        if not force_close_sampling_rates_on_merge_failure:
+            raise
+
+        ok, mean_sr = _can_force_sampling_rates_to_weighted_mean(
+            tmp,
+            sampling_rate_tolerance_hz,
+        )
+        if not ok or mean_sr is None:
+            log(
+                f"[smart_merge] Sampling-rate fallback not applied for {seed_id}: "
+                f"rates differ by more than ±{sampling_rate_tolerance_hz} Hz."
+            )
+            raise
+
+        log(
+            f"[smart_merge] Retrying merge for {seed_id} after forcing all sampling "
+            f"rates to weighted mean {mean_sr:.6f} Hz "
+            f"(tolerance ±{sampling_rate_tolerance_hz} Hz)."
+        )
+
+        for tr in tmp:
+            tr.stats.sampling_rate = mean_sr
+
+        tmp.merge(method=1, fill_value=np.nan)
+        return tmp
+
+    if len(stream_in) == 0:
+        return _finalize(Stream())
+
+    if allow_timeshift:
+        log(
+            f"[smart_merge] allow_timeshift=True requested, but time-shift "
+            f"alignment is not yet implemented (max_shift_seconds={max_shift_seconds})."
+        )
 
     grouped = defaultdict(Stream)
     for tr in stream_in:
@@ -240,6 +369,21 @@ def smart_merge(
         if len(substream) == 0:
             continue
 
+        if harmonize_rates and len(substream) > 1:
+            try:
+                substream = downsample_stream_to_common_rate(
+                    substream,
+                    inplace=False,
+                    max_sampling_rate=max_sampling_rate,
+                    skip_low_rate_channels=skip_low_rate_channels,
+                    verbose=verbose,
+                )
+            except Exception as e:
+                log(f"[smart_merge] Rate harmonization failed for {seed_id}: {e}")
+
+        if len(substream) == 0:
+            continue
+
         if len(substream) == 1:
             merged_out.append(substream[0])
             continue
@@ -247,8 +391,7 @@ def smart_merge(
         log(f"Merging {seed_id}: {len(substream)} traces")
 
         if strategy == "obspy":
-            tmp = substream.copy()
-            tmp.merge(method=1, fill_value=np.nan)
+            tmp = _try_obspy_merge_with_optional_rate_fix(substream, seed_id)
             merged_out.extend(tmp)
 
         elif strategy == "max":
@@ -256,8 +399,7 @@ def smart_merge(
 
         elif strategy == "both":
             try:
-                tmp = substream.copy()
-                tmp.merge(method=1, fill_value=np.nan)
+                tmp = _try_obspy_merge_with_optional_rate_fix(substream, seed_id)
                 merged_out.extend(tmp)
             except Exception as e:
                 log(f"ObsPy merge failed for {seed_id}: {e}; falling back to merge_max().")
@@ -266,13 +408,7 @@ def smart_merge(
         else:
             raise ValueError(f"Unknown merge strategy: {strategy!r}")
 
-    return {
-        "merged_stream": merged_out,
-        "n_input_traces": len(stream_in),
-        "n_output_traces": len(merged_out),
-        "strategy": strategy,
-        "ids": sorted(set(tr.id for tr in merged_out)),
-    }
+    return _finalize(merged_out)
 
 
 def write_mseed(
@@ -342,7 +478,6 @@ def write_mseed(
     obj = tr.copy()
 
     if use_preprocess_pipeline and not bypass_processing:
-        from flovopy.core.waveform_pipeline import preprocess_stream_before_write
 
         obj = preprocess_stream_before_write(
             obj,
@@ -492,7 +627,6 @@ def read_mseed(
         return Stream()
 
     if use_postprocess_pipeline and not bypass_processing:
-        from flovopy.core.waveform_pipeline import postprocess_stream_after_read
 
         stream = postprocess_stream_after_read(
             stream,
@@ -646,7 +780,6 @@ def _return_same_type(original: Stream | Trace, st: Stream) -> Stream | Trace:
         return st[0]
     return st
 
-
 def postprocess_stream_after_read(
     obj: Stream | Trace,
     *,
@@ -665,11 +798,58 @@ def postprocess_stream_after_read(
     allow_timeshift: bool = False,
     max_shift_seconds: int = 2,
     harmonize_rates: bool = False,
+    min_sampling_rate: Optional[float] = None,
     max_sampling_rate: Optional[float] = None,
     verbose: bool = False,
 ) -> Stream | Trace:
     """
     Lightweight FLOVOpy post-read normalization for Streams/Traces.
+
+    Parameters
+    ----------
+    obj
+        Input Stream or Trace.
+    bypass_processing
+        If True, return early after optional copy.
+    copy
+        If True, operate on a copy.
+    ensure_float32_data
+        Convert data arrays to float32 where appropriate.
+    ensure_masked_data
+        Convert arrays to masked arrays where appropriate.
+    sanitize
+        Run general stream sanitization.
+    drop_empty
+        Remove empty traces before returning.
+    fix_ids
+        Apply ``fix_trace_id()`` if ``trace_fixer`` is not supplied.
+    legacy
+        Passed to ``fix_trace_id()``.
+    netcode
+        Passed to ``fix_trace_id()``.
+    trace_fixer
+        Optional custom trace-fixing function applied to each trace.
+    merge
+        If True, apply ``smart_merge()``.
+    merge_strategy
+        Merge strategy passed to ``smart_merge()``.
+    allow_timeshift
+        Passed to ``smart_merge()``.
+    max_shift_seconds
+        Passed to ``smart_merge()``.
+    harmonize_rates
+        If True, downsample traces to a common sampling rate.
+    min_sampling_rate
+        If not None, drop traces whose sampling rate is below this value.
+    max_sampling_rate
+        Upper bound passed to ``downsample_stream_to_common_rate()``.
+    verbose
+        If True, print warnings/debug information.
+
+    Returns
+    -------
+    Stream | Trace
+        Object of the same type as the input.
     """
     if bypass_processing:
         return obj.copy() if copy else obj
@@ -677,17 +857,27 @@ def postprocess_stream_after_read(
     original = obj
     st = _as_stream(obj.copy() if copy else obj)
 
+    # ------------------------------------------------------------------
+    # Per-trace dtype / masking normalization
+    # ------------------------------------------------------------------
     for tr in st:
         if ensure_float32_data:
             ensure_float32(tr)
         if ensure_masked_data:
             ensure_masked(tr)
 
+    # ------------------------------------------------------------------
+    # General cleanup
+    # ------------------------------------------------------------------
     if sanitize:
         sanitize_stream(st)
+
     if drop_empty:
         remove_empty_traces(st, inplace=True)
 
+    # ------------------------------------------------------------------
+    # Optional trace-ID / metadata fixing
+    # ------------------------------------------------------------------
     if trace_fixer is not None:
         for tr in st:
             trace_fixer(tr)
@@ -696,22 +886,53 @@ def postprocess_stream_after_read(
         for tr in st:
             fix_trace_id(tr, legacy=legacy, netcode=netcode, verbose=verbose)
 
-    if merge and len(st) > 1:
-        smart_merge(
-            st,
-            strategy=merge_strategy,
-            allow_timeshift=allow_timeshift,
-            max_shift_seconds=max_shift_seconds,
-            verbose=verbose,
-        )
+    # ------------------------------------------------------------------
+    # Cull low-rate traces before harmonization/merge
+    # ------------------------------------------------------------------
+    if min_sampling_rate is not None:
+        for tr in list(st):
+            try:
+                if tr.stats.sampling_rate < min_sampling_rate:
+                    st.remove(tr)
+            except Exception as e:
+                if verbose:
+                    print(
+                        f"[WARN] Could not evaluate sampling rate for "
+                        f"{getattr(tr, 'id', 'unknown')}: {e}"
+                    )
 
+    if drop_empty:
+        remove_empty_traces(st, inplace=True)
+
+    # ------------------------------------------------------------------
+    # Optional harmonization of sample rates
+    # ------------------------------------------------------------------
     if harmonize_rates and len(st) > 1:
         downsample_stream_to_common_rate(
             st,
-            max_sampling_rate=max_sampling_rate,
             inplace=True,
+            max_sampling_rate=max_sampling_rate,
+            verbose=verbose,
         )
 
+    # ------------------------------------------------------------------
+    # Optional merge
+    # ------------------------------------------------------------------
+    if merge and len(st) > 1:
+        st = smart_merge(
+            st,
+            strategy=merge_strategy,
+            sanitize_before_merge=False,   # already sanitized above
+            harmonize_rates=False,         # already handled above if requested
+            allow_timeshift=allow_timeshift,
+            max_shift_seconds=max_shift_seconds,
+            return_stream_only=True,
+            verbose=verbose,
+        )
+
+    # ------------------------------------------------------------------
+    # Final cleanup
+    # ------------------------------------------------------------------
     if drop_empty:
         remove_empty_traces(st, inplace=True)
 
@@ -743,6 +964,54 @@ def preprocess_stream_before_write(
 ) -> Stream | Trace:
     """
     Lightweight FLOVOpy pre-write normalization for Streams/Traces.
+
+    Parameters
+    ----------
+    obj
+        Input Stream or Trace.
+    bypass_processing
+        If True, return early after optional copy.
+    copy
+        If True, operate on a copy.
+    ensure_float32_data
+        Convert data arrays to float32 where appropriate.
+    ensure_masked_data
+        Convert arrays to masked arrays where appropriate.
+    sanitize
+        Run general stream sanitization.
+    drop_empty
+        Remove empty traces before returning.
+    fix_ids
+        Apply ``fix_trace_id()`` if ``trace_fixer`` is not supplied.
+    legacy
+        Passed to ``fix_trace_id()``.
+    netcode
+        Passed to ``fix_trace_id()``.
+    trace_fixer
+        Optional custom trace-fixing function applied to each trace.
+    merge
+        If True, apply ``smart_merge()``.
+    merge_strategy
+        Merge strategy passed to ``smart_merge()``.
+    allow_timeshift
+        Passed to ``smart_merge()``.
+    max_shift_seconds
+        Passed to ``smart_merge()``.
+    harmonize_rates
+        If True, downsample traces to a common sampling rate.
+    max_sampling_rate
+        Upper bound passed to ``downsample_stream_to_common_rate()``.
+    unmask_before_write
+        If True, replace masked gaps with ``fill_value`` before returning.
+    fill_value
+        Fill value used when unmasking masked gaps.
+    verbose
+        If True, print warnings/debug information.
+
+    Returns
+    -------
+    Stream | Trace
+        Object of the same type as the input.
     """
     if bypass_processing:
         return obj.copy() if copy else obj
@@ -750,17 +1019,27 @@ def preprocess_stream_before_write(
     original = obj
     st = _as_stream(obj.copy() if copy else obj)
 
+    # ------------------------------------------------------------------
+    # Per-trace dtype / masking normalization
+    # ------------------------------------------------------------------
     for tr in st:
         if ensure_float32_data:
             ensure_float32(tr)
         if ensure_masked_data:
             ensure_masked(tr)
 
+    # ------------------------------------------------------------------
+    # General cleanup
+    # ------------------------------------------------------------------
     if sanitize:
         sanitize_stream(st)
+
     if drop_empty:
         remove_empty_traces(st, inplace=True)
 
+    # ------------------------------------------------------------------
+    # Optional trace-ID / metadata fixing
+    # ------------------------------------------------------------------
     if trace_fixer is not None:
         for tr in st:
             trace_fixer(tr)
@@ -769,28 +1048,47 @@ def preprocess_stream_before_write(
         for tr in st:
             fix_trace_id(tr, legacy=legacy, netcode=netcode, verbose=verbose)
 
-    if merge and len(st) > 1:
-        smart_merge(
-            st,
-            strategy=merge_strategy,
-            allow_timeshift=allow_timeshift,
-            max_shift_seconds=max_shift_seconds,
-            verbose=verbose,
-        )
+    if drop_empty:
+        remove_empty_traces(st, inplace=True)
 
+    # ------------------------------------------------------------------
+    # Optional harmonization of sample rates
+    # ------------------------------------------------------------------
     if harmonize_rates and len(st) > 1:
         downsample_stream_to_common_rate(
             st,
-            max_sampling_rate=max_sampling_rate,
             inplace=True,
+            max_sampling_rate=max_sampling_rate,
+            verbose=verbose,
         )
 
+    # ------------------------------------------------------------------
+    # Optional merge
+    # ------------------------------------------------------------------
+    if merge and len(st) > 1:
+        st = smart_merge(
+            st,
+            strategy=merge_strategy,
+            sanitize_before_merge=False,   # already sanitized above
+            harmonize_rates=False,         # already handled above if requested
+            allow_timeshift=allow_timeshift,
+            max_shift_seconds=max_shift_seconds,
+            return_stream_only=True,
+            verbose=verbose,
+        )
+
+    # ------------------------------------------------------------------
+    # Convert masked gaps to plain arrays before write
+    # ------------------------------------------------------------------
     if unmask_before_write:
         st2 = Stream()
         for tr in st:
             st2.append(unmask_gaps(tr, fill_value=fill_value, inplace=False))
         st = st2
 
+    # ------------------------------------------------------------------
+    # Final cleanup
+    # ------------------------------------------------------------------
     if drop_empty:
         remove_empty_traces(st, inplace=True)
 

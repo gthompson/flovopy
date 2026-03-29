@@ -90,69 +90,137 @@ class SDSobj:
         - trimming
         """
 
-        if trace_ids is None:
-            trace_ids = self.client.iter_trace_ids(startt, endt, skip_low_rate=skip_low_rate_channels)
-
-        st = Stream()
-        iterator = tqdm(trace_ids, desc="Reading SDS") if progress else trace_ids
-
-        for tid in iterator:
-            net, sta, loc, chan = tid.split(".")
-
-            if skip_low_rate_channels and chan.startswith("L"):
-                continue
-
-            try:
-                traces = self.client.get_waveforms(
-                    net, sta, loc, chan,
-                    startt, endt,
-                    merge=0
-                )
-            except Exception as e:
-                if verbose:
-                    print(f"[WARN] Failed to read {tid}: {e}")
-                continue
-
-            # Cull low-rate traces
-            if min_sampling_rate is not None:
-                for tr in list(traces):
-                    if tr.stats.sampling_rate < min_sampling_rate:
-                        traces.remove(tr)
-
-            # Downsample + merge per ID
-            ds = downsample_stream_to_common_rate(
-                traces,
-                max_sampling_rate=max_sampling_rate
-            )
-            smart_merge(ds, strategy=merge_strategy)
-            st += ds
-
-        remove_empty_traces(st, inplace=True)
-
-        if len(st):
-            st.trim(startt, endt)
-
-            if final_merge == "always":
-                smart_merge(st, strategy=merge_strategy)
-
-            for tr in st:
-                tr.stats.processing = (tr.stats.processing or []) + [
-                    "flovopy:smart_merge_v1"
-                ]
-
-        self.stream = st
+        self.stream = self.client.read(
+            starttime=startt,
+            endtime=endt,
+            trace_ids=trace_ids,
+            skip_low_rate_channels=skip_low_rate_channels,
+            progress=progress,
+            verbose=verbose,
+            postprocess=True,
+            postprocess_kwargs=dict(
+                drop_empty=True,
+                sanitize=True,
+                harmonize_rates=True,
+                max_sampling_rate=max_sampling_rate,
+                min_sampling_rate=min_sampling_rate,   # after you add this
+                merge=False,  # or True if you want done there
+                merge_strategy=merge_strategy,
+            ),
+            final_smart_merge=(final_merge == "always"),
+        )
         gc.collect()
-        return 0 if len(st) else 1
+        return 0 if len(self.stream) else 1
 
     # ------------------------------------------------------------------
     # Writing (delegated)
     # ------------------------------------------------------------------
 
-    def write(self, overwrite: bool = False) -> List[Path]:
+    def write(
+        self,
+        obj: Stream | Trace,
+        *,
+        mode: str = "merge",
+        preprocess: bool = True,
+        overwrite: Optional[bool] = None,
+        verbose: bool = False,
+        **kwargs,
+    ) -> List[Path]:
         """
-        Write current stream to SDS archive.
+        Write waveform data to the SDS archive (compatibility wrapper).
+
+        This method delegates to EnhancedSDSClient.write_stream(), which
+        provides safe handling of SDS files, including merging with existing
+        daily MiniSEED files.
+
+        Parameters
+        ----------
+        obj
+            ObsPy Stream or Trace to write.
+        mode
+            One of:
+                - "fail"      : raise if SDS file exists
+                - "overwrite" : replace existing SDS file
+                - "merge"     : merge with existing SDS file (recommended)
+
+            Default is "merge", which is safe for incremental archive building.
+        preprocess
+            If True, apply FLOVOpy preprocessing pipeline before writing.
+            This includes optional:
+                - sanitization
+                - ID fixing
+                - merging within input
+                - harmonizing sample rates
+                - unmasking gaps
+        overwrite
+            Legacy flag for backward compatibility:
+                - overwrite=True  → mode="overwrite"
+                - overwrite=False → mode="fail"
+            If provided, this overrides `mode`.
+        verbose
+            Print diagnostics.
+        **kwargs
+            Additional keyword arguments forwarded to:
+                - preprocess_stream_before_write()
+                - write_mseed()
+
+            Common options:
+                merge=True
+                merge_strategy="both"
+                harmonize_rates=True
+                max_sampling_rate=100.0
+                fill_value=0.0
+                encoding="STEIM2"
+                reclen=4096
+
+        Returns
+        -------
+        list[Path]
+            List of SDS file paths written.
+
+        Notes
+        -----
+        - This method replaces the legacy SDSobj.write() implementation.
+        - It is safe for ingesting many small waveform files into an existing
+          SDS archive without data loss.
+        - Internally, all writing is handled by EnhancedSDSClient.
         """
-        return self.client.write_stream(self.stream, overwrite=overwrite)
+
+        # ------------------------------------------------------------
+        # Normalize input to Stream
+        # ------------------------------------------------------------
+        if obj is None:
+            return []
+
+        if isinstance(obj, Trace):
+            st = Stream([obj])
+        elif isinstance(obj, Stream):
+            st = obj
+        else:
+            raise TypeError("Input must be an ObsPy Stream or Trace")
+
+        if len(st) == 0:
+            return []
+
+        # ------------------------------------------------------------
+        # Backward compatibility: overwrite flag → mode
+        # ------------------------------------------------------------
+        if overwrite is not None:
+            mode = "overwrite" if overwrite else "fail"
+
+        # ------------------------------------------------------------
+        # Delegate to EnhancedSDSClient
+        # ------------------------------------------------------------
+        if not hasattr(self, "client") or self.client is None:
+            raise RuntimeError("SDSobj has no associated EnhancedSDSClient")
+
+        return self.client.write_stream(
+            st,
+            mode=mode,
+            preprocess=preprocess,
+            verbose=verbose,
+            **kwargs,
+        )
 
     # ------------------------------------------------------------------
     # Availability (modern backend, legacy interface)
