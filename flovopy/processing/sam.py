@@ -559,29 +559,6 @@ class SAM:
                     fill_method='interp', mad_floor=1e-12):
         """
         Despike a 1-D array using a rolling median + rolling MAD.
-
-        Parameters
-        ----------
-        x : array-like
-            Input 1-D data.
-        z : float
-            Modified z-score threshold. Typical values: 5-8.
-        window : int
-            Rolling window length in samples. Will be forced odd.
-        max_run : int
-            Maximum consecutive flagged samples to replace. Longer runs are left
-            alone, since they may represent real transient signal.
-        fill_method : {'interp', 'median'}
-            How to replace flagged samples.
-        mad_floor : float
-            Minimum MAD to avoid division by zero.
-
-        Returns
-        -------
-        x_out : np.ndarray
-            Despiked copy of x.
-        info : dict
-            Diagnostics.
         """
         import numpy as np
         import pandas as pd
@@ -607,8 +584,8 @@ class SAM:
         with np.errstate(divide='ignore', invalid='ignore'):
             mz = 0.6745 * abs_dev / mad
 
-        bad = (mz > z).fillna(False).to_numpy()
-        bad &= np.isfinite(x)
+        bad = np.asarray((mz > z).fillna(False), dtype=bool).copy()
+        bad = bad & np.isfinite(x)
 
         # Do not replace long runs; they may be real signal
         if max_run is not None and max_run > 0 and np.any(bad):
@@ -646,7 +623,7 @@ class SAM:
                 x_out[:] = np.nanmedian(x)
 
         elif fill_method == 'median':
-            medv = med.to_numpy()
+            medv = np.asarray(med, dtype=float)
             x_out[bad] = medv[bad]
 
         else:
@@ -661,6 +638,7 @@ class SAM:
             'max_run': max_run,
             'fill_method': fill_method,
         }
+    
     def __len__(self):
         return len(self.dataframes)
     
@@ -720,12 +698,13 @@ class SAM:
             if not chosen:
                 print('no frequency bands data present')
                 return
-
+            '''
             # Add fratio if available (LP & VT)
             if {'LP', 'VT'}.issubset(all_cols):
                 metrics = chosen + ['fratio']
             else:
                 metrics = chosen
+            '''
 
         # -------- kind='stream' path --------
         if kind == 'stream':
@@ -1376,37 +1355,26 @@ class SAM:
 
     def __str__(self):
         keys = self.get_seed_ids()
-        lines = [f"{self.__class__.__name__} summary:"]
+        lines = [f"{self.__class__.__name__} object:"]
         lines.append(f"Number of SEED ids: {len(self)} [{keys}]")
         lines.append(f"Number of rows: {len(self.dataframes[keys[0]])}")
-        first = True
+        lines.append(f"Start time: {self.starttime}")
+        lines.append(f"End time: {self.endtime}")
+        lines.append(f"Duration: {self.duration} s")
+        lines.append(f"Sampling interval: {self.sampling_interval} s")
+        lines.append(f"Metrics: {', '.join(self.metrics)}")
 
         for trid, df in self.dataframes.items():
             if df is None or df.empty:
                 lines.append(f"{trid}: <empty dataframe>")
                 continue
 
-            if first:
-                si = self.get_sampling_interval(df)
-                metric_cols = [c for c in df.columns if c not in ("time", "date")]
-                lines.append(f"Sampling Interval = {si} s")
-                lines.append(f"Metrics: {', '.join(metric_cols)}")
-                lines.append("")
-                first = False
-
-            # Time range
-            startt = self.__get_starttime(df)
-            endt   = self.__get_endtime(df)
-            lines.append(f"{trid}: {startt.isoformat()} to {endt.isoformat()}")
-
-            # Summary stats on numeric columns, excluding 'time'
-            num_df = df[[c for c in df.columns if c not in ("time", "date")
-             and pd.api.types.is_numeric_dtype(df[c])]]
-            if not num_df.empty:
-                desc = num_df.describe().transpose()
-                with pd.option_context("display.float_format", lambda v: f"{v:.3g}"):
-                    lines.append(desc.to_string())
-            lines.append("")
+            if 'median' in df.columns:
+                av = df['median'].median() 
+                lines.append(f"{trid}: median={av:.3g}")
+            else:
+                av = df['mean'].mean()
+                lines.append(f"{trid}: mean={av:.3g}")
 
         return "\n".join(lines)  
     
@@ -1437,6 +1405,168 @@ class SAM:
         if st is None or et is None:
             return None
         return et - st
+    
+    @property
+    def sampling_interval(self):
+        """Return the sampling interval of the first non-empty dataframe in seconds."""
+        for df in self.dataframes.values():
+            if df is not None and not df.empty:
+                return self.get_sampling_interval(df)
+        return None
+    
+    @property
+    def seed_ids(self):
+        """Return the list of SEED IDs in this SAM object."""
+        return self.get_seed_ids()
+    
+    @property
+    def metrics(self):
+        """Return the list of metric columns in the first non-empty dataframe."""
+        for df in self.dataframes.values():
+            if df is not None and not df.empty:
+                return self.get_metrics(df)
+        return []   
+    
+    @staticmethod
+    def _peak_from_dataframe(
+        df: pd.DataFrame,
+        metric: str,
+    ) -> dict:
+        """
+        Return peak time and amplitude for a given metric in an RSAM dataframe.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            RSAM dataframe with a DatetimeIndex (or a time column).
+        metric : str
+            Column name to compute the peak from.
+
+        Returns
+        -------
+        dict
+            {
+                "peak_time": Timestamp,
+                "peak_amplitude": float,
+                "metric": str,
+                "n_rows": int
+            }
+        """
+        if df is None or len(df) == 0:
+            return {
+                "peak_time": pd.NaT,
+                "peak_amplitude": np.nan,
+                "metric": metric,
+                "n_rows": 0,
+            }
+
+        if metric not in df.columns:
+            raise KeyError(f"Metric '{metric}' not found in dataframe columns: {df.columns.tolist()}")
+
+        work = df.copy()
+
+        # Ensure datetime index
+        if not isinstance(work.index, pd.DatetimeIndex):
+            for candidate in ["time", "datetime", "date"]:
+                if candidate in work.columns:
+                    work[candidate] = pd.to_datetime(work[candidate], errors="coerce")
+                    work = work.set_index(candidate)
+                    break
+
+        if not isinstance(work.index, pd.DatetimeIndex):
+            raise ValueError("RSAM dataframe must have a DatetimeIndex or time column.")
+
+        y = pd.to_numeric(work[metric], errors="coerce")
+        y = y.replace([np.inf, -np.inf], np.nan)
+
+        if y.notna().sum() == 0:
+            return {
+                "peak_time": pd.NaT,
+                "peak_amplitude": np.nan,
+                "metric": metric,
+                "n_rows": len(work),
+            }
+
+        peak_time = y.idxmax()
+        peak_amplitude = float(y.loc[peak_time])
+
+        return {
+            "peak_time": peak_time,
+            "peak_amplitude": peak_amplitude,
+            "metric": metric,
+            "n_rows": len(work),
+        }
+
+    def get_peak(
+        self,
+        seed_id: str,
+        metric: str,
+    ) -> dict:
+        """
+        Get peak RSAM value for a single seed ID and metric.
+
+        Parameters
+        ----------
+        seed_id : str
+        metric : str
+            Column name (e.g. "mean", "median", "max")
+
+        Returns
+        -------
+        dict
+        """
+        if seed_id not in self.dataframes:
+            raise KeyError(f"{seed_id} not found in RSAM dataframes.")
+
+        out = self._peak_from_dataframe(self.dataframes[seed_id], metric)
+        out["seed_id"] = seed_id
+        return out
+
+    def get_peak_dataframe(
+        self,
+        metric: str,
+    ) -> pd.DataFrame:
+        """
+        Build a dataframe of peak RSAM values for all seed IDs.
+
+        Parameters
+        ----------
+        metric : str
+            Column to compute peak from.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Columns:
+            - seed_id
+            - peak_time
+            - peak_amplitude
+            - metric
+            - n_rows
+        """
+        rows = []
+
+        for seed_id, df in self.dataframes.items():
+            try:
+                row = self._peak_from_dataframe(df, metric)
+                row["seed_id"] = seed_id
+            except Exception as e:
+                row = {
+                    "seed_id": seed_id,
+                    "peak_time": pd.NaT,
+                    "peak_amplitude": np.nan,
+                    "metric": metric,
+                    "n_rows": 0 if df is None else len(df),
+                    "error": str(e),
+                }
+            rows.append(row)
+
+        out = pd.DataFrame(rows)
+
+        if "peak_time" in out.columns:
+            out = out.sort_values(["peak_time", "seed_id"], na_position="last").reset_index(drop=True)
+
+        return out
     
 class RSAM(SAM):
         

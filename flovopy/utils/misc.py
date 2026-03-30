@@ -74,22 +74,38 @@ def extract_definitions(path: Path):
 
 from pathlib import Path
 
-def tree(dir_path, prefix: str = ""):
+def tree(dir_path, prefix="", max_depth=None, dirs_only=False, _level=0):
     """
-    Recursively yield a visual tree of a directory. Accepts str or Path.
+    Print a directory tree.
+
+    Parameters
+    ----------
+    dir_path : str or Path
+    prefix : str
+        Internal indentation (do not set manually).
+    max_depth : int or None
+        Maximum depth to recurse (0 = only root contents).
+        None = no limit.
+    dirs_only : bool
+        If True, only show directories.
     """
-    # Coerce to Path and normalize
-    dir_path = Path(dir_path).expanduser()
+    dir_path = Path(dir_path)
+
+
+    if str(dir_path).startswith("~"):
+        dir_path = dir_path.expanduser()
 
     if not dir_path.exists():
-        yield prefix + f"(missing) {dir_path}"
+        print(prefix + f"(missing) {dir_path}")
         return
+
     if not dir_path.is_dir():
-        # If it's a file, just return the file name (plus definitions for .py)
-        line = prefix + dir_path.name
-        if dir_path.suffix == ".py":
-            line += extract_definitions(dir_path)  # your helper
-        yield line
+        if not dirs_only:
+            print(prefix + dir_path.name)
+        return
+
+    # Stop recursion if max depth reached
+    if max_depth is not None and _level > max_depth:
         return
 
     space  = "    "
@@ -98,23 +114,29 @@ def tree(dir_path, prefix: str = ""):
     last   = "└── "
 
     try:
-        contents = sorted(
-            dir_path.iterdir(),
-            key=lambda p: (not p.is_dir(), p.name.lower())
-        )
+        contents = list(dir_path.iterdir())
+        if dirs_only:
+            contents = [p for p in contents if p.is_dir()]
+
+        contents = sorted(contents, key=lambda p: (not p.is_dir(), p.name.lower()))
     except PermissionError:
-        yield prefix + f"{dir_path.name}/ (permission denied)"
+        print(prefix + f"{dir_path.name}/ (permission denied)")
         return
 
     pointers = [tee] * (len(contents) - 1) + [last] if contents else []
+
     for pointer, path in zip(pointers, contents):
-        line = prefix + pointer + path.name
-        if path.is_file() and path.suffix == ".py":
-            line += extract_definitions(path)  # your helper
-        yield line
+        print(prefix + pointer + path.name)
+
         if path.is_dir():
             extension = branch if pointer == tee else space
-            yield from tree(path, prefix=prefix + extension)
+            tree(
+                path,
+                prefix + extension,
+                max_depth=max_depth,
+                dirs_only=dirs_only,
+                _level=_level + 1,
+            )
 
 
 

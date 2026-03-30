@@ -236,7 +236,7 @@ def detect_and_correct_artifacts(
     amp_limit: float = 1e10,
     count_thresh: int = 10,
     spike_thresh: float = 3.5,
-    fill_method: Literal["median", "interpolate", "zero", "ignore"] = "median",
+    fill_method: Literal["median", "interpolate", "constant", "ignore"] = "median",
 ) -> None:
     """
     Detect clipping/spikes/steps and optionally correct them.
@@ -334,7 +334,7 @@ def detect_and_correct_artifacts(
         if fill_method == "median":
             med_all = float(np.nanmedian(y_out[finite]))
             y_out[spike_idx] = med_all
-        elif fill_method == "zero":
+        elif fill_method == "constant":
             y_out[spike_idx] = 0.0
         elif fill_method == "interpolate":
             # local linear interpolation using immediate finite neighbors
@@ -385,7 +385,7 @@ def preprocess_trace(
     # gaps
     normalize_gaps: bool = True,
     small_gap_sec: float = 2.0,
-    long_gap_fill: Literal["leave", "zero", "previous", "noise", "linear"] = "zero",
+    long_gap_fill: Literal["leave", "constant", "previous", "noise", "linear"] = "constant",
     piecewise_detrend: bool = True,
     force_unmasked: bool = True,
     # cleaning / response removal
@@ -433,18 +433,32 @@ def preprocess_trace(
     # (2) gap normalization
     if normalize_gaps:
         tmp = Stream([tr.copy()])
+
+        # convert gap threshold from seconds to samples
+        sr = float(tr.stats.sampling_rate)
+        short_gap_threshold_samples = max(1, int(round(small_gap_sec * sr)))
+
         tmp2 = normalize_stream_gaps(
             tmp,
-            small_gap_sec=small_gap_sec,
-            long_gap_fill=long_gap_fill,
-            piecewise=piecewise_detrend,
-            force_unmasked=force_unmasked,
+            detrend_first=piecewise_detrend,
+            detrend_mode="simple",          # or "linear"
+            mask_null_values=True,
+            null_values=(0.0,),
+            fill_gaps=True,                 # if you actually want filled gaps
+            short_gap_threshold_samples=short_gap_threshold_samples,
+            long_gap_method=long_gap_fill,  # e.g. "noise", "constant", etc.
+            fill_value=0.0,
+            keep_mask=False,
+            inplace=False,
         )
+
         if len(tmp2):
             tr.data = tmp2[0].data
             add_processing_step(
                 tr,
-                f"gaps:normalized(s={small_gap_sec}, fill={long_gap_fill}, piecewise={piecewise_detrend})",
+                f"gaps:normalized(sec={small_gap_sec}, "
+                f"samples={short_gap_threshold_samples}, "
+                f"fill={long_gap_fill}, piecewise={piecewise_detrend})",
             )
 
     # (3) artifacts (post)
@@ -484,7 +498,7 @@ def preprocess_stream(
     artifact_stage: Literal["pre", "post"] = "pre",
     normalize_gaps: bool = True,
     small_gap_sec: float = 2.0,
-    long_gap_fill: Literal["leave", "zero", "previous", "noise", "linear"] = "zero",
+    long_gap_fill: Literal["leave", "constant", "previous", "noise", "linear"] = "constant",
     piecewise_detrend: bool = True,
     force_unmasked: bool = True,
     do_clean: bool = True,

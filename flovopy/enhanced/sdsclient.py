@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple, Set
+from typing import List, Optional, Sequence, Tuple, Set, Iterator
 import pandas as pd
-
 
 from obspy import read, Stream, UTCDateTime
 from obspy.clients.filesystem.sds import Client
@@ -12,50 +11,101 @@ from obspy.clients.filesystem.sds import Client
 from flovopy.core.miniseed_io import postprocess_stream_after_read, smart_merge
 import re
 
+
 class EnhancedSDSClient(Client):
     """
-    Enhanced SDS Client extending ObsPy's filesystem SDS Client.
+    Small extension of ObsPy's SDS Client with:
 
-    Responsibilities
-    -----------------
-    - Robust NSLC discovery (client + filesystem fallback)
-    - Day-based SDS reads (browser-friendly)
-    - Safe file discovery and reading
-    - Availability / presence primitives
-    - SDS filename and path helpers
-
-    Non-responsibilities
-    --------------------
-    - Plotting
-    - Smart merging / downsampling
-    - Metadata reconciliation
-    - Workflow orchestration
+    - Path-safe SDS root handling
+    - UTC day helpers
+    - SDS filename construction
+    - NSLC discovery with filesystem fallback
     """
-
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
 
     def __init__(
         self,
         sds_root: str | Path,
         sds_type: str = "D",
         format: str = "MSEED",
-    ):
-        self.sds_root = Path(sds_root).expanduser().resolve()
-        super().__init__(str(self.sds_root), sds_type=sds_type, format=format)
+    ) -> None:
+        root = Path(sds_root).expanduser().resolve()
+        self._sds_root_path = root
+        super().__init__(str(root), sds_type=sds_type, format=format)
+
+    @property
+    def sds_root_path(self) -> Path:
+        """SDS root as a resolved Path object."""
+        return self._sds_root_path
+
+    # ------------------------------------------------------------------
+    # Small normalization helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _as_utcdatetime(value: UTCDateTime | str | float | int) -> UTCDateTime:
+        """Return value as UTCDateTime."""
+        return value if isinstance(value, UTCDateTime) else UTCDateTime(value)
+
+    @staticmethod
+    def _normalize_location_for_filename(loc: str | None) -> str:
+        """
+        Normalize location code for SDS filenames.
+
+        Blank location is represented on disk as '--'.
+        """
+        loc = "" if loc is None else str(loc).strip()
+        if loc in ("", "--"):
+            return "--"
+        return loc
+
+    @staticmethod
+    def _normalize_location_for_id(loc: str | None) -> str:
+        """
+        Normalize location code for NSLC tuples / trace IDs.
+
+        Keeps blank location as '' rather than '--'.
+        """
+        loc = "" if loc is None else str(loc).strip()
+        if loc == "--":
+            return ""
+        return loc
+
+    @staticmethod
+    def _trace_id_from_nslc(net: str, sta: str, loc: str, chan: str) -> str:
+        """Build a SEED-style trace ID from NSLC."""
+        return f"{net}.{sta}.{loc}.{chan}"
 
     # ------------------------------------------------------------------
     # Time helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def day_bounds(day: UTCDateTime) -> Tuple[UTCDateTime, UTCDateTime]:
+    @classmethod
+    def day_bounds(cls, day: UTCDateTime) -> Tuple[UTCDateTime, UTCDateTime]:
         """
-        Return (start, end) UTCDateTime for a full UTC day.
+        Return UTC midnight bounds for the day containing `day`.
         """
+        day = cls._as_utcdatetime(day)
         t0 = UTCDateTime(day.year, julday=day.julday)
         return t0, t0 + 86400
+
+    @classmethod
+    def iter_days(
+        cls,
+        startday: UTCDateTime,
+        endday: UTCDateTime,
+    ) -> Iterator[UTCDateTime]:
+        """
+        Yield UTC midnights from startday up to but not including endday.
+        """
+        startday = cls._as_utcdatetime(startday)
+        endday = cls._as_utcdatetime(endday)
+
+        t, _ = cls.day_bounds(startday)
+        stop, _ = cls.day_bounds(endday)
+
+        while t < stop:
+            yield t
+            t += 86400
 
     # ------------------------------------------------------------------
     # SDS filename helpers
@@ -70,18 +120,16 @@ class EnhancedSDSClient(Client):
         day: UTCDateTime,
     ) -> Path:
         """
-        Build full SDS daily file path without touching disk.
+        Build the expected SDS day-file path for a given NSLC and day.
         """
-        root = Path(self.sds_root)
+        day = self._as_utcdatetime(day)
         year = f"{day.year:04d}"
         jday = f"{day.julday:03d}"
-        loc = loc or "--"
-        if len(loc) == 1:
-            loc = f"0{loc}"
+        loc_disk = self._normalize_location_for_filename(loc)
 
-        fname = f"{net}.{sta}.{loc}.{chan}.D.{year}.{jday}"
+        fname = f"{net}.{sta}.{loc_disk}.{chan}.D.{year}.{jday}"
         return (
-            root
+            self.sds_root_path
             / year
             / net
             / sta
@@ -99,22 +147,41 @@ class EnhancedSDSClient(Client):
         skip_low_rate: bool = True,
     ) -> Set[Tuple[str, str, str, str]]:
         """
-        Return set of (net, sta, loc, chan) tuples reporting on a given day.
+        Return NSLC tuples available on a given UTC day.
 
-        Tries ObsPy client first; falls back to filesystem walk if needed.
+        Tries ObsPy discovery first, then falls back to walking the SDS tree.
         """
+        day = self._as_utcdatetime(day)
+
         try:
-            try:
-                nslc = self.get_all_nslc(sds_type="D", datetime=day)
-            except TypeError:
-                nslc = self.get_all_nslc(sds_type="D", datetime=day.datetime)
-            return {
-                (n, s, l, c)
+            nslc = self.get_all_nslc(sds_type=self.sds_type, datetime=day)
+            out = {
+                (n, s, self._normalize_location_for_id(l), c)
                 for n, s, l, c in nslc
-                if not (skip_low_rate and c.startswith("L"))
             }
         except Exception:
-            return self._walk_sds_for_day(day, skip_low_rate=skip_low_rate)
+            out = self._walk_sds_for_day(day)
+
+        if skip_low_rate:
+            out = {(n, s, l, c) for n, s, l, c in out if not c.startswith("L")}
+
+        return out
+
+    def iter_nslc(
+        self,
+        start: UTCDateTime,
+        end: UTCDateTime,
+        skip_low_rate: bool = False,
+    ) -> Set[Tuple[str, str, str, str]]:
+        """
+        Return NSLC tuples that exist on any UTC day in [start, end).
+        """
+        out: Set[Tuple[str, str, str, str]] = set()
+
+        for day in self.iter_days(start, end):
+            out |= self.get_nslc_for_day(day, skip_low_rate=skip_low_rate)
+
+        return out
 
     def iter_trace_ids(
         self,
@@ -122,76 +189,64 @@ class EnhancedSDSClient(Client):
         endday: Optional[UTCDateTime] = None,
         skip_low_rate: bool = True,
     ) -> List[str]:
+        """
+        Return sorted trace IDs present between startday and endday.
+
+        If endday is omitted, search one UTC day only.
+        """
+        startday = self._as_utcdatetime(startday)
         if endday is None:
             endday = startday + 86400
+        else:
+            endday = self._as_utcdatetime(endday)
 
-        nslc = self.iter_nslc(startday, endday)
         ids = {
-            f"{n}.{s}.{l}.{c}"
-            for n, s, l, c in nslc
-            if not (skip_low_rate and c.startswith("L"))
+            self._trace_id_from_nslc(n, s, l, c)
+            for n, s, l, c in self.iter_nslc(
+                startday,
+                endday,
+                skip_low_rate=skip_low_rate,
+            )
         }
         return sorted(ids)
-
-    
-    def iter_nslc(
-        self,
-        start: UTCDateTime,
-        end: UTCDateTime,
-    ) -> Set[Tuple[str, str, str, str]]:
-        """
-        Return set of (net, sta, loc, chan) tuples that exist at any time
-        between start and end (inclusive).
-
-        Pure SDS discovery: no filtering, no policy.
-        """
-        out: Set[Tuple[str, str, str, str]] = set()
-        day = UTCDateTime(start.year, julday=start.julday)
-
-        while day < end:
-            out |= self.get_nslc_for_day(day, skip_low_rate=False)
-            day += 86400
-
-        return out
 
     # ------------------------------------------------------------------
     # Filesystem fallback
     # ------------------------------------------------------------------
 
-    def _walk_sds_for_day(
-        self,
-        day: UTCDateTime,
-        skip_low_rate: bool = True,
-    ) -> Set[Tuple[str, str, str, str]]:
+    def _walk_sds_for_day(self, day: UTCDateTime) -> Set[Tuple[str, str, str, str]]:
         """
-        Walk SDS directory tree manually for a given day.
+        Discover NSLC tuples by scanning the SDS directory tree for one day.
         """
+        day = self._as_utcdatetime(day)
         year = f"{day.year:04d}"
         jday = f"{day.julday:03d}"
 
         out: Set[Tuple[str, str, str, str]] = set()
-        year_dir = self.sds_root / year
+        year_dir = self.sds_root_path / year
         if not year_dir.exists():
             return out
 
         for net_dir in year_dir.iterdir():
             if not net_dir.is_dir():
                 continue
+
             for sta_dir in net_dir.iterdir():
                 if not sta_dir.is_dir():
                     continue
+
                 for chan_dir in sta_dir.iterdir():
                     if not chan_dir.is_dir() or not chan_dir.name.endswith(".D"):
-                        continue
-                    chan = chan_dir.name[:-2]
-                    if skip_low_rate and chan.startswith("L"):
                         continue
 
                     for f in chan_dir.glob(f"*.D.{year}.{jday}"):
                         parts = f.name.split(".")
-                        if len(parts) >= 4:
-                            n, s, l, c = parts[:4]
-                            out.add((n, s, l, c))
+                        if len(parts) < 4:
+                            continue
+
+                        net, sta, loc, chan = parts[:4]
+                        loc = self._normalize_location_for_id(loc)
+                        out.add((net, sta, loc, chan))
 
         return out
 
@@ -707,263 +762,138 @@ class EnhancedSDSClient(Client):
             verbose=verbose,
         )
 
+
+
     # ------------------------------------------------------------------
-    # Availability primitives
+    # Availability helpers
     # ------------------------------------------------------------------
 
-    def _availability_seconds_waveform(
-        self,
-        net: str,
-        sta: str,
-        loc: str,
-        chan: str,
-        start: UTCDateTime,
-        end: UTCDateTime,
-        merge_strategy: str = "obspy",
-        verbose: bool = False,
-    ) -> float:
+    @staticmethod
+    def _split_trace_id(trace_id: str) -> Tuple[str, str, str, str]:
         """
-        Slow waveform-based estimate of coverage duration in seconds.
-
-        This reads waveform data, trims to the requested interval, merges
-        overlapping segments, and sums the resulting durations.
-        """
-        from flovopy.core.miniseed_io import smart_merge
-
-        start = UTCDateTime(start)
-        end = UTCDateTime(end)
-
-        if end <= start:
-            return 0.0
-
-        try:
-            st = self.get_waveforms(
-                network=net,
-                station=sta,
-                location=loc,
-                channel=chan,
-                starttime=start,
-                endtime=end,
-                merge=0,
-            )
-        except Exception as e:
-            if verbose:
-                print(
-                    f"⚠️ get_waveforms failed for "
-                    f"{net}.{sta}.{loc}.{chan} {start}–{end}: {e}"
-                )
-            return 0.0
-
-        if len(st) == 0:
-            return 0.0
-
-        try:
-            st.trim(start, end)
-        except Exception as e:
-            if verbose:
-                print(f"⚠️ Trim failed in _availability_seconds_waveform: {e}")
-
-        if len(st) > 1:
-            try:
-                smart_merge(st, strategy=merge_strategy, verbose=verbose)
-            except Exception:
-                try:
-                    st.merge(method=0)
-                except Exception as e:
-                    if verbose:
-                        print(f"⚠️ Merge failed in _availability_seconds_waveform: {e}")
-
-        seconds = 0.0
-        for tr in st:
-            try:
-                seconds += max(0.0, float(tr.stats.endtime - tr.stats.starttime))
-            except Exception:
-                try:
-                    if tr.stats.sampling_rate > 0:
-                        seconds += tr.stats.npts / tr.stats.sampling_rate
-                except Exception:
-                    pass
-
-        return seconds
-
-    def _availability_fraction_waveform(
-        self,
-        net: str,
-        sta: str,
-        loc: str,
-        chan: str,
-        start: UTCDateTime,
-        end: UTCDateTime,
-        merge_strategy: str = "obspy",
-        verbose: bool = False,
-    ) -> float:
-        """
-        Slow waveform-based availability fraction in [0, 1].
-        """
-        start = UTCDateTime(start)
-        end = UTCDateTime(end)
-
-        total = max(0.0, float(end - start))
-        if total == 0.0:
-            return 0.0
-
-        present = self._availability_seconds_waveform(
-            net=net,
-            sta=sta,
-            loc=loc,
-            chan=chan,
-            start=start,
-            end=end,
-            merge_strategy=merge_strategy,
-            verbose=verbose,
-        )
-        return min(1.0, present / total)
-
-    def availability_fraction(
-        self,
-        net: str,
-        sta: str,
-        loc: str,
-        chan: str,
-        start: UTCDateTime,
-        end: UTCDateTime,
-        method: str = "fast",
-        merge_strategy: str = "obspy",
-        verbose: bool = False,
-    ) -> float:
-        """
-        Availability fraction in [0, 1] for the given NSLC and time window.
+        Split a NET.STA.LOC.CHA trace id into components.
 
         Parameters
         ----------
-        method
-            'fast'     -> use ObsPy's get_availability_percentage()
-            'waveform' -> read waveform data and estimate true coverage
-        merge_strategy
-            Only used when method='waveform'.
-        verbose
-            If True, print warnings.
+        trace_id
+            Trace identifier in SEED-style form, e.g. ``MV.MBGB..BHZ``.
 
         Returns
         -------
-        float
-            Availability fraction in [0, 1].
+        tuple[str, str, str, str]
+            Network, station, location, channel.
+
+        Raises
+        ------
+        ValueError
+            If the trace ID does not have exactly 4 dot-separated fields.
         """
-        start = UTCDateTime(start)
-        end = UTCDateTime(end)
+        parts = str(trace_id).split(".")
+        if len(parts) != 4:
+            raise ValueError(
+                f"Invalid trace_id {trace_id!r}. Expected 'NET.STA.LOC.CHA'."
+            )
+        net, sta, loc, chan = parts
+        return net, sta, loc, chan
+    
 
-        if end <= start:
-            return 0.0
+    def get_availability_percentage(
+        self,
+        network,
+        station,
+        location,
+        channel,
+        starttime,
+        endtime,
+        sds_type=None,
+    ):
+        """
+        Return (availability_fraction, gap_count) for one NSLC and time window.
 
-        method = str(method).lower()
+        This overrides ObsPy's SDS Client implementation to cope with archives
+        where blank location codes may be stored on disk as '--', while waveform
+        lookup may only succeed with location='*'.
+        """
+        import warnings
+        import numpy as np
 
-        if method == "fast":
+
+        starttime = UTCDateTime(starttime)
+        endtime = UTCDateTime(endtime)
+
+        if starttime >= endtime:
+            raise ValueError("'endtime' must be after 'starttime'.")
+
+        sds_type = sds_type or self.sds_type
+
+        # Try a few sensible location variants
+        loc_candidates = []
+        for loc in [location, "", "--", "*"]:
+            if loc not in loc_candidates:
+                loc_candidates.append(loc)
+
+        st = None
+        last_error = None
+
+        for loc_try in loc_candidates:
             try:
-                frac, _ = self.get_availability_percentage(
-                    network=net,
-                    station=sta,
-                    location=loc,
-                    channel=chan,
-                    starttime=start,
-                    endtime=end,
-                )
-                return float(frac)
-            except Exception as e:
-                if verbose:
-                    print(
-                        f"⚠️ get_availability_percentage failed for "
-                        f"{net}.{sta}.{loc}.{chan} {start}–{end}: {e}"
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    st_try = self.get_waveforms(
+                        network=network,
+                        station=station,
+                        location=loc_try,
+                        channel=channel,
+                        starttime=starttime,
+                        endtime=endtime,
+                        sds_type=sds_type,
+                        headonly=True,
+                        _no_trim_or_merge=True,
                     )
-                return 0.0
 
-        if method in ("waveform", "slow"):
-            return self._availability_fraction_waveform(
-                net=net,
-                sta=sta,
-                loc=loc,
-                chan=chan,
-                start=start,
-                end=end,
-                merge_strategy=merge_strategy,
-                verbose=verbose,
-            )
+                if st_try and len(st_try) > 0:
+                    st = st_try
+                    break
 
-        raise ValueError(f"Unknown availability method: {method!r}")
+            except Exception as e:
+                last_error = e
 
-    def availability_fraction_for_day(
-        self,
-        net: str,
-        sta: str,
-        loc: str,
-        chan: str,
-        day: UTCDateTime,
-        method: str = "fast",
-        merge_strategy: str = "obspy",
-        verbose: bool = False,
-    ) -> float:
-        """
-        Availability fraction for one UTC day.
+        if st is None or len(st) == 0:
+            return (0.0, 1)
 
-        Parameters
-        ----------
-        day
-            Any time within the day of interest.
-        method
-            'fast' or 'waveform'
-        merge_strategy
-            Only used when method='waveform'.
-        verbose
-            If True, print warnings.
+        st.sort(keys=["starttime", "endtime"])
+        st.traces = [
+            tr for tr in st
+            if not (tr.stats.endtime < starttime or tr.stats.starttime > endtime)
+        ]
 
-        Returns
-        -------
-        float
-            Availability fraction in [0, 1].
-        """
-        t0, t1 = self.day_bounds(UTCDateTime(day))
-        return self.availability_fraction(
-            net=net,
-            sta=sta,
-            loc=loc,
-            chan=chan,
-            start=t0,
-            end=t1,
-            method=method,
-            merge_strategy=merge_strategy,
-            verbose=verbose,
-        )
+        if not st:
+            return (0.0, 1)
 
-    def has_data_for_day(
-        self,
-        net: str,
-        sta: str,
-        loc: str,
-        chan: str,
-        day: UTCDateTime,
-    ) -> bool:
-        """
-        Return True if any data exist for this NSLC on the given day.
+        total_duration = float(endtime - starttime)
 
-        Uses ObsPy's has_data() first, then falls back to checking whether
-        the corresponding SDS file exists and is non-empty.
-        """
-        t0, t1 = self.day_bounds(UTCDateTime(day))
+        gaps = [gap[6] for gap in st.get_gaps()]
+        gap_sum = float(np.sum(gaps))
+        gap_count = len(gaps)
 
-        try:
-            return self.has_data(
-                network=net,
-                station=sta,
-                location=loc,
-                channel=chan,
-                starttime=t0,
-                endtime=t1,
-            )
-        except Exception:
-            try:
-                path = self.build_sds_filename(net, sta, loc, chan, t0)
-                return path.exists() and path.stat().st_size > 0
-            except Exception:
-                return False
+        earliest = min(tr.stats.starttime for tr in st)
+        latest = max(tr.stats.endtime for tr in st)
+
+        if earliest > starttime:
+            gap_sum += float(earliest - starttime)
+            gap_count += 1
+        if latest < endtime:
+            gap_sum += float(endtime - latest)
+            gap_count += 1
+
+        frac = 1.0 - (gap_sum / total_duration)
+        frac = max(0.0, min(1.0, frac))
+
+        return (frac, gap_count)
+
+    # ------------------------------------------------------------------
+    # Bulk availability table
+    # ------------------------------------------------------------------
 
     def get_availability(
         self,
@@ -972,41 +902,49 @@ class EnhancedSDSClient(Client):
         trace_ids: Optional[Sequence[str]] = None,
         skip_low_rate_channels: bool = True,
         progress: bool = True,
-        method: str = "fast",
-        merge_strategy: str = "obspy",
         verbose: bool = False,
-    ) -> tuple[pd.DataFrame, list[str]]:
+    ) -> tuple[pd.DataFrame, List[str]]:
         """
-        Return (availability_df, trace_ids) for a day range.
+        Return a wide day-by-trace availability table using only
+        ObsPy's ``get_availability_percentage()``.
 
         Parameters
         ----------
         startday, endday
-            Day range. Rows are generated for each UTC day from startday
-            up to but not including endday.
+            UTC day range. Rows are produced from ``startday`` up to but not
+            including ``endday``.
         trace_ids
-            Explicit trace ID list. If None, discovered via iter_trace_ids().
+            Optional explicit list of ``NET.STA.LOC.CHA`` trace IDs.
+            If None, trace IDs are discovered with ``iter_trace_ids()``.
         skip_low_rate_channels
-            If True, skip channel codes beginning with "L" during discovery.
+            Used only during automatic trace-id discovery.
         progress
-            If True, show tqdm progress bar if available.
-        method
-            'fast'     -> use ObsPy get_availability_percentage()
-            'waveform' -> read waveform data to estimate coverage
-        merge_strategy
-            Only used when method='waveform'.
+            If True, show a tqdm progress bar if available.
         verbose
             If True, print warnings.
 
         Returns
         -------
-        (availability_df, trace_ids)
-            availability_df is a wide DataFrame:
-                columns = ['date'] + trace_ids
-                values in [0, 1]
+        wide : pandas.DataFrame
+            Wide availability table with columns:
+            ``['date'] + trace_ids``
+
+            Values are fractions in the range [0, 1].
+        trace_ids : list[str]
+            The trace IDs used to construct the table.
+
+        Notes
+        -----
+        This implementation intentionally uses only
+        ``get_availability_percentage()`` for per-day availability estimates.
+
+        It does not call ``get_waveforms()`` directly anywhere in this block.
         """
         startday = UTCDateTime(startday)
         endday = UTCDateTime(endday)
+
+        if endday <= startday:
+            return pd.DataFrame(columns=["date"]), []
 
         if trace_ids is None:
             trace_ids = list(
@@ -1019,60 +957,55 @@ class EnhancedSDSClient(Client):
         else:
             trace_ids = list(trace_ids)
 
-        days = []
-        t = UTCDateTime(startday.year, julday=startday.julday)
-        endday0 = UTCDateTime(endday.year, julday=endday.julday)
-
-        while t < endday0:
-            days.append(t)
-            t += 86400
+        days = list(self.iter_days(startday, endday))
 
         iterator = days
         if progress:
             try:
                 from tqdm import tqdm
-                iterator = tqdm(days, desc=f"Availability ({method})")
+                iterator = tqdm(days, desc="Availability")
             except Exception:
                 pass
 
-        records = []
+        rows = []
         for day in iterator:
+            t0, t1 = self.day_bounds(day)
+            row = {"date": t0.date}
+
             for tid in trace_ids:
                 try:
-                    net, sta, loc, chan = tid.split(".")
-                except ValueError:
+                    net, sta, loc, chan = self._split_trace_id(tid)
+
+                    frac, _gap_count = self.get_availability_percentage(
+                        network=net,
+                        station=sta,
+                        location=loc,
+                        channel=chan,
+                        starttime=t0,
+                        endtime=t1,
+                    )
+                    row[tid] = float(frac)
+
+                except Exception as e:
                     if verbose:
-                        print(f"⚠️ Invalid trace_id skipped in get_availability(): {tid}")
-                    continue
+                        print(f"⚠️ Failed availability for {tid} on {t0.date}: {e}")
+                    row[tid] = 0.0
 
-                frac = self.availability_fraction_for_day(
-                    net=net,
-                    sta=sta,
-                    loc=loc,
-                    chan=chan,
-                    day=day,
-                    method=method,
-                    merge_strategy=merge_strategy,
-                    verbose=verbose,
-                )
-                records.append((day.date, tid, frac))
+            rows.append(row)
 
-        if not records:
+        if not rows:
             return pd.DataFrame(columns=["date"]), trace_ids
 
-        df = pd.DataFrame(records, columns=["date", "trace_id", "value"])
-        wide = (
-            df.pivot_table(
-                index="date",
-                columns="trace_id",
-                values="value",
-                aggfunc="mean",
-            )
-            .reset_index()
-        )
+        wide = pd.DataFrame(rows)
+
+        # Ensure stable column order
+        ordered_cols = ["date"] + trace_ids
+        for col in ordered_cols:
+            if col not in wide.columns:
+                wide[col] = 0.0
+        wide = wide[ordered_cols]
 
         return wide, trace_ids
-
     def plot_availability(
         self,
         availability_df: Optional[pd.DataFrame] = None,
@@ -2035,7 +1968,7 @@ class EnhancedSDSClient(Client):
     @staticmethod
     def parse_sds_filename(
         filename,
-        normalize_empty_loc: bool = True,
+        normalize_empty_loc: bool = False,
     ) -> tuple[str, str, str, str, str, str, str] | None:
         """
         Parse an SDS MiniSEED filename.
@@ -2116,7 +2049,7 @@ class EnhancedSDSClient(Client):
     def parse_sds_path(
         cls,
         path,
-        normalize_empty_loc: bool = True,
+        normalize_empty_loc: bool = False,
         check_consistency: bool = True,
     ) -> dict | None:
         """
@@ -2461,3 +2394,66 @@ class EnhancedSDSClient(Client):
             "considered": considered,
             "matched": matched,
         }
+    
+
+    @staticmethod
+    def _location_matches_request(trace_location: str | None, requested_location: str | None) -> bool:
+        """
+        Decide whether a returned trace location matches the user's request.
+        """
+        tr_loc = "" if trace_location is None else str(trace_location).strip()
+        req_loc = "*" if requested_location is None else str(requested_location).strip()
+
+        if req_loc == "*":
+            return True
+
+        if req_loc in {"", "--"}:
+            return tr_loc in {"", "--"}
+
+        return tr_loc == req_loc
+
+    def get_waveforms(
+        self,
+        network,
+        station,
+        location,
+        channel,
+        starttime,
+        endtime,
+        merge=-1,
+        **kwargs,
+    ) -> Stream:
+        """
+        Override ObsPy SDSClient.get_waveforms() to handle blank location codes
+        more robustly for SDS archives written with '--' in filenames but read
+        back as '' in Trace.stats.location.
+
+        Strategy
+        --------
+        - If location is blank ('') or '--', query ObsPy using wildcard '*'
+        - Then filter returned traces back down to blank-location traces only
+        """
+        query_location = self._normalize_location_for_id(location)
+
+        st = super().get_waveforms(
+            network=network,
+            station=station,
+            location=query_location,
+            channel=channel,
+            starttime=UTCDateTime(starttime),
+            endtime=UTCDateTime(endtime),
+            merge=merge,
+            **kwargs,
+        )
+
+        # Post-filter by requested location semantics
+        if location not in (None, "*"):
+            st = Stream(
+                tr for tr in st
+                if self._location_matches_request(
+                    getattr(tr.stats, "location", ""),
+                    location,
+                )
+            )
+
+        return st

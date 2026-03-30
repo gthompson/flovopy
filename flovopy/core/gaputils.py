@@ -1,7 +1,6 @@
 from __future__ import annotations
 import numpy as np
 from obspy import Trace, Stream, UTCDateTime
-
 from typing import Literal
 import re
 
@@ -505,8 +504,6 @@ def normalize_stream_gaps(
     return out
 
 
-import numpy as np
-from obspy import Trace
 
 
 def classify_gaps(trace: Trace) -> list[tuple[int, int]]:
