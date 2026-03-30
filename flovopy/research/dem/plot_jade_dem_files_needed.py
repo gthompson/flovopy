@@ -13,7 +13,7 @@ from obspy import Inventory
 
 # correct helper import
 from flovopy.stationmetadata.utils import inventory2traceid
-from flovopy.core.mvo import dome_location  # ensure available
+from flovopy.research.mvo.mvo_ids import dome_location  # ensure available
 
 # optional, type-compat
 import xarray as xr  # noqa: F401

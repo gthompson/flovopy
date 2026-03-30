@@ -76,7 +76,7 @@ from flovopy.asl.misfit import plot_misfit_heatmap_for_peak_DR, StdOverMeanMisfi
 
 # for inverse locate
 from scipy.optimize import minimize
-from flovopy.core.mvo import dome_location
+from flovopy.research.mvo.mvo_ids import dome_location
 from flovopy.asl.grid import _meters_per_degree
 
 # ----------------------------------------------------------------------
@@ -1557,7 +1557,7 @@ class ASL:
         """
         import numpy as np
         from scipy.optimize import least_squares
-        from flovopy.core.mvo import dome_location
+        from flovopy.research.mvo.mvo_ids import dome_location
         from .grid import _meters_per_degree
         from .distances import geo_distance_3d_km  # optional guard for 3D check
 

@@ -211,7 +211,7 @@ os.system(f"gdalwarp -t_srs EPSG:4326 -r bilinear {OUT_TIF} {OUT_TIF_WGS84}")
 import pandas as pd
 import pygmt
 from flovopy.asl.map import topo_map
-from flovopy.core.mvo import REGION_DEFAULT
+from flovopy.research.mvo.mvo_ids import REGION_DEFAULT
 from pathlib import Path
 
 '''

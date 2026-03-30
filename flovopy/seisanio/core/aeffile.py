@@ -34,9 +34,9 @@ returning a structured list of dictionaries, one per station-channel. Each entry
 import os
 import re
 from obspy import read
-from flovopy.core.trace_utils import correct_nslc_mvo
+#from flovopy.core.mvo import correct_nslc_mvo, legacy_or_not
 from flovopy.seisanio.core.wavfile import wavpath2datetime
-from flovopy.seisanio.utils.helpers import legacy_or_not, find_matching_wavfiles, spath2datetime
+from flovopy.seisanio.utils.helpers import find_matching_wavfiles, spath2datetime
 
 class AEFfile:
     def __init__(self, path=None, filetime=None, verbose=False):

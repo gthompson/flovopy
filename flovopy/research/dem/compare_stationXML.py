@@ -1,7 +1,7 @@
 import pandas as pd
 import pygmt
 from flovopy.asl.map import topo_map
-from flovopy.core.mvo import REGION_DEFAULT
+from flovopy.research.mvo.mvo_ids import REGION_DEFAULT
 from pathlib import Path
 
 PROJECTDIR = "/Users/GlennThompson/Dropbox/BRIEFCASE/SSADenver"

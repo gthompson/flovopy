@@ -29,7 +29,8 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from obspy import Catalog, Event, Magnitude, Origin, Comment, Stream, Trace, UTCDateTime, read
+from obspy import read, Stream, Trace, UTCDateTime
+from obspy.core.event import Catalog, Event, Origin, Magnitude, Comment
 
 from obspy.core.inventory import Inventory, Network, Station, Channel, Site
 

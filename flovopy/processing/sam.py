@@ -31,11 +31,8 @@ from obspy.geodetics.base import gps2dist_azimuth
 # =============================================================================
 # flovopy core utilities
 # =============================================================================
-from flovopy.core.trace_utils import (
-    sanitize_stream, 
-    #fix_trace_id,
-    _fix_legacy_id,
-)
+from flovopy.core.trace_utils import sanitize_stream
+from flovopy.core.vdap import fix_legacy_vdap_id  
 
 # =============================================================================
 # flovopy physics (magnitude & energy conversions)
@@ -247,7 +244,7 @@ class SAM:
                 continue
 
             # Small taper helps prevent filter startup artifacts
-            tr_base.taper(max_percentage=0.01, type='cosine')
+            tr_base.taper(max_percentage=0.0001, type='cosine')
 
             # Window timestamps (left edge = min timestamp per window)
             t_epoch = tr.times('timestamp')
@@ -1543,7 +1540,7 @@ class RSAM(SAM):
 
             if convert_legacy_ids_using_this_network and not tr.stats.network:
                 #fix_trace_id(tr, legacy=True, netcode=convert_legacy_ids_using_this_network)
-                _fix_legacy_id(tr, network=convert_legacy_ids_using_this_network, add_T=False)
+                fix_legacy_vdap_id(tr, network=convert_legacy_ids_using_this_network, add_T=False)
             return tr
 
         def read_structured_file(station, year):
@@ -1577,7 +1574,7 @@ class RSAM(SAM):
 
             if convert_legacy_ids_using_this_network and not tr.stats.network:
                 #fix_trace_id(tr, legacy=True, netcode=convert_legacy_ids_using_this_network)
-                _fix_legacy_id(tr, network=convert_legacy_ids_using_this_network)  
+                fix_legacy_vdap_id(tr, network=convert_legacy_ids_using_this_network)  
             return tr
 
         if filepath:

@@ -6,18 +6,15 @@ from typing import Callable
 
 import numpy as np
 from obspy import Stream, Trace, read
-from obspy.core.inventory import read_inventory
+
 from obspy.core.utcdatetime import UTCDateTime
 
-from flovopy.seisanio.archive import SeisanArchive
+from flovopy.seisanio.core.seisanarchive import SeisanArchive
 from flovopy.core.trace_utils import (
-    remove_empty_traces,
     decompose_channel_code,
     fix_channel_code,
     fix_location_code,
 )
-from flovopy.seisanio.core.sfile import Sfile
-
 
 # -------------------------------------------------------------------
 # Montserrat constants
@@ -27,35 +24,6 @@ DOME_LOCATION = {"lat": 16.71060, "lon": -62.17747, "elev": 1000.0}
 
 # (lon_min, lon_max, lat_min, lat_max)
 REGION_DEFAULT = (-62.255, -62.135, 16.66, 16.84)
-
-
-# -------------------------------------------------------------------
-# Inventory helpers
-# -------------------------------------------------------------------
-
-def load_mvo_master_inventory(xmldir: str | Path):
-    """
-    Load the master StationXML file for the Montserrat digital seismic network.
-
-    Parameters
-    ----------
-    xmldir
-        Directory containing ``MontserratDigitalSeismicNetwork.xml``.
-
-    Returns
-    -------
-    Inventory or None
-        ObsPy Inventory if found, else None.
-    """
-    xmldir = Path(xmldir)
-    master_station_xml = xmldir / "MontserratDigitalSeismicNetwork.xml"
-    if master_station_xml.exists():
-        print(f"Loading {master_station_xml}")
-        return read_inventory(str(master_station_xml))
-
-    print(f"Could not find {master_station_xml}")
-    return None
-
 
 # -------------------------------------------------------------------
 # Generic small helpers
@@ -231,6 +199,8 @@ def fix_trace_mvo(trace: Trace, verbose: bool = False):
             net="MV",
             verbose=verbose,
         )
+    if trace.stats.location in {"Z", "N", "E"} and len(trace.stats.channel) >= 2 and trace.stats.channel[-1]==trace.stats.location:
+        trace.stats.location = ""
 
 
 def correct_nslc_mvo(
@@ -360,10 +330,23 @@ def correct_nslc_mvo(
 
         band, inst, orient = _safe_decompose(chan)
 
-        # Sometimes orientation is carried in 1-char location code
-        if not orient and len(loc) == 1 and loc in "ZNE":
-            orient = loc
-            loc = ""
+        # Sometimes orientation is carried in the 1-character location code.
+        # Prefer a valid location-code orientation over a missing or conflicting
+        # channel orientation, then blank the location code.
+        if len(loc) == 1 and loc in "ZNE12":
+            if not orient:
+                orient = loc
+                loc = ""
+            elif orient != loc:
+                if verbose:
+                    vprint(
+                        f"Overriding conflicting orientation for {sta}: "
+                        f"channel={chan!r} gives {orient!r}, location={loc!r}"
+                    )
+                orient = loc
+                loc = ""
+            else:
+                loc = ""
 
         if not inst:
             inst = "H"
@@ -452,65 +435,6 @@ def correct_nslc_mvo(
     return f"{net}.{sta}.{loc}.{chan}"
 
 
-# -------------------------------------------------------------------
-# MVO waveform and event helpers
-# -------------------------------------------------------------------
-
-def read_mvo_waveform_file(
-    wavpath: str | Path,
-    verbose: bool = False,
-    seismic_only: bool = False,
-    vertical_only: bool = False,
-) -> Stream:
-    """
-    Read a waveform file from the Montserrat archive and apply MVO-specific
-    NSLC fixing and light cleanup.
-
-    Parameters
-    ----------
-    wavpath
-        Path to waveform file readable by ObsPy.
-    verbose
-        Print warnings / debug messages.
-    seismic_only
-        Keep only seismic channels (instrument codes H or L).
-    vertical_only
-        Keep only vertical seismic channels.
-
-    Returns
-    -------
-    Stream
-    """
-    wavpath = Path(wavpath)
-    if not wavpath.exists():
-        if verbose:
-            print(f"ERROR: {wavpath} not found.")
-        return Stream()
-
-    try:
-        st = read(str(wavpath))
-    except Exception as e:
-        if verbose:
-            print(f"ERROR reading {wavpath}: {e}")
-        return Stream()
-
-    if vertical_only:
-        st = st.select(component="Z")
-    elif seismic_only:
-        tr_keep = Stream()
-        for tr in st:
-            chan = getattr(tr.stats, "channel", "")
-            if len(chan) >= 2 and chan[1] in "HL":
-                tr_keep.append(tr)
-        st = tr_keep
-
-    remove_empty_traces(st)
-
-    for tr in st:
-        fix_trace_mvo(tr, verbose=verbose)
-
-    return st
-
 
 def correct_mvo_waveformstreamid(waveform_id, time=None):
     """
@@ -545,104 +469,3 @@ def correct_mvo_event_ids(eventobj):
 
     return eventobj
 
-
-# -------------------------------------------------------------------
-# MVO-specific archive wrapper
-# -------------------------------------------------------------------
-
-class MVOSeisanArchive(SeisanArchive):
-    """
-    Convenience wrapper around a generic SeisanArchive for Montserrat.
-
-    Continuous DB:
-        WAV/DSNC_/
-
-    Event DB:
-        REA/MVOE_/
-    """
-
-    def __init__(self, root: str | Path):
-        super().__init__(root=root, db_cont="DSNC_", db_event="MVOE_")
-
-    def iter_continuous_streams(
-        self,
-        starttime: UTCDateTime,
-        endtime: UTCDateTime,
-        verbose: bool = False,
-        seismic_only: bool = False,
-        vertical_only: bool = False,
-    ):
-        """
-        Yield cleaned MVO waveform streams from the continuous WAV archive.
-        """
-        for wavpath in self.iter_waveform_files(starttime, endtime, db=self.db_cont):
-            st = read_mvo_waveform_file(
-                wavpath,
-                verbose=verbose,
-                seismic_only=seismic_only,
-                vertical_only=vertical_only,
-            )
-            if len(st) > 0:
-                yield wavpath, st
-
-    def iter_event_streams(
-        self,
-        starttime: UTCDateTime,
-        endtime: UTCDateTime,
-        verbose: bool = False,
-        use_mvo_parser: bool = True,
-        parse_aef: bool = False,
-        seismic_only: bool = False,
-        vertical_only: bool = False,
-        valid_subclasses: str = "",
-    ):
-        """
-        Yield (Sfile, Stream) pairs from the MVO event archive.
-        """
-        for sfile_path in self.iter_sfiles(starttime, endtime, db=self.db_event):
-            try:
-                s = Sfile(str(sfile_path), use_mvo_parser=use_mvo_parser, parse_aef=parse_aef)
-            except Exception as e:
-                if verbose:
-                    print(f"[WARN] Failed to parse Sfile {sfile_path}: {e}")
-                continue
-
-            if valid_subclasses:
-                if not (s.mainclass == "LV" and s.subclass in valid_subclasses):
-                    continue
-
-            if not getattr(s, "dsnwavfileobj", None):
-                continue
-
-            wavpath = getattr(s.dsnwavfileobj, "path", None)
-            if not wavpath:
-                continue
-
-            st = read_mvo_waveform_file(
-                wavpath,
-                verbose=verbose,
-                seismic_only=seismic_only,
-                vertical_only=vertical_only,
-            )
-            if len(st) > 0:
-                yield s, st
-
-    def apply_to_events(
-        self,
-        starttime: UTCDateTime,
-        endtime: UTCDateTime,
-        function: Callable | None = None,
-        verbose: bool = False,
-        **kwargs,
-    ):
-        """
-        Apply a user function to each event stream.
-
-        The callable should accept:
-            function(sfile, stream, **kwargs)
-        """
-        for s, st in self.iter_event_streams(starttime, endtime, verbose=verbose):
-            if function is None:
-                yield s, st
-            else:
-                function(s, st, **kwargs)

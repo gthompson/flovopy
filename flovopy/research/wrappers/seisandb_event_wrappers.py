@@ -4,7 +4,7 @@ import glob
 from obspy import UTCDateTime
 from flovopy.seisanio.core.sfile import get_sfile_list, Sfile
 from flovopy.core.preprocess import preprocess_stream
-from flovopy.core.mvo import read_mvo_waveform_file
+from flovopy.research.mvo.mvo_ids import read_mvo_waveform_file
 
 
 def apply_custom_function_to_each_event(

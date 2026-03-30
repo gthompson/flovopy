@@ -215,7 +215,7 @@ class SeisanArchive:
         from flovopy.core.trace_utils import fix_trace_id
 
         try:
-            from flovopy.core.mvo import fix_trace_mvo
+            from flovopy.research.mvo.mvo_ids import fix_trace_mvo
         except Exception:
             fix_trace_mvo = None
 
@@ -329,10 +329,16 @@ class SeisanArchive:
 
     def iter_waveform_files(self, starttime, endtime, db=None) -> Iterator[Path]:
         """
-        Yield waveform file paths across a time range.
+        Yield waveform file paths whose filename-derived start times satisfy
 
-        Handles day boundaries by also checking the previous month's directory
-        for late-evening files that may roll into the requested day.
+            starttime <= filetime < endtime
+
+        Parameters
+        ----------
+        starttime, endtime
+            Half-open time interval.
+        db
+            Continuous Seisan database name. Defaults to ``self.db_cont``.
         """
         if db is None:
             db = self.db_cont
@@ -340,10 +346,13 @@ class SeisanArchive:
         starttime = UTCDateTime(starttime)
         endtime = UTCDateTime(endtime)
 
-        t = UTCDateTime(starttime.date)
-        end = UTCDateTime(endtime.date)
+        if endtime <= starttime:
+            return
 
-        while t <= end:
+        t = UTCDateTime(starttime.date)
+        last_day = UTCDateTime((endtime - 1e-6).date)
+
+        while t <= last_day:
             yyyy, mm, dd = t.strftime("%Y %m %d").split()
 
             current = self._wav_dir(db, t)
@@ -352,13 +361,20 @@ class SeisanArchive:
             pattern_today = f"{yyyy}-{mm}-{dd}*"
             pattern_prev = f"{yyyy}-{mm}-{dd}-23[45]*"
 
-            files = sorted({
+            candidates = sorted({
                 *glob.glob(str(prev / pattern_prev)),
                 *glob.glob(str(current / pattern_today)),
             })
 
-            for f in files:
-                yield Path(f)
+            for f in candidates:
+                fpath = Path(f)
+                try:
+                    filetime = self._wavpath2datetime(fpath)
+                except Exception:
+                    continue
+
+                if starttime <= filetime < endtime:
+                    yield fpath
 
             t += 86400
 

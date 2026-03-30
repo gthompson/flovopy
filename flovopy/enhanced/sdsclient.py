@@ -1578,7 +1578,7 @@ class EnhancedSDSClient(Client):
                 harmonize_rates=True
                 max_sampling_rate=100.0
                 fill_value=0.0
-                encoding="STEIM2"
+                encoding=None
                 reclen=4096
 
         Returns
@@ -1789,7 +1789,7 @@ class EnhancedSDSClient(Client):
                 harmonize_rates=True
                 max_sampling_rate=100.0
                 fill_value=0.0
-                encoding="STEIM2"
+                encoding=None
                 reclen=4096
 
         Returns
@@ -1822,7 +1822,7 @@ class EnhancedSDSClient(Client):
             merge_strategy="both",
             harmonize_rates=True,
             max_sampling_rate=100.0,
-            encoding="STEIM2",
+            encoding=None,
             reclen=4096,
             verbose=True,
         )

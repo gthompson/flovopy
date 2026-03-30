@@ -12,7 +12,7 @@ import pandas as pd
 import pygmt
 from obspy import Inventory
 from flovopy.stationmetadata.utils import inventory2traceid
-from flovopy.core.mvo import dome_location  # ensure available
+from flovopy.research.mvo.mvo_ids import dome_location  # ensure available
 
 # Prefer Oceania mirror
 pygmt.config(GMT_DATA_SERVER="https://oceania.generic-mapping-tools.org")

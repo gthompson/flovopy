@@ -3,7 +3,7 @@ import tempfile
 import numpy as np
 from obspy import Trace, Stream, UTCDateTime
 from obsolete.asl import asl_event
-from flovopy.core.mvo import load_mvo_master_inventory
+from flovopy.research.mvo.mvo_ids import load_mvo_master_inventory
 
 def test_asl_event_runs_without_error():
     # Create dummy trace
