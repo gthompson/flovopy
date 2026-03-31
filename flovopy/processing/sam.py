@@ -672,22 +672,18 @@ class SAM:
         
         self.__remove_empty()
 
-        # Normalize metrics input
         if isinstance(metrics, str):
             metrics = [metrics]
 
-        # -------- Auto-detect band set if requested --------
         if metrics == ['bands']:
-            # Union of columns across all traces
             all_cols = set()
             for df in self.dataframes.values():
                 all_cols.update(df.columns)
 
-            # Preference order of band triads
             candidates = [
-                ['PRI', 'SEC', 'HI'],   # storm seismic
-                ['TC', 'MB', 'TH'],     # storm infrasound
-                ['VLP', 'LP', 'VT'],    # classic volcano
+                ['PRI', 'SEC', 'HI'],
+                ['TC', 'MB', 'TH'],
+                ['VLP', 'LP', 'VT'],
             ]
             chosen = None
             for triad in candidates:
@@ -698,15 +694,9 @@ class SAM:
             if not chosen:
                 print('no frequency bands data present')
                 return
-            '''
-            # Add fratio if available (LP & VT)
-            if {'LP', 'VT'}.issubset(all_cols):
-                metrics = chosen + ['fratio']
-            else:
-                metrics = chosen
-            '''
 
-        # -------- kind='stream' path --------
+            metrics = chosen
+
         if kind == 'stream':
             for m in metrics:
                 print('METRIC:', m)
@@ -721,19 +711,16 @@ class SAM:
                     st.plot(equal_scale=equal_scale)
             return
 
-        # -------- kind='line' / 'scatter' path --------
         for key, df in self.dataframes.items():
             this_df = df.copy()
-            this_df['time'] = pd.to_datetime(df['time'], unit='s')
+            this_df['time'] = pd.to_datetime(this_df['time'], unit='s', errors='coerce')
 
-            # Optional clipping
             if isinstance(ylims, (list, tuple)) and len(ylims) == 2:
                 lo, hi = ylims
                 for m in metrics:
                     if m in this_df.columns:
                         this_df[m] = this_df[m].clip(lower=lo, upper=hi)
 
-            # Ensure requested metrics exist for this trace
             missing = [m for m in metrics if m not in this_df.columns]
             if missing:
                 print(f"{key}: missing columns: {', '.join(missing)}")
@@ -772,16 +759,15 @@ class SAM:
         Parameters
         ----------
         startt, endt : obspy.UTCDateTime
-            Start and end times (UTC). End is treated as **exclusive**.
+            Start and end times (UTC). End is treated as exclusive.
         SAM_DIR : str
-            Base output directory that contains RSAM/ or VSAM subfolders (class handles this).
+            Base output directory that contains RSAM/ or VSAM subfolders.
         trace_ids : list[str], optional
-            Explicit list of trace IDs to load (e.g., "IU.DWPF.10.BHZ"). If omitted, the
-            method discovers trace IDs from files matching the network pattern.
+            Explicit list of trace IDs to load.
         network : str, default '*'
-            Network filter when discovering trace IDs (ignored if trace_ids is provided).
+            Network filter when discovering trace IDs.
         sampling_interval : int, default 60
-            SAM sampling interval (seconds).
+            SAM sampling interval in seconds.
         ext : {'pickle','csv'}, default 'pickle'
             File format to read.
         verbose : bool, default False
@@ -790,15 +776,14 @@ class SAM:
         Returns
         -------
         classref
-            A SAM/RSAM/VSAM instance with `dataframes` populated for the selected IDs/time span.
+            A SAM/RSAM/VSAM instance with `dataframes` populated.
 
         Notes
         -----
         - Input files are assumed to store `time` as Unix epoch seconds.
         - Output dataframes are regularized to an exact grid at `sampling_interval`
-        and preserve `time` as Unix epoch seconds.
-        - Missing rows introduced by regularization will contain NaNs in metric
-        columns.
+          and preserve `time` as Unix epoch seconds.
+        - Missing rows introduced by regularization contain NaNs in metric columns.
         """
         dataframes = {}
 
@@ -808,12 +793,9 @@ class SAM:
         if endt <= startt:
             raise ValueError("endt must be later than startt")
 
-        # ------------------------------------------------------------------
-        # Discover trace_ids if not explicitly provided
-        # ------------------------------------------------------------------
         if not trace_ids:
             found_ids = set()
-            subdir = classref.__name__.upper()  # e.g. RSAM / VSAM / DSAM
+            subdir = classref.__name__.upper()
 
             for year in range(startt.year, endt.year + 1):
                 pattern = os.path.join(
@@ -830,8 +812,6 @@ class SAM:
                 for path in samfiles:
                     base = os.path.basename(path)
                     parts = base.split("_")
-                    # Expected:
-                    # RSAM_<TRACEID>_<YEAR>_<SAMPLING>s.<ext>
                     if len(parts) >= 4:
                         found_ids.add(parts[-3])
 
@@ -839,19 +819,12 @@ class SAM:
 
             if verbose and not trace_ids:
                 print("No trace IDs discovered for the requested range.")
-
         else:
             trace_ids = list(trace_ids)
 
-        # ------------------------------------------------------------------
-        # Time bounds in epoch seconds for robust internal filtering
-        # ------------------------------------------------------------------
         start_epoch = float(startt.timestamp)
         end_epoch = float(endt.timestamp)
 
-        # ------------------------------------------------------------------
-        # Read per trace_id across requested years
-        # ------------------------------------------------------------------
         for tid in trace_ids:
             yearly_frames = []
 
@@ -872,9 +845,6 @@ class SAM:
                 if verbose:
                     print(f"Reading {samfile}")
 
-                # ----------------------------------------------------------
-                # Load dataframe
-                # ----------------------------------------------------------
                 if ext == "csv":
                     df = pd.read_csv(samfile, index_col=False)
                 elif ext == "pickle":
@@ -887,9 +857,6 @@ class SAM:
 
                 df = df.copy()
 
-                # ----------------------------------------------------------
-                # Standardize expected columns
-                # ----------------------------------------------------------
                 if "std" in df.columns and "rms" not in df.columns:
                     df.rename(columns={"std": "rms"}, inplace=True)
 
@@ -898,20 +865,15 @@ class SAM:
                         print(f"Skipping {samfile}: no 'time' column")
                     continue
 
-                # Force numeric epoch seconds
                 df["time"] = pd.to_numeric(df["time"], errors="coerce")
                 df = df.dropna(subset=["time"])
 
                 if len(df) == 0:
                     continue
 
-                # Sort and remove duplicate timestamps
                 df = df.sort_values("time")
                 df = df[~df["time"].duplicated(keep="first")]
 
-                # ----------------------------------------------------------
-                # Slice to requested half-open interval [start, end)
-                # ----------------------------------------------------------
                 mask = (df["time"] >= start_epoch) & (df["time"] < end_epoch)
                 subset_df = df.loc[mask].copy()
 
@@ -920,9 +882,6 @@ class SAM:
 
                 yearly_frames.append(subset_df)
 
-            # --------------------------------------------------------------
-            # Combine all yearly chunks for this trace_id
-            # --------------------------------------------------------------
             if len(yearly_frames) == 0:
                 continue
 
@@ -931,13 +890,9 @@ class SAM:
             else:
                 df_tid = pd.concat(yearly_frames, ignore_index=True)
 
-            # Final cleanup after concat
             df_tid = df_tid.sort_values("time")
             df_tid = df_tid[~df_tid["time"].duplicated(keep="first")]
 
-            # --------------------------------------------------------------
-            # Regularize onto exact sampling grid
-            # --------------------------------------------------------------
             df_tid = classref._regularize_dataframe_time(
                 df_tid,
                 sampling_interval,
@@ -946,9 +901,6 @@ class SAM:
 
             dataframes[tid] = df_tid
 
-        # ------------------------------------------------------------------
-        # Return populated object
-        # ------------------------------------------------------------------
         return classref(dataframes=dataframes)
 
     @classmethod
@@ -1239,7 +1191,6 @@ class SAM:
         obspy.Stream
             One Trace per dataframe.
         """
-
         st = Stream()
 
         for key, df in self.dataframes.items():
@@ -1256,18 +1207,19 @@ class SAM:
             if not np.isfinite(dt) or dt <= 0:
                 continue
 
+            # Keep time as epoch seconds internally
+            work['time'] = pd.to_numeric(work['time'], errors='coerce')
+            work = work.dropna(subset=['time']).sort_values('time')
+            work = work[~work['time'].duplicated(keep='first')].reset_index(drop=True)
+
+            if len(work) == 0:
+                continue
+
             if fill_missing:
                 try:
                     work = self._regularize_dataframe_time(work, dt, time_col='time')
                 except Exception:
                     continue
-            else:
-                work['time'] = pd.to_datetime(work['time'], errors='coerce')
-                work = work.dropna(subset=['time']).sort_values('time')
-                work = work[~work['time'].duplicated(keep='first')].reset_index(drop=True)
-
-            if len(work) == 0:
-                continue
 
             data_series = pd.to_numeric(work[metric], errors='coerce')
 
@@ -1284,7 +1236,7 @@ class SAM:
 
             tr = Trace(data=data)
             tr.stats.delta = dt
-            tr.stats.starttime = UTCDateTime(work.iloc[0]['time'].to_pydatetime())
+            tr.stats.starttime = UTCDateTime(float(work.iloc[0]['time']))
             tr.id = key
 
             st.append(tr)
@@ -1325,67 +1277,137 @@ class SAM:
             self.dataframes[id] = df.loc[mask]
         if not keep_empty:
             self.__remove_empty()
-        
+            
     def write(self, SAM_DIR, ext='pickle', overwrite=False, verbose=False):
-        ''' Write SAM object to CSV or Pickle files (one per net.sta.loc.chan, per year) into folder specified by SAM_DIR
+        """
+        Write SAM object to CSV or Pickle files (one per net.sta.loc.chan per year).
 
-            Optional name-value pairs:
-                ext: Should be 'csv' or 'pickle' (default). Specifies what file format to save each DataFrame.   
-        '''
-        print('write')
-        for id in self.dataframes:
-            df = self.dataframes[id]
-            if df.empty:
+        Parameters
+        ----------
+        SAM_DIR : str or Path
+            Base SAM directory.
+        ext : {'csv', 'pickle'}
+            Output format.
+        overwrite : bool
+            If True, replace any existing yearly file with the new dataframe for that year.
+            If False, merge with existing file on disk.
+        verbose : bool
+            Print diagnostics.
+        """
+        if ext not in {"csv", "pickle"}:
+            raise ValueError("ext must be 'csv' or 'pickle'")
+
+        for seed_id, df in self.dataframes.items():
+            if df is None or df.empty:
                 continue
-            starttime = df.iloc[0]['time']
-            yyyy = UTCDateTime(starttime).year
-            samfile = self.get_filename(SAM_DIR, id, yyyy, self.get_sampling_interval(df), ext)
-            samdir = os.path.dirname(samfile)
-            if not os.path.isdir(samdir):
-                os.makedirs(samdir)
-            if os.path.isfile(samfile): # COMBINE
-                if ext=='csv':
-                    original_df = pd.read_csv(samfile)
-                elif ext=='pickle':
-                    original_df = pd.read_pickle(samfile)
-                if not overwrite: # DO NOT COMBINE IF WE ALREADY HAVE DATA FOR THIS TIMEWINDOW
-                    endtime = df.iloc[-1]['time']
-                    if endtime > starttime:
-                        original_df['pddatetime'] = pd.to_datetime(original_df['time'], unit='s')
-                        # construct Boolean mask
-                        try:
-                            mask = original_df['pddatetime'].between(starttime.isoformat(), endtime.isoformat())
-                        except:
-                            # something went wrong. just try to combine
-                            pass
-                        else:
-                            # apply Boolean mask
-                            subset_df = original_df[mask]
-                            subset_df = subset_df.drop(columns=['pddatetime'])
-                            original_df.drop(columns=['pddatetime'])
-                            if len(subset_df)>=len(df):
-                                # skip combining
-                                continue
-                    else:
-                        # skip combining
-                        continue
 
-                # COMBINING HERE
-                combined_df = pd.concat([original_df, df], ignore_index=True)
-                combined_df = combined_df.drop_duplicates(subset=['time'], keep='last') # overwrite duplicate data
-                print(f'Modifying {samfile}')             
-                if ext=='csv':
+            if "time" not in df.columns:
+                if verbose:
+                    print(f"Skipping {seed_id}: no 'time' column")
+                continue
+
+            # ------------------------------------------------------------------
+            # Normalize incoming dataframe
+            # ------------------------------------------------------------------
+            work = df.copy()
+
+            work["time"] = pd.to_numeric(work["time"], errors="coerce")
+            work = work.dropna(subset=["time"])
+
+            if work.empty:
+                continue
+
+            # standardize column naming if needed
+            if "std" in work.columns and "rms" not in work.columns:
+                work = work.rename(columns={"std": "rms"})
+
+            work = work.sort_values("time")
+            work = work.drop_duplicates(subset=["time"], keep="last")
+            work = work.reset_index(drop=True)
+
+            # ------------------------------------------------------------------
+            # Split by year, because a single dataframe may span multiple years
+            # ------------------------------------------------------------------
+            years = pd.to_datetime(work["time"], unit="s").dt.year
+
+            for yyyy, year_df in work.groupby(years):
+                year_df = year_df.copy()
+                year_df = year_df.sort_values("time")
+                year_df = year_df.drop_duplicates(subset=["time"], keep="last")
+                year_df = year_df.reset_index(drop=True)
+
+                if year_df.empty:
+                    continue
+
+                dt = self.get_sampling_interval(year_df)
+                samfile = self.get_filename(SAM_DIR, seed_id, int(yyyy), dt, ext)
+                samdir = os.path.dirname(samfile)
+
+                if not os.path.isdir(samdir):
+                    os.makedirs(samdir, exist_ok=True)
+
+                # --------------------------------------------------------------
+                # Overwrite mode: just write normalized yearly dataframe
+                # --------------------------------------------------------------
+                if overwrite or not os.path.isfile(samfile):
+                    if verbose:
+                        action = "Overwriting" if os.path.isfile(samfile) else "Writing"
+                        print(f"{action} {samfile}")
+
+                    if ext == "csv":
+                        year_df.to_csv(samfile, index=False)
+                    else:
+                        year_df.to_pickle(samfile)
+                    continue
+
+                # --------------------------------------------------------------
+                # Merge with existing file
+                # --------------------------------------------------------------
+                try:
+                    if ext == "csv":
+                        original_df = pd.read_csv(samfile)
+                    else:
+                        original_df = pd.read_pickle(samfile)
+                except Exception as e:
+                    if verbose:
+                        print(f"Failed to read existing {samfile}: {e}")
+                        print("Writing incoming dataframe only.")
+                    original_df = pd.DataFrame(columns=year_df.columns)
+
+                # Normalize existing dataframe
+                if not original_df.empty:
+                    if "time" not in original_df.columns:
+                        if verbose:
+                            print(f"Existing file {samfile} has no 'time' column; replacing it.")
+                        original_df = pd.DataFrame(columns=year_df.columns)
+                    else:
+                        original_df = original_df.copy()
+                        original_df["time"] = pd.to_numeric(original_df["time"], errors="coerce")
+                        original_df = original_df.dropna(subset=["time"])
+
+                        if "std" in original_df.columns and "rms" not in original_df.columns:
+                            original_df = original_df.rename(columns={"std": "rms"})
+
+                        original_df = original_df.sort_values("time")
+                        original_df = original_df.drop_duplicates(subset=["time"], keep="last")
+                        original_df = original_df.reset_index(drop=True)
+
+                # Merge: keep new rows on duplicate timestamps
+                combined_df = pd.concat([original_df, year_df], ignore_index=True, sort=False)
+                combined_df = combined_df.sort_values("time")
+                combined_df = combined_df.drop_duplicates(subset=["time"], keep="last")
+                combined_df = combined_df.reset_index(drop=True)
+
+                if verbose:
+                    print(
+                        f"Modifying {samfile} "
+                        f"(existing={len(original_df)}, incoming={len(year_df)}, final={len(combined_df)})"
+                    )
+
+                if ext == "csv":
                     combined_df.to_csv(samfile, index=False)
-                elif ext=='pickle':
+                else:
                     combined_df.to_pickle(samfile)
-                    
-            else: # WRITE FOR FIRST TIME
-                # SCAFFOLD: do i need to create a blank file here for whole year? probably not because smooth() is date-aware
-                print(f'Writing {samfile}')
-                if ext=='csv':
-                    df.to_csv(samfile, index=False)
-                elif ext=='pickle':
-                    df.to_pickle(samfile)
 
     @staticmethod
     def check_units(st):
@@ -1407,27 +1429,31 @@ class SAM:
     def __get_npts(df):
         ''' return the number of rows of an SAM dataframe'''
         return len(df)
-    """
-    @staticmethod
-    def get_sampling_interval(df):
-        ''' return the sampling interval of an SAM dataframe in seconds '''
-        if df is None or df.empty or "time" not in df.columns or len(df) < 2:
-            return np.nan
-        t = pd.to_numeric(df["time"], errors="coerce").to_numpy(dtype=float)
-        t = t[np.isfinite(t)]
-        if len(t) < 2:
-            return np.nan
-        return float(np.nanmedian(np.diff(t)))
-    """
-    @staticmethod
-    def get_sampling_interval(df):
-        import pandas as pd
-        import numpy as np
 
-        t = pd.to_datetime(df['time'], errors='coerce').dropna().sort_values().unique()
-        if len(t) < 2:
+    @staticmethod
+    def get_sampling_interval(df):
+        """
+        Return median sampling interval in seconds from a dataframe whose
+        `time` column is Unix epoch seconds.
+        """
+        if df is None or len(df) < 2 or 'time' not in df.columns:
             return np.nan
-        diffs = np.diff(t).astype('timedelta64[ns]').astype(float) / 1e9
+
+        t = pd.to_numeric(df['time'], errors='coerce').dropna().to_numpy(dtype=float)
+
+        if t.size < 2:
+            return np.nan
+
+        t = np.unique(np.sort(t))
+        if t.size < 2:
+            return np.nan
+
+        diffs = np.diff(t)
+        diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+
+        if diffs.size == 0:
+            return np.nan
+
         return float(np.median(diffs))
 
     @staticmethod
@@ -1484,72 +1510,113 @@ class SAM:
         self.dataframes = dfs_dict
 
     @staticmethod
-    def _regularize_dataframe_time(df, dt, time_col='time'):
+    def _is_regular_time_dataframe(df, dt, time_col="time", tol=1e-6):
         """
-        Return a copy of a SAM/RSAM dataframe reindexed onto a complete regular
-        time grid.
+        Return True if dataframe is already on a complete regular grid.
 
-        Missing rows are inserted with NaNs so that conversion to an ObsPy Trace
-        preserves the correct time axis. time is in Unix epoch seconds (float)
+        Assumes `time_col` contains Unix epoch seconds.
+        """
+        if df is None or len(df) == 0:
+            return True
+
+        if time_col not in df.columns:
+            return False
+
+        t = pd.to_numeric(df[time_col], errors="coerce").to_numpy(dtype=float)
+
+        if np.any(~np.isfinite(t)):
+            return False
+
+        if len(t) == 1:
+            return True
+
+        # Must be strictly increasing with no duplicates
+        dtimes = np.diff(t)
+        if np.any(dtimes <= 0):
+            return False
+
+        # Must all match requested dt in seconds
+        if not np.allclose(dtimes, float(dt), atol=tol, rtol=0.0):
+            return False
+
+        # Row count must match first/last implied span
+        expected_n = int(round((t[-1] - t[0]) / float(dt))) + 1
+        return len(df) == expected_n
+
+    @staticmethod
+    def _regularize_dataframe_time(df, dt, time_col="time", force=False):
+        """
+        Regularize dataframe onto a complete uniform time grid.
 
         Parameters
         ----------
         df : pandas.DataFrame
-            Input dataframe containing a time column.
+            Input dataframe with `time_col` in Unix epoch seconds.
         dt : float
             Sampling interval in seconds.
         time_col : str
-            Name of the time column.
+            Name of time column.
+        force : bool
+            If False, return immediately when the dataframe is already regular.
 
         Returns
         -------
         pandas.DataFrame
-            DataFrame sorted by time and reindexed to a complete regular grid.
-
+            Regularized dataframe with `time_col` preserved as Unix epoch seconds.
         """
+        if df is None or len(df) == 0:
+            return df
 
+        dt = float(dt)
+        if not np.isfinite(dt) or dt <= 0:
+            raise ValueError(f"dt must be positive finite seconds, got {dt!r}")
+
+        if not force and SAM._is_regular_time_dataframe(df, dt, time_col=time_col):
+            print(
+                f"Dataframe with {len(df)} rows is already on a regular "
+                f"{dt:.3g} s grid based on column '{time_col}'"
+            )
+            return df
+
+        print(
+            f"Regularizing dataframe with {len(df)} rows onto a "
+            f"{dt:.3g} s grid based on column '{time_col}'"
+        )
 
         work = df.copy()
 
         if time_col not in work.columns:
             raise KeyError(f"Missing required time column: {time_col}")
 
-        # --- Convert to datetime safely ---
-        if np.issubdtype(work[time_col].dtype, np.number):
-            # epoch seconds
-            t = pd.to_datetime(work[time_col], unit='s')
-        else:
-            # already datetime-like
-            t = pd.to_datetime(work[time_col], errors='coerce')
-
-        work[time_col] = t
+        # Keep time internally as epoch seconds
+        work[time_col] = pd.to_numeric(work[time_col], errors="coerce")
         work = work.dropna(subset=[time_col])
 
         if len(work) == 0:
             return work
 
         work = work.sort_values(time_col)
-        work = work[~work[time_col].duplicated(keep='first')]
+        work = work[~work[time_col].duplicated(keep="first")]
 
         if len(work) <= 1:
             return work.reset_index(drop=True)
 
-        # --- Build full time grid ---
-        full_index = pd.date_range(
-            start=work[time_col].iloc[0],
-            end=work[time_col].iloc[-1],
-            freq=pd.to_timedelta(float(dt), unit='s'),
-        )
+        t0 = float(work[time_col].iloc[0])
+        t1 = float(work[time_col].iloc[-1])
+
+        # Build exact epoch-second grid
+        n = int(round((t1 - t0) / dt)) + 1
+        full_time = t0 + np.arange(n, dtype=float) * dt
 
         work = (
             work.set_index(time_col)
-                .reindex(full_index)
-                .rename_axis(time_col)
-                .reset_index()
+            .reindex(full_time)
+            .rename_axis(time_col)
+            .reset_index()
         )
 
-        # --- Convert back to epoch seconds (important!) ---
-        work[time_col] = work[time_col].astype('int64') / 1e9
+        # Ensure plain float epoch seconds
+        work[time_col] = pd.to_numeric(work[time_col], errors="coerce").astype(float)
 
         return work
 
@@ -1606,20 +1673,138 @@ class SAM:
         return len(self.dataframes)
     
     @property
-    def starttime(self):
-        """Return the start time of the first non-empty dataframe."""
+    def size(self):
+        """
+        Summary size information for this SAM object.
+
+        Returns
+        -------
+        dict
+            {
+                "n_seed_ids": int,
+                "max_rows": int,
+                "n_columns": int,
+            }
+        """
+        if not self.dataframes:
+            return {
+                "n_seed_ids": 0,
+                "max_rows": 0,
+                "n_columns": 0,
+            }
+
+        nonempty = [
+            df for df in self.dataframes.values()
+            if df is not None
+        ]
+
+        if not nonempty:
+            return {
+                "n_seed_ids": len(self.dataframes),
+                "max_rows": 0,
+                "n_columns": 0,
+            }
+
+        max_rows = max(len(df) for df in nonempty)
+
+        # assume all SAM dataframes should have the same schema;
+        # use the dataframe with the most columns just in case
+        n_columns = max(len(df.columns) for df in nonempty)
+
+        return {
+            "n_seed_ids": len(self.dataframes),
+            "max_rows": max_rows,
+            "n_columns": n_columns,
+        }
+    
+    @property
+    def sampling_interval(self):
+        """
+        Return the representative sampling interval in seconds.
+
+        Chooses the dataframe with the largest number of rows, since that is
+        usually the most reliable / most complete member of the collection.
+        """
+        best_df = None
+        best_n = 0
+
         for df in self.dataframes.values():
-            if df is not None and not df.empty:
-                return self.__get_starttime(df)
-        return None
+            if df is None or df.empty:
+                continue
+            if "time" not in df.columns:
+                continue
+
+            n = len(df)
+            if n > best_n:
+                best_df = df
+                best_n = n
+
+        if best_df is None:
+            return None
+
+        dt = self.get_sampling_interval(best_df)
+        return None if not np.isfinite(dt) else float(dt)
+
+    @property
+    def starttime(self):
+        """
+        Return the earliest start time across all dataframes as UTCDateTime.
+        """
+        tmin = None
+
+        for df in self.dataframes.values():
+            if df is None or df.empty:
+                continue
+            if "time" not in df.columns:
+                continue
+
+            t = pd.to_numeric(df["time"], errors="coerce")
+            if t.empty:
+                continue
+
+            this_min = t.min()
+            if not np.isfinite(this_min):
+                continue
+
+            if tmin is None or this_min < tmin:
+                tmin = float(this_min)
+
+        return UTCDateTime(tmin) if tmin is not None else None
 
     @property
     def endtime(self):
-        """Return the end time of the first non-empty dataframe."""
+        """
+        Return the latest implied end time across all dataframes as UTCDateTime.
+
+        Uses:
+            last_sample_time + sampling_interval
+        """
+        tmax = None
+
         for df in self.dataframes.values():
-            if df is not None and not df.empty:
-                return self.__get_endtime(df)
-        return None
+            if df is None or df.empty:
+                continue
+            if "time" not in df.columns:
+                continue
+
+            dt = self.get_sampling_interval(df)
+            if not np.isfinite(dt):
+                continue
+
+            t = pd.to_numeric(df["time"], errors="coerce")
+            if t.empty:
+                continue
+
+            this_max = t.max()
+            if not np.isfinite(this_max):
+                continue
+
+            this_end = float(this_max) + float(dt)
+
+            if tmax is None or this_end > tmax:
+                tmax = this_end
+
+        return UTCDateTime(tmax) if tmax is not None else None
 
     @property
     def duration(self):
@@ -1630,13 +1815,6 @@ class SAM:
             return None
         return et - st
     
-    @property
-    def sampling_interval(self):
-        """Return the sampling interval of the first non-empty dataframe in seconds."""
-        for df in self.dataframes.values():
-            if df is not None and not df.empty:
-                return self.get_sampling_interval(df)
-        return None
     
     @property
     def seed_ids(self):
@@ -1657,28 +1835,13 @@ class SAM:
         metric: str,
     ) -> dict:
         """
-        Return peak time and amplitude for a given metric in an RSAM dataframe.
+        Return peak time (epoch seconds) and amplitude for a given metric.
 
-        Parameters
-        ----------
-        df : pandas.DataFrame
-            RSAM dataframe with a DatetimeIndex (or a time column).
-        metric : str
-            Column name to compute the peak from.
-
-        Returns
-        -------
-        dict
-            {
-                "peak_time": Timestamp,
-                "peak_amplitude": float,
-                "metric": str,
-                "n_rows": int
-            }
+        Assumes df['time'] is Unix epoch seconds.
         """
         if df is None or len(df) == 0:
             return {
-                "peak_time": pd.NaT,
+                "peak_time": np.nan,
                 "peak_amplitude": np.nan,
                 "metric": metric,
                 "n_rows": 0,
@@ -1687,38 +1850,33 @@ class SAM:
         if metric not in df.columns:
             raise KeyError(f"Metric '{metric}' not found in dataframe columns: {df.columns.tolist()}")
 
-        work = df.copy()
+        if "time" not in df.columns:
+            raise KeyError("Dataframe must contain a 'time' column (epoch seconds).")
 
-        # Ensure datetime index
-        if not isinstance(work.index, pd.DatetimeIndex):
-            for candidate in ["time", "datetime", "date"]:
-                if candidate in work.columns:
-                    work[candidate] = pd.to_datetime(work[candidate], errors="coerce")
-                    work = work.set_index(candidate)
-                    break
+        # Clean inputs
+        t = pd.to_numeric(df["time"], errors="coerce").to_numpy(dtype=float)
+        y = pd.to_numeric(df[metric], errors="coerce").to_numpy(dtype=float)
 
-        if not isinstance(work.index, pd.DatetimeIndex):
-            raise ValueError("RSAM dataframe must have a DatetimeIndex or time column.")
+        valid = np.isfinite(t) & np.isfinite(y)
 
-        y = pd.to_numeric(work[metric], errors="coerce")
-        y = y.replace([np.inf, -np.inf], np.nan)
-
-        if y.notna().sum() == 0:
+        if not np.any(valid):
             return {
-                "peak_time": pd.NaT,
+                "peak_time": np.nan,
                 "peak_amplitude": np.nan,
                 "metric": metric,
-                "n_rows": len(work),
+                "n_rows": len(df),
             }
 
-        peak_time = y.idxmax()
-        peak_amplitude = float(y.loc[peak_time])
+        t = t[valid]
+        y = y[valid]
+
+        i = np.argmax(y)
 
         return {
-            "peak_time": peak_time,
-            "peak_amplitude": peak_amplitude,
+            "peak_time": float(t[i]),           # epoch seconds
+            "peak_amplitude": float(y[i]),
             "metric": metric,
-            "n_rows": len(work),
+            "n_rows": len(df),
         }
 
     def get_peak(
