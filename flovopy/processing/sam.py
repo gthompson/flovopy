@@ -791,75 +791,164 @@ class SAM:
         -------
         classref
             A SAM/RSAM/VSAM instance with `dataframes` populated for the selected IDs/time span.
+
+        Notes
+        -----
+        - Input files are assumed to store `time` as Unix epoch seconds.
+        - Output dataframes are regularized to an exact grid at `sampling_interval`
+        and preserve `time` as Unix epoch seconds.
+        - Missing rows introduced by regularization will contain NaNs in metric
+        columns.
         """
         dataframes = {}
 
-        # Convert bounds to pandas Timestamps (naive UTC) for robust masking
-        start_ts = pd.to_datetime(startt.datetime)
-        end_ts   = pd.to_datetime(endt.datetime)
+        startt = UTCDateTime(startt)
+        endt = UTCDateTime(endt)
 
-        # -------- Discover trace_ids if not provided --------
-        # -------- Discover trace_ids if not provided --------
+        if endt <= startt:
+            raise ValueError("endt must be later than startt")
+
+        # ------------------------------------------------------------------
+        # Discover trace_ids if not explicitly provided
+        # ------------------------------------------------------------------
         if not trace_ids:
             found_ids = set()
-            subdir = classref.__name__.upper()  # 'RSAM' or 'VSAM'
+            subdir = classref.__name__.upper()  # e.g. RSAM / VSAM / DSAM
+
             for year in range(startt.year, endt.year + 1):
-                # Files live at: <SAM_DIR>/<RSAM|VSAM>/<NET>/<RSAM|VSAM>_<NET.STA.LOC.CHA>_<YEAR>_<Δs>.<ext>
                 pattern = os.path.join(
-                    SAM_DIR, subdir, network,
-                    f"{subdir}_*_{year}_{int(sampling_interval)}s.{ext}"
+                    str(SAM_DIR),
+                    subdir,
+                    network,
+                    f"{subdir}_*_{year}_{int(sampling_interval)}s.{ext}",
                 )
                 samfiles = glob.glob(pattern)
-                if not samfiles and verbose:
-                    print(f'No files found matching {pattern}')
+
+                if verbose and not samfiles:
+                    print(f"No files found matching {pattern}")
+
                 for path in samfiles:
                     base = os.path.basename(path)
-                    parts = base.split('_')
-                    # e.g., VSAM_IU.DWPF.10.BHZ_2011_60s.pickle  -> parts[-3] == 'IU.DWPF.10.BHZ'
-                    if len(parts) >= 3:
+                    parts = base.split("_")
+                    # Expected:
+                    # RSAM_<TRACEID>_<YEAR>_<SAMPLING>s.<ext>
+                    if len(parts) >= 4:
                         found_ids.add(parts[-3])
+
             trace_ids = sorted(found_ids)
 
             if verbose and not trace_ids:
-                print("No trace IDs discovered for the given pattern/time range.")
+                print("No trace IDs discovered for the requested range.")
 
-        # -------- Load frames per id across years, then slice by time --------
+        else:
+            trace_ids = list(trace_ids)
+
+        # ------------------------------------------------------------------
+        # Time bounds in epoch seconds for robust internal filtering
+        # ------------------------------------------------------------------
+        start_epoch = float(startt.timestamp)
+        end_epoch = float(endt.timestamp)
+
+        # ------------------------------------------------------------------
+        # Read per trace_id across requested years
+        # ------------------------------------------------------------------
         for tid in trace_ids:
-            yearly = []
-            for yyyy in range(startt.year, endt.year + 1):
-                samfile = classref.get_filename(SAM_DIR, tid, yyyy, sampling_interval, ext)
-                if os.path.isfile(samfile):
-                    if verbose:
-                        print('Reading', samfile)
-                    if ext == 'csv':
-                        df = pd.read_csv(samfile, index_col=False)
-                    elif ext == 'pickle':
-                        df = pd.read_pickle(samfile)
-                    else:
-                        raise ValueError(f"Unsupported ext '{ext}'. Use 'pickle' or 'csv'.")
-                    if df.empty:
-                        continue
+            yearly_frames = []
 
-                    # Standardize column name
-                    if 'std' in df.columns:
-                        df.rename(columns={'std': 'rms'}, inplace=True)
+            for year in range(startt.year, endt.year + 1):
+                samfile = classref.get_filename(
+                    SAM_DIR,
+                    tid,
+                    year,
+                    sampling_interval,
+                    ext,
+                )
 
-                    # Time mask: [start, end)
-                    df['pddatetime'] = pd.to_datetime(df['time'], unit='s', utc=False)
-                    mask = df['pddatetime'].between(start_ts, end_ts, inclusive='left')
-                    subset_df = df.loc[mask].drop(columns=['pddatetime'])
-                    if not subset_df.empty:
-                        yearly.append(subset_df)
-                else:
+                if not os.path.isfile(samfile):
                     if verbose:
                         print(f"Cannot find {samfile}")
+                    continue
 
-            if len(yearly) == 1:
-                dataframes[tid] = yearly[0]
-            elif len(yearly) > 1:
-                dataframes[tid] = pd.concat(yearly, ignore_index=True)
+                if verbose:
+                    print(f"Reading {samfile}")
 
-        # Return a SAM/RSAM/VSAM instance populated with the loaded frames
+                # ----------------------------------------------------------
+                # Load dataframe
+                # ----------------------------------------------------------
+                if ext == "csv":
+                    df = pd.read_csv(samfile, index_col=False)
+                elif ext == "pickle":
+                    df = pd.read_pickle(samfile)
+                else:
+                    raise ValueError(f"Unsupported ext {ext!r}. Use 'pickle' or 'csv'.")
+
+                if df is None or len(df) == 0:
+                    continue
+
+                df = df.copy()
+
+                # ----------------------------------------------------------
+                # Standardize expected columns
+                # ----------------------------------------------------------
+                if "std" in df.columns and "rms" not in df.columns:
+                    df.rename(columns={"std": "rms"}, inplace=True)
+
+                if "time" not in df.columns:
+                    if verbose:
+                        print(f"Skipping {samfile}: no 'time' column")
+                    continue
+
+                # Force numeric epoch seconds
+                df["time"] = pd.to_numeric(df["time"], errors="coerce")
+                df = df.dropna(subset=["time"])
+
+                if len(df) == 0:
+                    continue
+
+                # Sort and remove duplicate timestamps
+                df = df.sort_values("time")
+                df = df[~df["time"].duplicated(keep="first")]
+
+                # ----------------------------------------------------------
+                # Slice to requested half-open interval [start, end)
+                # ----------------------------------------------------------
+                mask = (df["time"] >= start_epoch) & (df["time"] < end_epoch)
+                subset_df = df.loc[mask].copy()
+
+                if len(subset_df) == 0:
+                    continue
+
+                yearly_frames.append(subset_df)
+
+            # --------------------------------------------------------------
+            # Combine all yearly chunks for this trace_id
+            # --------------------------------------------------------------
+            if len(yearly_frames) == 0:
+                continue
+
+            if len(yearly_frames) == 1:
+                df_tid = yearly_frames[0].copy()
+            else:
+                df_tid = pd.concat(yearly_frames, ignore_index=True)
+
+            # Final cleanup after concat
+            df_tid = df_tid.sort_values("time")
+            df_tid = df_tid[~df_tid["time"].duplicated(keep="first")]
+
+            # --------------------------------------------------------------
+            # Regularize onto exact sampling grid
+            # --------------------------------------------------------------
+            df_tid = classref._regularize_dataframe_time(
+                df_tid,
+                sampling_interval,
+                time_col="time",
+            )
+
+            dataframes[tid] = df_tid
+
+        # ------------------------------------------------------------------
+        # Return populated object
+        # ------------------------------------------------------------------
         return classref(dataframes=dataframes)
 
     @classmethod
@@ -1128,24 +1217,78 @@ class SAM:
             dataframes[thisid]=thisdf
         return self.__class__(dataframes=dataframes)       
     
-    def to_stream(self, metric='mean', ylims=None):
-        ''' Convert one column (specified by metric) of each DataFrame in an SAM object to an obspy.Trace, 
-            return an ObsPy.Stream that is the combination of all of these Trace objects'''
+
+    def to_stream(self, metric='mean', ylims=None, fill_missing=True, use_masked=True):
+        """
+        Convert one metric column from each SAM dataframe into an ObsPy Stream.
+
+        Parameters
+        ----------
+        metric : str
+            Column name to extract from each dataframe.
+        ylims : tuple/list or None
+            Optional lower/upper clipping limits applied to the selected metric.
+        fill_missing : bool
+            If True, reindex each dataframe onto a complete regular time grid,
+            inserting NaNs for missing rows.
+        use_masked : bool
+            If True, convert NaNs to a masked array before creating the Trace.
+
+        Returns
+        -------
+        obspy.Stream
+            One Trace per dataframe.
+        """
+
         st = Stream()
-        for key in self.dataframes:
-            df = self.dataframes[key]
-            if metric in df.columns:
-                dataSeries = df[metric]
-                if isinstance(ylims, list) or isinstance(ylims, tuple):
-                    dataSeries = dataSeries.clip(lower=ylims[0], upper=ylims[1])
-                # Ensure float dtype for Trace data
-                tr = Trace(data=np.array(dataSeries, dtype=float))
-                tr.stats.delta = self.get_sampling_interval(df)
-                tr.stats.starttime = UTCDateTime(df.iloc[0]['time'])
-                tr.id = key
-                # Only append if there is at least one non-NaN value
-                if tr.data.size - np.count_nonzero(np.isnan(tr.data)):
-                    st.append(tr)
+
+        for key, df in self.dataframes.items():
+            if df is None or len(df) == 0:
+                continue
+            if metric not in df.columns:
+                continue
+            if 'time' not in df.columns:
+                continue
+
+            work = df.copy()
+            dt = float(self.get_sampling_interval(work))
+
+            if not np.isfinite(dt) or dt <= 0:
+                continue
+
+            if fill_missing:
+                try:
+                    work = self._regularize_dataframe_time(work, dt, time_col='time')
+                except Exception:
+                    continue
+            else:
+                work['time'] = pd.to_datetime(work['time'], errors='coerce')
+                work = work.dropna(subset=['time']).sort_values('time')
+                work = work[~work['time'].duplicated(keep='first')].reset_index(drop=True)
+
+            if len(work) == 0:
+                continue
+
+            data_series = pd.to_numeric(work[metric], errors='coerce')
+
+            if isinstance(ylims, (list, tuple)) and len(ylims) == 2:
+                data_series = data_series.clip(lower=ylims[0], upper=ylims[1])
+
+            data = np.asarray(data_series, dtype=float)
+
+            if np.all(np.isnan(data)):
+                continue
+
+            if use_masked:
+                data = np.ma.masked_invalid(data)
+
+            tr = Trace(data=data)
+            tr.stats.delta = dt
+            tr.stats.starttime = UTCDateTime(work.iloc[0]['time'].to_pydatetime())
+            tr.id = key
+
+            st.append(tr)
+
         return st
     
     def select_ids(self, ids):
@@ -1264,7 +1407,7 @@ class SAM:
     def __get_npts(df):
         ''' return the number of rows of an SAM dataframe'''
         return len(df)
-
+    """
     @staticmethod
     def get_sampling_interval(df):
         ''' return the sampling interval of an SAM dataframe in seconds '''
@@ -1275,6 +1418,17 @@ class SAM:
         if len(t) < 2:
             return np.nan
         return float(np.nanmedian(np.diff(t)))
+    """
+    @staticmethod
+    def get_sampling_interval(df):
+        import pandas as pd
+        import numpy as np
+
+        t = pd.to_datetime(df['time'], errors='coerce').dropna().sort_values().unique()
+        if len(t) < 2:
+            return np.nan
+        diffs = np.diff(t).astype('timedelta64[ns]').astype(float) / 1e9
+        return float(np.median(diffs))
 
     @staticmethod
     def __get_starttime(df):
@@ -1328,6 +1482,76 @@ class SAM:
             if len(df) == 0:
                 del dfs_dict[id]
         self.dataframes = dfs_dict
+
+    @staticmethod
+    def _regularize_dataframe_time(df, dt, time_col='time'):
+        """
+        Return a copy of a SAM/RSAM dataframe reindexed onto a complete regular
+        time grid.
+
+        Missing rows are inserted with NaNs so that conversion to an ObsPy Trace
+        preserves the correct time axis. time is in Unix epoch seconds (float)
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Input dataframe containing a time column.
+        dt : float
+            Sampling interval in seconds.
+        time_col : str
+            Name of the time column.
+
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame sorted by time and reindexed to a complete regular grid.
+
+        """
+
+
+        work = df.copy()
+
+        if time_col not in work.columns:
+            raise KeyError(f"Missing required time column: {time_col}")
+
+        # --- Convert to datetime safely ---
+        if np.issubdtype(work[time_col].dtype, np.number):
+            # epoch seconds
+            t = pd.to_datetime(work[time_col], unit='s')
+        else:
+            # already datetime-like
+            t = pd.to_datetime(work[time_col], errors='coerce')
+
+        work[time_col] = t
+        work = work.dropna(subset=[time_col])
+
+        if len(work) == 0:
+            return work
+
+        work = work.sort_values(time_col)
+        work = work[~work[time_col].duplicated(keep='first')]
+
+        if len(work) <= 1:
+            return work.reset_index(drop=True)
+
+        # --- Build full time grid ---
+        full_index = pd.date_range(
+            start=work[time_col].iloc[0],
+            end=work[time_col].iloc[-1],
+            freq=pd.to_timedelta(float(dt), unit='s'),
+        )
+
+        work = (
+            work.set_index(time_col)
+                .reindex(full_index)
+                .rename_axis(time_col)
+                .reset_index()
+        )
+
+        # --- Convert back to epoch seconds (important!) ---
+        work[time_col] = work[time_col].astype('int64') / 1e9
+
+        return work
 
     @staticmethod
     def reshape_trace_data(x, sampling_rate, sampling_interval):

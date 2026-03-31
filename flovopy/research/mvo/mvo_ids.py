@@ -162,6 +162,8 @@ def fix_trace_mvo(trace: Trace, verbose: bool = False):
       embedded station/channel info decoded elsewhere.
     - Digital traces are normalized via ``correct_nslc_mvo()``.
     """
+    trace_id_in = trace.id
+
     sta = (trace.stats.station or "").upper()
     fs = float(trace.stats.sampling_rate) if trace.stats.sampling_rate else np.nan
 
@@ -201,6 +203,8 @@ def fix_trace_mvo(trace: Trace, verbose: bool = False):
         )
     if trace.stats.location in {"Z", "N", "E"} and len(trace.stats.channel) >= 2 and trace.stats.channel[-1]==trace.stats.location:
         trace.stats.location = ""
+
+    print(f"{trace_id_in} -> {trace.id}")
 
 
 def correct_nslc_mvo(
