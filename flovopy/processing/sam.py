@@ -1284,7 +1284,7 @@ class SAM:
 
             tr = Trace(data=data)
             tr.stats.delta = dt
-            tr.stats.starttime = UTCDateTime(work.iloc[0]['time'].to_pydatetime())
+            tr.stats.starttime = UTCDateTime(float(work.iloc[0]['time']))
             tr.id = key
 
             st.append(tr)
@@ -1407,27 +1407,30 @@ class SAM:
     def __get_npts(df):
         ''' return the number of rows of an SAM dataframe'''
         return len(df)
-    """
+    
     @staticmethod
     def get_sampling_interval(df):
-        ''' return the sampling interval of an SAM dataframe in seconds '''
-        if df is None or df.empty or "time" not in df.columns or len(df) < 2:
-            return np.nan
-        t = pd.to_numeric(df["time"], errors="coerce").to_numpy(dtype=float)
-        t = t[np.isfinite(t)]
-        if len(t) < 2:
-            return np.nan
-        return float(np.nanmedian(np.diff(t)))
-    """
-    @staticmethod
-    def get_sampling_interval(df):
-        import pandas as pd
-        import numpy as np
+        """
+        Return the median sampling interval in seconds.
 
-        t = pd.to_datetime(df['time'], errors='coerce').dropna().sort_values().unique()
+        Assumes df['time'] stores Unix epoch seconds.
+        """
+        if df is None or df.empty or 'time' not in df.columns:
+            return np.nan
+
+        t = pd.to_numeric(df['time'], errors='coerce').dropna().to_numpy(dtype=float)
         if len(t) < 2:
             return np.nan
-        diffs = np.diff(t).astype('timedelta64[ns]').astype(float) / 1e9
+
+        t = np.unique(np.sort(t))
+        if len(t) < 2:
+            return np.nan
+
+        diffs = np.diff(t)
+        diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+        if len(diffs) == 0:
+            return np.nan
+
         return float(np.median(diffs))
 
     @staticmethod
