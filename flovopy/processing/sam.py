@@ -1836,13 +1836,24 @@ class SAM:
         metric: str,
     ) -> dict:
         """
-        Return peak time (epoch seconds) and amplitude for a given metric.
+        Return peak time and amplitude for a given metric.
 
         Assumes df['time'] is Unix epoch seconds.
+
+        Returns
+        -------
+        dict
+            Keys:
+            - peak_time_epoch : float
+            - peak_time       : pandas.Timestamp
+            - peak_amplitude  : float
+            - metric          : str
+            - n_rows          : int
         """
         if df is None or len(df) == 0:
             return {
-                "peak_time": np.nan,
+                "peak_time_epoch": np.nan,
+                "peak_time": pd.NaT,
                 "peak_amplitude": np.nan,
                 "metric": metric,
                 "n_rows": 0,
@@ -1862,7 +1873,8 @@ class SAM:
 
         if not np.any(valid):
             return {
-                "peak_time": np.nan,
+                "peak_time_epoch": np.nan,
+                "peak_time": pd.NaT,
                 "peak_amplitude": np.nan,
                 "metric": metric,
                 "n_rows": len(df),
@@ -1872,9 +1884,11 @@ class SAM:
         y = y[valid]
 
         i = np.argmax(y)
+        peak_epoch = float(t[i])
 
         return {
-            "peak_time": float(t[i]),           # epoch seconds
+            "peak_time_epoch": peak_epoch,
+            "peak_time": pd.to_datetime(peak_epoch, unit="s", utc=True),
             "peak_amplitude": float(y[i]),
             "metric": metric,
             "n_rows": len(df),
@@ -1922,6 +1936,7 @@ class SAM:
         pandas.DataFrame
             Columns:
             - seed_id
+            - peak_time_epoch
             - peak_time
             - peak_amplitude
             - metric
@@ -1936,6 +1951,7 @@ class SAM:
             except Exception as e:
                 row = {
                     "seed_id": seed_id,
+                    "peak_time_epoch": np.nan,
                     "peak_time": pd.NaT,
                     "peak_amplitude": np.nan,
                     "metric": metric,
@@ -1947,6 +1963,7 @@ class SAM:
         out = pd.DataFrame(rows)
 
         if "peak_time" in out.columns:
+            out["peak_time"] = pd.to_datetime(out["peak_time"], errors="coerce", utc=True)
             out = out.sort_values(["peak_time", "seed_id"], na_position="last").reset_index(drop=True)
 
         return out
