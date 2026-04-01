@@ -1433,10 +1433,11 @@ class SAM:
     @staticmethod
     def get_sampling_interval(df):
         """
-        Return median sampling interval in seconds from a dataframe whose
-        `time` column is Unix epoch seconds.
+        Return the median sampling interval in seconds.
+
+        Assumes df['time'] stores Unix epoch seconds.
         """
-        if df is None or len(df) < 2 or 'time' not in df.columns:
+        if df is None or df.empty or 'time' not in df.columns:
             return np.nan
 
         t = pd.to_numeric(df['time'], errors='coerce').dropna().to_numpy(dtype=float)
