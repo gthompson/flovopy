@@ -1599,9 +1599,12 @@ class SAM:
             if 'median' in df.columns:
                 av = df['median'].median() 
                 lines.append(f"{trid}: median={av:.3g}")
-            else:
+            elif 'mean' in df.columns:
                 av = df['mean'].mean()
                 lines.append(f"{trid}: mean={av:.3g}")
+            elif 'energy' in df.columns:
+                av = df['energy'].sum()
+                lines.append(f"{trid}: energy={av:.3g}")
 
         return "\n".join(lines)  
     
