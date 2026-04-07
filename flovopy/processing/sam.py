@@ -2433,6 +2433,106 @@ class VSEM(VSAM):
     def compute_reduced_energy(self, inventory, source, Q=None):
         corrected_dataframes = self.reduce(inventory, source, Q=Q)
         return ER(dataframes=corrected_dataframes)
+    
+    def reduce(self, inventory, source, Q=None, wavespeed_kms=None, fixpeakf=None,
+            model="body", rho_earth=2500.0, return_joules=False, verbose=True):
+        """
+        Apply source-energy correction to VSEM dataframe metrics.
+
+        If return_joules=False:
+            returns path-corrected energies
+
+        If return_joules=True:
+            also multiplies by 2*pi*rho*c to estimate source energy in J
+        """
+        if not wavespeed_kms:
+            wavespeed_kms = 3.0  # km/s
+
+        c_earth = wavespeed_kms * 1000.0  # m/s
+
+        # source should be a dict with name, lat, lon, elev
+        distance_km, coordinates = self.get_distance_km(inventory, source)
+
+        corrected_dataframes = {}
+        metrics = self.get_metrics()
+
+        for seed_id, df0 in self.dataframes.items():
+            if seed_id not in distance_km:
+                continue
+
+            df = df0.copy()
+            this_distance_km = distance_km[seed_id]
+
+            # crude representative peak frequency
+            try:
+                ratio = df['VT'].sum() / df['LP'].sum()
+                peakf = fixpeakf if fixpeakf is not None else np.sqrt(ratio) * 4.0
+            except Exception:
+                ratio = np.nan
+                peakf = fixpeakf if fixpeakf is not None else 4.0
+
+            net, sta, loc, chan = seed_id.split('.')
+
+            if verbose:
+                print(f"Reducing {seed_id}: distance={this_distance_km:.1f} km, ratio={ratio:.3g}, peakf={peakf:.3g} Hz")
+
+            # full energy correction (Boatwright-style spreading + attenuation)
+            energy_correction = total_energy_correction(
+                np.array(this_distance_km),
+                chan=chan,
+                surface_waves=(model == "surface"),
+                wavespeed_kms=wavespeed_kms,
+                peakf_hz=peakf,
+                Q=Q,
+            ) * 1e6  # km^2 -> m^2
+
+            # separate correction for VLP
+            energy_correction_vlp = total_energy_correction(
+                np.array(this_distance_km),
+                chan=chan,
+                surface_waves=(model == "surface"),
+                wavespeed_kms=wavespeed_kms,
+                peakf_hz=0.06,
+                Q=Q,
+            ) * 1e6  # km^2 -> m^2
+
+            # optional final conversion to source energy in joules
+            source_scale = 2.0 * np.pi * rho_earth * c_earth if return_joules else 1.0
+
+            if verbose:
+                print(f"  Energy correction: {float(energy_correction):.3e}")
+                if return_joules:
+                    print(f"  Source scale 2πρc: {source_scale:.3e}")
+
+            for col in df.columns:
+                if col in metrics:
+                    if col == 'VLP':
+                        df[col] = df[col] * float(energy_correction_vlp) * source_scale
+                    else:
+                        df[col] = df[col] * float(energy_correction) * source_scale
+
+            corrected_dataframes[seed_id] = df
+
+        return corrected_dataframes
+
+
+    def compute_reduced_energy(self, inventory, source, Q=None, wavespeed_kms=None,
+                            fixpeakf=None, model="body", rho_earth=2500.0, verbose=True):
+        """
+        Compute reduced/source energy from VSEM metrics and return as ER.
+        """
+        corrected_dataframes = self.reduce(
+            inventory,
+            source,
+            Q=Q,
+            wavespeed_kms=wavespeed_kms,
+            fixpeakf=fixpeakf,
+            model=model,
+            rho_earth=rho_earth,
+            return_joules=True,
+            verbose=verbose,
+        )
+        return ER(dataframes=corrected_dataframes)
 
     @staticmethod
     def Eseismic_correction(dist_m, *, chan=None, surfaceWaves=False, wavespeed_kms=3.0, peakf=2.0):
