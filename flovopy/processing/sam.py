@@ -2385,7 +2385,7 @@ class VSEM(VSAM):
                 
         return good_st  
     
-    def reduce(self, inventory, source, Q=None, wavespeed_kms=None, fixpeakf=None):
+    def reduce(self, inventory, source, Q=None, wavespeed_kms=None, fixpeakf=None, verbose=True):
         # if the original Trace objects had coordinates attached, add a method in SAM to save those
         # in self.inventory. And add to SAM __init___ the possibility to pass an inventory object.
         
@@ -2410,9 +2410,13 @@ class VSEM(VSAM):
             else:
                 peakf = np.sqrt(ratio) * 4
 
-            net, sta, loc, chan = seed_id.split('.') 
+            net, sta, loc, chan = seed_id.split('.')
+            if verbose:
+                print(f"Reducing {seed_id}: distance={this_distance_km:.1f} km, ratio={ratio:.3g}, peakf={peakf:.3g} Hz") 
             g_E = self.Eseismic_correction(this_distance_km * 1000.0, chan=chan, wavespeed_kms=wavespeed_kms, peakf=peakf)
             a_E = self.compute_inelastic_attenuation_energy(this_distance_km, peakf, wavespeed_kms, Q)
+            if verbose:
+                print(f"  Geometrical spreading correction: {g_E:.3e}, Inelastic attenuation correction: {a_E:.3e}")
 
             for col in df.columns:
                 if col in self.get_metrics():
@@ -2699,7 +2703,7 @@ class ER(DR):
     def get_filename(SAM_DIR, id, year, sampling_interval, ext, name='ER'):
         return SAM.get_filename(SAM_DIR, id, year, sampling_interval, ext, name=name)   
        
-    def sum_energy(self, startt=None, endt=None, metric='energy', a=-3.2, b=2/3): #, inventory, source):
+    def sum_energy(self, startt=None, endt=None, metric='energy', a=-3.2, b=2/3, verbose=True): #, inventory, source):
         st = self.to_stream(metric)
         if startt and endt:
             st.trim(starttime=startt, endtime=endt)
