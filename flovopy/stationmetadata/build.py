@@ -68,6 +68,9 @@ def NRL2inventory(
     inventory : obspy.core.inventory.Inventory
         Inventory containing one station with the specified response.
     """
+    if isinstance(chans, str):
+        chans = [chans]
+
     print(f"[INFO] NRL2inventory: Building inventory for {net}.{sta}.{loc} with channels: {chans}")
     if nrl_path and os.path.isdir(nrl_path):
         try:

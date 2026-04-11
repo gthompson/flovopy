@@ -12,7 +12,7 @@ import pandas as pd
 import pygmt
 from obspy import Inventory
 from flovopy.stationmetadata.utils import inventory2traceid
-from flovopy.research.mvo.mvo_ids import dome_location  # ensure available
+from flovopy.research.mvo.mvo_ids import DOME_LOCATION as dome_location  # ensure available
 
 # Prefer Oceania mirror
 pygmt.config(GMT_DATA_SERVER="https://oceania.generic-mapping-tools.org")
@@ -334,7 +334,7 @@ def topo_map(
     # --------------------
     # CPT (avoid -Z warning by omitting continuous=True without increment)
     # --------------------
-    cmap='gray' # REMOVE THIS
+    #cmap='gray' # REMOVE THIS
     use_palette = cmap if cmap is not None else ("geo" if topo_color else "gray")
     use_cmap_flag = None
 
