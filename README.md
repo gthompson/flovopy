@@ -2,6 +2,7 @@
 
 FLOVOpy is a Python package providing advanced tools for volcano observatories and seismology research. It includes waveform processing utilities, RSAM/DRS computation, spectrogram generation, amplitude source location (ASL), and enhanced support for legacy datasets such as Seisan files.
 
+<img src="flovo.jpg" height=200>
 ---
 
 ## 📦 Installation (via Conda) on Linux/MacOS
