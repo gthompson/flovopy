@@ -6,10 +6,10 @@ from flovopy.stationmetadata.sensors import (
     countsPerPa1,
     countsPerPaChap40,
     countsPerPaChap1,
-)
-from flovopy.stationmetadata.utils import (
     download_infraBSU_stationxml,
-    get_stationXML_inventory,
+)
+from flovopy.stationmetadata.wrapper import get_stationXML_inventory
+from flovopy.stationmetadata.convert import (
     inventory2dataless_and_resp,
 )
 
