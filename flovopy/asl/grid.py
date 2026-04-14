@@ -17,7 +17,7 @@ from obspy.core.inventory import Inventory
 from obspy import Stream
 import pygmt
 from flovopy.utils.make_hash import make_hash
-from flovopy.research.mvo.mvo_ids import dome_location
+from flovopy.research.mvo.mvo_ids import DOME_LOCATION as dome_location #just used for default in defs
 from flovopy.asl.map import topo_map
 
 # ------------------------------
