@@ -2708,9 +2708,10 @@ class DR(SAM):
         medians = {}
         station_corrections = {}
         metrics = self.get_metrics()
+        print(metrics)
         for bad_metric in ['min', 'max', 'fratio']:
             if bad_metric in metrics:
-                metrics = metrics.drop(bad_metric)       
+                metrics.remove(bad_metric)       
         seed_ids = self.get_seed_ids()
         for metric in metrics: 
             st = self.to_stream(metric=metric)
