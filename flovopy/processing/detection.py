@@ -612,6 +612,7 @@ def extract_triggers_to_dataframe(
 
 
 
+
 def run_coincidence_trigger_dataframe(
     st: Stream,
     *,
@@ -631,9 +632,54 @@ def run_coincidence_trigger_dataframe(
     details: Optional[bool] = True,
     event_templates: Optional[dict] = None,
     similarity_threshold: float = 0.7,
+    debug_on_short_trace: bool = False,
     **kwargs,
 ) -> pd.DataFrame:
-    """Run ObsPy ``coincidence_trigger()`` on a Stream and return a dataframe catalogue."""
+    """Run ObsPy coincidence_trigger() on a Stream and return a dataframe catalogue.
+
+    Traces shorter than the STA/LTA requirements are dropped before triggering.
+    If no valid traces remain, an empty dataframe is returned.
+    """
+    if len(st) == 0:
+        return pd.DataFrame()
+
+    # Work on a copy so the caller's stream is not modified unexpectedly.
+    st = st.copy()
+
+    # Compute minimum required samples per trace.
+    # For classic STA/LTA, the hard requirement is len(data) >= nlta.
+    # We use lta_seconds as the main threshold, but require at least sta too.
+    kept = Stream()
+    dropped = []
+
+    for tr in st:
+        sr = float(tr.stats.sampling_rate)
+        nsta = max(1, int(round(sta_seconds * sr)))
+        nlta = max(1, int(round(lta_seconds * sr)))
+        npts = int(tr.stats.npts)
+
+        if npts < nlta:
+            dropped.append((tr.id, npts, nlta, sr))
+        else:
+            kept += tr
+
+    if dropped:
+        print("[WARN] Dropping traces shorter than LTA requirement:")
+        for tr_id, npts, nlta, sr in dropped:
+            print(f"  {tr_id}: npts={npts}, required_nlta={nlta}, sr={sr:.2f} Hz")
+
+        if debug_on_short_trace:
+            try:
+                print("[DEBUG] Plotting original stream for inspection...")
+                st.plot(equal_scale=False)
+                plt.show()
+            except Exception as e:
+                print(f"[DEBUG] Could not plot stream: {e}")
+
+    if len(kept) == 0:
+        print("[WARN] No traces long enough for STA/LTA. Returning empty dataframe.")
+        return pd.DataFrame()
+
     trigger_kwargs = dict(
         sta=sta_seconds,
         lta=lta_seconds,
@@ -645,17 +691,30 @@ def run_coincidence_trigger_dataframe(
         trigger_kwargs["event_templates"] = event_templates
         trigger_kwargs["similarity_threshold"] = similarity_threshold
 
-    trig = coincidence_trigger(
-        trigger_type,
-        threshold_on,
-        threshold_off,
-        st,
-        min_channels,
-        **trigger_kwargs,
-    )
+    try:
+        trig = coincidence_trigger(
+            trigger_type,
+            threshold_on,
+            threshold_off,
+            kept,
+            min_channels,
+            **trigger_kwargs,
+        )
+    except Exception as e:
+        print(f"[WARN] coincidence_trigger failed: {e}")
+
+        if debug_on_short_trace:
+            try:
+                print("[DEBUG] Plotting kept stream for inspection...")
+                kept.plot(equal_scale=False)
+                plt.show()
+            except Exception as plot_e:
+                print(f"[DEBUG] Could not plot kept stream: {plot_e}")
+
+        return pd.DataFrame()
 
     return extract_triggers_to_dataframe(
-        st,
+        kept,
         trig,
         pretrigger_seconds=pretrigger_seconds,
         posttrigger_seconds=posttrigger_seconds,
