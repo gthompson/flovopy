@@ -1,7 +1,7 @@
 import os
 from obspy import read, UTCDateTime
 
-from flovopy.seisanio.utils.helpers import filetime2spath, legacy_or_not
+from flovopy.seisanio.utils.helpers import filetime2spath#, legacy_or_not
 from flovopy.core.trace_utils import fix_trace_id
 from flovopy.research.mvo.mvo_ids import fix_trace_mvo
 
