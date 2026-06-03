@@ -255,7 +255,7 @@ class SAM:
             filt_cache = {}
             if filt:
                 fmin, fmax = float(filt[0]), float(filt[1])
-                if fs < 2.2 * fmax:
+                if fmax >= 0.5 * fs:
                     if verbose:
                         print(f"{tr.id}: bad sampling rate for primary band {fmin}-{fmax} Hz. Skipping trace.")
                     continue
@@ -288,7 +288,7 @@ class SAM:
             # Extra bands: mean(|bandpass|) per window
             if band_dict:
                 for key_name, (flow, fhigh) in band_dict.items():
-                    if fs < 2.2 * fhigh:
+                    if fhigh >= 0.5 * fs:
                         if verbose:
                             print(f"{tr.id}: bad sampling rate for band {key_name} {flow}-{fhigh} Hz. Skipping band.")
                         continue
@@ -642,8 +642,8 @@ class SAM:
     def __len__(self):
         return len(self.dataframes)
     
-
-    def plot(self, metrics=['mean'], kind='stream', logy=False, equal_scale=False, outfile=None, ylims=None):
+    '''
+    def plot(self, metrics=['mean'], kind='stream', logy=False, equal_scale=False, outfile=None, ylims=None, trim_to_data=False):
         """Plot a SAM object.
 
         Parameters
@@ -668,6 +668,8 @@ class SAM:
             the metric name is appended before '.png' unless already present.
         ylims : (low, high) or None
             Optional clipping bounds applied before plotting (non-stream).
+        trim_to_data : bool, default False
+            If True, trim x-axis to the time range that actual has non-NaN data for at least one SEED id. Otherwise, use the full time range of the DataFrame(s).
         """
         
         self.__remove_empty()
@@ -696,6 +698,45 @@ class SAM:
                 return
 
             metrics = chosen
+            
+        if trim_to_data:
+            valid_times = []
+
+            for df in self.dataframes.values():
+                if df is None or len(df) == 0 or 'time' not in df.columns:
+                    continue
+
+                present_metrics = [m for m in metrics if m in df.columns]
+                if not present_metrics:
+                    continue
+
+                # True where at least one requested metric has real data.
+                mask = df[present_metrics].notna().any(axis=1)
+
+                if mask.any():
+                    valid_times.extend(df.loc[mask, 'time'].values)
+
+            if not valid_times:
+                print('no non-NaN data found across requested metrics')
+                return
+
+            tmin = np.nanmin(valid_times)
+            tmax = np.nanmax(valid_times)
+
+            print(f"Trimming plot time range to data: {pd.to_datetime(tmin, unit='s')} to {pd.to_datetime(tmax, unit='s')}")
+
+            for key, df in list(self.dataframes.items()):
+                if df is None or len(df) == 0 or 'time' not in df.columns:
+                    continue
+
+                self.dataframes[key] = df[
+                    (df['time'] >= tmin) &
+                    (df['time'] <= tmax)
+                ].copy()
+
+            self.__remove_empty()
+
+            
 
         if kind == 'stream':
             for m in metrics:
@@ -749,6 +790,264 @@ class SAM:
                 plt.show()
 
             plt.close('all')
+    '''      
+    def plot(
+        self,
+        metrics=['mean'],
+        kind='stream',
+        logy=False,
+        equal_scale=False,
+        outfile=None,
+        ylims=None,
+        trim_to_data=False,
+    ):
+        """Plot a SAM object.
+
+        Parameters
+        ----------
+        metrics : str or list, default 'mean'
+            Columns to plot from each SAM DataFrame. Special value 'bands'
+            auto-detects a band set among:
+            - PRI, SEC, HI   (storm seismic)
+            - TC, MB, TH     (storm infrasound)
+            - VLP, LP, VT    (classic volcano)
+            If LP and VT are present anywhere, 'fratio' is appended too.
+        kind : {'stream','line','scatter'}, default 'stream'
+            'stream' → convert each metric to an ObsPy.Stream and call .plot()
+            'line'   → pandas line plot (metrics on one axes)
+            'scatter'→ two stacked scatter subplots (for 2 metrics)
+        logy : bool, default False
+            Log-scale y-axis (only for kind != 'stream').
+        equal_scale : bool, default False
+            If True, same y-limits for all Stream plots (kind='stream').
+        outfile : str or None
+            If provided, figures are written to disk. For kind='stream',
+            the metric name is appended before '.png' unless already present.
+        ylims : (low, high) or None
+            Optional clipping bounds applied before plotting.
+        trim_to_data : bool, default False
+            If True, trim the plot x-axis to the first and last time where at
+            least one requested metric has non-NaN data in at least one SEED id.
+            This does not modify the incoming SAM/RSAM object.
+        """
+
+        self.__remove_empty()
+
+        if isinstance(metrics, str):
+            metrics = [metrics]
+
+        if metrics == ['bands']:
+            all_cols = set()
+            for df in self.dataframes.values():
+                if df is not None and len(df):
+                    all_cols.update(df.columns)
+
+            candidates = [
+                ['PRI', 'SEC', 'HI'],
+                ['TC', 'MB', 'TH'],
+                ['VLP', 'LP', 'VT'],
+            ]
+
+            chosen = None
+            for triad in candidates:
+                if set(triad).issubset(all_cols):
+                    chosen = triad
+                    break
+
+            if not chosen:
+                print('no frequency bands data present')
+                return
+
+            metrics = chosen
+
+            if {'LP', 'VT'}.issubset(all_cols) and 'fratio' in all_cols:
+                metrics = metrics + ['fratio']
+
+        # ------------------------------------------------------------------
+        # Determine optional plotting time limits without modifying self.
+        # ------------------------------------------------------------------
+        trim_tmin = None
+        trim_tmax = None
+
+        if trim_to_data:
+            valid_times = []
+
+            for df in self.dataframes.values():
+                if df is None or len(df) == 0 or 'time' not in df.columns:
+                    continue
+
+                present_metrics = [m for m in metrics if m in df.columns]
+                if not present_metrics:
+                    continue
+
+                # True where at least one requested metric has real data.
+                mask = df[present_metrics].notna().any(axis=1)
+
+                if mask.any():
+                    valid_times.extend(df.loc[mask, 'time'].values)
+
+            if not valid_times:
+                print('no non-NaN data found across requested metrics')
+                return
+
+            trim_tmin = float(np.nanmin(valid_times))
+            trim_tmax = float(np.nanmax(valid_times))
+
+            print(
+                "Trimming plot time range to data: "
+                f"{pd.to_datetime(trim_tmin, unit='s')} to "
+                f"{pd.to_datetime(trim_tmax, unit='s')}"
+            )
+
+        # ------------------------------------------------------------------
+        # Stream plotting: trim only the local Stream object.
+        # ------------------------------------------------------------------
+        if kind == 'stream':
+            for m in metrics:
+                print('METRIC:', m)
+
+                # Warn but continue if metric is absent everywhere.
+                has_metric = any(
+                    df is not None and len(df) and m in df.columns
+                    for df in self.dataframes.values()
+                )
+                if not has_metric:
+                    print(f"metric '{m}' not found in any dataframe")
+                    continue
+
+                st = self.to_stream(metric=m, ylims=ylims)
+
+                if trim_to_data and trim_tmin is not None and trim_tmax is not None:
+                    st.trim(
+                        UTCDateTime(trim_tmin),
+                        UTCDateTime(trim_tmax)
+                    )
+
+                if outfile:
+                    if m not in outfile:
+                        this_outfile = outfile.replace('.png', f"_{m}.png")
+                        st.plot(equal_scale=equal_scale, outfile=this_outfile)
+                    else:
+                        st.plot(equal_scale=equal_scale, outfile=outfile)
+                else:
+                    st.plot(equal_scale=equal_scale)
+
+            return
+
+        # ------------------------------------------------------------------
+        # Pandas plotting: trim only local dataframe copies.
+        # ------------------------------------------------------------------
+        for key, df in self.dataframes.items():
+            if df is None or len(df) == 0:
+                continue
+
+            this_df = df.copy()
+
+            if 'time' not in this_df.columns:
+                print(f"{key}: missing time column")
+                continue
+
+            this_df['time'] = pd.to_datetime(
+                this_df['time'],
+                unit='s',
+                errors='coerce'
+            )
+
+            if trim_to_data and trim_tmin is not None and trim_tmax is not None:
+                trim_start = pd.to_datetime(trim_tmin, unit='s')
+                trim_end = pd.to_datetime(trim_tmax, unit='s')
+                this_df = this_df[
+                    (this_df['time'] >= trim_start) &
+                    (this_df['time'] <= trim_end)
+                ].copy()
+
+            if len(this_df) == 0:
+                print(f"{key}: no data in trimmed plotting range")
+                continue
+
+            missing = [m for m in metrics if m not in this_df.columns]
+            if missing:
+                print(f"{key}: missing columns: {', '.join(missing)}")
+                continue
+
+            # Drop rows where all requested metrics are NaN.
+            this_df = this_df.dropna(subset=metrics, how='all')
+            if len(this_df) == 0:
+                print(f"{key}: all requested metrics are NaN")
+                continue
+
+            if isinstance(ylims, (list, tuple)) and len(ylims) == 2:
+                lo, hi = ylims
+                for m in metrics:
+                    this_df[m] = this_df[m].clip(lower=lo, upper=hi)
+
+            if kind == 'line':
+                ax = this_df.plot(
+                    x='time',
+                    y=metrics,
+                    kind='line',
+                    title=key,
+                    logy=logy,
+                    rot=45,
+                )
+                fig = ax.get_figure()
+
+            elif kind == 'scatter':
+                if len(metrics) < 2:
+                    print(f"{key}: scatter requires at least 2 metrics")
+                    continue
+
+                nplots = min(2, len(metrics))
+                fig, ax = plt.subplots(
+                    nrows=nplots,
+                    ncols=1,
+                    sharex=True,
+                    sharey=False,
+                )
+
+                if not isinstance(ax, (list, tuple, np.ndarray)):
+                    ax = [ax]
+
+                for i, m in enumerate(metrics[:nplots]):
+                    this_df.plot(
+                        x='time',
+                        y=m,
+                        kind='scatter',
+                        ax=ax[i],
+                        title=key if i == 0 else None,
+                        logy=logy,
+                        rot=45,
+                    )
+
+            else:
+                print(f"Unknown kind='{kind}'")
+                continue
+
+            fig.tight_layout()
+
+            if outfile:
+                band_sets = [
+                    {'PRI', 'SEC', 'HI'},
+                    {'VLP', 'LP', 'VT'},
+                    {'TC', 'MB', 'TH'},
+                ]
+
+                is_band_plot = any(s.issubset(set(metrics)) for s in band_sets)
+                suffix = "_bands.png" if is_band_plot else "_metrics.png"
+
+                stem = outfile.replace('.png', '')
+                safe_key = (
+                    key.replace('.', '_')
+                    .replace('/', '_')
+                    .replace(':', '_')
+                )
+                this_outfile = f"{stem}_{safe_key}{suffix}"
+
+                fig.savefig(this_outfile)
+            else:
+                plt.show()
+
+            plt.close('all')            
 
     @classmethod
     def read(classref, startt, endt, SAM_DIR, trace_ids=None, network='*',
