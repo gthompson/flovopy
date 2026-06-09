@@ -1191,6 +1191,18 @@ class SAM:
 
             df_tid = df_tid.sort_values("time")
             df_tid = df_tid[~df_tid["time"].duplicated(keep="first")]
+            
+            # added this block on June 8, 2026
+            df_tid["time"] = pd.to_numeric(df_tid["time"], errors="coerce")
+            df_tid = df_tid.dropna(subset=["time"])
+            # Snap epoch times to exact sampling grid to avoid millisecond drift
+            df_tid["time"] = (
+                (df_tid["time"] / sampling_interval).round() * sampling_interval
+            )
+            df_tid = df_tid.sort_values("time")
+            df_tid = df_tid.drop_duplicates(subset=["time"], keep="last")
+            df_tid = df_tid.reset_index(drop=True)        
+            # end of block added on June 8, 2026    
 
             df_tid = classref._regularize_dataframe_time(
                 df_tid,
