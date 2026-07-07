@@ -2133,7 +2133,12 @@ class EnhancedSDSClient(Client):
     # ------------------------------------------------------------------
     # Export: SDS → BUD (via symlinks)
     # ------------------------------------------------------------------
-
+    @staticmethod
+    def _as_list(x):
+        if isinstance(x, (list, tuple, set)):
+            return list(x)
+        return [x]
+    
     def to_bud_symlinks(
         self,
         bud_root,
@@ -2243,10 +2248,7 @@ class EnhancedSDSClient(Client):
         sds_root = Path(self.sds_root)
         bud_root = Path(bud_root)
 
-        def _as_list(x):
-            if isinstance(x, (list, tuple, set)):
-                return list(x)
-            return [x]
+
 
         net_patterns = [str(x).upper() for x in _as_list(net)]
         sta_patterns = [str(x).upper() for x in _as_list(sta)]

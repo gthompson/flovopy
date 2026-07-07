@@ -204,27 +204,53 @@ class EnhancedStream(Stream):
         compute_ssam: bool = False,
         compute_bandratios: bool = False,
         stream_units: str = "m/s",
-        # SAM / SEM controls
         compute_sam: bool = True,
         compute_sem: bool = False,
         bands: tuple[float, float, float, float] = (0.5, 2.0, 2.0, 8.0),
+        pressure_band: tuple[float, float] = (1.0, 20.0),
+        disp_highpass_hz: float = 0.2,
         sam_stat: str = "mean_abs",
         sam_log2: bool = True,
         sem_log2: bool = True,
-        # spectral params
         threshold: float = 0.707,
         window_length: int = 9,
         polyorder: int = 2,
+        remove_bad_traces: bool = False,
+        verbose: bool = False,
     ) -> None:
-        """Compute per-trace metrics (TD + optional spectral) and station rollup.
-           Assumes EnhancedStream has displacement units """
+        """
+        Compute per-trace amplitude/energy/frequency metrics and station-level rollups.
+
+        Expected corrected units:
+        - seismic displacement: "m"
+        - seismic velocity: "m/s"
+        - pressure: "Pa"
+
+        For seismic traces:
+        - PGD is max(abs(displacement))
+        - PGV is max(abs(velocity))
+        - PGA is max(abs(acceleration))
+
+        For pressure traces:
+        - PAP is max(abs(pressure))
+        - PAP bandpassed is max(abs(pressure bandpassed over pressure_band))
+
+        Notes
+        -----
+        The preferred KSC workflow is to response-correct seismic channels to velocity
+        ("m/s") before calling this method. PGA is then computed by differentiating
+        velocity; PGD is computed by integrating velocity and high-pass filtering to
+        reduce drift.
+        """
         if len(self) == 0:
             self.station_metrics = pd.DataFrame()
             return
 
-        for tr in self:
+        bad_traces = []
+
+        for tr in list(self):
             m = self._ensure_metrics(tr)
-            # detrend/taper (light)
+
             try:
                 tr.detrend("linear")
             except Exception:
@@ -233,44 +259,125 @@ class EnhancedStream(Stream):
             dt = float(tr.stats.delta)
             y_raw = np.asarray(tr.data, dtype=np.float64)
 
-            # ----- branch by data type -----
-            is_seismic = True
-            units = tr.stats.get('units', None)
-            vel = disp = acc = None
-            print(f'ampengfft Trace {tr.id} units={units}')
-            if units.lower() in [None, "counts"]:
-                print('[AMPENGFFT]: You must set tr.stats.units on {tr.id} before calling this function. Rejecting this Trace.')
-                self.remove(tr)
-                continue
-            elif units.lower() == "m":
-                #print('processing as displacement')
-                disp = tr.copy()
-                vel  = tr.copy().differentiate()
-                acc  = vel.copy().differentiate()  
-            elif units.lower() == "m/s":
-                #print('processing as velocity')
-                vel  = tr
-                disp = tr.copy().integrate().detrend('linear').filter('highpass', freq=0.2, corners=2)
-                acc  = tr.copy().differentiate()    
-            elif units.lower() == 'pa':     
-                #print('processing as pressure')                  
-                # pressure series
-                self._td_stats(tr, y_raw)
-                pap, pap_bp = self._pressure_metrics(tr, band=(1.0, 20.0))
-                m["pap"] = pap
-                m["pap_bp_1_20"] = pap_bp
-                is_seismic = False
-            
-            if is_seismic:
+            units_raw = tr.stats.get("units", None)
+            units = str(units_raw).strip().lower() if units_raw is not None else ""
 
-                y = np.asarray(vel.data, dtype=np.float64)
+            if verbose:
+                print(f"ampengfft Trace {tr.id} units={units_raw}")
+
+            vel = disp = acc = None
+            is_seismic = True
+
+            if units in ["", "none", "counts", "count"]:
+                msg = (
+                    f"[AMPENGFFT] Missing/uncorrected units for {tr.id}. "
+                    "Set tr.stats.units before calling ampengfft()."
+                )
+                if verbose:
+                    print(msg)
+                m["metric_error"] = msg
+                bad_traces.append(tr)
+                continue
+
+            elif units in ["m", "meter", "meters"]:
+                disp = tr.copy()
+                vel = tr.copy().differentiate()
+                acc = vel.copy().differentiate()
+
+            elif units in ["m/s", "meter/second", "meters/second", "mps"]:
+                vel = tr.copy()
+
+                disp = tr.copy().integrate()
+                try:
+                    disp.detrend("linear")
+                    if disp_highpass_hz is not None and disp_highpass_hz > 0:
+                        disp.filter(
+                            "highpass",
+                            freq=disp_highpass_hz,
+                            corners=2,
+                            zerophase=True,
+                        )
+                except Exception as e:
+                    if verbose:
+                        print(f"  displacement integration/highpass warning for {tr.id}: {e}")
+
+                acc = tr.copy().differentiate()
+
+            elif units in ["m/s/s", "m/s^2", "m s-2", "mps2"]:
+                acc = tr.copy()
+                vel = tr.copy().integrate()
+                try:
+                    vel.detrend("linear")
+                    if disp_highpass_hz is not None and disp_highpass_hz > 0:
+                        vel.filter(
+                            "highpass",
+                            freq=disp_highpass_hz,
+                            corners=2,
+                            zerophase=True,
+                        )
+                except Exception as e:
+                    if verbose:
+                        print(f"  velocity integration/highpass warning for {tr.id}: {e}")
+
+                disp = vel.copy().integrate()
+                try:
+                    disp.detrend("linear")
+                    if disp_highpass_hz is not None and disp_highpass_hz > 0:
+                        disp.filter(
+                            "highpass",
+                            freq=disp_highpass_hz,
+                            corners=2,
+                            zerophase=True,
+                        )
+                except Exception as e:
+                    if verbose:
+                        print(f"  displacement integration/highpass warning for {tr.id}: {e}")
+
+            elif units in ["pa", "pascal", "pascals"]:
+                self._td_stats(tr, y_raw)
+                pap, pap_bp = self._pressure_metrics(tr, band=pressure_band)
+                m["pap"] = pap
+
+                lo, hi = pressure_band
+                m[f"pap_bp_{lo:g}_{hi:g}"] = pap_bp
+                m["pressure_band_low_hz"] = float(lo)
+                m["pressure_band_high_hz"] = float(hi)
+
+                is_seismic = False
+
+            else:
+                msg = f"[AMPENGFFT] Unsupported units for {tr.id}: {units_raw}"
+                if verbose:
+                    print(msg)
+                m["metric_error"] = msg
+                bad_traces.append(tr)
+                continue
+
+            if is_seismic:
+                y = np.asarray(vel.data, dtype=np.float64) if vel is not None else y_raw
                 self._td_stats(tr, y)
 
-                m["pgd"] = float(np.nanmax(np.abs(disp.data))) if disp.stats.npts else np.nan
-                m["pgv"] = float(np.nanmax(np.abs(vel.data)))  if vel.stats.npts  else np.nan
-                m["pga"] = float(np.nanmax(np.abs(acc.data)))  if acc.stats.npts  else np.nan
+                m["pgd"] = (
+                    float(np.nanmax(np.abs(disp.data)))
+                    if disp is not None and disp.stats.npts
+                    else np.nan
+                )
+                m["pgv"] = (
+                    float(np.nanmax(np.abs(vel.data)))
+                    if vel is not None and vel.stats.npts
+                    else np.nan
+                )
+                m["pga"] = (
+                    float(np.nanmax(np.abs(acc.data)))
+                    if acc is not None and acc.stats.npts
+                    else np.nan
+                )
 
-                # dominant frequency (TD ratio)
+                m["seismic_units_input"] = units_raw
+                m["pgd_units"] = "m"
+                m["pgv_units"] = "m/s"
+                m["pga_units"] = "m/s^2"
+
                 try:
                     num = np.abs(vel.data).astype(np.float64)
                     den = 2.0 * np.pi * np.abs(disp.data).astype(np.float64) + 1e-20
@@ -279,7 +386,6 @@ class EnhancedStream(Stream):
                 except Exception:
                     m["fdom"] = np.nan
 
-            # ----- unified band features -----
             if compute_sam or compute_sem:
                 l1, l2, h1, h2 = bands
                 self._compute_sam_sem(
@@ -291,26 +397,33 @@ class EnhancedStream(Stream):
                     corners=2,
                     zerophase=True,
                 )
-                # drop unused structure if only one requested
                 if not compute_sam:
                     self._ensure_metrics(tr).pop("sam", None)
                 if not compute_sem:
                     self._ensure_metrics(tr).pop("sem", None)
 
-            # ----- spectral (optional) -----
             if compute_spectral:
                 spectral_block(
-                    tr, y_raw, dt,
+                    tr,
+                    y_raw,
+                    dt,
                     threshold=threshold,
                     window_length=window_length,
                     polyorder=polyorder,
                     compute_ssam=compute_ssam,
                     compute_bandratios=compute_bandratios,
-                    helper=None,  # or provide a callable adapter to compute_amplitude_spectra
+                    helper=None,
                 )
 
-        # --- station-level aggregation after per-trace loop ---
+        if remove_bad_traces:
+            for tr in bad_traces:
+                try:
+                    self.remove(tr)
+                except ValueError:
+                    pass
+
         self.station_metrics = self._station_level_metrics()
+
         if self.station_metrics is not None and not self.station_metrics.empty:
             station_map = self.station_metrics.set_index("station_key").to_dict(orient="index")
             for tr in self:
@@ -319,28 +432,76 @@ class EnhancedStream(Stream):
                     for k, v in station_map[key].items():
                         if k != "station_key":
                             self._ensure_metrics(tr)[f"station_{k}"] = v
-                            
 
     # ---------------- station-level aggregation ----------------
 
-    def _vector_max_3c(self, trZ: Trace, trN: Trace, trE: Trace, *, kind="vel") -> float:
-        def as_kind(tr):
-            if kind == "vel":  return tr.copy()
-            if kind == "disp": return tr.copy().integrate().detrend('linear')
-            if kind == "acc":  return tr.copy().differentiate()
-            raise ValueError("kind must be vel|disp|acc")
-        # trim to overlap
+    def _vector_max_3c(
+        self,
+        trZ: Trace,
+        trN: Trace,
+        trE: Trace,
+        *,
+        kind: str = "vel",
+        disp_highpass_hz: float = 0.2,
+    ) -> float:
+        """
+        Compute max 3-component vector amplitude for overlapping Z/N/E traces.
+
+        Assumes input seismic traces are corrected velocity traces in m/s unless
+        kind="vel". For kind="disp", integrates velocity and high-pass filters to
+        reduce drift. For kind="acc", differentiates velocity.
+        """
+
+        def as_kind(tr: Trace) -> Trace:
+            out = tr.copy()
+
+            if kind == "vel":
+                return out
+
+            if kind == "disp":
+                out.integrate()
+                try:
+                    out.detrend("linear")
+                    if disp_highpass_hz is not None and disp_highpass_hz > 0:
+                        out.filter(
+                            "highpass",
+                            freq=disp_highpass_hz,
+                            corners=2,
+                            zerophase=True,
+                        )
+                except Exception:
+                    pass
+                return out
+
+            if kind == "acc":
+                out.differentiate()
+                return out
+
+            raise ValueError("kind must be 'vel', 'disp', or 'acc'")
+
         t0 = max(tr.stats.starttime for tr in (trZ, trN, trE))
-        t1 = min(tr.stats.endtime   for tr in (trZ, trN, trE))
+        t1 = min(tr.stats.endtime for tr in (trZ, trN, trE))
+
         if t1 <= t0:
             return np.nan
+
         trs = [as_kind(tr).trim(t0, t1, pad=False) for tr in (trZ, trN, trE)]
+
         if any(t.stats.npts <= 1 for t in trs):
             return np.nan
-        z, n, e = (np.asarray(t.data, dtype=np.float64) for t in trs)
-        vec = np.sqrt(z*z + n*n + e*e)
-        return float(np.nanmax(np.abs(vec))) if vec.size else np.nan
 
+        min_npts = min(t.stats.npts for t in trs)
+        if min_npts <= 1:
+            return np.nan
+
+        z, n, e = (
+            np.asarray(t.data[:min_npts], dtype=np.float64)
+            for t in trs
+        )
+
+        vec = np.sqrt(z * z + n * n + e * e)
+
+        return float(np.nanmax(vec)) if vec.size else np.nan
 
     def _station_level_metrics(self) -> pd.DataFrame:
         """
