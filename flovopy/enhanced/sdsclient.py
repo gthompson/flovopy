@@ -679,10 +679,16 @@ class EnhancedSDSClient(Client):
                 strategy = "obspy"
                 if postprocess_kwargs:
                     strategy = postprocess_kwargs.get("merge_strategy", "obspy")
-                smart_merge(st, strategy=strategy, verbose=verbose)
+                st = smart_merge(
+                    st,
+                    strategy=strategy,
+                    return_stream_only=True,
+                    verbose=verbose,
+                )
             except Exception as e:
                 if verbose:
                     print(f"⚠️ final smart_merge failed: {e}")
+                raise RuntimeError("final smart_merge failed") from e
 
         # ------------------------------------------------------------
         # Annotate processing
@@ -1265,8 +1271,9 @@ class EnhancedSDSClient(Client):
         Prepare a stream for SDS writing.
 
         This applies the FLOVOpy pre-write pipeline if requested, but handles
-        smart_merge explicitly here because current smart_merge() returns a
-        report dict rather than operating in-place.
+        smart_merge explicitly here. smart_merge() returns a Stream by default;
+        this method requests that return type explicitly rather than relying on
+        its default.
 
         Parameters
         ----------
@@ -1322,17 +1329,23 @@ class EnhancedSDSClient(Client):
 
         if merge_requested and len(st) > 1:
             try:
-                report = smart_merge(
+                st = smart_merge(
                     st,
                     strategy=merge_strategy,
                     allow_timeshift=allow_timeshift,
                     max_shift_seconds=max_shift_seconds,
+                    return_stream_only=True,
                     verbose=verbose,
                 )
-                st = report["merged_stream"]
             except Exception as e:
                 if verbose:
                     print(f"⚠️ smart_merge failed during SDS write preparation: {e}")
+                # Never continue to an SDS write with an unmerged stream after
+                # a requested collision merge has failed.  The caller can then
+                # leave/restore the previous target file transactionally.
+                raise RuntimeError(
+                    "smart_merge failed during SDS write preparation"
+                ) from e
 
         try:
             remove_empty_traces(st, inplace=True)
