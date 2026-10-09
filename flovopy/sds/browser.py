@@ -154,70 +154,32 @@ def _parse_hhmm(hhmm: str) -> int:
 # =============================================================================
 
 class SDSAccessor:
-    """
-    Read a single day of waveform data from an SDS archive.
+    """Raw SDS access. EnhancedSDSClient preferred; ObsPy is the fallback.
 
-    Preference order:
-      1) flovopy EnhancedSDSClient (if importable)
-      2) ObsPy SDS Client (fallback)
+    No response removal, filtering, detrending, resampling or gap filling.
     """
 
     def __init__(self, sds_root: str):
         self.sds_root = sds_root
-        self.backend = "unknown"
-        self._enh = None
-        self._obspy_client = None
-
-        # Try EnhancedSDSClient first
         try:
-            from flovopy.enhanced.enhanced_sds_client import EnhancedSDSClient  # type: ignore
-            self._enh = EnhancedSDSClient(sds_root=sds_root)
-            self.backend = "EnhancedSDSClient"
-            return
-        except Exception:
-            self._enh = None
+            from flovopy.enhanced.sdsclient import EnhancedSDSClient
+            self.client = EnhancedSDSClient(sds_root)
+            self.backend = "EnhancedSDSClient (raw get_waveforms)"
+        except (ImportError, TypeError) as exc:
+            from obspy.clients.filesystem.sds import Client
+            self.client = Client(sds_root)
+            self.backend = f"ObsPy SDSClient (fallback: {exc})"
 
-        # Fallback to ObsPy SDS client
-        try:
-            from obspy.clients.filesystem.sds import Client as SDSClient  # type: ignore
-            self._obspy_client = SDSClient(sds_root)
-            self.backend = "ObsPySDSClient"
-        except Exception as e:
-            raise RuntimeError(
-                "Could not initialize any SDS backend. "
-                "Install/configure flovopy EnhancedSDSClient or ObsPy SDS client."
-            ) from e
-
-    def has_data_for_day(self, year: int, jday: int, net: str, sta: str, loc: str, chan: str) -> bool:
-        if self._enh is not None:
-            try:
-                return bool(self._enh.has_data_for_browser_day(year=str(year), jday=str(jday),
-                                                              net=net, sta=sta, loc=loc, chan=chan))
-            except Exception:
-                # If the helper method misbehaves, just attempt a read.
-                return True
-        # ObsPy SDS client doesn't have "has_data"; we just attempt to read.
-        return True
-
-    def read_day(self, year: int, jday: int, net: str, sta: str, loc: str, chan: str) -> Stream:
-        if self._enh is not None:
-            return self._enh.read_day(
-                net=net, sta=sta, loc=loc, chan=chan,
-                year=str(year), jday=str(jday),
-                merge=0,
-            )
-
-
-        # ObsPy SDS client
-        t0 = UTCDateTime(year, julday=jday)
-        t1 = t0 + 86400
-        st = self._obspy_client.get_waveforms(
-            network=net, station=sta, location=loc, channel=chan,
-            starttime=t0, endtime=t1
+    def read_day(self, year: int, jday: int, net: str, sta: str,
+                 loc: str, chan: str) -> Stream:
+        start = UTCDateTime(year, julday=jday)
+        # Read exactly one UTC day; preserve independent segments and raw counts.
+        return self.client.get_waveforms(
+            network=net or "*", station=sta or "*",
+            location=loc or "*", channel=chan or "*",
+            starttime=start, endtime=start + 86400 - 0.000001,
+            merge=-1,
         )
-        #if merge:
-        #    st.merge(method=1, fill_value=None)   # or without fill_value if you prefer
-        return st
 
 
 # =============================================================================
@@ -339,6 +301,30 @@ class StatsComputer:
 # Plot + export
 # =============================================================================
 
+def overview_minmax(trace, bin_seconds=1.0):
+    """Plot envelope for long windows without discarding short transients.
+
+    Returns matplotlib dates and minimum/maximum arrays. Does not modify trace.
+    Each output time represents one bin (typically one second).
+    """
+    data = np.ma.asarray(trace.data)
+    n = len(data)
+    if not n:
+        return np.array([]), np.array([]), np.array([])
+    step = max(1, int(round(float(trace.stats.sampling_rate) * bin_seconds)))
+    times, lows, highs = [], [], []
+    for i in range(0, n, step):
+        block = data[i:i + step]
+        if np.ma.count(block) == 0:
+            continue
+        lo, hi = float(np.ma.min(block)), float(np.ma.max(block))
+        t = trace.stats.starttime + (i + min(step, n - i) / 2) / float(trace.stats.sampling_rate)
+        times.append(mdates.date2num(t.datetime))
+        lows.append(lo)
+        highs.append(hi)
+    return np.asarray(times), np.asarray(lows), np.asarray(highs)
+
+
 class PlotManager:
     """Manages the persistent waveform plot and optional mass position plot."""
 
@@ -350,7 +336,7 @@ class PlotManager:
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
         ax.grid(True, alpha=0.3)
 
-    def redraw_waveforms(self, st: Stream, title: str, same_y_scale: bool = False) -> None:
+    def redraw_waveforms(self, st: Stream, title: str, same_y_scale: bool = False, window_seconds: float = 0) -> None:
         self.fig.clf()
 
         n = len(st)
@@ -387,8 +373,13 @@ class PlotManager:
             axes = [axes]
 
         for ax, tr in zip(axes, st):
-            t = tr.times("matplotlib")
-            ax.plot(t, tr.data, linewidth=0.8)
+            if window_seconds > 600 and tr.stats.sampling_rate > 1:
+                t, lo, hi = overview_minmax(tr, bin_seconds=1.0)
+                # Vertical min/max strokes show the full amplitude range in each second.
+                ax.vlines(t, lo, hi, linewidth=0.65)
+            else:
+                t = tr.times("matplotlib")
+                ax.plot(t, tr.data, linewidth=0.8)
             label = f"{tr.stats.station}.{tr.stats.channel}"
             ax.set_ylabel(label, rotation=0, labelpad=35, fontsize=9)
             self._format_time_axis(ax)
@@ -594,7 +585,8 @@ class SDSBrowser:
             # clamp within the day bounds if possible
             t0 = max(t0, self.day_start)
             t1 = min(t1, self.day_end)
-            self.win = t0
+            # Preserve requested start time (clamp only when outside data).
+            self.win = max(t0, min(self.win, t1))
             # keep a sane window length
             self.win_sec = max(10.0, float(self.cfg.window_sec))
             # ensure the first window doesn't exceed t1
@@ -676,7 +668,7 @@ class SDSBrowser:
                 print(f"⚠️ SOH summary failed: {e}")
 
         # redraw plot
-        self.plot.redraw_waveforms(self.st_view, title, same_y_scale=bool(self.cfg.same_y_scale))
+        self.plot.redraw_waveforms(self.st_view, title, same_y_scale=bool(self.cfg.same_y_scale), window_seconds=self.win_sec)
 
         # keep config in sync
         self.cfg.window_sec = float(self.win_sec)
@@ -903,8 +895,46 @@ Menu:
 # =============================================================================
 
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Browse raw waveforms in an SDS archive")
+    parser.add_argument("--sds-root")
+    parser.add_argument("--network")
+    parser.add_argument("--station")
+    parser.add_argument("--location")
+    parser.add_argument("--channel")
+    parser.add_argument("--time", help="UTC ISO timestamp; opens at this time")
+    parser.add_argument("--window", type=float, help="Window duration in seconds")
+    parser.add_argument("--mode", choices=["all", "high", "seismic", "infrasound", "soh", "soh_imp"])
+    parser.add_argument("--no-prompts", action="store_true", help="Use CLI arguments and saved defaults without interactive setup")
+    args = parser.parse_args()
     cfg = BrowserConfig.load()
-    SDSBrowser(cfg).run()
+    for arg, attr in (("sds_root", "sds_root"), ("network", "net"),
+                      ("station", "sta"), ("location", "loc"),
+                      ("channel", "chan"), ("mode", "mode")):
+        value = getattr(args, arg)
+        if value is not None:
+            setattr(cfg, attr, value)
+    if args.time:
+        t = UTCDateTime(args.time)
+        cfg.year = str(t.year)
+        cfg.jday = str(t.julday)
+        cfg.start_hhmm = t.strftime("%H:%M")
+        # Preserve sub-minute precision via explicit override.
+        exact_start = t
+    else:
+        exact_start = None
+    if args.window is not None:
+        cfg.window_sec = args.window
+    browser = SDSBrowser(cfg)
+    if args.no_prompts:
+        browser._ensure_sds_accessor()
+        browser._load_day()
+        if exact_start is not None:
+            browser.win = exact_start
+        browser.refresh()
+        browser.menu()
+    else:
+        browser.run()
 
 
 if __name__ == "__main__":
