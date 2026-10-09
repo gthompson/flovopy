@@ -1,0 +1,7 @@
+sta,chan,ondate,chanid,offdate,ctype,edepth,hang,vang,descrip,lddate
+BCI1,DD1,2016055,1,2016100,n,0.0,0.0,90.0,Unverified response and sensor swap epoch,1791571775.295634
+BCI2,DD2,2016055,2,2016100,n,0.0,0.0,90.0,Unverified response and sensor swap epoch,1791571775.295658
+BCI3,DD3,2016055,3,2016100,n,0.0,0.0,90.0,Unverified response and sensor swap epoch,1791571775.295678
+BCHH,DHZ,2016055,4,2016100,n,0.0,0.0,0.0,Illustrative component expansion of legacy DHZNE; verify recorded NSLC,1791571775.295692
+BCHH,DHN,2016055,5,2016100,n,0.0,0.0,90.0,Illustrative component expansion of legacy DHZNE; verify recorded NSLC,1791571775.295705
+BCHH,DHE,2016055,6,2016100,n,0.0,90.0,90.0,Illustrative component expansion of legacy DHZNE; verify recorded NSLC,1791571775.295722

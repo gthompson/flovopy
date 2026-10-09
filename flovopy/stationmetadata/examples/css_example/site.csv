@@ -1,0 +1,5 @@
+sta,ondate,offdate,lat,lon,elev,staname,statype,refsta,dnorth,deast,lddate
+BCI1,2016055,2016100,28.57422161,-80.57241686,0.0,Approximate offsets calculated from legacy coordinates; survey verification required,ar,BCHH,0.02273,-0.00404,1791571775.295582
+BCI2,2016055,2016100,28.57388119,-80.57229578,0.0,Approximate offsets calculated from legacy coordinates; survey verification required,ar,BCHH,-0.01512,0.00778,1791571775.295652
+BCI3,2016055,2016100,28.57400644,-80.57256045,0.0,Approximate offsets calculated from legacy coordinates; survey verification required,ar,BCHH,-0.00119,-0.01806,1791571775.295672
+BCHH,2016055,2016100,28.57401716,-80.5723755,0.0,Three co-located seismic components,ss,BCHH,0.0,0.0,1791571775.295716

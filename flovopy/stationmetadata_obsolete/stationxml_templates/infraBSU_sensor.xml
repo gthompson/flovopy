@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<FDSNStationXML xmlns="http://www.fdsn.org/xml/station/1" schemaVersion="1.1">
+  <Source>IRIS-DMC</Source>
+  <Module>IRIS NRL service | version: 1</Module>
+  <ModuleURI>https://service.iris.edu/irisws/nrl/1/combine?instconfig=sensor_JeffreyBJohnson_infraBSU_LP21_SG0.000046_STairPressure</ModuleURI>
+  <Created>2025-08-08T18:23:51.207915Z</Created>
+  <Network code="XX" startDate="1970-01-01T00:00:00Z">
+    <Station code="YY" startDate="1970-01-01T00:00:00Z">
+      <Comment>
+        <Value>This is a comment.</Value>
+      </Comment>
+      <Latitude>0.0</Latitude>
+      <Longitude>0.0</Longitude>
+      <Elevation>0.0</Elevation>
+      <Site>
+        <Name>Long site name</Name>
+      </Site>
+      <Channel code="ZZZ" locationCode="00" startDate="1970-01-01T00:00:00Z">
+        <Latitude>0.0</Latitude>
+        <Longitude>0.0</Longitude>
+        <Elevation>0.0</Elevation>
+        <Depth>0.0</Depth>
+        <Azimuth>0.0</Azimuth>
+        <Dip>0.0</Dip>
+        <Sensor>
+          <Description>The sensor name</Description>
+        </Sensor>
+        <Response xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.fdsn.org/xml/station/1">
+          <InstrumentSensitivity>
+            <Value>+4.60000E-05</Value>
+            <Frequency>1</Frequency>
+            <InputUnits>
+              <Name>Pa</Name>
+              <Description>Pascals</Description>
+            </InputUnits>
+            <OutputUnits>
+              <Name>V</Name>
+              <Description>Volts</Description>
+            </OutputUnits>
+          </InstrumentSensitivity>
+          <Stage number="1" resourceId="NRL:AnaPAZ_IUPa_NZ1_NP1_PHb6ca319_AN1_FN1::NRL:Gain_SG4.6em05_FN1">
+            <PolesZeros>
+              <InputUnits>
+                <Name>Pa</Name>
+                <Description>Pascals</Description>
+              </InputUnits>
+              <OutputUnits>
+                <Name>V</Name>
+                <Description>Volts</Description>
+              </OutputUnits>
+              <PzTransferFunctionType>LAPLACE (RADIANS/SECOND)</PzTransferFunctionType>
+              <NormalizationFactor>1</NormalizationFactor>
+              <NormalizationFrequency>1</NormalizationFrequency>
+              <Zero number="0">
+                <Real>0</Real>
+                <Imaginary>0</Imaginary>
+              </Zero>
+              <Pole number="0">
+                <Real>-0.301593</Real>
+                <Imaginary>0</Imaginary>
+              </Pole>
+            </PolesZeros>
+            <StageGain>
+              <Value>4.6e-05</Value>
+              <Frequency>1</Frequency>
+            </StageGain>
+          </Stage>
+        </Response>
+      </Channel>
+    </Station>
+  </Network>
+</FDSNStationXML>
+

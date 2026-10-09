@@ -16,6 +16,7 @@ import sqlite3
 import pandas as pd
 from obspy import UTCDateTime
 import re
+from pathlib import Path
 
 
 def setup_database(db_path, mode="write"):
@@ -105,7 +106,38 @@ def setup_database(db_path, mode="write"):
             )
             """)
 
+        if mode == "audit":
+            # Non-destructive migration of existing audit databases.
+            cols = {row[1] for row in c.execute("PRAGMA table_info(file_log)")}
+            for name in ("file_size", "file_mtime_ns", "scan_speed"):
+                if name not in cols:
+                    c.execute(f"ALTER TABLE file_log ADD COLUMN {name} INTEGER")
         conn.commit()
+
+def refresh_audit_file_log(file_list, db_path, speed=1):
+    """Register new/changed files and invalidate stale audit rows atomically.
+
+    Existing done rows lacking fingerprints are rescanned once. Switching from
+    filename-only speed=2 to header speed=1 also forces a rescan.
+    """
+    now = UTCDateTime().isoformat()
+    changed = 0
+    with sqlite3.connect(db_path, timeout=60) as conn:
+        for filepath in file_list:
+            try:
+                st = os.stat(filepath)
+                size, mtime = st.st_size, st.st_mtime_ns
+            except OSError:
+                continue
+            row = conn.execute("SELECT status, file_size, file_mtime_ns, scan_speed FROM file_log WHERE filepath=?", (filepath,)).fetchone()
+            if row is None:
+                conn.execute("INSERT INTO file_log (filepath,status,reason,timestamp,file_size,file_mtime_ns,scan_speed) VALUES (?,'pending',NULL,?,?,?,?)", (filepath,now,size,mtime,speed))
+                changed += 1
+            elif row[1] != size or row[2] != mtime or (speed == 1 and row[3] != 1):
+                conn.execute("DELETE FROM trace_metadata WHERE filepath=?", (filepath,))
+                conn.execute("UPDATE file_log SET status='pending', reason=NULL, timestamp=?,file_size=?,file_mtime_ns=?,scan_speed=? WHERE filepath=?", (now,size,mtime,speed,filepath))
+                changed += 1
+    return changed
 
 def populate_file_log(file_list, db_path, mode="write"):
     with sqlite3.connect(db_path) as conn:
@@ -225,6 +257,37 @@ def discover_files(sds_root, use_sds=True, filterdict=None, starttime=None, endt
                     file_list.append(full_path)
         return file_list
 '''    
+def is_canonical_sds_path(filepath, sds_root):
+    """True only for ROOT/YEAR/NET/STA/CHAN.D/NET.STA.LOC.CHAN.D.YEAR.JDAY.
+
+    Hidden/working directories and paths whose directory and filename identifiers
+    disagree are excluded. This does not inspect MiniSEED contents.
+    """
+    try:
+        relative = Path(filepath).resolve().relative_to(Path(sds_root).resolve())
+    except (ValueError, OSError):
+        return False
+    parts = relative.parts
+    if len(parts) != 5 or any(part.startswith('.') for part in parts):
+        return False
+    year_dir, network_dir, station_dir, channel_dir, filename = parts
+    parsed = parse_sds_filename(filename, normalize_empty_loc=False)
+    if parsed is None:
+        return False
+    net, sta, loc, chan, dtype, year, jday = parsed
+    if dtype.upper() != 'D' or not year_dir.isdigit() or year_dir != year:
+        return False
+    if network_dir.upper() != net.upper() or station_dir.upper() != sta.upper():
+        return False
+    if channel_dir.upper() != f'{chan}.{dtype}'.upper():
+        return False
+    try:
+        UTCDateTime(int(year), julday=int(jday))
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
 def discover_files(
     sds_root,
     use_sds=True,
@@ -263,14 +326,26 @@ def discover_files(
     if not use_sds:
         # --- raw filesystem fallback ---
         file_list = []
-        for root, _, files in os.walk(sds_root):
+        for root, dirs, files in os.walk(sds_root):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
             for fname in files:
-                if is_valid_sds_filename(fname):
+                if is_canonical_sds_path(Path(root) / fname, sds_root):
+                    parsed = parse_sds_filename(fname, normalize_empty_loc=False)
+                    net, sta, loc, chan, _, year, julday = parsed
+                    if filterdict:
+                        values = dict(network=net, station=sta, location=loc, channel=chan)
+                        if any(values[k] not in allowed for k, allowed in filterdict.items() if k in values):
+                            continue
+                    day = UTCDateTime(int(year), julday=int(julday))
+                    if starttime is not None and day + 86400 <= UTCDateTime(starttime):
+                        continue
+                    if endtime is not None and day > UTCDateTime(endtime):
+                        continue
                     file_list.append(str(Path(root) / fname))
         return sorted(file_list)
 
     # --- SDS-aware discovery ---
-    from flovopy.sds.enhanced_sds_client import EnhancedSDSClient
+    from flovopy.sds.sdsclient import EnhancedSDSClient
 
     client = EnhancedSDSClient(sds_root)
     file_list = []
@@ -330,7 +405,7 @@ def discover_files(
 
             file_list.append(str(path))
 
-    return sorted(set(file_list))
+    return sorted(f for f in set(file_list) if is_canonical_sds_path(f, sds_root))
 
 
 def estimate_eta(start_time, done, total):

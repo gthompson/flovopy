@@ -1594,9 +1594,18 @@ class EnhancedSDSClient(Client):
                     try:
                         existing = obspy_read(str(path))
                     except Exception as e:
-                        if verbose:
-                            print(f"⚠️ Failed to read existing SDS file {path}: {e}")
-                        existing = Stream()
+                        # Never replace an unreadable destination with only the
+                        # incoming traces: that would silently discard archived data.
+                        raise IOError(
+                            f"Cannot merge into unreadable existing SDS file {path}; "
+                            "destination left unchanged"
+                        ) from e
+
+                    if len(existing) == 0:
+                        raise IOError(
+                            f"Cannot merge into empty existing SDS file {path}; "
+                            "destination left unchanged"
+                        )
 
                     combined = existing + new_group
 
