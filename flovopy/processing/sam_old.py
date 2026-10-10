@@ -7,8 +7,6 @@ import fnmatch
 import math
 import struct
 import re
-import warnings
-import copy
 #import argparse
 
 # =============================================================================
@@ -47,182 +45,281 @@ from flovopy.core.physics import (
 
 class SAM:
 
-    def __init__(self, dataframes=None, stream=None, sampling_interval=60.0,
-                 filter=(0.5, 18.0), bands=None, corners=4, despike=False,
-                 verbose=False, align="utc"):
-        """Compute UTC-aligned, NaN-aware window metrics from waveform samples.
+    def __init__(self,
+                 dataframes=None,
+                 stream=None,
+                 sampling_interval: float = 60.0,
+                 filter=[0.5, 18.0],
+                 bands={'VLP': [0.02, 0.2], 'LP': [0.5, 4.0], 'VT': [4.0, 18.0]},
+                 corners: int = 4,
+                 despike: bool = False,
+                 verbose: bool = False,
+                 ):
+        """
+        Initialize a Seismic Amplitude Measurement (SAM) object.
 
-        ``rms`` is population STD of signed samples (demeaned RMS).
-        Other base amplitude metrics operate on absolute values.
-        ``coverage`` is the fraction of observed, finite samples in a window.
-        ``align='start'`` anchors windows at each trace start, useful for events.
-        Filtering operates on contiguous finite runs, never across data gaps.
+        The SAM object stores per-trace, windowed metrics (e.g., min, mean, max, median, RMS)
+        and optionally filtered-band means, computed from an ObsPy Stream or precomputed
+        pandas DataFrames.
+
+        Parameters
+        ----------
+        dataframes : dict of {str: pandas.DataFrame}, optional
+            Precomputed metrics to use directly. Keys are trace IDs
+            (e.g., "NET.STA.LOC.CHAN"), and values are DataFrames containing
+            at least a 'time' column (epoch seconds) and one or more metric
+            columns. If provided, `stream` is ignored.
+        stream : obspy.Stream, optional
+            ObsPy Stream of waveform data from which to compute metrics.
+            If given and `dataframes` is None, metrics will be computed.
+        sampling_interval : float, default=60.0
+            Output sampling interval in seconds for the computed metrics.
+            This is the window length over which min/mean/max/etc. are computed.
+        filter : list [fmin, fmax] or None, default=[0.5, 18.0]
+            Primary bandpass filter to apply before computing the core metrics.
+            If None, no primary bandpass is applied.
+        bands : dict {name: [fmin, fmax]}, default={'VLP': [0.02, 0.2], 'LP': [0.5, 4.0], 'VT': [4.0, 18.0]}
+            Additional named frequency bands. For each band, the mean absolute
+            amplitude per window is computed and stored under the given name.
+            Set to None or empty dict to skip band-specific metrics.
+        corners : int, default=4
+            Number of corners for all bandpass filters (Butterworth design).
+        despike: bool, default=False
+            If True, apply despiking to all trace data before filtering/metrics.
+        verbose : bool, default=False
+            If True, print progress messages and diagnostic information.
+
+        Notes
+        -----
+        - If `dataframes` is supplied and valid, no computation is performed.
+        - If `stream` traces appear to have been merged by `SDSobj.read()` with
+          the `flovopy:smart_merge_v1` tag, no further sanitization is done.
+          Otherwise, a light `sanitize_stream()` pass removes empties/duplicates.
+        - If `stream`'s sampling rate matches exactly 1 / `sampling_interval`,
+          the method will skip filtering and directly store time/mean pairs.
+        - If the trace sampling rate is insufficient for a given band
+          (less than 2.2 × fmax), that band is skipped for that trace.
+        - All metrics are computed on the absolute value of the waveform.
+          Zero values are replaced with NaN before computation.
+        - Computed metric columns:
+            'time'   – epoch seconds (window start/left edge)
+            'min'    – minimum absolute amplitude in the window
+            'mean'   – mean absolute amplitude
+            'max'    – maximum absolute amplitude
+            'median' – median absolute amplitude
+            'rms'    – standard deviation (as RMS) of absolute amplitude
+          plus one column per band in `bands`, and optionally 'fratio'
+          if both 'LP' and 'VT' bands are present.
+
+        Raises
+        ------
+        ValueError
+            If `stream`'s sampling rate is less than the Nyquist requirement for
+            the primary filter or any requested band.
+        Exception
+            If filtering or detrending fails for a given trace, that trace is skipped.
+
+        Examples
+        --------
+        >>> from obspy import read
+        >>> from flovopy.sam import SAM
+        >>> st = read("IU_ANMO.mseed")
+        >>> sam = SAM(stream=st, sampling_interval=60.0)
+        >>> list(sam.dataframes.keys())
+        ['IU.ANMO..BHZ']
+        >>> sam.dataframes['IU.ANMO..BHZ'].head()
+               time       min      mean       max    median       rms   VLP    LP    VT
+        0  1.691040e+09  ...   ...   ...   ...   ...   ...   ...
         """
         self.dataframes = {}
+
+        # 0) Accept prebuilt dataframes (unchanged behavior)
         if isinstance(dataframes, dict):
-            self.dataframes = {k: v.copy(deep=True) for k, v in dataframes.items()
-                               if isinstance(v, pd.DataFrame)}
-            if self.dataframes:
+            good = {k: v for k, v in dataframes.items() if isinstance(v, pd.DataFrame)}
+            if good:
+                self.dataframes = good
                 return
-        if stream is None:
-            return
+
+        # 1) No stream → blank object
         if not isinstance(stream, Stream):
-            raise TypeError("stream must be an ObsPy Stream")
-        if sampling_interval < 1:
-            raise ValueError("sampling_interval must be at least 1 second")
-        if align not in ("utc", "start"):
-            raise ValueError("align must be 'utc' or 'start'")
-        if bands is None:
-            bands = {'VLP': (0.02, 0.2), 'LP': (0.5, 4.), 'VT': (4., 18.)}
-        if filter is not None and not (0 < filter[0] < filter[1]):
-            raise ValueError("filter must be (positive_low, higher_high) or None")
-        for name, limits in bands.items():
-            if not (0 < limits[0] < limits[1]):
-                raise ValueError(f"Invalid frequency band {name}: {limits}")
-        self._validate_units(stream)
-        for tr in stream:
-            fs = float(tr.stats.sampling_rate)
-            if fs <= 0:
-                raise ValueError(f"{tr.id}: invalid sampling rate {fs}")
-            if fs * sampling_interval < 1:
-                raise ValueError(f"{tr.id}: sampling interval shorter than a sample")
-            raw = np.ma.asarray(tr.data, dtype=float)
-            x = np.asarray(raw.filled(np.nan), dtype=float).copy()
-            x[~np.isfinite(x)] = np.nan
-            observed = np.isfinite(x)
-            if not observed.any():
-                continue
-            if despike:
-                raise NotImplementedError("despike with gap-aware metrics requires an explicit preprocessing step")
-            # Use a stable reference; preserve the observed mask for coverage.
-            x = x - np.nanmean(x)
-            start = float(tr.stats.starttime.timestamp)
-            period = float(sampling_interval)
-            anchor = 0.0 if align == 'utc' else start
-            indices = np.floor((start + np.arange(len(x)) / fs - anchor) / period + 1e-10).astype(np.int64)
-            first, last = int(indices.min()), int(indices.max())
-            nwin = last - first + 1
-            if nwin > 10_000_000:
-                raise ValueError(f"{tr.id}: unreasonable number of windows")
-            bins = indices - first
-            timestamps = anchor + (first + np.arange(nwin)) * period
-            expected = fs * period
-            if not np.isclose(expected, round(expected), rtol=0, atol=1e-6):
-                raise ValueError(f"{tr.id}: window duration * sampling rate must be integer")
-            expected = int(round(expected))
-            valid_counts = np.bincount(bins[observed], minlength=nwin)
-            # Partial windows count unobserved samples as missing.
-            coverage = np.minimum(valid_counts / expected, 1.0)
-            df = pd.DataFrame({'time': timestamps, 'coverage': coverage})
-            primary = self._filter_valid_runs(x, fs, filter, corners, tr.id, verbose)
-            self._window_statistics(df, primary, bins, nwin)
-            for name, limits in bands.items():
-                if filter is not None and tuple(limits) == tuple(filter):
-                    band_data = primary
-                else:
-                    band_data = self._filter_valid_runs(x, fs, limits, corners, tr.id, verbose)
-                df[name] = self._window_abs_mean(band_data, bins, nwin)
-            if 'LP' in df and 'VT' in df:
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    ratio = np.log2(df['VT'] / df['LP'])
-                df['fratio'] = ratio.replace([np.inf, -np.inf], np.nan)
-            if tr.id in self.dataframes:
-                # Multiple segments may overlap; do not silently overwrite.
-                raise ValueError(f"{tr.id}: multiple traces with same ID; merge/resolve overlaps before SAM calculation")
-            self.dataframes[tr.id] = df
+            print('creating blank SAM object')
+            return
 
-    def _validate_units(self, stream):
-        expected = {'VSAM': {'M/S'}, 'DSAM': {'M'}, 'VSEM': {'M/S'}}.get(type(self).__name__)
-        for tr in stream:
-            unit = str(tr.stats.get('units', '')).strip().upper()
-            if expected is not None and unit not in expected:
-                raise ValueError(f"{type(self).__name__} requires calibrated units {sorted(expected)}; "
-                                 f"trace {tr.id} has units={unit or '<missing>'}. "
-                                 "Floating-point dtype or channel code cannot establish physical units.")
-            if type(self).__name__ == 'RSAM' and unit not in ('', 'COUNTS', 'COUNT'):
-                raise ValueError(f"RSAM expects counts for {tr.id}, got {unit}")
+        # Defensive copy of mutable defaults
+        filt = None if filter is None else [float(filter[0]), float(filter[1])]
+        band_dict = None if bands is None else {str(k): [float(v[0]), float(v[1])] for k, v in bands.items()}
 
-    @staticmethod
-    def _filter_valid_runs(x, fs, band, corners, trace_id, verbose):
-        if band is None:
-            return x.copy()
-        lo, hi = map(float, band)
-        out = np.full(x.shape, np.nan)
-        if hi >= fs / 2:
-            warnings.warn(f"{trace_id}: band {lo}-{hi} Hz exceeds Nyquist {fs/2:g}; returning NaN", RuntimeWarning)
-            return out
-        from scipy.signal import butter, sosfiltfilt
-        sos = butter(corners, (lo, hi), btype='bandpass', fs=fs, output='sos')
-        good = np.isfinite(x)
-        boundaries = np.diff(np.r_[False, good, False].astype(np.int8))
-        starts, ends = np.where(boundaries == 1)[0], np.where(boundaries == -1)[0]
-        # filtfilt requires sufficient samples; reject runs shorter than
-        # several cycles of the lowest frequency, to avoid misleading VLP.
-        min_len = max(int(np.ceil(3 * fs / lo)), 3 * (2 * len(sos) + 1))
-        for a, b in zip(starts, ends):
-            if b - a < min_len:
-                continue
+        st = stream
+
+        # 2) Trust-but-verify: light sanitize if SDS merge tag missing
+        has_tag = False
+        for tr_chk in st:
+            proc = getattr(tr_chk.stats, "processing", []) or []
+            if any("flovopy:smart_merge_v1" in p for p in proc):
+                has_tag = True
+                break
+        if not has_tag:
             try:
-                out[a:b] = sosfiltfilt(sos, x[a:b])
-            except ValueError as exc:
+                sanitize_stream(st, drop_empty=True, drop_duplicates=True,
+                                unmask_short_zeros=True, min_gap_duration_s=1.0)
+            except Exception as e:
                 if verbose:
-                    warnings.warn(f"{trace_id}: filter failed on {a}:{b}: {exc}", RuntimeWarning)
-        return out
+                    print(f"sanitize_stream skipped/failed: {e}")
 
-    @staticmethod
-    def _window_abs_mean(x, bins, nwin):
-        valid = np.isfinite(x)
-        count = np.bincount(bins[valid], minlength=nwin)
-        total = np.bincount(bins[valid], weights=np.abs(x[valid]), minlength=nwin)
-        return np.divide(total, count, out=np.full(nwin, np.nan), where=count > 0)
+        if verbose:
+            print('good_stream:\n', st)
 
-    @staticmethod
-    def _window_statistics(df, x, bins, nwin):
-        good = np.isfinite(x)
-        counts = np.bincount(bins[good], minlength=nwin)
-        sums = np.bincount(bins[good], weights=x[good], minlength=nwin)
-        sums2 = np.bincount(bins[good], weights=x[good] ** 2, minlength=nwin)
-        mean_signed = np.divide(sums, counts, out=np.zeros(nwin), where=counts > 0)
-        variance = np.maximum(np.divide(sums2, counts, out=np.zeros(nwin), where=counts > 0) - mean_signed**2, 0)
-        df['rms'] = np.where(counts > 0, np.sqrt(variance), np.nan)
-        df['mean'] = SAM._window_abs_mean(x, bins, nwin)
-        minimum = np.full(nwin, np.nan)
-        maximum = np.full(nwin, np.nan)
-        median = np.full(nwin, np.nan)
-        present_bins = bins[good]
-        values = np.abs(x[good])
-        if len(values):
-            # bins are monotonically ordered in a Trace; split once rather
-            # than scanning the entire waveform for each window.
-            cuts = np.flatnonzero(np.diff(present_bins)) + 1
-            for group_bins, group_values in zip(np.split(present_bins, cuts),
-                                                np.split(values, cuts)):
-                j = int(group_bins[0])
-                minimum[j] = np.min(group_values)
-                maximum[j] = np.max(group_values)
-                median[j] = np.median(group_values)
-        df['min'], df['max'], df['median'] = minimum, maximum, median
+        if len(st) == 0:
+            return
 
-    def filter_by_coverage(self, min_coverage=0.8, inplace=False, drop=False):
-        """Mask low-coverage metric values (or drop rows), retaining coverage."""
-        if not 0 <= min_coverage <= 1:
-            raise ValueError("min_coverage must be between 0 and 1")
-        target = self if inplace else self.copy()
-        for key, df in list(target.dataframes.items()):
-            if 'coverage' not in df:
-                raise ValueError(f"{key}: coverage unavailable in legacy SAM dataframe")
-            bad = df['coverage'].isna() | (df['coverage'] < min_coverage)
-            if drop:
-                target.dataframes[key] = df.loc[~bad].reset_index(drop=True)
+        # 3) Fast path: if fs == 1/Δt, emit time+mean directly
+        ref_fs = st[0].stats.sampling_rate
+        if np.isclose(ref_fs, 1.0 / sampling_interval):
+            for tr in st:
+                df = pd.DataFrame({
+                    'time': pd.Series(tr.times('timestamp')),
+                    'mean': pd.Series(tr.data)
+                })
+                self.dataframes[tr.id] = df
+            return
+
+        # 4) Disallow undersampled streams for requested Δt
+        if ref_fs < 1.0 / sampling_interval:
+            print('error: cannot compute SAM for a Stream with a tr.stats.delta bigger than requested sampling interval')
+            return
+
+        # 5) Per-trace processing
+        for tr in st:
+            fs = tr.stats.sampling_rate
+            if tr.stats.npts < int(fs * sampling_interval):
+                if verbose:
+                    print(f'Not enough samples for {tr.id}. Skipping.')
+                continue
+
+            # Base copy once per trace: handle masking, detrend, optional clip
+            tr_base = tr.copy()
+            x = tr_base.data
+
+            # Handle masked data by interpolation, not zero-fill
+            if isinstance(x, np.ma.MaskedArray):
+                x = x.astype(float)
+                mask = np.ma.getmaskarray(x)
+                x = x.filled(np.nan)
+
+                if np.any(mask):
+                    good = ~np.isnan(x)
+                    if np.sum(good) >= 2:
+                        x[mask] = np.interp(np.flatnonzero(mask),
+                                            np.flatnonzero(good),
+                                            x[good])
+                    elif np.sum(good) == 1:
+                        x[mask] = x[good][0]
+                    else:
+                        x[:] = 0.0
             else:
-                cols = [c for c in df.columns if c not in ('time', 'date', 'coverage')]
-                df.loc[bad, cols] = np.nan
-        return target
+                x = np.asarray(x, dtype=float)
 
+            # Optional despiking
+            if despike:
+                x, despike_info = self._apply_despike(
+                    x,
+                    despike=despike,
+                    z=6.0,
+                    window=9,
+                    max_run=2,
+                    fill_method='interp',
+                )
+
+                if verbose:
+                    print(f"{tr_base.id}: {despike_info}")
+
+            tr_base.data = x
+
+            # Detrend after despiking
+            try:
+                tr_base.detrend('demean')
+            except Exception as e:
+                if verbose:
+                    print(f"{tr.id}: detrend failed ({e})")
+                continue
+
+            # Small taper helps prevent filter startup artifacts
+            tr_base.taper(max_percentage=0.0001, type='cosine')
+
+            # Window timestamps (left edge = min timestamp per window)
+            t_epoch = tr.times('timestamp')
+            T = self.reshape_trace_data(t_epoch, fs, sampling_interval)
+            time_col = pd.Series(np.nanmin(T, axis=1))
+
+            # Primary filter (optional) with 2.2× Nyquist guard; cache filtered copies
+            filt_cache = {}
+            if filt:
+                fmin, fmax = float(filt[0]), float(filt[1])
+                if fmax >= 0.5 * fs:
+                    if verbose:
+                        print(f"{tr.id}: bad sampling rate for primary band {fmin}-{fmax} Hz. Skipping trace.")
+                    continue
+                key = (round(fmin, 6), round(fmax, 6), int(corners))
+                tr_primary = tr_base.copy()
+                try:
+                    tr_primary.filter('bandpass', freqmin=fmin, freqmax=fmax, corners=corners)
+                except Exception as e:
+                    if verbose:
+                        print(f"{tr.id}: bandpass {fmin}-{fmax} Hz failed ({e})")
+                    continue
+                filt_cache[key] = tr_primary
+                y = tr_primary.data
+            else:
+                y = tr_base.data
+
+            # Windowed metrics on |y| with NaN-aware reducers
+            y = np.asarray(y, dtype=float)
+            y[y == 0.0] = np.nan
+            Y = self.reshape_trace_data(np.abs(y), fs, sampling_interval)
+
+            df = pd.DataFrame()
+            df['time']   = time_col
+            df['min']    = pd.Series(np.nanmin(Y, axis=1))
+            df['mean']   = pd.Series(np.nanmean(Y, axis=1))
+            df['max']    = pd.Series(np.nanmax(Y, axis=1))
+            df['median'] = pd.Series(np.nanmedian(Y, axis=1))
+            df['rms']    = pd.Series(np.nanstd(Y, axis=1))
+
+            # Extra bands: mean(|bandpass|) per window
+            if band_dict:
+                for key_name, (flow, fhigh) in band_dict.items():
+                    if fhigh >= 0.5 * fs:
+                        if verbose:
+                            print(f"{tr.id}: bad sampling rate for band {key_name} {flow}-{fhigh} Hz. Skipping band.")
+                        continue
+                    bkey = (round(float(flow), 6), round(float(fhigh), 6), int(corners))
+                    if bkey in filt_cache:
+                        tr_band = filt_cache[bkey]
+                    else:
+                        tr_band = tr_base.copy()
+                        try:
+                            tr_band.filter('bandpass', freqmin=float(flow), freqmax=float(fhigh), corners=corners)
+                        except Exception as e:
+                            if verbose:
+                                print(f"{tr.id}: bandpass {flow}-{fhigh} Hz failed ({e})")
+                            continue
+                        filt_cache[bkey] = tr_band
+                    Yb = self.reshape_trace_data(np.abs(np.asarray(tr_band.data, dtype=float)), fs, sampling_interval)
+                    df[key_name] = pd.Series(np.nanmean(Yb, axis=1))
+
+                # frequency ratio when LP & VT available
+                if 'LP' in band_dict and 'VT' in band_dict and 'LP' in df and 'VT' in df:
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        df['fratio'] = np.log2(df['VT'] / df['LP'])
+
+            # Normalize zeros to NaN, store
+            df.replace(0.0, np.nan, inplace=True)
+            self.dataframes[tr.id] = df
+    
     def copy(self):
         ''' make a full copy of an SAM object and return it '''
         selfcopy = self.__class__(stream=Stream())
-        selfcopy.dataframes = {k: v.copy(deep=True) for k, v in self.dataframes.items()}
+        selfcopy.dataframes = self.dataframes.copy()
         return selfcopy
 
     def downsample(self, new_sampling_interval=3600, inplace=False):
@@ -270,7 +367,7 @@ class SAM:
 
             # Rebuild Unix epoch seconds and datetime column
             d2 = agg.reset_index()
-            d2['time'] = d2['date'].astype('int64') / 1e9
+            d2['time'] = d2['date'].astype('int64')
 
             # Put columns in expected order
             ordered = ['time'] + [c for c in df.columns if c not in ('time', 'date') and c in d2.columns] + ['date']
@@ -1839,6 +1936,7 @@ class SAM:
     def reshape_trace_data(x, sampling_rate, sampling_interval):
         ''' reshape data vector from 1-D to 2-D to support vectorized loop for SAM computation '''
         # reshape the data vector into an array, so we can take matplotlib.pyplot.xticks(fontsize= )advantage of np.mean()
+        x = np.absolute(x)
         s = np.size(x) # find the size of the data vector
         nc = int(sampling_rate * sampling_interval) # number of columns
         nr = int(s / nc) # number of rows
@@ -1856,7 +1954,7 @@ class SAM:
         else:
             seed_ids = self.get_seed_ids()
             cols = self.dataframes[seed_ids[0]].columns
-        return [c for c in cols if c not in ("time", "date", "coverage", "fratio")]
+        return [c for c in cols if c not in ("time", "date")]        
 
     def __str__(self):
         keys = self.get_seed_ids()
@@ -2372,12 +2470,14 @@ class VSAM(SAM):
 
     @staticmethod
     def check_units(st):
+        #print('VSAM')
+        good_st = Stream()
         for tr in st:
-            if str(tr.stats.get('units', '')).strip().upper() != 'M/S':
-                raise ValueError(f"VSAM requires calibrated velocity in m/s for {tr.id}; "
-                                 f"got {tr.stats.get('units', '<missing>')}. "
-                                 "Channel codes and floating-point dtype do not establish physical units.")
-        return st
+            if 'units' in tr.stats:
+                u = tr.stats['units'].upper()
+                if u == 'M/S' or u == 'PA':
+                    good_st.append(tr)
+        return good_st    
 
     @staticmethod
     def get_filename(SAM_DIR, id, year, sampling_interval, ext, name='VSAM'):
@@ -2397,7 +2497,6 @@ class VSAM(SAM):
                                     wavespeed_kms=wavespeed_kms, peakf_hz=peakf, Q=Q, out_dtype=out_dtype)
       
     def reduce(self, inventory, source, surfaceWaves=False, Q=None, wavespeed_kms=None, fixpeakf=None):
-        warnings.warn("Reduced amplitudes depend on propagation, attenuation and source assumptions; verify before scientific interpretation.", UserWarning, stacklevel=2)
         # if the original Trace objects had coordinates attached, add a method in SAM to save those
         # in self.inventory. And add to SAM __init___ the possibility to pass an inventory object.
         
@@ -2456,18 +2555,32 @@ class DSAM(VSAM):
     
     @staticmethod
     def check_units(st):
+        #print('DSAM')
+        good_st = Stream()
         for tr in st:
-            if str(tr.stats.get('units', '')).strip().upper() != 'M':
-                raise ValueError(f"DSAM requires calibrated displacement in m for {tr.id}; "
-                                 f"got {tr.stats.get('units', '<missing>')}. "
-                                 "Channel codes and floating-point dtype do not establish physical units.")
-        return st
+            if 'units' in tr.stats:
+                u = tr.stats['units'].upper()
+                if u == 'M' or u == 'PA':
+                    good_st.append(tr)
+                else:
+                    print(f'DSAM: skipping {tr}: units are wrong {tr.stats.units}')
+
+            elif tr.stats.channel[1]=='H':
+                tr.stats['units'] = 'm'
+                good_st.append(tr)
+            elif tr.stats.channel[1]=='D':
+                tr.stats['units'] = 'Pa'
+                good_st.append(tr)                
+            else:
+                print(f'DSAM: skipping {tr}: malformed channel code, not seismometer or pressure sensor')
+        return good_st
 
     @staticmethod
     def get_filename(SAM_DIR, id, year, sampling_interval, ext, name='DSAM'):
         return SAM.get_filename(SAM_DIR, id, year, sampling_interval, ext, name=name)
 
     def compute_reduced_displacement(self, inventory, source, surfaceWaves=False, Q=None, wavespeed_kms=2.0, peakf=None):
+        print(f'SCAFFOLD: {inventory}')
         corrected_dataframes = self.reduce(inventory, source, surfaceWaves=surfaceWaves, Q=Q, wavespeed_kms=wavespeed_kms, fixpeakf=peakf)
         if surfaceWaves:
             return DRS(dataframes=corrected_dataframes)
@@ -2478,89 +2591,160 @@ class DSAM(VSAM):
 
 class VSEM(VSAM):
 
-    def __init__(self, dataframes=None, stream=None, sampling_interval=60.0,
-                 filter=(0.5, 18.0), bands=None, corners=4, verbose=False,
-                 align="utc"):
-        """Integrated squared velocity per UTC-aligned window (m²/s).
+    def __init__(self, dataframes=None, stream=None, sampling_interval=60.0, filter=[0.5, 18.0], bands = {'VLP': [0.02, 0.2], 'LP':[0.5, 4.0], 'VT':[4.0, 18.0]}, corners=4, verbose=False):
+        ''' Create a VSEM object 
+        
+            Optional name-value pairs:
+                dataframes: Create an VSEM object using these dataframes. Used by downsample() method, for example. Default: None.
+                stream: Create an VSEM object from this ObsPy.Stream object.
+                sampling_interval: Compute VSEM data using this sampling interval (in seconds). Default: 60
+                filter: list of two floats, representing fmin and fmax. Default: [0.5, 18.0]. Set to None if no filter wanted.
+                bands: a dictionary of filter bands and corresponding column names. Default: {'VLP': [0.02, 0.2], 'LP':[0.5, 4.0], 
+                    'VT':[4.0, 18.0]}. For example, the default setting creates 3 additional columns for each DataFrame called 
+                    'VLP', 'LP', and 'VT', which contain the mean value for each sampling_interval within the specified filter band
+                    (e.g. 0.02-0.2 Hz for VLP). If 'LP' and 'VT' are in this dictionary, an extra column called 'fratio' will also 
+                    be computed, which is the log2 of the ratio of the 'VT' column to the 'LP' column, following the definition of
+                    frequency ratio by Rodgers et al. (2015).
+        '''
+        self.dataframes = {} 
 
-        ``energy`` and named band columns are integrals of v² dt, not joules.
-        All windows are retained; ``coverage`` describes observed input data.
-        Invalid/filtered-out samples never contribute zero energy silently.
-        """
-        self.dataframes = {}
         if isinstance(dataframes, dict):
-            self.dataframes = {k: v.copy(deep=True) for k, v in dataframes.items()
-                               if isinstance(v, pd.DataFrame)}
-            if self.dataframes:
+            good_dataframes = {}
+            for id, df in dataframes.items():
+                if isinstance(df, pd.DataFrame):
+                    good_dataframes[id]=df
+            if len(good_dataframes)>0:
+                self.dataframes = good_dataframes
+                if verbose:
+                    print('dataframes found. ignoring other arguments.')
                 return
-        if stream is None:
-            return
+            else:
+                print('no valid dataframes found')
+                pass
+
         if not isinstance(stream, Stream):
-            raise TypeError("stream must be an ObsPy Stream")
-        if sampling_interval < 1:
-            raise ValueError("sampling_interval must be at least 1 second")
-        if align not in ("utc", "start"):
-            raise ValueError("align must be 'utc' or 'start'")
-        if bands is None:
-            bands = {'VLP': (0.02, 0.2), 'LP': (0.5, 4.), 'VT': (4., 18.)}
-        if filter is not None and not (0 < filter[0] < filter[1]):
-            raise ValueError("filter must be (positive_low, higher_high) or None")
-        for name, limits in bands.items():
-            if not (0 < limits[0] < limits[1]):
-                raise ValueError(f"Invalid frequency band {name}: {limits}")
-        self._validate_units(stream)
-        for tr in stream:
-            fs = float(tr.stats.sampling_rate)
-            if fs <= 0:
-                raise ValueError(f"{tr.id}: invalid sampling rate {fs}")
-            expected = fs * sampling_interval
-            if not np.isclose(expected, round(expected), rtol=0, atol=1e-6):
-                raise ValueError(f"{tr.id}: window duration * sampling rate must be integer")
-            expected = int(round(expected))
-            raw = np.ma.asarray(tr.data, dtype=float)
-            x = np.asarray(raw.filled(np.nan), dtype=float).copy()
-            x[~np.isfinite(x)] = np.nan
-            if not np.isfinite(x).any():
+            # empty VSEM object
+            print('creating blank VSEM object')
+            return
+
+        good_stream = self.check_units(stream)
+        if verbose:
+            print('good_stream:\n',good_stream)
+
+
+        if len(good_stream)>0:
+            if good_stream[0].stats.sampling_rate == 1/sampling_interval:
+                # no downsampling to do
+                for tr in good_stream:
+                    df = pd.DataFrame()
+                    df['time'] = pd.Series(tr.times('timestamp'))
+                    df['mean'] = pd.Series(tr.data) 
+                    self.dataframes[tr.id] = df
+                return 
+            elif good_stream[0].stats.sampling_rate < 1/sampling_interval:
+                print('error: cannot compute SAM for a Stream with a tr.stats.delta bigger than requested sampling interval')
+                return
+            
+        for tr in good_stream:
+            if tr.stats.npts < tr.stats.sampling_rate * sampling_interval:
+                print('Not enough samples for ',tr.id,'. Skipping.')
                 continue
-            #x -= np.nanmean(x)
-            start = float(tr.stats.starttime.timestamp)
-            period = float(sampling_interval)
-            anchor = 0.0 if align == 'utc' else start
-            indices = np.floor((start + np.arange(len(x)) / fs - anchor) / period + 1e-10).astype(np.int64)
-            first, last = int(indices.min()), int(indices.max())
-            nwin = last - first + 1
-            if nwin > 10_000_000:
-                raise ValueError(f"{tr.id}: unreasonable number of windows")
-            bins = indices - first
-            timestamps = anchor + (first + np.arange(nwin)) * period
-            observed = np.isfinite(x)
-            counts = np.bincount(bins[observed], minlength=nwin)
-            df = pd.DataFrame({'time': timestamps, 'coverage': np.minimum(counts / expected, 1.0)})
-            def integrated_energy(band):
-                y = self._filter_valid_runs(x, fs, band, corners, tr.id, verbose)
-                good = np.isfinite(y)
-                count = np.bincount(bins[good], minlength=nwin)
-                total = np.bincount(bins[good], weights=np.square(y[good]), minlength=nwin) / fs
-                return np.where(count > 0, total, np.nan)
-            df['energy'] = integrated_energy(filter)
-            for name, limits in bands.items():
-                df[name] = integrated_energy(limits)
-            if 'LP' in df and 'VT' in df:
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    ratio = np.log2(df['VT'] / df['LP'])
-                df['fratio'] = ratio.replace([np.inf, -np.inf], np.nan)
-            if tr.id in self.dataframes:
-                raise ValueError(f"{tr.id}: multiple traces with same ID; resolve overlaps before VSEM calculation")
+            #print(tr.id, 'absolute=',absolute)
+            df = pd.DataFrame()
+            
+            t = tr.times('timestamp') # Unix epoch time
+            sampling_rate = tr.stats.sampling_rate
+            t = self.reshape_trace_data(t, sampling_rate, sampling_interval)
+            df['time'] = pd.Series(np.nanmin(t,axis=1))
+
+            if filter:
+                if tr.stats.sampling_rate<filter[1]*2.2:
+                    print(f"{tr}: Sampling rate must be at least {filter[1]*2.2:.1f}. Skipping.")
+                    continue
+                tr2 = tr.copy()
+                tr2.detrend('demean')
+                tr2.filter('bandpass', freqmin=filter[0], freqmax=filter[1], corners=corners)
+                y = self.reshape_trace_data(np.absolute(tr2.data), sampling_rate, sampling_interval)
+            else:
+                y = self.reshape_trace_data(np.absolute(tr.data), sampling_rate, sampling_interval)
+ 
+            df['energy'] = pd.Series(np.nansum(np.square(y),axis=1)/tr.stats.sampling_rate)
+
+            if bands:
+                for key in bands:
+                    tr2 = tr.copy()
+                    [flow, fhigh] = bands[key]
+                    tr2.filter('bandpass', freqmin=flow, freqmax=fhigh, corners=corners)
+                    y = self.reshape_trace_data(abs(tr2.data), sampling_rate, sampling_interval)
+                    df[key] = pd.Series(np.nansum(np.square(y),axis=1)) 
+  
             self.dataframes[tr.id] = df
 
     @staticmethod
     def check_units(st):
+        #print('VSEM')
+        good_st = Stream()
         for tr in st:
-            if str(tr.stats.get('units', '')).upper() != 'M/S':
-                raise ValueError(f"VSEM requires calibrated velocity m/s for {tr.id}; "
-                                 f"got {tr.stats.get('units', '<missing>')}")
-        return st
+            if 'units' in tr.stats:
+                u = tr.stats['units'].upper()
+                if u == 'M/S' or u == 'PA':
+                #if u == 'M2/S' or u == 'PA2':
+                    good_st.append(tr)
+            elif tr.stats.channel[1]=='H':
+                tr.stats['units'] = 'm/s'
+                good_st.append(tr)
+                
+        return good_st  
+    
+    def reduce(self, inventory, source, Q=None, wavespeed_kms=None, fixpeakf=None, verbose=True):
+        # if the original Trace objects had coordinates attached, add a method in SAM to save those
+        # in self.inventory. And add to SAM __init___ the possibility to pass an inventory object.
+        
+        #print(self)
+        # Otherwise, need to pass an inventory here.
 
+        if not wavespeed_kms:
+            wavespeed_kms=3 # km/s
+        
+        # Need to pass a source too, which should be a dict with name, lat, lon, elev.
+        distance_km, coordinates = self.get_distance_km(inventory, source)
+
+        corrected_dataframes = {}
+        for seed_id, df0 in self.dataframes.items():
+            if not seed_id in distance_km:
+                continue
+            df = df0.copy()
+            this_distance_km = distance_km[seed_id]
+            ratio = df['VT'].sum()/df['LP'].sum()
+            if fixpeakf:
+                peakf = fixpeakf
+            else:
+                peakf = np.sqrt(ratio) * 4
+
+            net, sta, loc, chan = seed_id.split('.')
+            if verbose:
+                print(f"Reducing {seed_id}: distance={this_distance_km:.1f} km, ratio={ratio:.3g}, peakf={peakf:.3g} Hz") 
+            g_E = self.Eseismic_correction(this_distance_km * 1000.0, chan=chan, wavespeed_kms=wavespeed_kms, peakf=peakf)
+            a_E = self.compute_inelastic_attenuation_energy(this_distance_km, peakf, wavespeed_kms, Q)
+            if verbose:
+                print(f"  Geometrical spreading correction: {g_E:.3e}, Inelastic attenuation correction: {a_E:.3e}")
+
+            for col in df.columns:
+                if col in self.get_metrics():
+                    if col == 'VLP':
+                        g_E_vlp = self.Eseismic_correction(this_distance_km * 1000.0, chan=chan, 
+                                                        wavespeed_kms=wavespeed_kms, peakf=0.06)
+                        a_E_vlp = self.compute_inelastic_attenuation_energy(this_distance_km, 0.06, wavespeed_kms, Q)
+                        df[col] = df[col] * g_E_vlp * a_E_vlp
+                    else:
+                        df[col] = df[col] * g_E * a_E
+            corrected_dataframes[seed_id] = df
+        return corrected_dataframes
+       
+    def compute_reduced_energy(self, inventory, source, Q=None):
+        corrected_dataframes = self.reduce(inventory, source, Q=Q)
+        return ER(dataframes=corrected_dataframes)
+    
     def reduce(self, inventory, source, Q=None, wavespeed_kms=None, fixpeakf=None,
             model="body", rho_earth=2500.0, return_joules=False, verbose=True):
         """
@@ -2572,7 +2756,6 @@ class VSEM(VSAM):
         If return_joules=True:
             also multiplies by 2*pi*rho*c to estimate source energy in J
         """
-        warnings.warn("Reduced energy depends on density, wavespeed, geometry and attenuation; validate the physical model.", UserWarning, stacklevel=2)
         if not wavespeed_kms:
             wavespeed_kms = 3.0  # km/s
 
@@ -2684,47 +2867,27 @@ class VSEM(VSAM):
         return total_energy_correction(dist_km, chan=chan, surface_waves=surfaceWaves, wavespeed_kms=wavespeed_kms,
                                     peakf_hz=peakf, Q=Q, out_dtype="float32", legacy_body=legacy_body)
 
-    def downsample(self, new_sampling_interval=3600, inplace=False):
-        """Coarsen energy integrals by SUM (not mean), coverage by mean.
+    def downsample(self, new_sampling_interval=3600):
+        ''' downsample a VSEM object to a larger sampling interval(e.g. from 1 minute to 1 hour). Returns a new VSEM object.
+         
+            Optional name-value pair:
+                new_sampling_interval: the new sampling interval (in seconds) to downsample to. Default: 3600
+        '''
 
-        Assumes nonoverlapping, regularly spaced source windows. Frequency
-        ratios are recomputed from the coarsened LP and VT energies.
-        """
-        if new_sampling_interval < 1:
-            raise ValueError("new_sampling_interval must be at least one second")
-        result = {}
-        for seed_id, df in self.dataframes.items():
-            if df.empty:
-                result[seed_id] = df.copy(deep=True)
-                continue
-            if 'time' not in df:
-                raise ValueError(f"{seed_id}: missing time column")
-            if len(df) > 1:
-                old = float(np.median(np.diff(np.sort(df['time'].to_numpy(dtype=float)))))
-                if new_sampling_interval < old or not np.isclose(new_sampling_interval / old,
-                                                               round(new_sampling_interval / old)):
-                    raise ValueError("new_sampling_interval must be an integer multiple of existing window size")
-            tmp = df.copy(deep=True)
-            tmp['date'] = pd.to_datetime(tmp['time'], unit='s', utc=True)
-            tmp = tmp.set_index('date')
-            sums = [c for c in tmp.select_dtypes(include='number').columns
-                    if c not in ('time', 'coverage', 'fratio')]
-            aggregation = {c: (lambda x: x.sum(min_count=1)) for c in sums}
-            if 'coverage' in tmp:
-                aggregation['coverage'] = 'mean'
-            out = tmp.resample(f'{int(new_sampling_interval)}s').agg(aggregation)
-            if 'LP' in out and 'VT' in out:
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    out['fratio'] = np.log2(out['VT'] / out['LP'])
-                out['fratio'] = out['fratio'].replace([np.inf, -np.inf], np.nan)
-            out = out.reset_index()
-            out['time'] = out['date'].astype('int64') / 1e9
-            result[seed_id] = out[['time'] + [c for c in out if c not in ('time', 'date')] + ['date']]
-        if inplace:
-            self.dataframes = result
-            return self
-        return self.__class__(dataframes=result)
-
+        dataframes = {}
+        for id in self.dataframes:
+            df = self.dataframes[id]
+            df['date'] = pd.to_datetime(df['time'], unit='s')
+            old_sampling_interval = self.get_sampling_interval(df)
+            if new_sampling_interval > old_sampling_interval:
+                freq = '%.0fmin' % (new_sampling_interval/60)
+                new_df = df.groupby(pd.Grouper(key='date', freq=freq)).sum()
+                new_df.reset_index(drop=True)
+                dataframes[id] = new_df
+            else:
+                print('Cannot downsample to a smaller sampling interval')
+        return self.__class__(dataframes=dataframes) 
+            
     @staticmethod
     def get_filename(SAM_DIR, id, year, sampling_interval, ext, name='VSEM'):
         return SAM.get_filename(SAM_DIR, id, year, sampling_interval, ext, name=name)
