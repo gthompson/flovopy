@@ -1,297 +1,206 @@
-import os
+"""Restartable MiniSEED-to-SDS ingestion using EnhancedSDSClient.
+
+Writes are deliberately serialized: EnhancedSDSClient(mode='merge') reads and
+rewrites existing SDS day files, so independent writers must not race.
+"""
+from __future__ import annotations
+
+import fnmatch
 import glob
-import multiprocessing as mp
-import pandas as pd
-from obspy import UTCDateTime
-from flovopy.sds.sds import SDSobj
-from flovopy.core.trace_utils import fix_id_wrapper
-from flovopy.core.miniseed_io import read_mseed
-import traceback
+import os
+from pathlib import Path
 import sqlite3
-import gc
-from flovopy.core.computer_health import (
-    pause_if_too_hot,
-    start_cpu_logger,
-    log_memory_usage
-)
-from flovopy.sds.sds_utils import (
-    try_lock_output_file,
-    release_output_file_lock_safe,
-    release_input_file_lock,
-    remove_stale_locks,
-    remove_empty_dirs,
-    sqlite_to_excel,
-    setup_database, 
-    populate_file_log, 
-    get_pending_file_list
-)
+import traceback
+from typing import Optional
+
+from obspy import UTCDateTime, read, read_inventory
+from flovopy.enhanced.sdsclient import EnhancedSDSClient
+from flovopy.sds.sds_utils import discover_files, setup_database, populate_file_log
+
+
+def _matches(value, patterns):
+    if patterns is None:
+        return True
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    return any(fnmatch.fnmatchcase(value, p) for p in patterns)
+
+
+def _has_metadata(inventory, trace):
+    if inventory is None:
+        return True
+    # Select by channel AND time, avoiding an incorrect match to another epoch.
+    sel = inventory.select(network=trace.stats.network,
+                           station=trace.stats.station,
+                           location=trace.stats.location,
+                           channel=trace.stats.channel,
+                           time=trace.stats.starttime)
+    return any(ch for net in sel for sta in net for ch in sta
+               if (ch.start_date is None or ch.start_date <= trace.stats.starttime)
+               and (ch.end_date is None or ch.end_date >= trace.stats.endtime))
+
+
+def _record(conn, filepath, status, reason, n_in, n_out):
+    conn.execute("""UPDATE file_log SET status=?, reason=?, ntraces_in=?,
+        ntraces_out=?, cpu_id='main', timestamp=datetime('now') WHERE filepath=?""",
+        (status, reason, n_in, n_out, filepath))
+    conn.commit()
+
+
+def _trace_record(conn, filepath, trace, status, reason, paths):
+    # Existing trace_log schema uses (trace_id, filepath) as primary key.
+    # Multiple segments with the same ID in one input file cannot be logged
+    # separately without a schema migration; preserve the latest status.
+    conn.execute("""INSERT OR REPLACE INTO trace_log
+        (source_id, fixed_id, trace_id, filepath, station, sampling_rate,
+         starttime, endtime, reason, outputfile, status, cpu_id, timestamp)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,'main',datetime('now'))""",
+        (trace.id, trace.id, trace.id, filepath, trace.stats.station,
+         trace.stats.sampling_rate, str(trace.stats.starttime),
+         str(trace.stats.endtime), reason,
+         ';'.join(map(str, paths)) if paths else None, status))
+    conn.commit()
+
 
 def write_sds_archive(
-    src_dir,
-    dest_dir,
-    networks='*',
-    stations='*',
-    start_date=None,
-    end_date=None,
-    metadata_excel_path=None,
-    use_sds_structure=True,
-    custom_file_list=None,
-    recursive=True,
-    file_glob="*.mseed",
-    n_processes=1,
-    debug=False,
-    merge_strategy='obspy'
+    src_dir, dest_dir, networks='*', stations='*', start_date=None,
+    end_date=None, metadata_excel_path=None, use_sds_structure=True,
+    custom_file_list=None, recursive=True, file_glob='*.mseed',
+    n_processes=1, debug=False, merge_strategy='obspy',
+    cpu_temp=False, min_sampling_rate=None, write_mode='merge',
+    retry_failed=True,
 ):
-    try:
-        if os.path.abspath(src_dir) == os.path.abspath(dest_dir):
-            raise ValueError("Source and destination directories must be different.")
+    """Ingest source waveforms into SDS, retaining restartable SQLite logging.
 
-        networks = [networks] if isinstance(networks, str) else networks
-        stations = [stations] if isinstance(stations, str) else stations
-        start_date = UTCDateTime(start_date) if isinstance(start_date, str) else start_date
-        end_date = UTCDateTime(end_date) if isinstance(end_date, str) else end_date
+    `metadata_excel_path` is a legacy argument: only StationXML (.xml) is
+    supported for metadata matching; spreadsheets require explicit conversion.
+    Nonmatching channels are written to DEST/unmatched (not discarded).
 
-        os.makedirs(dest_dir, exist_ok=True)
-        db_path = os.path.join(dest_dir, "processing_log.sqlite")
-
-        if os.path.exists(db_path):
-            print(f"{UTCDateTime()}: 📂 Resuming from existing database: {db_path}")
-            file_list = get_pending_file_list(db_path)
-            if not file_list:
-                print(f"{UTCDateTime()}: ✅ No pending files left to process.")
-                return
-        else:
-            setup_database(db_path, mode="write")
-            if use_sds_structure:
-                sdsin = SDSobj(src_dir)
-                filterdict = {}
-                if networks:
-                    filterdict['networks'] = networks
-                if stations:
-                    filterdict['stations'] = stations
-                file_list, non_sds_list = sdsin.build_file_list(
-                    parameters=filterdict,
-                    starttime=start_date,
-                    endtime=end_date,
-                    return_failed_list_too=True
-                )
-                pd.DataFrame(non_sds_list, columns=['file']).to_csv(os.path.join(dest_dir, 'non_sds_file_list.csv'), index=False)
-            elif custom_file_list:
-                file_list = custom_file_list
-            else:
-                pattern = os.path.join(src_dir, "**", file_glob) if recursive else os.path.join(src_dir, file_glob)
-                file_list = sorted(glob.glob(pattern, recursive=recursive))
-
-            if not file_list:
-                print(f"{UTCDateTime()}: No MiniSEED files found to process.")
-                return
-
-            populate_file_log(file_list, db_path)
-            pd.DataFrame(file_list, columns=['file']).to_csv(os.path.join(dest_dir, 'original_file_list.csv'), index=False)
-
-        start_cpu_logger(interval_sec=60, log_path=os.path.join(dest_dir, "cpu_temperature_log.csv"))
-
-        chunk_size = len(file_list) // n_processes + (len(file_list) % n_processes > 0)
-        file_chunks = [file_list[i:i + chunk_size] for i in range(0, len(file_list), chunk_size)]
-
-        args = [
-            (chunk, dest_dir, networks, stations, start_date, end_date, db_path, str(i), metadata_excel_path, debug, merge_strategy)
-            for i, chunk in enumerate(file_chunks)
-        ]
-
-        with mp.Pool(processes=n_processes) as pool:
-            pool.starmap(process_partial_file_list_db, args)
-
-    except Exception as e:
-        traceback.print_exc()
-    finally:
-        remove_empty_dirs(dest_dir)
-        sqlite_to_excel(db_path, db_path.replace('.sqlite', '.xlsx'))
-
-        try:
-            with sqlite3.connect(db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) FROM file_log WHERE status = 'pending'")
-                pending_count = cursor.fetchone()[0]
-
-            if pending_count == 0:
-                print(f"{UTCDateTime()}: ✅ All files processed and logged in SQLite database: {db_path}", flush=True)
-                print("OK", flush=True)
-            else:
-                print(f"{UTCDateTime()}: ⚠️ {pending_count} files remain unprocessed. Check logs or rerun script to resume.", flush=True)
-
-        except Exception as e:
-            print(f"{UTCDateTime()}: ❌ Could not verify processing completion: {e}", flush=True)
-
-        gc.collect()
-
-
-def process_partial_file_list_db(file_list, sds_output_dir, networks, stations, start_date, 
-                                 end_date, db_path, cpu_id, metadata_excel_path, 
-                                 debug, merge_strategy):
-    print(f"{UTCDateTime()}: ✅ Started {cpu_id} with {len(file_list)} files")
-    os.makedirs(sds_output_dir, exist_ok=True)
-    sdsout = SDSobj(sds_output_dir)
-    unmatcheddir = os.path.join(sds_output_dir, 'unmatched')
-    sdsunmatched = SDSobj(unmatcheddir)
-
-
+    `n_processes` is accepted for compatibility, but writes are serialized.
+    `merge_strategy` is forwarded only for merge mode.
+    """
+    source = Path(src_dir).expanduser().resolve()
+    destination = Path(dest_dir).expanduser().resolve()
+    if source == destination or source in destination.parents or destination in source.parents:
+        raise ValueError('Source and destination must be separate, non-nested directories')
+    if write_mode not in {'merge', 'fail', 'overwrite'}:
+        raise ValueError('write_mode must be merge, fail or overwrite')
+    if n_processes != 1:
+        print('NOTE: n_processes is ignored; SDS writes are serialized to prevent collisions.')
+    if cpu_temp:
+        print('NOTE: CPU-temperature monitoring is not implemented in this writer; no monitoring enabled.')
+    start = UTCDateTime(start_date) if start_date is not None else None
+    end = UTCDateTime(end_date) if end_date is not None else None
+    if start and end and end < start:
+        raise ValueError('end_date precedes start_date')
+    inventory = None
     if metadata_excel_path:
-        ext = os.path.splitext(metadata_excel_path)[1].lower()
-        if ext in ['.xls', '.xlsx', '.csv']:
-            sdsout.load_metadata_from_excel(metadata_excel_path)
-        elif ext in ['.xml']:
-            sdsout.load_metadata_from_stationxml(metadata_excel_path)
-        else:
-            raise ValueError(f"Unsupported metadata file extension: {ext}")
+        if Path(metadata_excel_path).suffix.lower() != '.xml':
+            raise ValueError('Metadata matching requires StationXML (.xml); convert Excel/CSV first')
+        inventory = read_inventory(metadata_excel_path)
+    destination.mkdir(parents=True, exist_ok=True)
+    db_path = destination / 'processing_log.sqlite'
+    setup_database(str(db_path), mode='write')
 
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    cursor = conn.cursor()
-    start_time = UTCDateTime()
-    total_files = len(file_list)
-
-    for filenum, file_path in enumerate(file_list):
-        try:
-            pause_if_too_hot(threshold=75.0)
-
-            cursor.execute("""
-                INSERT OR IGNORE INTO locks (filepath, locked_by, locked_at)
-                VALUES (?, ?, datetime('now'))
-            """, (file_path, cpu_id))
-            conn.commit()
-
-            cursor.execute("SELECT locked_by FROM locks WHERE filepath = ?", (file_path,))
-            row = cursor.fetchone()
-            if not row or row[0] != cpu_id:
-                release_input_file_lock(cursor, conn, file_path)
-                continue
-
+    if custom_file_list is not None:
+        files = [str(Path(f).expanduser().resolve()) for f in custom_file_list]
+    elif use_sds_structure:
+        files = discover_files(str(source), use_sds=True,
+            filterdict={'networks': networks, 'stations': stations},
+            starttime=start, endtime=end)
+        # Some older discover_files implementations return (files, rejected).
+        if isinstance(files, tuple):
+            files = files[0]
+    else:
+        pattern = str(source / ('**/' if recursive else '') / file_glob)
+        files = sorted(glob.glob(pattern, recursive=recursive))
+        files = [f for f in files if not any(p.startswith('.') for p in Path(f).relative_to(source).parts)]
+    files = sorted(set(map(str, files)))
+    populate_file_log(files, str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.execute('PRAGMA busy_timeout=30000')
+        statuses = ('pending', 'incomplete', 'failed') if retry_failed else ('pending', 'incomplete')
+        marks = ','.join('?' for _ in statuses)
+        pending = [r[0] for r in conn.execute(
+            f'SELECT filepath FROM file_log WHERE filepath IN ({",".join("?" for _ in files)}) AND status IN ({marks}) ORDER BY filepath',
+            (*files, *statuses))] if files else []
+        print(f'Ingesting {len(pending)} pending files of {len(files)} discovered')
+        main_client = EnhancedSDSClient(destination)
+        unmatched_client = EnhancedSDSClient(destination / 'unmatched') if inventory else None
+        for index, filepath in enumerate(pending, 1):
             try:
-                st_in = read_mseed(file_path)
-                log_memory_usage(f"[{cpu_id}] After read_mseed: {file_path}")
-            except Exception as e:
-                cursor.execute("""
-                    UPDATE file_log
-                    SET status = 'failed', reason = ?, ntraces_in = 0, ntraces_out = 0, cpu_id = ?, timestamp = datetime('now')
-                    WHERE filepath = ?
-                """, (f'read_mseed error: {str(e)}', cpu_id, file_path))
-                conn.commit()
-                continue
-
-            ntraces_in = len(st_in)
-            ntraces_out = 0
-            nmerged = 0
-
-            for tr in st_in:
-                if (start_date and tr.stats.endtime < start_date) or (end_date and tr.stats.starttime > end_date):
-                    status = 'skipped'
-                    reason = 'Outside time range'
-                    outputfile = None
-                elif tr.stats.sampling_rate < 50:
-                    status = 'skipped'
-                    reason = 'Low sample rate'
-                    outputfile = None
-                else:
-                    source_id, fixed_id = fix_id_wrapper(tr)
-                    metadata_matched = sdsout.match_metadata(tr) if sdsout.metadata is not None else True
-
-                    unmatched = False
-                    whichsdsobj = sdsout
-                    if not metadata_matched:
-                        unmatched = True
-                        whichsdsobj = sdsunmatched
-                    full_dest_path = whichsdsobj.get_fullpath(tr)
-                    output_locked = False
+                st = read(filepath)
+                n_in = len(st)
+                n_written = n_skipped = n_failed = 0
+                for tr in st:
+                    if not _matches(tr.stats.network, networks) or not _matches(tr.stats.station, stations):
+                        n_skipped += 1
+                        _trace_record(conn, filepath, tr, 'skipped', 'NSLC filter', [])
+                        continue
+                    if (start is not None and tr.stats.endtime < start) or (end is not None and tr.stats.starttime > end):
+                        n_skipped += 1
+                        _trace_record(conn, filepath, tr, 'skipped', 'Outside time range', [])
+                        continue
+                    if min_sampling_rate is not None and tr.stats.sampling_rate < min_sampling_rate:
+                        n_skipped += 1
+                        _trace_record(conn, filepath, tr, 'skipped', 'Below requested sample rate', [])
+                        continue
+                    tr = tr.copy()
+                    if start is not None or end is not None:
+                        tr.trim(starttime=start, endtime=end, nearest_sample=False)
+                    if not tr.stats.npts:
+                        n_skipped += 1
+                        continue
+                    matched = _has_metadata(inventory, tr)
+                    client = main_client if matched else unmatched_client
                     try:
-                        output_locked = try_lock_output_file(conn, full_dest_path, cpu_id)
-                    except Exception as e:
-                        print(f"{UTCDateTime()}: ⚠️ Output lock attempt failed for {full_dest_path}: {e}", flush=True)
+                        kwargs = {'merge_strategy': merge_strategy} if write_mode == 'merge' else {}
+                        paths = client.write_trace(tr, mode=write_mode, preprocess=False,
+                                                   verbose=debug, **kwargs)
+                        if not paths:
+                            raise IOError('Client returned no output paths')
+                        n_written += 1
+                        _trace_record(conn, filepath, tr, 'ok' if matched else 'unmatched ok', '', paths)
+                    except Exception as exc:
+                        n_failed += 1
+                        _trace_record(conn, filepath, tr, 'failed', str(exc), [])
+                if n_failed:
+                    status = 'incomplete' if n_written else 'failed'
+                elif n_skipped and n_written:
+                    status = 'partial'
+                elif n_skipped:
+                    status = 'skipped'
+                else:
+                    status = 'done'
+                _record(conn, filepath, status,
+                        f'{n_written} written, {n_skipped} skipped, {n_failed} failed',
+                        n_in, n_written)
+            except Exception as exc:
+                _record(conn, filepath, 'failed', f'{type(exc).__name__}: {exc}', 0, 0)
+                if debug:
+                    traceback.print_exc()
+            if index % 100 == 0 or index == len(pending):
+                print(f'Processed {index}/{len(pending)} input files', flush=True)
+    print(f'Processing log: {db_path}')
+    return str(db_path)
 
-                    if output_locked:
-                        whichsdsobj.stream.traces = [tr]
-                        try:
-                            results = whichsdsobj.write(debug=debug, merge_strategy=merge_strategy)
-                            res = results.get(tr.id, {})
-                            status = res.get('status', 'failed')
-                            reason = res.get('reason', 'Unknown write error')
-                            outputfile = res.get('path', None) if status == 'ok' else None
-                            if status == 'ok':
-                                ntraces_out += 1
-                                if "Merged" in reason:
-                                    nmerged += 1
-                        except Exception as e:
-                            status = 'failed'
-                            reason = f"Write exception: {str(e)}"
-                            outputfile = None
-                        finally:
-                            whichsdsobj.stream.clear()
-                            release_output_file_lock_safe(conn, full_dest_path)
-                    else:
-                        status = 'skipped'
-                        reason = 'SDS output file locked by another worker'
-                        outputfile = None
 
-                    if unmatched:
-                        status = 'unmatched ' + status
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO trace_log
-                        (source_id, fixed_id, trace_id, filepath, station, sampling_rate, starttime, endtime, reason, outputfile, status, cpu_id, timestamp)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                    """, (
-                        source_id, fixed_id, tr.id, file_path, tr.stats.station, tr.stats.sampling_rate,
-                        tr.stats.starttime.isoformat(), tr.stats.endtime.isoformat(),
-                        reason, outputfile, status, cpu_id
-                    ))
-                    conn.commit()
-                    tr.stats = None
-                    del tr
-
-            st_in.clear()
-            gc.collect()
-
-            if ntraces_out == ntraces_in:
-                file_status = 'done'
-                file_reason = None
-            elif ntraces_out > 0:
-                file_status = 'incomplete'
-                file_reason = f"{ntraces_out} of {ntraces_in} written"
-                if nmerged:
-                    file_reason += f"; {nmerged} merged"
-            else:
-                file_status = 'failed'
-                file_reason = 'All traces failed or skipped'
-
-            cursor.execute("""
-                UPDATE file_log
-                SET status = ?, reason = ?, ntraces_in = ?, ntraces_out = ?, cpu_id = ?, timestamp = datetime('now')
-                WHERE filepath = ?
-            """, (file_status, file_reason, ntraces_in, ntraces_out, cpu_id, file_path))
-            conn.commit()
-
-        except Exception as e:
-            print(f"{UTCDateTime()}: ❌ Worker {cpu_id} crashed on {file_path}: {e}", flush=True)
-            traceback.print_exc()
-        finally:
-            release_input_file_lock(cursor, conn, file_path)
-
-        try:
-            if filenum % 10 == 0:
-                processed_count = filenum + 1
-                elapsed = UTCDateTime() - start_time
-                if processed_count > 0:
-                    est_total_time = elapsed / processed_count * total_files
-                    est_remaining = est_total_time - elapsed
-                    est_finish = UTCDateTime() + est_remaining
-                    print(f"{UTCDateTime()}: 📊 [{cpu_id}] Progress: {processed_count}/{total_files} files processed, ETA: {est_finish.strftime('%Y-%m-%d %H:%M:%S')} UTC", flush=True)
-                remove_stale_locks(cursor, conn, max_age_minutes=2)
-        except Exception as e:
-            print(f"{UTCDateTime()}: ❌ Worker {cpu_id} crashed on progress logging: {e}", flush=True)
-            traceback.print_exc()
-
-        gc.collect()
-
-    conn.close()
-    gc.collect()
-    log_memory_usage(f"{UTCDateTime()}: [{cpu_id}] Finished all files")
-    print(f"{UTCDateTime()}: ✅ Finished {cpu_id}", flush=True)
+if __name__ == '__main__':
+    import argparse
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('src_dir')
+    p.add_argument('dest_dir')
+    p.add_argument('--network', default='*')
+    p.add_argument('--station', default='*')
+    p.add_argument('--metadata', default=None, help='StationXML for channel matching')
+    p.add_argument('--non-sds', action='store_true')
+    p.add_argument('--glob', default='*.mseed')
+    p.add_argument('--mode', choices=('merge', 'overwrite', 'fail'), default='merge')
+    p.add_argument('--min-sampling-rate', type=float)
+    p.add_argument('--debug', action='store_true')
+    args = p.parse_args()
+    write_sds_archive(args.src_dir, args.dest_dir, networks=args.network,
+        stations=args.station, metadata_excel_path=args.metadata,
+        use_sds_structure=not args.non_sds, file_glob=args.glob,
+        write_mode=args.mode, min_sampling_rate=args.min_sampling_rate,
+        debug=args.debug)

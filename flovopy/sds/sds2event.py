@@ -6,7 +6,7 @@ SDS orchestration helpers for event windows.
 
 This module is intentionally *thin* and SDS-specific. It provides convenience
 functions that:
-  1) Read time windows from an SDS archive via `SDSobj`.
+  1) Read time windows from an SDS archive via `EnhancedSDSClient`.
   2) Normalize gaps and optionally filter / remove instrument response using the
      source-agnostic utilities in `flovopy.core.preprocess` and `flovopy.core.remove_response`.
   3) (Optionally) write normalized waveforms to MiniSEED files.
@@ -63,7 +63,7 @@ Edge behavior / failure modes
 
 Performance notes
 -----------------
-- Reading performance is controlled by `speed` in `SDSobj.read`.
+- The legacy `speed` argument is accepted but ignored by EnhancedSDSClient.
 - Gap normalization is vectorized and typically fast even for multi-minute windows.
 - Filtering uses ObsPy’s IIR tools. Corner count and zero-phase can increase CPU time.
 
@@ -96,9 +96,9 @@ Examples
 import os
 import numpy as np
 import pandas as pd
-from typing import Tuple, Literal, Optional, List, Dict, Any
+from typing import Tuple, Literal, Optional, List, Dict, Any, Union
 from obspy import UTCDateTime, Stream, Trace
-from flovopy.sds.sds import SDSobj
+from flovopy.enhanced.sdsclient import EnhancedSDSClient
 
 # Core, source-agnostic utilities
 from flovopy.core.preprocess import preprocess_stream
@@ -108,7 +108,7 @@ Preset = Literal["raw_preset", "archive_preset", "analysis_preset"]
 
 
 def load_event_stream_from_sds(
-    sds_root: str,
+    sds_root: Union[str, EnhancedSDSClient],
     t1: UTCDateTime,
     t2: UTCDateTime,
     *,
@@ -133,8 +133,7 @@ def load_event_stream_from_sds(
     net, sta, loc, cha : str
         SDS selectors. Wildcards are allowed (e.g., '1R', '*', '10', 'D*').
     speed : int
-        Passed to `SDSobj.read`; higher values can increase read performance
-        (implementation-specific).
+        Deprecated compatibility argument; ignored by EnhancedSDSClient.
     preset : {"raw_present", "archive_preset", "analysis_preset"}
         - "raw_preset": no preprocessing at all, best for reading from SDS and writing to event miniseed
         - "archive_preset": gap-normalize only (no filtering/response).
@@ -152,30 +151,27 @@ def load_event_stream_from_sds(
 
     Notes
     -----
-    - This does *not* merge/sanitize SDS segments—assumes `SDSobj.read` returns
-      already merged traces (as is typical for MiniSEED daily archives).
+    - Raw reads do not merge or sanitize SDS segments. Other presets
+      explicitly run the preprocessing described below.
     - For *analysis_preset*, the default bandpass is (0.5, 30.0) Hz, corners=4,
       zerophase=True. You can tune these in code below if you fork the preset.
     """
-    if isinstance(sds_root, SDSobj):
-        sdsin = sds_root
-    else:
-        sdsin = SDSobj(sds_root)
-    #sdsin.read(t1, t2, net=net, sta=sta, loc=loc, cha=cha, speed=speed)
-    # BEFORE (broken)
-    # sdsin.read(t1, t2, net=net, sta=sta, loc=loc, cha=cha, speed=speed)
-
-    # AFTER (works with your SDSobj.read signature)
-    sdsin.read(
-        t1, t2,
-        speed=speed,
+    # Raw SDS read: no implicit merging, filtering, response removal or low-rate exclusion.
+    # Keep speed for backward compatibility; EnhancedSDSClient.read has no speed argument.
+    client = sds_root if isinstance(sds_root, EnhancedSDSClient) else EnhancedSDSClient(sds_root)
+    st = client.read(
+        t1, t2, net=net, sta=sta, loc=loc, chan=cha,
+        skip_low_rate_channels=False,
+        merge=None,
+        trim=True,
+        postprocess=False,
+        final_smart_merge=False,
+        annotate_processing=False,
         verbose=verbose,
-        # keep other kwargs only if SDSobj.read supports them
     )
-
-    # post-filter by SEED selectors (wildcards OK)
-    st = sdsin.stream.select(network=net, station=sta, location=loc, channel=cha).copy()
-    st = sdsin.stream or Stream()
+    # Explicitly retain selectors, including when a client implementation
+    # returns more channels than requested.
+    st = st.select(network=net, station=sta, location=loc, channel=cha).copy()
     st = Stream(tr for tr in st if tr.stats.npts > 0)
 
     if not len(st):
@@ -186,7 +182,8 @@ def load_event_stream_from_sds(
     if verbose:
         print(f"[SDS] {len(st)} traces for {t1}–{t2}")
 
-    print(st)
+    if verbose:
+        print(st)
 
     if preset == "raw_preset": # No preprocessing applied
         pass
@@ -274,7 +271,7 @@ def write_event_miniseed(
         mseedfile = os.path.join(out_dir, fname)
     else:
         mseedfile = filename_path
-        os.makedirs(os.path.dirname(mseedfile) or out_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(mseedfile) or out_dir or ".", exist_ok=True)
 
     if verbose:
         print(f"[write_event_miniseed] Writing event → {mseedfile}")
@@ -378,9 +375,13 @@ def _to_utc_any(val) -> UTCDateTime:
         return UTCDateTime(ts.to_pydatetime())
     return UTCDateTime(s)
 
-def _safe_event_id(row: pd.Series, idx: int, event_id: str) -> str:
-    """Return a sanitized event_id containing only alphanumeric characters, hyphens, or underscores."""
-    return "".join(c for c in event_id if c.isalnum() or c in ("-", "_"))
+def _safe_event_id(row: pd.Series, idx: int, event_id_col: Optional[str]) -> str:
+    """Resolve an event ID from the selected CSV column, with a stable fallback."""
+    value = row.get(event_id_col) if event_id_col and event_id_col in row.index else None
+    if value is None or pd.isna(value) or not str(value).strip():
+        value = f"event_{idx:06d}"
+    cleaned = "".join(c for c in str(value) if c.isalnum() or c in ("-", "_"))
+    return cleaned or f"event_{idx:06d}"
 
 def csv_to_event_miniseed(
     *,

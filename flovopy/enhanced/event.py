@@ -136,7 +136,9 @@ class EnhancedEvent(Event):
         for k, v in obspy_event.__dict__.items():
             setattr(ev, k, v)
         # attach ephemeral extras if you want
-        ev.stream = stream
+        # Waveforms are transient, not QuakeML Event attributes. Bypass
+        # ObsPy AttribDict validation for this deliberately nonstandard field.
+        object.__setattr__(ev, "stream", stream)
         return ev
 
     # --------- Sidecar persistence ---------

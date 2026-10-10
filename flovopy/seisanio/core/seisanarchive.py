@@ -4,7 +4,7 @@ from pathlib import Path
 import glob
 from typing import Callable, Iterator
 
-from obspy import UTCDateTime, read
+from obspy import Stream, UTCDateTime, read
 from collections import defaultdict
 from flovopy.enhanced.sdsclient import EnhancedSDSClient
 
@@ -327,56 +327,40 @@ class SeisanArchive:
     # WAV (continuous)
     # ------------------------------------------------------------------
 
-    def iter_waveform_files(self, starttime, endtime, db=None) -> Iterator[Path]:
-        """
-        Yield waveform file paths whose filename-derived start times satisfy
+    def iter_waveform_files(self, starttime, endtime, db=None, *, lookback_days=1):
+        """Yield candidate WAV files for a half-open interval.
 
-            starttime <= filetime < endtime
-
-        Parameters
-        ----------
-        starttime, endtime
-            Half-open time interval.
-        db
-            Continuous Seisan database name. Defaults to ``self.db_cont``.
+        SEISAN filenames encode start time, not duration. Include files starting
+        on preceding days (default: one day) so midnight-spanning recordings are
+        not silently missed. The reader/converter clips using actual trace times.
+        Files with non-SEISAN names are not discoverable through this iterator.
         """
+        db = self.db_cont if db is None else db
         if db is None:
-            db = self.db_cont
-
-        starttime = UTCDateTime(starttime)
-        endtime = UTCDateTime(endtime)
-
+            raise ValueError("No continuous SEISAN database name was provided")
+        starttime, endtime = UTCDateTime(starttime), UTCDateTime(endtime)
         if endtime <= starttime:
             return
-
-        t = UTCDateTime(starttime.date)
-        last_day = UTCDateTime((endtime - 1e-6).date)
-
-        while t <= last_day:
-            yyyy, mm, dd = t.strftime("%Y %m %d").split()
-
-            current = self._wav_dir(db, t)
-            prev = self._wav_dir(db, t - 86400)
-
-            pattern_today = f"{yyyy}-{mm}-{dd}*"
-            pattern_prev = f"{yyyy}-{mm}-{dd}-23[45]*"
-
-            candidates = sorted({
-                *glob.glob(str(prev / pattern_prev)),
-                *glob.glob(str(current / pattern_today)),
-            })
-
-            for f in candidates:
-                fpath = Path(f)
-                try:
-                    filetime = self._wavpath2datetime(fpath)
-                except Exception:
-                    continue
-
-                if starttime <= filetime < endtime:
-                    yield fpath
-
-            t += 86400
+        if not isinstance(lookback_days, int) or lookback_days < 0:
+            raise ValueError("lookback_days must be a nonnegative integer")
+        first = UTCDateTime((starttime - lookback_days * 86400).date)
+        last = UTCDateTime((endtime - 1e-6).date)
+        seen = set()
+        day = first
+        while day <= last:
+            folder = self._wav_dir(db, day)
+            if folder.is_dir():
+                for path in sorted(folder.iterdir()):
+                    if not path.is_file() or path in seen:
+                        continue
+                    try:
+                        filetime = self._wavpath2datetime(path)
+                    except (ValueError, IOError):
+                        continue
+                    if first <= filetime < endtime:
+                        seen.add(path)
+                        yield path
+            day += 86400
 
     def get_file_list(self, starttime, endtime, db=None):
         """
@@ -573,199 +557,14 @@ class SeisanArchive:
     # Conversion / export
     # ------------------------------------------------------------------
 
-    def to_sds(
-        self,
-        starttime,
-        endtime,
-        sds_root,
-        db=None,
-        reader=read,
-        fixid: bool = False,
-        preprocess: bool = False,
-        preprocess_fn=None,
-        preprocess_kwargs=None,
-        write_mode: str = "merge",
-        write_preprocess: bool = True,
-        return_counts: bool = False,
-        verbose: bool = False,
-        **write_kwargs,
-    ):
+    def to_sds(self, starttime, endtime, sds_root, **kwargs):
+        """Compatibility wrapper around :func:`flovopy.seisanio.conversion.archive_to_sds`.
+
+        All existing keyword options are forwarded unchanged. The implementation
+        lives in one place so archive users and CLI callers share the same writer.
         """
-        Convert a Seisan waveform archive to SDS format.
-
-        This method groups Seisan waveform files by UTC day before writing,
-        so that each SDS day file is merged/re-written at most once per call
-        per day group.
-
-        Parameters
-        ----------
-        starttime, endtime : UTCDateTime or compatible
-            Time range to process.
-        sds_root : str or Path
-            Output SDS root directory.
-        db : str or None
-            Seisan database name (defaults to self.db_cont).
-        reader : callable
-            Function used to read waveform files (default: obspy.read).
-        fixid : bool
-            If True, apply Seisan/MVO trace-id fixing during read.
-        preprocess : bool
-            If True, apply `preprocess_fn` during read.
-        preprocess_fn : callable or None
-            Optional read-side preprocessing function.
-            Signature:
-                preprocess_fn(stream, **kwargs) -> stream
-        preprocess_kwargs : dict or None
-            Optional kwargs for `preprocess_fn`.
-        write_mode : str
-            SDS write mode passed to EnhancedSDSClient.write_stream():
-                - "fail"
-                - "overwrite"
-                - "merge"   (recommended; default)
-        write_preprocess : bool
-            If True, apply FLOVOpy pre-write processing inside
-            EnhancedSDSClient.write_stream() before writing to SDS.
-        return_counts : bool
-            If True, return summary statistics.
-        verbose : bool
-            Print progress messages.
-        **write_kwargs
-            Additional kwargs passed to EnhancedSDSClient.write_stream().
-
-            Examples:
-                merge=True
-                merge_strategy="both"
-                harmonize_rates=True
-                max_sampling_rate=100.0
-                fill_value=0.0
-                encoding="STEIM2"
-                reclen=4096
-
-        Returns
-        -------
-        dict or None
-            If return_counts=True, returns a summary dictionary with keys:
-                - files_read
-                - files_failed
-                - traces_read
-                - days_written
-                - sds_files_written
-                - failed_files
-        """
-
-
-        starttime = UTCDateTime(starttime)
-        endtime = UTCDateTime(endtime)
-
-        sds_root = Path(sds_root)
-        sds_root.mkdir(parents=True, exist_ok=True)
-
-        client = EnhancedSDSClient(str(sds_root))
-
-        # ------------------------------------------------------------
-        # Group Seisan waveform files by UTC day using filename time
-        # ------------------------------------------------------------
-        files_by_day = defaultdict(list)
-        failed_files = []
-
-        for path in self.iter_waveform_files(starttime, endtime, db=db):
-            try:
-                filetime = self._wavpath2datetime(path)
-                day = UTCDateTime(filetime.year, julday=filetime.julday)
-                files_by_day[day].append(Path(path))
-            except Exception as e:
-                failed_files.append(str(path))
-                if verbose:
-                    print(f"[WARN] Could not determine day for {path}: {e}")
-
-        # ------------------------------------------------------------
-        # Process one day at a time
-        # ------------------------------------------------------------
-        n_files_read = 0
-        n_files_failed = len(failed_files)
-        n_traces_read = 0
-        n_days_written = 0
-        n_sds_files_written = 0
-
-        for day in sorted(files_by_day.keys()):
-            day_files = files_by_day[day]
-            day_stream = Stream()
-
-            if verbose:
-                print(f"[INFO] Processing {len(day_files)} file(s) for day {day.date}")
-
-            # --------------------------------------------------------
-            # Read all Seisan files for this day into one Stream
-            # --------------------------------------------------------
-            for path in day_files:
-                st = self.read_waveform_file(
-                    path,
-                    reader=reader,
-                    fixid=fixid,
-                    preprocess=preprocess,
-                    preprocess_fn=preprocess_fn,
-                    preprocess_kwargs=preprocess_kwargs,
-                    verbose=verbose,
-                )
-
-                if st is None or len(st) == 0:
-                    n_files_failed += 1
-                    failed_files.append(str(path))
-                    continue
-
-                day_stream += st
-                n_files_read += 1
-                n_traces_read += len(st)
-
-            if len(day_stream) == 0:
-                if verbose:
-                    print(f"[WARN] No usable traces for day {day.date}")
-                continue
-
-            # --------------------------------------------------------
-            # Write once per day-group into SDS
-            # --------------------------------------------------------
-            try:
-                written = client.write_stream(
-                    day_stream,
-                    mode=write_mode,
-                    preprocess=write_preprocess,
-                    verbose=verbose,
-                    **write_kwargs,
-                )
-            except Exception as e:
-                if verbose:
-                    print(f"[WARN] Failed to write day {day.date} to SDS: {e}")
-                continue
-
-            if written:
-                n_days_written += 1
-                n_sds_files_written += len(written)
-
-            if verbose:
-                print(
-                    f"[INFO] Day {day.date}: "
-                    f"{len(day_stream)} trace(s) in memory, "
-                    f"{len(written) if written else 0} SDS file(s) written"
-                )
-
-        if verbose:
-            print(
-                f"[DONE] Read {n_files_read} Seisan file(s), "
-                f"{n_traces_read} trace(s); "
-                f"wrote {n_sds_files_written} SDS file(s) across {n_days_written} day(s)"
-            )
-
-        if return_counts:
-            return {
-                "files_read": n_files_read,
-                "files_failed": n_files_failed,
-                "traces_read": n_traces_read,
-                "days_written": n_days_written,
-                "sds_files_written": n_sds_files_written,
-                "failed_files": failed_files,
-            }
-    
+        from flovopy.seisanio.conversion import archive_to_sds
+        return archive_to_sds(self, starttime, endtime, sds_root, **kwargs)
 
 
 def get_file_list(SEISAN_DATA, DB, startdate, enddate):

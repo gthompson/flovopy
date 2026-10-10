@@ -274,6 +274,7 @@ def cli():
     parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
     parser.add_argument("--nosds", action="store_true", help="Disable SDS parsing (use raw walk)")
     parser.add_argument("--speed", type=int, choices=[1, 2], default=1, help="Speed mode: 1 for normal, 2 for fast SDS filename parsing")
+    parser.add_argument("--filename-coverage", default=None, help="Export consecutive SDS file-day runs from successful --speed 2 filename scans")
     parser.add_argument("--coverage", default=None, help="Export sample-aware observed coverage intervals to CSV (requires --speed 1)")
     parser.add_argument("--recheck-done", action="store_true", help="Rescan completed files in the selected set")
     parser.add_argument("--recheck-all", action="store_true", help="Rescan all selected files, including previously completed ones")
@@ -299,6 +300,11 @@ def cli():
         gap_threshold=1.0,
         rate_tolerance=1.0
     )
+    if args.filename_coverage:
+        if args.speed != 2:
+            parser.error("--filename-coverage requires --speed 2")
+        from flovopy.sds.filename_coverage import export_filename_coverage
+        export_filename_coverage(args.db, args.filename_coverage, args.sds_root)
     if args.coverage:
         if args.speed != 1:
             parser.error("--coverage requires --speed 1; filename-only dates are not observed waveform coverage")

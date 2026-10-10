@@ -1,112 +1,166 @@
-import os
-import glob
-from obspy import UTCDateTime, read
-from flovopy.sds.sds import SDSobj
+"""Convert SEISAN WAV archives to SDS using :class:`EnhancedSDSClient`.
+
+Days in ``start``..``end`` are inclusive UTC calendar days.  A file starting
+on the preceding day can contribute samples to the requested day.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import subprocess
+from collections import Counter
+from pathlib import Path
+from typing import Iterator
+
+from obspy import Stream, UTCDateTime, read
+
+from flovopy.enhanced.sdsclient import EnhancedSDSClient
 from flovopy.core.trace_utils import fix_trace_mvo
 
+LOG = logging.getLogger(__name__)
 SECONDS_PER_DAY = 86400
 
-def seisan_to_sds(seisandbdir, sdsdir, startt0, endt0, net, dbout=None, round_sampling_rate=True, MBWHZ_only=False):
-    sdsobj = SDSobj(sdsdir)
-    startt = UTCDateTime(startt0.date)
-    endt = UTCDateTime(endt0.date)
-    mseeddir = 'seisan2mseed'
-    os.makedirs(mseeddir, exist_ok=True)
-    os.makedirs(sdsdir, exist_ok=True)
-    print(startt, endt)
-    seisandbdir = os.path.join(seisandbdir, 'WAV', 'DSNC_')
 
-    dayt = startt
-    while dayt <= endt:
-        ymd = dayt.strftime("%Y%m%d")
-        yyyy, mm, dd = dayt.strftime("%Y %m %d").split()
-        currentdb = f"{seisandbdir}/{yyyy}/{mm}"
-        prevdb = f"{seisandbdir}/{UTCDateTime(dayt - SECONDS_PER_DAY).strftime('%Y/%m')}"
-        print(ymd, prevdb, currentdb)
-        allfiles = sorted(set(
-            glob.glob(f"{prevdb}/{yyyy}-{mm}-{dd}-23[45]*S.MVO___*") +
-            glob.glob(f"{currentdb}/{yyyy}-{mm}-{dd}*S.MVO___*")
-        ))
+def _midnight(value) -> UTCDateTime:
+    t = UTCDateTime(value)
+    return UTCDateTime(t.year, t.month, t.day)
 
-        if not allfiles:
-            dayt += SECONDS_PER_DAY
+
+def _days(start, end) -> Iterator[UTCDateTime]:
+    day, last = _midnight(start), _midnight(end)
+    if last < day:
+        raise ValueError("end precedes start")
+    while day <= last:
+        yield day
+        day += SECONDS_PER_DAY
+
+
+def _files_for_day(wavroot: Path, day: UTCDateTime) -> list[Path]:
+    """Include previous-day files starting at 23:40–23:59 UTC."""
+    previous = day - SECONDS_PER_DAY
+    previous_dir = wavroot / previous.strftime("%Y/%m")
+    current_dir = wavroot / day.strftime("%Y/%m")
+    previous_pattern = previous.strftime("%Y-%m-%d") + "-23[45]*S.MVO___*"
+    current_pattern = day.strftime("%Y-%m-%d") + "*S.MVO___*"
+    return sorted(set(previous_dir.glob(previous_pattern)) | set(current_dir.glob(current_pattern)))
+
+
+def _clip_to_day(stream: Stream, day: UTCDateTime) -> Stream:
+    """Retain samples whose actual timestamps fall in [day, day+86400)."""
+    stop = day + SECONDS_PER_DAY
+    output = Stream()
+    for original in stream:
+        if not original.stats.npts or original.stats.sampling_rate <= 0:
             continue
+        tr = original.copy()
+        # Trim to the requested day.  An exclusive end is enforced below.
+        tr.trim(starttime=day, endtime=stop, nearest_sample=False, pad=False)
+        if not tr.stats.npts:
+            continue
+        # ObsPy trim endpoints are inclusive; explicitly drop a sample at midnight.
+        if tr.stats.endtime >= stop:
+            tr.trim(endtime=stop - tr.stats.delta, nearest_sample=False, pad=False)
+        if tr.stats.npts and tr.stats.starttime >= day and tr.stats.endtime < stop:
+            output.append(tr)
+    return output
 
-        print(f"Processing {ymd}: {len(allfiles)} files")
-        firstfile = True
-        for file in allfiles:
+
+def _export_datascope(sdsdir: Path, dbout: str, day: UTCDateTime) -> None:
+    year, jday = day.strftime("%Y"), day.strftime("%j")
+    # SDS layout: YEAR/NET/STA/CHAN.D/NET.STA.LOC.CHAN.D.YEAR.JDAY
+    files = sorted(sdsdir.glob(f"{year}/*/*/*.D/*.{year}.{jday}"))
+    if not files:
+        LOG.info("No SDS files for %s; skipping Datascope export", day.date)
+        return
+    destination = f"{dbout}{day.strftime('%Y%m%d')}"
+    subprocess.run(["miniseed2db", *(str(p) for p in files), destination], check=True)
+
+
+def seisan_to_sds(
+    seisandbdir,
+    sdsdir,
+    startt0,
+    endt0,
+    net,
+    dbout=None,
+    round_sampling_rate=True,
+    MBWHZ_only=False,
+    *,
+    database="DSNC_",
+    skip_unreadable=True,
+):
+    """Import SEISAN waveforms into SDS, merging existing day files.
+
+    Parameters are compatible with the legacy wrapper. ``round_sampling_rate``
+    is accepted but deliberately ignored: changing the sampling rate requires
+    explicit resampling. ``database`` selects the SEISAN ``WAV`` subdirectory.
+
+    Returns a count dictionary for logging/verification.
+    """
+    if not net:
+        raise ValueError("net must be a nonempty SEED network code")
+    wavroot = Path(seisandbdir).expanduser() / "WAV" / database
+    if not wavroot.is_dir():
+        raise FileNotFoundError(f"SEISAN WAV database not found: {wavroot}")
+    sdsroot = Path(sdsdir).expanduser()
+    sdsroot.mkdir(parents=True, exist_ok=True)
+    client = EnhancedSDSClient(str(sdsroot))
+    counts = Counter(days=0, files=0, unreadable=0, traces=0)
+    if round_sampling_rate:
+        LOG.debug("round_sampling_rate is a legacy no-op; sample rates are unchanged")
+
+    for day in _days(startt0, endt0):
+        counts["days"] += 1
+        for path in _files_for_day(wavroot, day):
             try:
-                st = read(file, format='SEISAN')
+                stream = read(str(path), format="SEISAN")
             except Exception:
+                counts["unreadable"] += 1
+                if not skip_unreadable:
+                    raise
+                LOG.warning("Skipping unreadable SEISAN file: %s", path, exc_info=True)
                 continue
-            if net=='MV':
-                for tr in st:
-                    fix_trace_mvo(tr, legacy=False, netcode=net)
+            counts["files"] += 1
+            if net == "MV":
+                for trace in stream:
+                    fix_trace_mvo(trace, legacy=False, netcode=net)
             if MBWHZ_only:
-                st = st.select(station='MBWH', component='Z')
-            st.trim(dayt, dayt + SECONDS_PER_DAY)
-            sdsobj.stream = st
-            sdsobj.write(overwrite=firstfile)
-            firstfile = False
-
+                stream = stream.select(station="MBWH", component="Z")
+            stream = _clip_to_day(stream, day)
+            if stream:
+                client.write_stream(stream, mode="merge", preprocess=False)
+                counts["traces"] += len(stream)
         if dbout:
-            jday = dayt.strftime('%j')
-            dboutday = f"{dbout}{ymd}"
-            files = glob.glob(os.path.join(sdsdir, '*', '*', '*', '*.D', f'*{jday}'))
-            os.system(f"miniseed2db {' '.join(files)} {dboutday}")
+            _export_datascope(sdsroot, str(dbout), day)
+        LOG.info("Completed SEISAN import for %s", day.strftime("%Y-%m-%d"))
+    return dict(counts)
 
-        dayt += SECONDS_PER_DAY
 
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Convert Seisan waveform files to SDS archive format")
-
-    parser.add_argument("--start", type=str, required=True,
-                        help="Start date in UTC (e.g., 2001-01-01T00:00:00)")
-    parser.add_argument("--end", type=str, required=True,
-                        help="End date in UTC (e.g., 2001-01-02T00:00:00)")
-    parser.add_argument("--seisan", type=str, required=True,
-                        help="Path to Seisan database root directory (e.g., /data/SEISAN_DB)")
-    parser.add_argument("--sds", type=str, required=True,
-                        help="Path to output SDS archive directory")
-    parser.add_argument("--net", type=str, required=True,
-                        help="Network code (e.g., MV)")
-    parser.add_argument("--dbout", type=str,
-                        help="Optional Datascope database name prefix (e.g., SDS2DB/MVOE_)")
-    parser.add_argument("--round_sampling_rate", action="store_true",
-                        help="Round sampling rate to nearest integer Hz")
-    parser.add_argument("--MBWHZ_only", action="store_true",
-                        help="Only include MBWH station Z component")
-
-    args = parser.parse_args()
-
-    seisan_to_sds(
-        seisandbdir=args.seisan,
-        sdsdir=args.sds,
-        startt0=UTCDateTime(args.start),
-        endt0=UTCDateTime(args.end),
-        net=args.net,
-        dbout=args.dbout,
-        round_sampling_rate=args.round_sampling_rate,
-        MBWHZ_only=args.MBWHZ_only
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--start", required=True, help="First UTC calendar day (inclusive)")
+    parser.add_argument("--end", required=True, help="Last UTC calendar day (inclusive)")
+    parser.add_argument("--seisan", required=True, help="SEISAN database root")
+    parser.add_argument("--sds", required=True, help="Output SDS root")
+    parser.add_argument("--net", required=True, help="Network code (MV applies MVO trace fixes)")
+    parser.add_argument("--database", default="DSNC_", help="SEISAN WAV database (default: DSNC_)")
+    parser.add_argument("--dbout", help="Optional Datascope output prefix (requires miniseed2db)")
+    parser.add_argument("--round_sampling_rate", action="store_true", help="Legacy no-op")
+    parser.add_argument("--MBWHZ_only", action="store_true", help="Only MBWH vertical traces")
+    parser.add_argument("--strict", action="store_true", help="Fail on unreadable SEISAN files")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s %(message)s")
+    counts = seisan_to_sds(
+        args.seisan, args.sds, args.start, args.end, args.net,
+        dbout=args.dbout, round_sampling_rate=args.round_sampling_rate,
+        MBWHZ_only=args.MBWHZ_only, database=args.database,
+        skip_unreadable=not args.strict,
     )
+    LOG.info("Import summary: %s", counts)
+    return counts
+
 
 if __name__ == "__main__":
     main()
-"""
-run-seisan2sds \
-  --start 2001-01-01T00:00:00 \
-  --end 2001-01-02T00:00:00 \
-  --seisan /data/SEISAN_DB \
-  --sds SDS_ARCHIVE \
-  --net MV \
-  --dbout SDS2DB/MVOE_ \
-  --MBWHZ_only
-
-"""
-
-
-
-
-

@@ -335,28 +335,25 @@ class MVOSfile(Sfile):
         if self.eventobj is None:
             raise ValueError("No ObsPy Event object found in MVOSfile.")
 
-        wav_paths = [w.path for w in (self.dsnwavfileobj, self.asnwavfileobj) if hasattr(w, "path")]
-        aef_path = self.aeffileobj.path if self.aeffileobj else None
-        trigger_window = self.aeffileobj.trigger_window if self.aeffileobj else None
-        average_window = self.aeffileobj.average_window if self.aeffileobj else None
+        from flovopy.enhanced.event import EnhancedEventMeta
 
+        wav_paths = [str(w.path) for w in (self.dsnwavfileobj, self.asnwavfileobj)
+                     if w is not None and getattr(w, "path", None)]
+        aef = self.aeffileobj
         metrics = {
             "filetime": self.filetime,
             "mainclass": self.mainclass,
             "subclass": self.subclass,
             "analyst": self.analyst,
             "analyst_delay": self.analyst_delay,
-            "aefrows": self.aeffileobj.aefrows if self.aeffileobj else None,
+            "aefrows": getattr(aef, "aefrows", None) if aef is not None else None,
         }
-
-        return EnhancedEvent(
-            obspy_event=self.eventobj,
-            metrics=metrics,
-            sfile_path=self.path,
+        meta = EnhancedEventMeta(
+            sfile_path=str(self.path),
             wav_paths=wav_paths,
-            aef_path=aef_path,
-            trigger_window=trigger_window,
-            average_window=average_window,
-            stream=stream,
+            aef_path=str(aef.path) if aef is not None and getattr(aef, "path", None) else None,
+            trigger_window=getattr(aef, "trigger_window", None),
+            average_window=getattr(aef, "average_window", None),
+            metrics=metrics,
         )
-
+        return EnhancedEvent.wrap(self.eventobj, meta=meta, stream=stream)
