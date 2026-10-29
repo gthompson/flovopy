@@ -67,10 +67,12 @@ class SeisanArchive:
 
         if not basename:
             raise IOError("Empty WAV filename")
-        if "S." not in basename:
-            raise IOError(f"Filename does not contain 'S.' marker: {basename}")
+        # SEISAN files can use S. or M. markers (e.g. Pinatubo M.PNTBO).
+        marker = next((m for m in ("S.", "M.") if m in basename), None)
+        if marker is None:
+            raise IOError(f"Filename does not contain 'S.' or 'M.' marker: {basename}")
 
-        stem = basename.split("S.")[0]
+        stem = basename.split(marker, 1)[0]
         parts = stem.split("-")
 
         try:

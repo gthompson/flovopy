@@ -1630,11 +1630,6 @@ class SAM:
         return good_st
     
     @staticmethod
-    def __get_endtime(df):
-        ''' return the end time of an SAM dataframe as an ObsPy UTCDateTime'''
-        return UTCDateTime(df.iloc[-1]['time'])
-    
-    @staticmethod
     def get_filename(SAM_DIR, id, year, sampling_interval, ext, name='RSAM'):
         network = id.split('.')[0]
         return os.path.join(SAM_DIR, name, network, '%s_%s_%4d_%ds.%s' % (name, id, year, sampling_interval, ext))
@@ -1671,39 +1666,7 @@ class SAM:
 
         return float(np.median(diffs))
 
-    @staticmethod
-    def __get_starttime(df):
-        ''' return the start time of an SAM dataframe as an ObsPy UTCDateTime'''
-        if df is None or df.empty:
-            return UTCDateTime(0)
-
-        if "time" in df.columns:
-            t = pd.to_numeric(df["time"], errors="coerce").iloc[0]
-            if pd.notna(t):
-                return UTCDateTime(float(t))
-
-        if "date" in df.columns:
-            dt = pd.to_datetime(df["date"].iloc[0])
-            return UTCDateTime(dt.to_pydatetime())
-
-        return UTCDateTime(0)
-    
-    @staticmethod
-    def __get_endtime(df):
-        """Return the end time of an SAM dataframe as an ObsPy UTCDateTime."""
-        if df is None or df.empty:
-            return UTCDateTime(0)
-
-        if "time" in df.columns:
-            t = pd.to_numeric(df["time"], errors="coerce").iloc[-1]
-            if pd.notna(t):
-                return UTCDateTime(float(t))
-
-        if "date" in df.columns:
-            dt = pd.to_datetime(df["date"].iloc[-1])
-            return UTCDateTime(dt.to_pydatetime())
-
-        return UTCDateTime(0)
+   
     
     def __get_trace_ids(self):
         return [id for id in self.dataframes]
@@ -1859,32 +1822,71 @@ class SAM:
         return [c for c in cols if c not in ("time", "date", "coverage", "fratio")]
 
     def __str__(self):
-        keys = self.get_seed_ids()
         lines = [f"{self.__class__.__name__} object:"]
-        lines.append(f"Number of SEED ids: {len(self)} [{keys}]")
-        lines.append(f"Number of rows: {len(self.dataframes[keys[0]])}")
-        lines.append(f"Start time: {self.starttime}")
-        lines.append(f"End time: {self.endtime}")
-        lines.append(f"Duration: {self.duration} s")
-        lines.append(f"Sampling interval: {self.sampling_interval} s")
-        lines.append(f"Metrics: {', '.join(self.metrics)}")
 
-        for trid, df in self.dataframes.items():
-            if df is None or df.empty:
-                lines.append(f"{trid}: <empty dataframe>")
-                continue
+        def safe(label, func):
+            """Evaluate a property or method without breaking __str__."""
+            try:
+                value = func()
+                lines.append(f"{label}: {value}")
+            except Exception as e:
+                lines.append(f"{label}: <ERROR: {type(e).__name__}: {e}>")
 
-            if 'median' in df.columns:
-                av = df['median'].median() 
-                lines.append(f"{trid}: median={av:.3g}")
-            elif 'mean' in df.columns:
-                av = df['mean'].mean()
-                lines.append(f"{trid}: mean={av:.3g}")
-            elif 'energy' in df.columns:
-                av = df['energy'].sum()
-                lines.append(f"{trid}: energy={av:.3g}")
+        # Basic properties
+        safe("SEED ids", lambda: self.get_seed_ids())
+        safe("Number of SEED ids", lambda: len(self))
+        safe("Start time", lambda: self.starttime)
+        safe("End time", lambda: self.endtime)
+        safe("Duration (s)", lambda: self.duration)
+        safe("Sampling interval (s)", lambda: self.sampling_interval)
+        safe("Metrics", lambda: ", ".join(self.metrics))
 
-        return "\n".join(lines)  
+        # Dataframes
+        try:
+            dataframes = self.dataframes
+
+            if not dataframes:
+                lines.append("Dataframes: <empty>")
+            else:
+                for trid, df in dataframes.items():
+                    try:
+                        if df is None:
+                            lines.append(f"{trid}: <None>")
+                            continue
+
+                        if df.empty:
+                            lines.append(f"{trid}: <empty dataframe>")
+                            continue
+
+                        lines.append(
+                            f"{trid}: {len(df)} rows, "
+                            f"{len(df.columns)} columns "
+                            f"{list(df.columns)}"
+                        )
+
+                        if "median" in df.columns:
+                            av = df["median"].median()
+                            lines.append(f"  median={av:.3g}")
+
+                        elif "mean" in df.columns:
+                            av = df["mean"].mean()
+                            lines.append(f"  mean={av:.3g}")
+
+                        elif "energy" in df.columns:
+                            av = df["energy"].sum()
+                            lines.append(f"  energy={av:.3g}")
+
+                    except Exception as e:
+                        lines.append(
+                            f"{trid}: <ERROR: {type(e).__name__}: {e}>"
+                        )
+
+        except Exception as e:
+            lines.append(
+                f"Dataframes: <ERROR: {type(e).__name__}: {e}>"
+            )
+
+        return "\n".join(lines)
     
     def __len__(self):
         return len(self.dataframes)
@@ -1962,76 +1964,426 @@ class SAM:
         dt = self.get_sampling_interval(best_df)
         return None if not np.isfinite(dt) else float(dt)
 
+    @staticmethod
+    def __get_valid_times(df, non_null=False, metric="mean"):
+        """
+        Extract valid timestamps from an SAM dataframe.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            SAM dataframe containing 'time' (Unix epoch seconds)
+            or 'date' (datetime).
+
+        non_null : bool, default False
+            If True, retain only timestamps for which the specified
+            metric has a finite value.
+
+        metric : str, default 'mean'
+            Metric column used when non_null=True.
+
+        Returns
+        -------
+        numpy.ndarray
+            Valid Unix epoch timestamps as float64.
+
+        Notes
+        -----
+        - NaN and infinite timestamps are always excluded.
+        - When non_null=True, NaN and infinite metric values are excluded.
+        - Zero is considered a valid measurement.
+        - The dataframe is not modified.
+        """
+        if df is None or df.empty:
+            return np.array([], dtype=float)
+
+        if "time" in df.columns:
+            times = pd.to_numeric(
+                df["time"], errors="coerce"
+            ).to_numpy(dtype=float)
+
+        elif "date" in df.columns:
+            dates = pd.to_datetime(
+                df["date"], errors="coerce", utc=True
+            )
+            times = dates.astype("int64").to_numpy(dtype=float) / 1e9
+            times[dates.isna().to_numpy()] = np.nan
+
+        else:
+            return np.array([], dtype=float)
+
+        valid = np.isfinite(times)
+
+        if non_null:
+            if metric not in df.columns:
+                return np.array([], dtype=float)
+
+            values = pd.to_numeric(
+                df[metric], errors="coerce"
+            ).to_numpy(dtype=float)
+
+            valid &= np.isfinite(values)
+
+        return times[valid]
+
+
+    @staticmethod
+    def __get_starttime(df, non_null=False, metric="mean"):
+        """
+        Return the earliest timestamp in an SAM dataframe.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            SAM dataframe.
+
+        non_null : bool, default False
+            If True, consider only rows with finite values
+            in the specified metric.
+
+        metric : str, default 'mean'
+            Metric used to determine valid measurements.
+
+        Returns
+        -------
+        obspy.UTCDateTime or None
+        """
+        times = SAM.__get_valid_times(
+            df, non_null=non_null, metric=metric
+        )
+
+        if times.size == 0:
+            return None
+
+        return UTCDateTime(float(np.min(times)))
+
+
+    @staticmethod
+    def __get_endtime(df, non_null=False, metric="mean"):
+        """
+        Return the latest sample timestamp in an SAM dataframe.
+
+        Does not add the sampling interval.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            SAM dataframe.
+
+        non_null : bool, default False
+            If True, consider only rows with finite values
+            in the specified metric.
+
+        metric : str, default 'mean'
+            Metric used to determine valid measurements.
+
+        Returns
+        -------
+        obspy.UTCDateTime or None
+        """
+        times = SAM.__get_valid_times(
+            df, non_null=non_null, metric=metric
+        )
+
+        if times.size == 0:
+            return None
+
+        return UTCDateTime(float(np.max(times)))
+
+
+    def get_starttime(self, non_null=False, metric="mean"):
+        """
+        Return the earliest start time across all SAM dataframes.
+
+        Parameters
+        ----------
+        non_null : bool, default False
+            If True, consider only finite values of `metric`.
+
+        metric : str, default 'mean'
+            Metric used to determine valid measurements.
+
+        Returns
+        -------
+        obspy.UTCDateTime or None
+
+        Examples
+        --------
+        >>> sam.get_starttime()
+        >>> sam.get_starttime(non_null=True)
+        >>> sam.get_starttime(non_null=True, metric="rms")
+        """
+        starts = []
+
+        for df in self.dataframes.values():
+            t = self.__get_starttime(
+                df,
+                non_null=non_null,
+                metric=metric,
+            )
+
+            if t is not None:
+                starts.append(t)
+
+        return min(starts) if starts else None
+
+
+    def get_endtime(self, non_null=False, metric="mean",
+                    exclusive=True):
+        """
+        Return the latest end time across all SAM dataframes.
+
+        Parameters
+        ----------
+        non_null : bool, default False
+            If True, consider only finite values of `metric`.
+
+        metric : str, default 'mean'
+            Metric used to determine valid measurements.
+
+        exclusive : bool, default True
+            If True, return the end of the final sampling interval:
+
+                last_sample_time + sampling_interval
+
+            If False, return the timestamp of the final sample.
+
+        Returns
+        -------
+        obspy.UTCDateTime or None
+
+        Examples
+        --------
+        >>> sam.get_endtime()
+        >>> sam.get_endtime(non_null=True)
+        >>> sam.get_endtime(non_null=True, exclusive=False)
+        """
+        ends = []
+
+        for df in self.dataframes.values():
+
+            t = self.__get_endtime(
+                df,
+                non_null=non_null,
+                metric=metric,
+            )
+
+            if t is None:
+                continue
+
+            if exclusive:
+                dt = self.get_sampling_interval(df)
+
+                if np.isfinite(dt) and dt > 0:
+                    t += float(dt)
+
+            ends.append(t)
+
+        return max(ends) if ends else None
+
+
+    def get_duration(self, non_null=False, metric="mean"):
+        """
+        Return the duration of the combined SAM object in seconds.
+
+        Duration spans the earliest start and latest exclusive end
+        across all dataframes.
+
+        Parameters
+        ----------
+        non_null : bool, default False
+            If True, use the extent of finite measurements.
+
+        metric : str, default 'mean'
+            Metric used to determine valid measurements.
+
+        Returns
+        -------
+        float or None
+
+        Notes
+        -----
+        This is the elapsed time span, not the cumulative duration
+        of valid measurements. Internal gaps are included.
+        """
+        start = self.get_starttime(
+            non_null=non_null,
+            metric=metric,
+        )
+
+        end = self.get_endtime(
+            non_null=non_null,
+            metric=metric,
+        )
+
+        if start is None or end is None:
+            return None
+
+        return float(end - start)
+
+
     @property
     def starttime(self):
         """
-        Return the earliest start time across all dataframes as UTCDateTime.
+        Earliest timestamp across all dataframes.
+
+        Includes rows containing missing metric values.
         """
-        tmin = None
+        return self.get_starttime(non_null=False)
 
-        for df in self.dataframes.values():
-            if df is None or df.empty:
-                continue
-            if "time" not in df.columns:
-                continue
-
-            t = pd.to_numeric(df["time"], errors="coerce")
-            if t.empty:
-                continue
-
-            this_min = t.min()
-            if not np.isfinite(this_min):
-                continue
-
-            if tmin is None or this_min < tmin:
-                tmin = float(this_min)
-
-        return UTCDateTime(tmin) if tmin is not None else None
 
     @property
     def endtime(self):
         """
-        Return the latest implied end time across all dataframes as UTCDateTime.
+        Latest exclusive end time across all dataframes.
 
-        Uses:
-            last_sample_time + sampling_interval
+        Includes rows containing missing metric values.
         """
-        tmax = None
+        return self.get_endtime(non_null=False)
 
-        for df in self.dataframes.values():
-            if df is None or df.empty:
-                continue
-            if "time" not in df.columns:
-                continue
-
-            dt = self.get_sampling_interval(df)
-            if not np.isfinite(dt):
-                continue
-
-            t = pd.to_numeric(df["time"], errors="coerce")
-            if t.empty:
-                continue
-
-            this_max = t.max()
-            if not np.isfinite(this_max):
-                continue
-
-            this_end = float(this_max) + float(dt)
-
-            if tmax is None or this_end > tmax:
-                tmax = this_end
-
-        return UTCDateTime(tmax) if tmax is not None else None
 
     @property
     def duration(self):
-        """Return the duration of the first non-empty dataframe in seconds."""
-        st = self.starttime
-        et = self.endtime
-        if st is None or et is None:
-            return None
-        return et - st
-    
+        """
+        Total elapsed time span in seconds, including missing data.
+        """
+        return self.get_duration(non_null=False)
+
+
+    def trim_to_data(
+        self,
+        metric="mean",
+        per_station=False,
+        inplace=False,
+        drop_empty=True,
+    ):
+        """
+        Trim leading and trailing intervals containing no valid data.
+
+        Internal gaps are preserved.
+
+        Parameters
+        ----------
+        metric : str, default 'mean'
+            Metric used to identify valid measurements.
+
+        per_station : bool, default False
+            If False, trim all dataframes to the common network-wide
+            interval containing valid measurements.
+
+            If True, trim each dataframe independently to its
+            own first and last valid measurement.
+
+        inplace : bool, default False
+            If True, modify the existing object.
+
+            If False, return a new object.
+
+        drop_empty : bool, default True
+            If True, remove dataframes containing no finite values
+            in the selected metric.
+
+        Returns
+        -------
+        SAM or subclass
+            Trimmed object.
+
+        Notes
+        -----
+        - Missing values within the retained interval are preserved.
+        - Zero is treated as a valid measurement.
+        - The first and last valid samples are included.
+        - The sampling interval is not changed.
+        """
+        if not per_station:
+            global_start = self.get_starttime(
+                non_null=True,
+                metric=metric,
+            )
+
+            global_end = self.get_endtime(
+                non_null=True,
+                metric=metric,
+                exclusive=False,
+            )
+
+            if global_start is None or global_end is None:
+                global_tmin = None
+                global_tmax = None
+            else:
+                global_tmin = float(global_start.timestamp)
+                global_tmax = float(global_end.timestamp)
+
+        new_dataframes = {}
+
+        for seed_id, df in self.dataframes.items():
+
+            if df is None or df.empty:
+                if not drop_empty and df is not None:
+                    new_dataframes[seed_id] = df.copy()
+                continue
+
+            if metric not in df.columns:
+                if not drop_empty:
+                    new_dataframes[seed_id] = df.copy()
+                continue
+
+            if "time" not in df.columns:
+                if not drop_empty:
+                    new_dataframes[seed_id] = df.copy()
+                continue
+
+            times = pd.to_numeric(
+                df["time"], errors="coerce"
+            ).to_numpy(dtype=float)
+
+            values = pd.to_numeric(
+                df[metric], errors="coerce"
+            ).to_numpy(dtype=float)
+
+            valid = np.isfinite(times) & np.isfinite(values)
+
+            if not valid.any():
+                if not drop_empty:
+                    new_dataframes[seed_id] = df.copy()
+                continue
+
+            if per_station:
+                tmin = float(np.min(times[valid]))
+                tmax = float(np.max(times[valid]))
+
+            else:
+                if global_tmin is None:
+                    if not drop_empty:
+                        new_dataframes[seed_id] = df.copy()
+                    continue
+
+                tmin = global_tmin
+                tmax = global_tmax
+
+            mask = (
+                np.isfinite(times)
+                & (times >= tmin)
+                & (times <= tmax)
+            )
+
+            trimmed = (
+                df.loc[mask]
+                .copy()
+                .reset_index(drop=True)
+            )
+
+            if not trimmed.empty or not drop_empty:
+                new_dataframes[seed_id] = trimmed
+
+        if inplace:
+            self.dataframes = new_dataframes
+            return self
+
+        return self.__class__(
+            dataframes=new_dataframes,
+            sampling_interval=self.sampling_interval,
+        )
     
     @property
     def seed_ids(self):
@@ -2204,6 +2556,7 @@ class RSAM(SAM):
     def get_filename(SAM_DIR, id, year, sampling_interval, ext, name='RSAM'):
         return SAM.get_filename(SAM_DIR, id, year, sampling_interval, ext, name=name)
 
+    '''
     @classmethod
     def readRSAMbinary(cls, SAM_DIR=None, station=None, stime=None, etime=None,
                     filepath=None, sampling_interval=60, verbose=False,
@@ -2363,7 +2716,353 @@ class RSAM(SAM):
                 return cls(stream=stream, sampling_interval=sampling_interval)
 
         raise ValueError("Invalid arguments provided to readRSAMbinary.")    
+    '''
+    
+    @classmethod
+    def readRSAMbinary(
+        cls,
+        SAM_DIR=None,
+        station=None,
+        stime=None,
+        etime=None,
+        filepath=None,
+        sampling_interval=600,
+        verbose=False,
+        convert_legacy_ids_using_this_network=None,
+        fill_missing_with=None,
+        skip_first_day=True,
+        byteorder="native",
+    ):
+        """
+        Read legacy VDAP RSAM binary files into an RSAM object.
 
+        Archived RSAM values are preserved directly. They are NOT
+        passed through SAM's waveform-processing constructor.
+
+        Parameters
+        ----------
+        SAM_DIR : str or Path, optional
+            Directory containing legacy RSAM files.
+
+        station : str or list[str], optional
+            Station code(s) for structured archive reading.
+
+        stime, etime : obspy.UTCDateTime, optional
+            Requested time interval. Inclusive endpoints.
+
+        filepath : str or Path, optional
+            Read one legacy RSAM file directly.
+
+        sampling_interval : float
+            RSAM sampling interval in seconds.
+            Typically 60 or 600 seconds. Default 600.
+
+        verbose : bool
+            Print file-reading diagnostics.
+
+        convert_legacy_ids_using_this_network : str, optional
+            Network code for legacy SEED-ID conversion.
+
+        fill_missing_with : float or None
+            Replacement for missing values.
+            None preserves NaNs (recommended).
+
+        skip_first_day : bool
+            Skip the first day's records. Default True,
+            matching the original legacy reader.
+
+        byteorder : {'native', 'little', 'big'}
+            Binary float32 byte order.
+
+        Returns
+        -------
+        RSAM
+            RSAM object containing dataframes with columns:
+            time, mean.
+
+        Notes
+        -----
+        Legacy files may contain 366 days of records even for
+        non-leap years, with the first day representing padding.
+
+        The time axis is assumed to begin at January 1 after
+        skipping the first day. This convention should be
+        verified against the original archive documentation.
+        """
+
+        import os
+        import re
+        import numpy as np
+        import pandas as pd
+
+        from pathlib import Path
+        from obspy import UTCDateTime
+
+        if sampling_interval <= 0:
+            raise ValueError("sampling_interval must be positive")
+
+        records_per_day = 86400 / sampling_interval
+
+        if not float(records_per_day).is_integer():
+            raise ValueError(
+                "sampling_interval must divide 86400 exactly"
+            )
+
+        records_per_day = int(records_per_day)
+
+        dtype_map = {
+            "native": "=f4",
+            "little": "<f4",
+            "big": ">f4",
+        }
+
+        if byteorder not in dtype_map:
+            raise ValueError(
+                "byteorder must be 'native', 'little', or 'big'"
+            )
+
+        dtype = np.dtype(dtype_map[byteorder])
+
+        if stime is not None:
+            stime = UTCDateTime(stime)
+
+        if etime is not None:
+            etime = UTCDateTime(etime)
+
+        if stime is not None and etime is not None:
+            if etime < stime:
+                raise ValueError("etime must not precede stime")
+
+        def parse_filename(path):
+            """
+            Parse legacy names such as PPOZ91.DAT.
+            """
+            name = Path(path).stem.upper()
+
+            match = re.fullmatch(
+                r"([A-Z0-9]+?)(\d{2}|\d{4})",
+                name
+            )
+
+            if not match:
+                raise ValueError(
+                    f"Cannot parse station/year from {path}"
+                )
+
+            station_code = match.group(1)
+            year_text = match.group(2)
+
+            if len(year_text) == 2:
+                yy = int(year_text)
+                year = 2000 + yy if yy < 50 else 1900 + yy
+            else:
+                year = int(year_text)
+
+            return station_code, year
+
+        def make_trace_id(station_code):
+            """
+            Construct a stable legacy trace ID.
+
+            Preserve the original four-character station/component
+            identifier unless explicit legacy conversion is requested.
+            """
+            if convert_legacy_ids_using_this_network:
+                from obspy import Trace
+
+                tr = Trace(data=np.empty(0, dtype=np.float32))
+                tr.stats.station = station_code
+
+                fix_legacy_vdap_id(
+                    tr,
+                    network=convert_legacy_ids_using_this_network,
+                    add_T=False,
+                )
+
+                return tr.id
+
+            return f"..{station_code}."
+
+        def read_file(path):
+            path = Path(path)
+
+            if not path.is_file():
+                raise FileNotFoundError(path)
+
+            station_code, year = parse_filename(path)
+
+            if verbose:
+                print(f"Reading {path}")
+
+            # Read the complete binary file.
+            values = np.fromfile(path, dtype=dtype)
+
+            if skip_first_day:
+                if len(values) <= records_per_day:
+                    raise ValueError(
+                        f"{path.name}: file too short to skip first day"
+                    )
+
+                values = values[records_per_day:]
+
+            # Convert to native float32 and sanitize missing values.
+            data = values.astype(np.float32, copy=True)
+
+            data[data == -998.0] = np.nan
+            data[~np.isfinite(data)] = np.nan
+
+            # Time axis begins January 1 after optional padding.
+            start = UTCDateTime(year, 1, 1)
+
+            times = (
+                start.timestamp
+                + np.arange(len(data), dtype=np.float64)
+                * sampling_interval
+            )
+
+            # Restrict to the calendar year. This also handles
+            # annual files with additional trailing padding.
+            year_end = UTCDateTime(year + 1, 1, 1)
+
+            mask = times < year_end.timestamp
+
+            if stime is not None:
+                mask &= times >= stime.timestamp
+
+            if etime is not None:
+                mask &= times <= etime.timestamp
+
+            times = times[mask]
+            data = data[mask]
+
+            if fill_missing_with is not None:
+                data = np.nan_to_num(
+                    data,
+                    nan=fill_missing_with,
+                    posinf=fill_missing_with,
+                    neginf=fill_missing_with,
+                )
+
+            df = pd.DataFrame({
+                "time": times,
+                "mean": data,
+            })
+
+            trace_id = make_trace_id(station_code)
+
+            if verbose:
+                finite = np.isfinite(data)
+
+                print(
+                    f"  Station: {station_code}\n"
+                    f"  Year: {year}\n"
+                    f"  Interval: {sampling_interval} s\n"
+                    f"  Samples: {len(data)}\n"
+                    f"  Finite: {finite.sum()}\n"
+                    f"  Missing: {(~finite).sum()}"
+                )
+
+            return trace_id, df
+
+        # -----------------------------------------------------
+        # Determine which files to read.
+        # -----------------------------------------------------
+
+        if filepath is not None:
+
+            paths = [Path(filepath)]
+
+        else:
+
+            if SAM_DIR is None:
+                raise ValueError(
+                    "Provide filepath or SAM_DIR"
+                )
+
+            if station is None:
+                raise ValueError(
+                    "Provide station when using SAM_DIR"
+                )
+
+            if stime is None or etime is None:
+                raise ValueError(
+                    "stime and etime are required for "
+                    "structured archive reading"
+                )
+
+            if isinstance(station, str):
+                stations = [station]
+            else:
+                stations = list(station)
+
+            paths = []
+
+            for sta in stations:
+                for year in range(
+                    stime.year,
+                    etime.year + 1
+                ):
+                    # Support both 2-digit and 4-digit years.
+                    candidates = [
+                        Path(SAM_DIR) / f"{sta}{year % 100:02d}.DAT",
+                        Path(SAM_DIR) / f"{sta}{year}.DAT",
+                    ]
+
+                    for candidate in candidates:
+                        if candidate.is_file():
+                            paths.append(candidate)
+                            break
+
+        # -----------------------------------------------------
+        # Read and combine dataframes.
+        # -----------------------------------------------------
+
+        dataframes = {}
+
+        for path in paths:
+
+            try:
+                trace_id, df = read_file(path)
+
+                if trace_id in dataframes:
+                    dataframes[trace_id] = pd.concat(
+                        [dataframes[trace_id], df],
+                        ignore_index=True,
+                    )
+                else:
+                    dataframes[trace_id] = df
+
+            except Exception as exc:
+                if filepath is not None:
+                    raise
+
+                if verbose:
+                    print(
+                        f"Error reading {path}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+        # Sort, remove duplicate timestamps, and reset index.
+        for trace_id, df in dataframes.items():
+
+            df = (
+                df.sort_values("time")
+                .drop_duplicates(
+                    subset="time",
+                    keep="last",
+                )
+                .reset_index(drop=True)
+            )
+
+            dataframes[trace_id] = df
+
+        # IMPORTANT:
+        # Construct directly from existing RSAM dataframes.
+        # Do not pass RSAM samples through SAM(stream=...).
+        return cls(
+            dataframes=dataframes,
+            sampling_interval=sampling_interval,
+        )
 
 ########################################################################################################################
 
