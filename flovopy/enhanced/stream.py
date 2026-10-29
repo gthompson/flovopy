@@ -102,6 +102,17 @@ class EnhancedStream(Stream):
         if "energy" not in m:
             m["energy"] = float(np.nansum(y*y) * float(tr.stats.delta)) if y.size else np.nan
 
+    def extract_features(self, noise_by_id=None, *, config=None, attach=True):
+        """Return one result per trace, preserving duplicate IDs and order.
+
+        noise_by_id maps exact NSLC IDs to explicitly selected noise traces.
+        Existing ampengfft metrics and station aggregates are not changed.
+        """
+        from flovopy.core.features import extract_trace_features
+        noise_by_id = {} if noise_by_id is None else noise_by_id
+        return [extract_trace_features(tr, noise_by_id.get(tr.id),
+                                       config=config, attach=attach) for tr in self]
+
     # ---------------- pressure metrics (PAP, bandpassed PAP) ----------------
     @staticmethod
     def _pressure_metrics(tr: Trace, band=(1.0, 20.0)) -> tuple[float, float]:
@@ -204,9 +215,10 @@ class EnhancedStream(Stream):
         compute_ssam: bool = False,
         compute_bandratios: bool = False,
         stream_units: str = "m/s",
+        allow_uncalibrated: bool = False,
         compute_sam: bool = True,
         compute_sem: bool = False,
-        bands: tuple[float, float, float, float] = (0.8, 4.0, 4.0, 20.0),
+        bands: tuple[float, float, float, float] = (0.5, 2.0, 2.0, 8.0),
         pressure_band: tuple[float, float] = (1.0, 20.0),
         disp_highpass_hz: float = 0.2,
         sam_stat: str = "mean_abs",
@@ -216,21 +228,19 @@ class EnhancedStream(Stream):
         window_length: int = 9,
         polyorder: int = 2,
         remove_bad_traces: bool = False,
-        allow_uncalibrated: bool = False,
         verbose: bool = False,
     ) -> None:
         """
         Compute per-trace amplitude/energy/frequency metrics and station-level rollups.
 
+        With allow_uncalibrated=True, counts receive descriptive statistics,
+        SAM/SEM and optional spectra, without physical motion/pressure metrics.
+        The default continues to reject counts and unspecified units.
+
         Expected corrected units:
         - seismic displacement: "m"
         - seismic velocity: "m/s"
         - pressure: "Pa"
-
-        With allow_uncalibrated=True, counts/relative_counts are processed as
-        dimensionless amplitudes: sample statistics, energy proxy, SAM/SEM and
-        optional spectral metrics. Physical PGD/PGV/PGA/fdom are not estimated.
-        The input traces are never detrended in place.
 
         For seismic traces:
         - PGD is max(abs(displacement))
@@ -257,14 +267,13 @@ class EnhancedStream(Stream):
         for tr in list(self):
             m = self._ensure_metrics(tr)
 
-            work = tr.copy()
             try:
-                work.detrend("linear")
+                tr.detrend("linear")
             except Exception:
                 pass
 
-            dt = float(work.stats.delta)
-            y_raw = np.asarray(work.data, dtype=np.float64)
+            dt = float(tr.stats.delta)
+            y_raw = np.asarray(tr.data, dtype=np.float64)
 
             units_raw = tr.stats.get("units", None)
             units = str(units_raw).strip().lower() if units_raw is not None else ""
@@ -275,16 +284,13 @@ class EnhancedStream(Stream):
             vel = disp = acc = None
             is_seismic = True
 
-            is_counts = units in ("counts", "count", "relative_counts")
-            if is_counts and allow_uncalibrated:
+            if allow_uncalibrated and units in ["", "none", "counts", "count"]:
                 self._td_stats(tr, y_raw)
-                m["amplitude_units"] = units_raw
-                m["calibration_status"] = "uncalibrated" if units != "relative_counts" else "relative"
-                m["pgd"] = m["pgv"] = m["pga"] = m["fdom"] = np.nan
-                m["pgd_units"] = m["pgv_units"] = m["pga_units"] = None
+                m["amplitude_units"] = "counts" if units in ["counts", "count"] else "unknown"
+                m["uncalibrated"] = True
                 is_seismic = False
 
-            elif units in ["", "none", "counts", "count", "relative_counts"]:
+            elif units in ["", "none", "counts", "count"]:
                 msg = (
                     f"[AMPENGFFT] Missing/uncorrected units for {tr.id}. "
                     "Set tr.stats.units before calling ampengfft()."
@@ -296,14 +302,14 @@ class EnhancedStream(Stream):
                 continue
 
             elif units in ["m", "meter", "meters"]:
-                disp = work.copy()
-                vel = work.copy().differentiate()
+                disp = tr.copy()
+                vel = tr.copy().differentiate()
                 acc = vel.copy().differentiate()
 
             elif units in ["m/s", "meter/second", "meters/second", "mps"]:
-                vel = work.copy()
+                vel = tr.copy()
 
-                disp = work.copy().integrate()
+                disp = tr.copy().integrate()
                 try:
                     disp.detrend("linear")
                     if disp_highpass_hz is not None and disp_highpass_hz > 0:
@@ -317,11 +323,11 @@ class EnhancedStream(Stream):
                     if verbose:
                         print(f"  displacement integration/highpass warning for {tr.id}: {e}")
 
-                acc = work.copy().differentiate()
+                acc = tr.copy().differentiate()
 
             elif units in ["m/s/s", "m/s^2", "m s-2", "mps2"]:
-                acc = work.copy()
-                vel = work.copy().integrate()
+                acc = tr.copy()
+                vel = tr.copy().integrate()
                 try:
                     vel.detrend("linear")
                     if disp_highpass_hz is not None and disp_highpass_hz > 0:
@@ -351,7 +357,7 @@ class EnhancedStream(Stream):
 
             elif units in ["pa", "pascal", "pascals"]:
                 self._td_stats(tr, y_raw)
-                pap, pap_bp = self._pressure_metrics(work, band=pressure_band)
+                pap, pap_bp = self._pressure_metrics(tr, band=pressure_band)
                 m["pap"] = pap
 
                 lo, hi = pressure_band
@@ -405,7 +411,7 @@ class EnhancedStream(Stream):
             if compute_sam or compute_sem:
                 l1, l2, h1, h2 = bands
                 self._compute_sam_sem(
-                    work,
+                    tr,
                     low=(l1, l2),
                     high=(h1, h2),
                     sam_stat=sam_stat,
@@ -413,8 +419,6 @@ class EnhancedStream(Stream):
                     corners=2,
                     zerophase=True,
                 )
-                m["sam"] = self._ensure_metrics(work).get("sam")
-                m["sem"] = self._ensure_metrics(work).get("sem")
                 if not compute_sam:
                     self._ensure_metrics(tr).pop("sam", None)
                 if not compute_sem:
@@ -422,7 +426,7 @@ class EnhancedStream(Stream):
 
             if compute_spectral:
                 spectral_block(
-                    work,
+                    tr,
                     y_raw,
                     dt,
                     threshold=threshold,
@@ -431,10 +435,7 @@ class EnhancedStream(Stream):
                     compute_ssam=compute_ssam,
                     compute_bandratios=compute_bandratios,
                     helper=None,
-                    bands=bands,
                 )
-                if "spectral" in self._ensure_metrics(work):
-                    m["spectral"] = self._ensure_metrics(work)["spectral"]
 
         if remove_bad_traces:
             for tr in bad_traces:
@@ -532,8 +533,7 @@ class EnhancedStream(Stream):
         groups: dict[str, dict[str, list]] = defaultdict(lambda: {"seis": [], "infra": []})
         for tr in self:
             key = self._station_key(tr)
-            units = str(tr.stats.get("units", "")).strip().lower()
-            if self._is_seismic(tr) and units not in ("counts", "count", "relative_counts", "", "none"):
+            if self._is_seismic(tr):
                 groups[key]["seis"].append(tr)
             elif self._is_infrasound(tr):
                 groups[key]["infra"].append(tr)

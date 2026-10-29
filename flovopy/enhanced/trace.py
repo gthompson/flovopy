@@ -37,3 +37,8 @@ class EnhancedTrace(Trace):
         if not hasattr(self.stats, "metrics") or self.stats.metrics is None:
             self.stats.metrics = {}
         return self.stats.metrics
+
+    def extract_features(self, noise_trace=None, *, config=None, attach=True):
+        """Compute versioned event descriptors without changing waveform data."""
+        from flovopy.core.features import extract_trace_features
+        return extract_trace_features(self, noise_trace, config=config, attach=attach)
