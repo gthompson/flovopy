@@ -51,14 +51,12 @@ def compute_amplitude_spectra(
         if y.size < 2:
             continue
 
+        work = tr.copy()
         if detrend:
-            # in-place operations on a copy
-            tr = tr.copy().detrend("linear")
-            y = np.asarray(tr.data, dtype=np.float64)
-
+            work.detrend("linear")
         if taper and taper > 0:
-            tr = tr.copy().taper(max(0.0, min(1.0, float(taper))))
-            y = np.asarray(tr.data, dtype=np.float64)
+            work.taper(max(0.0, min(1.0, float(taper))))
+        y = np.asarray(work.data, dtype=np.float64)
 
         if window:
             try:
@@ -333,12 +331,13 @@ def spectral_block(
     compute_bandratios: bool = False,
     helper: callable | None = None,     # optional: fn(Stream, **opts) that fills .stats.spectral
     helper_opts: dict | None = None,
+    bands: tuple[float, float, float, float] = (0.8, 4.0, 4.0, 20.0),
 ) -> None:
     """
     Compute one-sided amplitude spectrum for `y` and store:
       - arrays:  tr.stats.spectral["freqs"], ["amplitudes"]
       - summaries: tr.stats.metrics["spectral"] = {...}
-        keys include: peakf, meanf, medianf, peakA, bandwidth, f_low, f_high
+        keys include: peakf, meanf, peakA, bandwidth, f_low, f_high
         and optional: ssam {f, A}, bandratio {freqlims, low_sum, high_sum, ratio}
     """
     m = _ensure_metrics(tr)
@@ -371,9 +370,7 @@ def spectral_block(
             F = A = None
 
     if F is None or A is None:
-        N = int(tr.stats.npts)
-        if N < 2:
-            return
+        N = y.size
         A = np.abs(rfft(y))
         F = rfftfreq(N, d=dt)
 
@@ -391,26 +388,35 @@ def spectral_block(
     )
     spm.update(bw)
 
-    # ---- simple spectral summaries ----
-    if A.size and np.any(A > 0):
-        peak_idx = int(np.nanargmax(A))
-        peakf   = float(F[peak_idx])
-        meanf   = float(np.nansum(F * A) / np.nansum(A))
-        medianf = float(np.nanmedian(F[A > 0]))
-        peakA   = float(np.nanmax(A))
+    # ---- power-weighted mean frequency (spectral centroid) ----
+    # P_i = |FFT(y)_i|**2. The common FFT scaling cancels in the ratio.
+    # This is NOT the median frequency and NOT an amplitude-weighted mean.
+    valid = np.isfinite(F) & np.isfinite(A) & (A >= 0)
+    fv = np.asarray(F[valid], dtype=float)
+    av = np.asarray(A[valid], dtype=float)
+    if av.size and np.any(av > 0):
+        peak_idx = int(np.argmax(av))
+        peakf = float(fv[peak_idx])
+        peakA = float(av[peak_idx])
+        # Scale before squaring to avoid overflow on large spectra.
+        scaled = av / peakA
+        power = scaled * scaled
+        total_power = float(np.sum(power))
+        meanf = float(np.sum(fv * power) / total_power) if total_power > 0 else np.nan
     else:
-        peakf = meanf = medianf = peakA = np.nan
+        peakf = meanf = peakA = np.nan
 
-    spm["peakf"]   = peakf
-    spm["meanf"]   = meanf
-    spm["medianf"] = medianf
-    spm["peakA"]   = peakA
+    spm["peakf"] = peakf
+    spm["meanf"] = meanf
+    spm["peakA"] = peakA
+    # Remove stale legacy median-frequency metrics on repeated processing.
+    spm.pop("medianf", None)
 
-    # keep old back-compat mirror if someone uses tr.stats.spectrum
     s = getattr(tr.stats, "spectrum", {}) or {}
     s["peakF"] = peakf
-    s["medianF"] = medianf
+    s["meanF"] = meanf
     s["peakA"] = peakA
+    s.pop("medianF", None)
     tr.stats.spectrum = s
 
     # ---- optional extras under m["spectral"] ----
@@ -418,8 +424,7 @@ def spectral_block(
         _ssam(tr)  # writes into m["spectral"]["ssam"]
 
     if compute_bandratios:
-        _band_ratio(tr, freqlims=[1.0, 6.0, 11.0])     # writes into m["spectral"]["bandratio"]
-        _band_ratio(tr, freqlims=[0.5, 3.0, 18.0])
+        _band_ratio(tr, bands=bands)
 
 
 def _ssam(tr: Trace, freq_bins: np.ndarray | None = None) -> None:
@@ -450,43 +455,46 @@ def _ssam(tr: Trace, freq_bins: np.ndarray | None = None) -> None:
     spm["ssam"] = {"f": np.asarray(centers), "A": np.asarray(values)}
 
 
-def _band_ratio(tr: Trace, freqlims: list[float] = [1.0, 6.0, 11.0]) -> None:
+def _band_ratio(
+    tr: Trace,
+    freqlims: list[float] | None = None,
+    *,
+    bands: tuple[float, float, float, float] | None = None,
+) -> None:
+    """Log2 ratio of mean spectral amplitude per Hz in two bands.
+
+    `freqlims=(low, split, high)` is accepted for backward compatibility.
+    The output retains `low_sum` and `high_sum` for historical consumers,
+    but ratio uses bandwidth-normalized means so unequal linear bandwidths
+    do not bias the ratio. `ratio_sum_legacy` records the old definition.
     """
-    Compute log2(sum(A_high)/sum(A_low)) using spectral data and store under:
-      tr.stats.metrics["spectral"]["bandratio"] = {
-        'freqlims': [low, split, high],
-        'low_sum': float, 'high_sum': float, 'ratio': float
-      }
-    """
-    f = A = None
+    if bands is None:
+        bands = (freqlims[0], freqlims[1], freqlims[1], freqlims[2]) if freqlims is not None else (0.8, 4.0, 4.0, 20.0)
+    l0, l1, h0, h1 = map(float, bands)
+    if not (0 <= l0 < l1 <= h0 < h1):
+        raise ValueError(f"Invalid bands: {bands}")
     spec = getattr(tr.stats, "spectral", None)
-    if spec and "freqs" in spec and "amplitudes" in spec:
-        f = np.asarray(spec["freqs"], dtype=float)
-        A = np.asarray(spec["amplitudes"], dtype=float)
-    elif hasattr(tr.stats, "spectrum"):
-        f = np.asarray(tr.stats.spectrum.get("F"), dtype=float)
-        A = np.asarray(tr.stats.spectrum.get("A"), dtype=float)
-
-    if f is None or A is None or f.size == 0 or A.size == 0:
+    if not spec or "freqs" not in spec or "amplitudes" not in spec:
         return
-
-    idx_low  = np.where((f > freqlims[0]) & (f < freqlims[1]))[0]
-    idx_high = np.where((f > freqlims[1]) & (f < freqlims[2]))[0]
-
-    low_sum  = float(np.nansum(A[idx_low]))  if idx_low.size  else np.nan
-    high_sum = float(np.nansum(A[idx_high])) if idx_high.size else np.nan
-
-    ratio = np.nan
-    if np.isfinite(low_sum) and low_sum > 0 and np.isfinite(high_sum):
-        ratio = float(np.log2(high_sum / low_sum))
-
+    f = np.asarray(spec["freqs"], dtype=float)
+    A = np.asarray(spec["amplitudes"], dtype=float)
+    valid = np.isfinite(f) & np.isfinite(A) & (A >= 0)
+    low = valid & (f >= l0) & (f < l1)
+    high = valid & (f >= h0) & (f <= h1)
+    low_sum = float(np.sum(A[low])) if low.any() else np.nan
+    high_sum = float(np.sum(A[high])) if high.any() else np.nan
+    low_mean = float(np.mean(A[low])) if low.any() else np.nan
+    high_mean = float(np.mean(A[high])) if high.any() else np.nan
+    ratio = float(np.log2(high_mean / low_mean)) if low_mean > 0 and high_mean > 0 else np.nan
+    legacy = float(np.log2(high_sum / low_sum)) if low_sum > 0 and high_sum > 0 else np.nan
     m = _ensure_metrics(tr)
-    spm = m.setdefault("spectral", {})
-    spm["bandratio"] = {
-        "freqlims": freqlims,
-        "low_sum": low_sum,
-        "high_sum": high_sum,
-        "ratio": ratio,
+    m.setdefault("spectral", {})["bandratio"] = {
+        "bands": [l0, l1, h0, h1],
+        "freqlims": [l0, l1, h1] if l1 == h0 else None,
+        "low_sum": low_sum, "high_sum": high_sum,
+        "low_mean": low_mean, "high_mean": high_mean,
+        "ratio": ratio, "ratio_sum_legacy": legacy,
+        "definition": "log2(mean_fft_amplitude_high / mean_fft_amplitude_low)",
     }
 
 
