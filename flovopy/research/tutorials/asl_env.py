@@ -2,8 +2,8 @@
 from pathlib import Path
 #from datetime import datetime
 from obspy import read_inventory, UTCDateTime
-from flovopy.asl.map import topo_map  # your function
-#from flovopy.asl.grid import make_grid, Grid, _meters_per_degree,  apply_channel_land_circle_mask
+from flowloc.map import topo_map  # your function
+#from flowloc.grid import make_grid, Grid, _meters_per_degree,  apply_channel_land_circle_mask
 
 DROPBOXDIR = Path('~').expanduser() / 'Dropbox'
 PROJECTDIR = DROPBOXDIR / "BRIEFCASE" / "SSADenver"

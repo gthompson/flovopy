@@ -11,10 +11,10 @@ import numpy as np
 import pandas as pd
 from obspy import read_inventory
 from importlib import reload
-from flovopy.asl.wrappers import run_single_event, find_event_files, run_all_events
+from flowloc.wrappers import run_single_event, find_event_files, run_all_events
 from flovopy.research.mvo.mvo_ids import DOME_LOCATION, REGION_DEFAULT
 from flovopy.processing.sam import VSAM, DSAM 
-from flovopy.asl.config import ASLConfig, tweak_config
+from flowloc.config import ASLConfig, tweak_config
 # -------------------------- Config --------------------------
 # directories
 HOME = Path.home()
@@ -52,7 +52,7 @@ station_corrections_df = pd.read_csv(station_corrections_csv)
 annual_station_corrections_df = pd.read_csv(annual_station_corrections_csv)
 
 # Montserrat pre-defined Grid (from 02 tutorial)
-from flovopy.asl.grid import Grid
+from flowloc.grid import Grid
 gridobj = Grid.load(GRIDFILE_DEFAULT)
 print(gridobj)
 landgridobj = Grid.load(GLOBAL_CACHE / "land" / "Grid_9c2fd59b.pkl")

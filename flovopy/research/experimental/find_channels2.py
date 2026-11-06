@@ -39,7 +39,7 @@ except Exception:
 # ============================= Optional ASL NodeGrid =============================
 _HAVE_ASL = True
 try:
-    from flovopy.asl.grid import NodeGrid
+    from flowloc.grid import NodeGrid
 except Exception:
     _HAVE_ASL = False
 
