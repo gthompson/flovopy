@@ -13,24 +13,24 @@ import numpy as np
 import pandas as pd
 from obspy import read_inventory, UTCDateTime
 from importlib import reload
-from flovopy.asl.wrappers import run_single_event, find_event_files, run_all_events
+from flowloc.wrappers import run_single_event, find_event_files, run_all_events
 from flovopy.processing.sam import VSAM, DSAM 
-from flovopy.asl.config import ASLConfig, tweak_config
+from flowloc.config import ASLConfig, tweak_config
 
 # Core ASL + utilities
-from flovopy.asl.asl import ASL
-from flovopy.asl.wrappers import asl_sausage
-from flovopy.asl.grid import Grid, make_grid
-from flovopy.asl.distances import compute_or_load_distances, distances_signature
-from flovopy.asl.ampcorr import AmpCorr, AmpCorrParams
-from flovopy.asl.misfit import StdOverMeanMisfit, R2DistanceMisfit, LinearizedDecayMisfit
-from flovopy.asl.map import topo_map
+from flowloc.asl import ASL
+from flowloc.wrappers import asl_sausage
+from flowloc.grid import Grid, make_grid
+from flowloc.distances import compute_or_load_distances, distances_signature
+from flowloc.ampcorr import AmpCorr, AmpCorrParams
+from flowloc.misfit import StdOverMeanMisfit, R2DistanceMisfit, LinearizedDecayMisfit
+from flowloc.map import topo_map
 
 # --- Diagnostics / comparisons ---
-from flovopy.asl.compare import extract_asl_diagnostics, compare_asl_sources
+from flowloc.compare import extract_asl_diagnostics, compare_asl_sources
 
 # --- Simulation helpers ---
-from flovopy.asl.simulate import simulate_SAM, plot_SAM, synthetic_source_from_grid
+from flowloc.simulate import simulate_SAM, plot_SAM, synthetic_source_from_grid
 
 # -------------------------- Config --------------------------
 # directories
@@ -124,7 +124,7 @@ gridobj.plot(show=True, min_display_spacing=300, scale=2.0, topo_map_kwargs=topo
 # In[ ]:
 
 
-from flovopy.asl.find_channels import run_find_channels,  nodegrid_from_channels_dir
+from flowloc.find_channels import run_find_channels,  nodegrid_from_channels_dir
 # Your region and output directory
 
 outdir = DATA_DIR / "jacob_channels"

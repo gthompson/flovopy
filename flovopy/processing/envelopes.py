@@ -21,7 +21,6 @@ import matplotlib.pyplot as plt
 from obspy import Inventory, Stream, Trace
 from obspy.signal.filter import envelope as obspy_envelope
 
-from flovopy.asl.distances import compute_or_load_distances
 
 
 # --------------------------------------------------------------------------- #
@@ -582,7 +581,7 @@ def locate_with_grid_from_delays(
     """
     import json, os
     import matplotlib.pyplot as plt
-    from flovopy.asl.distances import compute_or_load_distances
+    from flowloc.distances import compute_or_load_distances
     # Optional: fallbacks if helpers are missing in your module
     # def _station_key(seedid, mode="sta"):
     #     try:
@@ -874,7 +873,7 @@ def locate_with_grid_from_delays(
     # --- Optional topo map with best node ---
     if topo_map_out:
         try:
-            from flovopy.asl.map import topo_map
+            from flowloc.map import topo_map
             title = "Best node (red dot) & stations"
             fig = topo_map(
                 show=False, inv=inventory, title=title,
@@ -935,7 +934,6 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Tuple, Dict, Union
 from obspy import Inventory
-from flovopy.asl.distances import compute_or_load_distances
 
 def _station_key(seed_id: str, mode: str = "sta") -> str:
     """
@@ -1016,6 +1014,7 @@ def estimate_speed_source_at_dome_from_stable_pairs(
         uncert_col = None
 
     # Load/compute node→station distances (dense arrays)
+    from flowloc.distances import compute_or_load_distances
     node_distances_km, coords_by_sta, meta = compute_or_load_distances(
         grid,
         cache_dir=cache_dir,
