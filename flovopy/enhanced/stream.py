@@ -434,6 +434,7 @@ class EnhancedStream(Stream):
                     polyorder=polyorder,
                     compute_ssam=compute_ssam,
                     compute_bandratios=compute_bandratios,
+                    bands=bands,
                     helper=None,
                 )
 

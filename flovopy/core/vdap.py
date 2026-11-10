@@ -19,11 +19,14 @@ Main functionality
 - read_station0_file
 - subset_stations_within_radius
 - fix_legacy_vdap_id
+- convert_dmx_to_seisan
+- detect_pretrigger_window (generic triggered-record onset/noise analysis)
 """
 
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +37,207 @@ from obspy.core.event import Catalog, Event, Origin, Magnitude, Comment
 
 from obspy.core.inventory import Inventory, Network, Station, Channel, Site
 
+
+# ============================================================================
+# DMX to SEISAN DB wrapper (with waveform files to MiniSEED)
+# ============================================================================
+
+
+def convert_dmx_to_seisan(
+    rawtop: str | Path,
+    seisan_wav_db: str | Path,
+    *,
+    network: str,
+    database: str,
+    sampling_rate: float | None = None,
+    pattern: str = "**/*.DMX",
+    max_files: int | None = None,
+    remove_irig: bool = True,
+    event_id_func=None,
+    id_fixer=None,
+    out_waveform_index: str | Path | None = None,
+    out_trace_id_map: str | Path | None = None,
+    out_trace_id_map_tex: str | Path | None = None,
+    out_failures: str | Path | None = None,
+    out_trace_id_provenance: str | Path | None = None,
+    overwrite: bool = False,
+    continue_on_error: bool = True,
+    verbose: bool = False,
+) -> dict:
+    """Convert legacy DMX files to SEISAN-named MiniSEED and build indexes.
+
+    ``sampling_rate`` corrects metadata only; it does not resample samples.
+    Data correction is delegated to read_dmx_file (float conversion and
+    subtraction of 2048). Low gain is preserved by fix_legacy_vdap_id.
+
+    event_id_func(path) returns an event ID, or None to reject a filename.
+    The default expects YYMMDDNN.DMX. id_fixer(trace, network=network)
+    modifies each trace in place; the default is fix_legacy_vdap_id.
+
+    Files are sorted, merged (method=1, zero-filled) and padded to the union
+    of their time windows before writing. Existing files are reused unless
+    overwrite=True. Their actual saved headers supply the waveform index;
+    their IDs and sample rates must match the proposed conversion. Reused files
+    must be regenerated explicitly to apply changed IDs or rate corrections.
+
+    Returns DataFrames: waveform_index, trace_id_map (unique verified output-ID
+    mappings), trace_id_provenance (per-file observed mappings and status),
+    failures; plus a summary dictionary. Existing-file mappings are included
+    only when saved IDs and sample rates match the proposed conversion.
+    CSV/LaTeX exports are optional; empty tables retain their column names.
+    Per-file exceptions are collected unless continue_on_error=False.
+    """
+    # Local imports avoid loading SEISAN helpers during ordinary VDAP imports.
+    from flovopy.core.trace_utils import remove_empty_traces
+    from flovopy.seisanio.utils.helpers import write_wavfile
+
+    rawtop = Path(rawtop).expanduser()
+    outroot = Path(seisan_wav_db).expanduser()
+    if not rawtop.is_dir():
+        raise NotADirectoryError(str(rawtop))
+    if not network or not database:
+        raise ValueError("network and database must be nonempty")
+    if sampling_rate is not None and (
+        not math.isfinite(sampling_rate) or sampling_rate <= 0
+    ):
+        raise ValueError("sampling_rate must be finite and positive")
+    if max_files is not None and (
+        isinstance(max_files, bool) or not isinstance(max_files, int) or max_files <= 0
+    ):
+        raise ValueError("max_files must be a positive integer or None")
+
+    event_id_func = extract_event_id if event_id_func is None else event_id_func
+    id_fixer = fix_legacy_vdap_id if id_fixer is None else id_fixer
+    files = [p for p in discover_dmx_files(rawtop, pattern) if p.is_file()]
+    if max_files is not None:
+        files = files[:max_files]
+    if not files:
+        raise FileNotFoundError(f"No files matching {pattern!r} under {rawtop}")
+
+    index_columns = ["event_id", "dmx_file", "wav_file", "starttime", "endtime",
+                     "stations", "channels", "ntraces", "status"]
+    provenance_columns = ["dmx_file", "event_id", "original_id", "fixed_id", "status"]
+    index_rows, provenance_rows, failures = [], [], []
+    successful_map = {}
+    claimed_paths = {}
+    counts = dict(processed=len(files), written=0, existing=0, empty=0, failed=0)
+
+    for i, dmx in enumerate(files, 1):
+        event_id = None
+        pairs = []
+        status = "failed"
+        stage = "event_id"
+        try:
+            event_id = event_id_func(dmx)
+            if not event_id:
+                raise ValueError(f"Cannot derive event ID from {dmx.name}")
+            if verbose:
+                print(f"[{i}/{len(files)}] {event_id}: {dmx}")
+            stage = "read"
+            st = read_dmx_file(dmx, defaultnet=network, verbose=verbose)
+            if not st:
+                raise ValueError("DMX reader returned an empty stream")
+            stage = "prepare"
+            st = remove_empty_traces(st)
+            if remove_irig:
+                remove_IRIG_channel(st)
+            if not st:
+                counts["empty"] += 1
+                status = "empty"
+                continue
+            if sampling_rate is not None:
+                fix_sampling_rate(st, sampling_rate)
+            for tr in st:
+                original = tr.stats.get("vdap_original_id", tr.id)
+                id_fixer(tr, network=network)
+                pairs.append((original, tr.id))
+
+            proposed = {}
+            for original, fixed in pairs:
+                if original in proposed and proposed[original] != fixed:
+                    raise ValueError(f"Conflicting mappings for {original}")
+                proposed[original] = fixed
+                if original in successful_map and successful_map[original] != fixed:
+                    raise ValueError(f"Mapping changed between files for {original}")
+
+            st.sort(keys=["station", "channel"])
+            st.merge(method=1, fill_value=0)
+            start = min(tr.stats.starttime for tr in st)
+            end = max(tr.stats.endtime for tr in st)
+            st.trim(start, end, pad=True, fill_value=0)
+            t = min(tr.stats.starttime for tr in st)
+            name = (f"{t.year:04d}-{t.month:02d}-{t.day:02d}-"
+                    f"{t.hour:02d}{t.minute:02d}-{t.second:02d}M."
+                    f"{str(database).ljust(5, '_')}_{len(st):03d}")
+            target = outroot / f"{t.year:04d}" / f"{t.month:02d}" / name
+            key = target.resolve()
+            if key in claimed_paths:
+                raise ValueError(f"Output filename collision with {claimed_paths[key]}: {target}")
+            claimed_paths[key] = str(dmx)
+            existed = target.exists()
+            stage = "write"
+            wavpath = Path(write_wavfile(
+                st, outroot, database,
+                skip_existing=not overwrite,
+                sort_traces=False, merge_traces=False, align_traces=False,
+            ))
+            if wavpath.resolve() != key or not wavpath.is_file():
+                raise OSError(f"Writer did not produce expected file: {target}")
+            stage = "verify"
+            # Index what is on disk, including when an existing file was reused.
+            saved = read(str(wavpath), headonly=True)
+            if not saved:
+                raise OSError(f"Saved waveform has no traces: {wavpath}")
+            expected_ids = {tr.id for tr in st}
+            if {tr.id for tr in saved} != expected_ids:
+                raise ValueError("Saved IDs differ from proposed IDs; regenerate with overwrite=True")
+            expected_rates = {(tr.id, tr.stats.sampling_rate) for tr in st}
+            if {(tr.id, tr.stats.sampling_rate) for tr in saved} != expected_rates:
+                raise ValueError("Saved sample rates differ; regenerate with overwrite=True")
+            status = "existing" if existed and not overwrite else "written"
+            index_rows.append(dict(
+                event_id=event_id, dmx_file=str(dmx), wav_file=str(wavpath),
+                starttime=min(tr.stats.starttime for tr in saved).isoformat(),
+                endtime=max(tr.stats.endtime for tr in saved).isoformat(),
+                stations=",".join(sorted({tr.stats.station for tr in saved})),
+                channels=",".join(sorted({tr.stats.channel for tr in saved})),
+                ntraces=len(saved), status=status,
+            ))
+            successful_map.update(proposed)
+            counts[status] += 1
+        except Exception as exc:
+            counts["failed"] += 1
+            failures.append(dict(dmx_file=str(dmx), event_id=event_id,
+                                 stage=stage, error=f"{type(exc).__name__}: {exc}"))
+            if verbose:
+                print(f"Failed at {stage}: {dmx} | {exc}")
+            if not continue_on_error:
+                raise
+        finally:
+            provenance_rows.extend(dict(
+                dmx_file=str(dmx), event_id=event_id, original_id=old,
+                fixed_id=new, status=status,
+            ) for old, new in pairs)
+
+    index = pd.DataFrame(index_rows, columns=index_columns)
+    mapping = pd.DataFrame(sorted(successful_map.items()),
+                           columns=["original_id", "fixed_id"])
+    provenance = pd.DataFrame(provenance_rows, columns=provenance_columns)
+    failure_table = pd.DataFrame(failures, columns=["dmx_file", "event_id", "stage", "error"])
+    for table, path in [(index, out_waveform_index), (mapping, out_trace_id_map),
+                        (failure_table, out_failures), (provenance, out_trace_id_provenance)]:
+        if path is not None:
+            path = Path(path).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            table.to_csv(path, index=False)
+    if out_trace_id_map_tex is not None:
+        path = Path(out_trace_id_map_tex).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mapping.to_latex(path, index=False, escape=True,
+                         caption="Verified output DMX trace ID mappings.",
+                         label="tab:trace_id_mapping")
+    return dict(waveform_index=index, trace_id_map=mapping,
+                trace_id_provenance=provenance, failures=failure_table, summary=counts)
 
 # -----------------------------------------------------------------------------
 # Coordinate helpers
@@ -86,69 +290,54 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # -----------------------------------------------------------------------------
 
 def parse_hypo71_line(line: str, *, verbose: bool = False) -> Optional[dict]:
-    """
-    Parse one line of HYPO71 earthquake location output.
+    """Parse the supported fixed-column HYPO71 summary dialect.
 
-    Parameters
-    ----------
-    line
-        One text line from a HYPO71 output file.
-    verbose
-        If True, print parse failures.
-
-    Returns
-    -------
-    dict or None
-        Dictionary containing parsed origin/magnitude information, or None if
-        parsing fails.
+    Normalize hour/minute/second overflow by arithmetic from midnight.
+    Blank optional quality fields are allowed; nonnumeric quality text is
+    retained in n_ass_raw/time_residual_raw without rejecting the origin.
+    Return UTCDateTime origin_time and the existing VDAP numeric field names.
+    Unsupported/malformed origin records return None (optionally logged).
     """
     try:
-        year = int(line[0:2])
-        month = int(line[2:4])
-        day = int(line[4:6])
-        hour = int(line[7:9]) if line[7:9].strip() else 0
-        minute = int(line[9:11]) if line[9:11].strip() else 0
-        seconds = float(line[12:17]) if line[12:17].strip() else 0.0
-
-        lat_deg = int(line[17:20].strip())
-        lat_hem = line[20].strip().upper()
-        lat_min = float(line[21:26].strip())
-
-        lon_deg = int(line[27:30].strip())
-        lon_hem = line[30].strip().upper()
-        lon_min = float(line[31:36].strip())
-
-        depth_km = float(line[37:43].strip())
-        magnitude = float(line[44:50].strip())
-        n_ass = int(line[51:53].strip())
-        time_residual = float(line[62:].strip())
-
-        year = year + 1900 if year >= 70 else year + 2000
-
-        add_seconds = 0.0
-        if minute == 60:
-            minute = 0
-            add_seconds = 60.0
-
-        origin_time = UTCDateTime(year, month, day, hour, minute, seconds) + add_seconds
-
+        year = int(line[0:2]); month = int(line[2:4]); day = int(line[4:6])
+        year += 1900 if year >= 70 else 2000
+        hour = int(line[7:9].strip() or 0)
+        minute = int(line[9:11].strip() or 0)
+        seconds = float(line[12:17].strip() or 0)
+        if hour < 0 or minute < 0 or not math.isfinite(seconds) or seconds < 0:
+            raise ValueError('Invalid negative/nonfinite clock field')
+        origin_time = UTCDateTime(year, month, day) + hour*3600 + minute*60 + seconds
+        lat_deg = int(line[17:20]); lat_hem = line[20].upper()
+        lat_min = float(line[21:26])
+        lon_deg = int(line[27:30]); lon_hem = line[30].upper()
+        lon_min = float(line[31:36])
+        if lat_hem not in 'NS' or lon_hem not in 'EW':
+            raise ValueError('Missing/invalid hemisphere')
+        if not (0 <= lat_min < 60 and 0 <= lon_min < 60):
+            raise ValueError('Invalid coordinate minutes')
         latitude = dm_to_decimal(lat_deg, lat_min, lat_hem)
         longitude = dm_to_decimal(lon_deg, lon_min, lon_hem)
-
-        return {
-            "origin_time": origin_time,
-            "latitude": latitude,
-            "longitude": longitude,
-            "depth_km": depth_km,
-            "magnitude": magnitude,
-            "n_ass": n_ass,
-            "time_residual": time_residual,
-        }
-
-    except Exception as e:
+        depth = float(line[37:43]); magnitude = float(line[44:50])
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            raise ValueError('Coordinates out of range')
+        if not all(math.isfinite(v) for v in (depth, magnitude)):
+            raise ValueError('Nonfinite depth/magnitude')
+        nraw = line[51:53].strip(); rraw = line[62:].strip()
+        def optional(text, converter):
+            try:
+                value = converter(text) if text else None
+                return value if value is None or math.isfinite(value) else None
+            except ValueError:
+                return None
+        return dict(origin_time=origin_time, latitude=latitude, longitude=longitude,
+                    depth_km=depth, magnitude=magnitude,
+                    n_ass=optional(nraw, int), time_residual=optional(rraw, float),
+                    n_ass_raw=nraw or None, time_residual_raw=rraw or None)
+    except (ValueError, IndexError, TypeError) as exc:
         if verbose:
-            print(f"Failed to parse HYPO71 line: {line.rstrip()} | Error: {e}")
+            print(f'Failed to parse HYPO71 line: {line.rstrip()} | {exc}')
         return None
+
 
 
 def parse_hypo71_file(file_path: str | Path, *, verbose: bool = True) -> tuple[Catalog, list[str]]:
@@ -186,8 +375,10 @@ def parse_hypo71_file(file_path: str | Path, *, verbose: bool = True) -> tuple[C
                 longitude=event_data["longitude"],
                 depth=event_data["depth_km"] * 1000.0,
             )
-            origin.comments.append(Comment(text=f"n_ass: {event_data['n_ass']}"))
-            origin.comments.append(Comment(text=f"time_residual: {event_data['time_residual']} sec"))
+            if event_data["n_ass"] is not None:
+                origin.comments.append(Comment(text=f"n_ass: {event_data['n_ass']}"))
+            if event_data["time_residual"] is not None:
+                origin.comments.append(Comment(text=f"time_residual: {event_data['time_residual']} sec"))
 
             magnitude = Magnitude(mag=event_data["magnitude"])
 
@@ -350,39 +541,47 @@ def subset_stations_within_radius(
 # DMX waveform reading
 # -----------------------------------------------------------------------------
 
-def read_dmx_file(dmx_file: str | Path, fix: bool = True, defaultnet: str = "") -> Stream:
+def read_dmx_file(
+    dmx_file: str | Path,
+    fix: bool = True,
+    defaultnet: str = "",
+    verbose: bool = False,
+) -> Stream:
     """
-    Read a DMX waveform file into an ObsPy Stream.
+    Read a legacy VDAP DMX waveform file.
 
-    Parameters
-    ----------
-    dmx_file
-        Path to DMX file.
-    fix
-        If True, apply basic metadata/data corrections.
-    defaultnet
-        Network code to assign if trace network is 'unk'.
+    If fix=True, fill missing network codes with defaultnet and convert
+    samples to float before subtracting the legacy 2048-count offset.
 
-    Returns
-    -------
-    obspy.Stream
+    Read failures are reported and return an empty Stream. Correction
+    errors propagate to the caller; partially corrected data are not returned.
+
+    Station and channel ID conversion must be applied separately.
     """
     dmx_file = Path(dmx_file)
-    st = Stream()
 
-    print(f"Reading {dmx_file}")
+    if verbose:
+        print(f"Reading {dmx_file}")
+
     try:
         st = read(str(dmx_file))
-        print("- read successful")
+    except Exception as exc:
+        print(f"Failed to read DMX file: {dmx_file} | {exc}")
+        return Stream()
 
-        if fix:
-            for tr in st:
-                if getattr(tr.stats, "network", "") == "unk":
-                    tr.stats.network = defaultnet
-                tr.data = tr.data.astype(float) - 2048.0
+    for tr in st:
+        tr.stats.vdap_original_id = tr.id
 
-    except Exception as e:
-        print(f"- Failed to read DMX file: {e}")
+    if fix:
+        for tr in st:
+            network = getattr(tr.stats, "network", None)
+            if network is None or network.strip().lower() in ("", "unk"):
+                tr.stats.network = defaultnet
+
+            tr.data = tr.data.astype(float) - 2048.0
+
+    if verbose:
+        print(f"Read successful: {len(st)} trace(s)")
 
     return st
 
@@ -492,7 +691,35 @@ def fix_legacy_vdap_id(
     trace.stats.location = loc
     trace.stats.channel = f"{bandcode}{instrumentcode}{orientationcode}"
 
+# ============================================================================
+# Helpers
+# ============================================================================
 
+def remove_IRIG_channel(st):
+    to_remove = [tr for tr in st if (tr.stats.station or "").upper().startswith("IRIG")]
+    for tr in to_remove:
+        st.remove(tr)
+
+
+def fix_sampling_rate(st, fs):
+    for tr in st:
+        tr.stats.sampling_rate = fs
+
+def discover_dmx_files(rawtop, pattern):
+    return sorted(Path(rawtop).glob(pattern))
+
+
+def extract_event_id(dmx_path: Path):
+    """
+    Extract YYMMDDNN from YYMMDDNN.DMX
+    """
+    m = re.match(r"(\d{6}[0-9A-Z]{2})\.DMX$", dmx_path.name.upper())
+    return m.group(1) if m else None
+
+
+# ============================================================================
+# Station0 to Inventory
+# ============================================================================
 
 
 def station0_to_inventory(
@@ -631,3 +858,149 @@ def station0_to_inventory(
         module=module,
     )
     return inv
+
+
+
+
+def parse_vdap_phase_line(line, *, network='', dialect='auto'):
+    """Decode one single-event VDAP phase record into pick dictionaries.
+
+    Supports compact 12-digit timestamps (YYMMDDHHMMSS.fraction) in tokenized
+    records and the documented fixed-column VDAP P/S dialect. No multi-event
+    delimiter interpretation, time clustering or outlier filtering occurs.
+    Placeholder XXXX/XXX records return []; malformed records raise ValueError.
+    Legacy station suffixes are decoded by fix_legacy_vdap_id (including L).
+    S fields contain seconds within the minute, not a P-to-S duration.
+    """
+    if dialect not in ('auto', 'tokenized', 'fixed'):
+        raise ValueError("dialect must be 'auto', 'tokenized', or 'fixed'")
+    text = line.rstrip('\r\n')
+    if not text.strip():
+        return []
+    tokens = text.split()
+    if tokens[0].upper() in ('XXX', 'XXXX'):
+        return []
+
+    def timestamp(value):
+        match = re.fullmatch(r'(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\.\d+)?', value)
+        if not match:
+            raise ValueError(f'Invalid VDAP timestamp: {value!r}')
+        yy, mo, day, hour, minute, sec = map(int, match.groups()[:6])
+        year = yy + (1900 if yy >= 70 else 2000)
+        return UTCDateTime(year, mo, day) + hour*3600 + minute*60 + sec + float(match[7] or 0)
+
+    def metadata(station):
+        if not re.fullmatch(r'[A-Z0-9]{2,6}', station):
+            raise ValueError(f'Invalid station identifier: {station!r}')
+        trace = Trace(); trace.stats.station = station
+        fix_legacy_vdap_id(trace, network=network or None)
+        return dict(station=trace.stats.station, channel=trace.stats.channel, seed_id=trace.id)
+
+    def pick(meta, phase, time, code='', weight=None):
+        onset = next((c for c in code[:1] if c in 'IE'), None)
+        motion = next((c for c in code if c in 'UD'), None)
+        if weight is None and code and code[-1].isdigit():
+            weight = int(code[-1])
+        return dict(**meta, phase=phase, time=time, onset=onset,
+                    first_motion=motion, weight=weight)
+
+    quality_pattern = r'(?P<onset>[IE])?(?P<phase>[PS])?(?P<motion>[UD])?(?P<weight>\d)?'
+    compact_quality = re.fullmatch(quality_pattern, tokens[1].upper()) if len(tokens) == 3 else None
+    token_like = ((len(tokens) == 4 and tokens[1].upper() in ('P', 'S')) or
+                  (compact_quality is not None and compact_quality['phase'] is not None))
+    if dialect == 'tokenized' or (dialect == 'auto' and token_like):
+        if len(tokens) == 3:
+            station, code, stamp = tokens
+            quality = re.fullmatch(quality_pattern, code.upper())
+            phase = quality['phase'] if quality else None
+        elif len(tokens) == 4:
+            station, phase, code, stamp = tokens
+            phase = phase.upper()
+            quality = re.fullmatch(quality_pattern, code.upper())
+        else:
+            raise ValueError('Expected station [phase] quality timestamp')
+        if not quality or not any(quality.groups()) or phase not in ('P', 'S'):
+            raise ValueError('Unsupported phase/quality fields')
+        if quality['phase'] and quality['phase'] != phase:
+            raise ValueError('Phase/quality mismatch')
+        return [pick(metadata(station.upper()), phase, timestamp(stamp),
+                     code.upper(), int(quality['weight']) if quality['weight'] else None)]
+
+    if len(text) < 23:
+        raise ValueError('Short fixed-column phase record')
+    meta = metadata(text[:4].strip().upper())
+    pcode = text[4:8].upper().ljust(4)
+    start = 9 if text[8:9] == ' ' else 8
+    stamp = text[start:start+15].strip().replace(' ', '0')
+    time = timestamp(stamp)
+    picks = []
+    if pcode[1:2] == 'P':
+        picks.append(pick(meta, 'P', time, pcode))
+    spos = [i for i, c in enumerate(text) if c.upper() == 'S' and 35 <= i <= 40]
+    if len(spos) > 1:
+        raise ValueError('Ambiguous S-phase fields')
+    if spos:
+        pos = spos[0]
+        value = float(text[pos-7:pos-1].strip())
+        if not math.isfinite(value) or value < 0:
+            raise ValueError('Invalid S seconds')
+        minute_start = UTCDateTime(time.year, time.month, time.day, time.hour, time.minute)
+        stime = minute_start + value
+        while stime < time:
+            stime += 60
+        scode = text[max(0, pos-1):pos+3].upper()
+        picks.append(pick(meta, 'S', stime, scode))
+    if not picks:
+        raise ValueError('No supported phase fields')
+    return picks
+
+
+def read_vdap_pha_file(path, *, network='', dialect='auto', strict=True,
+                       return_diagnostics=False):
+    """Read one event's VDAP PHA file; retain file/line provenance.
+
+    Multi-event 10/100 separators are rejected, never merged into one event.
+    With strict=False, malformed lines are returned as structured diagnostics;
+    I/O errors always raise. No deduplication or outlier rejection is applied.
+    Return picks, or (picks, diagnostics) if return_diagnostics=True.
+    """
+    if dialect not in ('auto', 'tokenized', 'fixed'):
+        raise ValueError('Invalid dialect')
+    path = Path(path)
+    picks, diagnostics = [], []
+    with path.open('r', encoding='utf-8', errors='strict') as stream:
+        for lineno, raw in enumerate(stream, 1):
+            line = raw.rstrip('\r\n')
+            if line.strip() in ('10', '100'):
+                raise ValueError(f'{path}:{lineno}: multi-event delimiters are unsupported')
+            try:
+                parsed = parse_vdap_phase_line(line, network=network, dialect=dialect)
+            except (ValueError, IndexError) as exc:
+                diagnostic = dict(source_file=str(path), source_line=lineno,
+                                  raw_line=line, error=str(exc))
+                if strict:
+                    raise ValueError(f'{path}:{lineno}: {exc}') from exc
+                diagnostics.append(diagnostic)
+                continue
+            for item in parsed:
+                item.update(raw_line=line, raw_lineno=lineno, raw_file=path.name)
+                picks.append(item)
+    return (picks, diagnostics) if return_diagnostics else picks
+
+
+def detect_pretrigger_window(trace_or_stream, *, settings=None):
+    """Propose quiet prefixes and onset support in an already triggered record.
+
+    Discoverable VDAP entry point for the generic implementation in
+    ``flovopy.processing.detection.detect_pretrigger_window``. Settings and
+    results are identical: no independent VDAP algorithm/defaults are applied.
+    Use ``PretriggerSettings`` from ``flovopy.processing.detection`` to change
+    the initial assumed noise duration, guard or station support. In particular,
+    ``network_min_stations=1`` explicitly enables single-station analysis.
+
+    This estimates quiet waveform prefixes, not the recorder's trigger time or
+    configured buffer length. All proposals need review, especially for emergent
+    rockfall/PDC signals. No files are written and inputs are not modified.
+    """
+    from flovopy.processing.detection import detect_pretrigger_window as detect
+    return detect(trace_or_stream, settings=settings)
