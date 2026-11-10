@@ -20,6 +20,7 @@ Included functionality
 - per-trace trigger overlays
 - lightweight automatic phase-picking helpers
 - classic STA/LTA convenience wrappers
+- detect_pretrigger_window: quiet-prefix proposals for triggered records
 
 Interactive / GUI workflows belong in:
     flovopy.processing.detection_gui
@@ -51,6 +52,9 @@ from flovopy.core.spectral import (
     plot_amplitude_ratios,
 )
 from flovopy.core.trace_qc import estimate_snr
+
+# Triggered-record noise prefixes and per-trace onset support.
+from flovopy.processing.event_windows import PretriggerSettings, detect_pretrigger_window
 
 try:
     from flovopy.core.remove_response import pad_trace

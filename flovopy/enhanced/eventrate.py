@@ -24,6 +24,7 @@ class EventRateConfig:
     # rolling/rt helpers
     rolling: Optional[int] = None       # e.g., 7 bins rolling mean on counts
     ema_alpha: Optional[float] = None   # optional exponential moving avg (0..1)
+    time_source: str = "origin"         # origin | recorded_file (explicit sidecar time)
 
 
 class EventRate:
@@ -60,16 +61,19 @@ class EventRate:
         If None, we try to read common fields from EnhancedEvent.meta or Event.comments.
         """
         cfg = config or EventRateConfig()
+        if cfg.time_source not in ('origin','recorded_file'):raise ValueError('Invalid time_source')
 
         # -------- collect per-event rows --------
         rows: List[Dict[str, Any]] = []
         for ev in catalog:  # type: Event
-            if not ev.origins:
-                continue
-            o = ev.origins[0]
-            t = o.time.datetime if o.time else None
-            if t is None:
-                continue
+            if cfg.time_source == 'origin':
+                if not ev.origins:continue
+                t = ev.origins[0].time.datetime if ev.origins[0].time else None
+            elif cfg.time_source == 'recorded_file':
+                t = (getattr(getattr(ev,'meta',None),'metrics',{}) or {}).get('record_reference_recorded_time')
+            else:
+                raise ValueError('time_source must be origin or recorded_file')
+            if t is None:continue
 
             mag = ev.magnitudes[0] if ev.magnitudes else None
             mval = mag.mag if mag else None
@@ -105,13 +109,13 @@ class EventRate:
 
             rows.append(row)
 
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(rows,columns=list(dict.fromkeys(["time","magnitude","mag_type"]+[k for r in rows for k in r])))
 
         # -------- clean & convert --------
         df["time"] = pd.to_datetime(df["time"])
         if df.empty:
             cols = [
-                "time","event_count","minimum_magnitude","average_magnitude","maximum_magnitude",
+                "time","event_count","magnitude_count","minimum_magnitude","average_magnitude","maximum_magnitude",
                 "cumulative_energy","cumulative_magnitude",
                 "thresholded_count","thresholded_energy","thresholded_magnitude",
             ]
@@ -119,14 +123,16 @@ class EventRate:
                 cols.insert(1, cfg.groupby)  # after 'time'
             return cls(pd.DataFrame(columns=cols), groupby=cfg.groupby)
 
-        # sanitize magnitudes
+        # Missing magnitudes remain missing; counts include events without them.
+        df["magnitude"] = pd.to_numeric(df["magnitude"],errors="coerce")
+        # sanitize actual placeholder values only
         df["imputed"] = df["magnitude"] < cfg.lowest_magnitude
         valid = df["magnitude"] >= cfg.lowest_magnitude
         if valid.any():
             min_valid = df.loc[valid, "magnitude"].min()
-            df.loc[~valid, "magnitude"] = min_valid
+            df.loc[df["imputed"], "magnitude"] = min_valid
         else:
-            df["magnitude"] = cfg.lowest_magnitude
+            df.loc[df["imputed"], "magnitude"] = np.nan
 
         if cfg.include_energy:
             df["energy"] = magnitude2Eseismic(df["magnitude"])
@@ -142,11 +148,12 @@ class EventRate:
             group_cols.append(cfg.groupby)
 
         grouped = df.groupby(group_cols).agg(
-            event_count=("magnitude", "count"),
+            event_count=("magnitude", "size"),
+            magnitude_count=("magnitude", "count"),
             minimum_magnitude=("magnitude", "min"),
             average_magnitude=("magnitude", "mean"),
             maximum_magnitude=("magnitude", "max"),
-            cumulative_energy=("energy", "sum"),
+            cumulative_energy=("energy", lambda values: values.sum(min_count=1)),
         ).reset_index()
 
         if cfg.include_energy:
@@ -163,10 +170,15 @@ class EventRate:
         on_keys = ["time"] + ([cfg.groupby] if cfg.groupby and cfg.groupby in grouped.columns else [])
         grouped = grouped.merge(thr, on=on_keys, how="left")
 
-        grouped = grouped.merge(thr, on=[c for c in grouped.columns if c in thr.columns], how="left")
         grouped["thresholded_count"] = grouped["thresholded_count"].fillna(0)
-        grouped["thresholded_energy"] = grouped["thresholded_energy"].fillna(0)
-        grouped["thresholded_magnitude"] = Eseismic2magnitude(grouped["thresholded_energy"].fillna(0))
+        if cfg.include_energy:
+            grouped["thresholded_energy"] = grouped["thresholded_energy"].fillna(0)
+        grouped["thresholded_magnitude"] = Eseismic2magnitude(grouped["thresholded_energy"].fillna(0)) if cfg.include_energy else np.nan
+
+        if cfg.include_energy:
+            unknown = grouped["magnitude_count"].eq(0)
+            grouped.loc[unknown,["cumulative_energy","cumulative_magnitude","thresholded_energy","thresholded_magnitude"]] = np.nan
+        grouped["thresholded_magnitude"] = grouped["thresholded_magnitude"].replace([np.inf,-np.inf],np.nan)
 
         # ensure time col present & sorted
         grouped["time"] = pd.to_datetime(grouped["time"])
@@ -204,9 +216,11 @@ class EventRate:
             fig, ax = plt.subplots(figsize=(12, 4))
             own = True
 
-        series = "event_count_ema" if use_smoothed and "event_count_ema" in df.columns else "event_count_roll"
-        if use_smoothed and series not in df.columns:
-            series = "event_count"
+        series = "event_count"
+        if use_smoothed:
+            for candidate in ("event_count_ema","event_count_roll"):
+                if candidate in df.columns:
+                    series=candidate;break
 
         if self.groupby and self.groupby in df.columns:
             for key, g in df.groupby(self.groupby):

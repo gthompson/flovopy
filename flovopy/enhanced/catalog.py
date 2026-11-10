@@ -16,6 +16,7 @@ from obspy.core.event import (
 from obspy.core.event.catalog import read_events
 from obspy import read, UTCDateTime  # for optional waveform loading
 from flovopy.enhanced.event import EnhancedEvent, EnhancedEventMeta
+from flovopy.enhanced.serialization import flatten_metrics
 from flovopy.enhanced.eventrate import EventRate, EventRateConfig
 from flovopy.core.physics import magnitude2Eseismic
 
@@ -602,6 +603,82 @@ class EnhancedCatalog(Catalog):
 
         # EnhancedEvent is an Event, so use the same objects for both lists
         return cls(events=[r for r in records], records=records)
+
+    @classmethod
+    def from_sidecars(cls, paths, *, require_quakeml=False):
+        """Load an explicit list of sidecars, avoiding stale cache versions.
+
+        Paths may end in .json or name the base. No waveform access occurs.
+        Duplicate resource IDs raise: choose one active version per event.
+        """
+        records=[];seen=set()
+        for path in paths:
+            base=os.fspath(path)
+            if base.endswith('.json'):base=base[:-5]
+            event=EnhancedEvent.load(base,require_quakeml=require_quakeml)
+            if event.event_id in seen:raise ValueError('Duplicate event ID: '+event.event_id)
+            seen.add(event.event_id);records.append(event)
+        return cls(events=records,records=records)
+
+    def metrics_dataframe(self, *, level='trace'):
+        """Export ALL sidecar fields, not the selected event-summary columns.
+
+        level='trace' emits one row per meta.traces entry, preserving duplicate
+        trace IDs and explicit window labels/indexes. level='event' emits one
+        row per event with the complete trace list in a JSON cell. Nested dicts
+        become dotted columns; arrays/lists are complete JSON-valued CSV cells.
+        New metric keys are included automatically. No allowlist is applied.
+        Events without trace summaries have no trace rows, but retain event rows.
+        """
+        if level not in ('trace','event'):raise ValueError('level must be trace or event')
+        rows=[]
+        records=self.records if self.records else list(self)
+        for event in records:
+            if not isinstance(event,EnhancedEvent):event=EnhancedEvent.wrap(event)
+            if level=='trace' and not event.meta.traces:continue
+            payload=event.to_json();traces=payload.pop('traces',[])
+            if level=='event':
+                payload['traces']=traces;rows.append(flatten_metrics(payload));continue
+            base=flatten_metrics(payload)
+            for index,trace in enumerate(traces):
+                row=dict(base);row['trace_entry_index']=index
+                row.update(flatten_metrics(trace,prefix='trace'));rows.append(row)
+        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=['event_id','trace_entry_index'])
+
+    def export_metrics_csv(self, filepath, *, level='trace'):
+        """Write the full dynamic metrics view; export_csv remains the summary API."""
+        self.metrics_dataframe(level=level).to_csv(filepath,index=False)
+
+    @classmethod
+    def export_sidecars_csv(cls, paths, filepath, *, level='trace', include_trace_summaries=True):
+        """Two-pass complete export with memory bounded to one event sidecar.
+
+        First discover the union of all keys; then write rows. No waveform access
+        or feature recalculation occurs. Arrays remain complete JSON-valued cells.
+        For event-level metadata only, include_trace_summaries=False omits the
+        redundant trace list (which remains in sidecars and the trace export).
+        """
+        import csv
+        paths=list(paths)
+        def rows():
+            for path in paths:
+                base=os.fspath(path)
+                if base.endswith('.json'):base=base[:-5]
+                event=EnhancedEvent.load(base,require_quakeml=False)
+                if not include_trace_summaries:event.meta.traces=[]
+                catalog=cls(events=[event],records=[event])
+                yield from catalog.metrics_dataframe(level=level).to_dict('records')
+        fields=[];seen=set()
+        for row in rows():
+            for key in row:
+                if key not in seen:seen.add(key);fields.append(key)
+        if not fields:fields=['event_id','trace_entry_index']
+        temporary=os.fspath(filepath)+'.tmp'
+        with open(temporary,'w',newline='') as handle:
+            writer=csv.DictWriter(handle,fieldnames=fields);writer.writeheader()
+            for row in rows():writer.writerow(row)
+        os.replace(temporary,filepath)
+        return fields
 
     # ---------- EventRate bridge ----------
     def to_event_rate(self, config: Optional[EventRateConfig] = None) -> EventRate:

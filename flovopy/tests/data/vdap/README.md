@@ -1,0 +1,1 @@
+Historical Pinatubo regression excerpts from LEGACY/EVENT_METADATA: two individual PHA files from PHA/910603 and the first five Pinatubo_all.sum records from HYPOCENTERS. Byte content of PHA files is unchanged. These fixtures establish the supported single-event dialect, not a general monthly/yearly format.

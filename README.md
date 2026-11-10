@@ -51,6 +51,12 @@ tests/                    # Unit tests
 
 ---
 
+## Triggered waveform records
+
+Use `flovopy.processing.detection.detect_pretrigger_window()` to propose per-trace quiet prefixes and onset support in event files. It is also available as `flovopy.core.vdap.detect_pretrigger_window()` for VDAP workflows. See the [usage guide](flovopy/docs/processing/pretrigger_windows.md) for configuration, single-station mode and interpretation of unreviewed proposals.
+
+---
+
 ## 📋 Requirements
 
 - Python 3.8 or newer

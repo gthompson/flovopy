@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import json
+from flovopy.enhanced.serialization import json_compatible, atomic_json
 from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
@@ -146,10 +147,10 @@ class EnhancedEvent(Event):
         """
         JSON representation of enhanced pieces (not the QuakeML event itself).
         """
-        return {
+        return json_compatible({
             "event_id": self.event_id,
             **self.meta.to_json_dict(),
-        }
+        })
 
     def _extract_trajectory(self) -> list[dict]:
         """
@@ -204,30 +205,38 @@ class EnhancedEvent(Event):
             obsjson = os.path.join(outdir, base_name + ".obs.json")
             Catalog(events=[self]).write(obsjson, format="JSON")
 
-        with open(json_path, "w") as f:
-            json.dump(payload, f, indent=2, default=str)
+        atomic_json(json_path, payload)
 
         return qml_path, json_path
 
     @classmethod
-    def load(cls, base_path: str) -> "EnhancedEvent":
+    def load(cls, base_path: str, *, require_quakeml: bool = True) -> "EnhancedEvent":
         """
         Load from `{base_path}.qml` + `{base_path}.json`.
+
+        With require_quakeml=False, a JSON-only sidecar can be loaded. Only its
+        resource ID and enhanced metadata are reconstructed; core origins/picks
+        remain absent unless QuakeML exists. Arrays load as numeric JSON lists.
         """
+        base_path = os.fspath(base_path)
         qml_file = base_path + ".qml"
         json_file = base_path + ".json"
-        if not os.path.exists(qml_file):
+        if require_quakeml and not os.path.exists(qml_file):
             raise FileNotFoundError(f"Missing QuakeML file: {qml_file}")
         if not os.path.exists(json_file):
             raise FileNotFoundError(f"Missing JSON metadata file: {json_file}")
 
-        cat = read_events(qml_file)
-        if len(cat) == 0:
-            raise ValueError(f"No events found in {qml_file}")
-        obspy_event: Event = cat[0]
-
         with open(json_file, "r") as f:
-            meta = EnhancedEventMeta.from_json_dict(json.load(f))
+            payload = json.load(f)
+        meta = EnhancedEventMeta.from_json_dict(payload)
+        if os.path.exists(qml_file):
+            cat = read_events(qml_file)
+            if len(cat) == 0:
+                raise ValueError(f"No events found in {qml_file}")
+            obspy_event = cat[0]
+        else:
+            # Explicit metadata-only loading: no invented origins or picks.
+            obspy_event = Event(resource_id=payload.get('event_id'))
 
         # Wrap the ObsPy Event into our subclass
         # Easiest path: create new EnhancedEvent and copy attributes.

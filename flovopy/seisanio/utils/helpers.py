@@ -74,7 +74,6 @@ def find_matching_wavfiles(filetime, sfilepath, y2kfix=False):
     return matching_wavfiles
 
 
-
 def write_wavfile(
     st: Stream,
     out_root: str | Path,
@@ -88,88 +87,157 @@ def write_wavfile(
     preprocess_fn=None,
     preprocess_kwargs: dict | None = None,
     write_kwargs: dict | None = None,
+    skip_existing: bool = True,
+    sort_traces: bool = True,
+    merge_traces: bool = True,
+    align_traces: bool = True,
+    merge_method: int = 1,
+    fill_value: float = 0.0,
 ) -> str:
     """
     Write a Stream using a SEISAN-style waveform filename.
 
-    Optionally applies preprocessing before writing.
+    Processing operates on a copy, leaving the caller's stream unchanged.
 
-    Parameters
-    ----------
-    st
-        Input waveform stream.
-    preprocess : bool
-        If True, apply preprocess_fn before writing.
-    preprocess_fn : callable or None
-        Signature: preprocess_fn(stream, **kwargs) -> stream
-    preprocess_kwargs : dict or None
-        Passed to preprocess_fn.
+    By default:
+    - skip an existing output file;
+    - sort by station and channel;
+    - merge matching trace IDs;
+    - pad all traces to the full stream time range;
+    - write MiniSEED through write_mseed().
+
+    numchans controls the filename suffix. If omitted, it is calculated
+    after merging and alignment.
+
+    Optional preprocessing runs before sorting, merging and alignment.
+    The filename timestamp is taken from the earliest prepared trace.
+
+    Returns
+    -------
+    str
+        Path written, or the existing path when skip_existing=True.
+
+    Raises
+    ------
+    ValueError
+        For an empty stream or invalid options.
+    RuntimeError
+        If preprocessing fails.
+    OSError
+        If the MiniSEED writer reports failure.
     """
-
-    if not st or len(st) == 0:
+    if not st:
         raise ValueError("Empty stream given to write_wavfile")
 
-    out_root = Path(out_root)
-    write_kwargs = write_kwargs or {}
+    if preprocess and preprocess_fn is None:
+        raise ValueError("preprocess=True but no preprocess_fn provided")
 
-    # -------------------------------------------------
-    # Preprocessing stage (NEW)
-    # -------------------------------------------------
+    if numchans is not None and numchans < 1:
+        raise ValueError("numchans must be positive")
+
+    # Never modify the caller's stream.
+    prepared = st.copy()
+
     if preprocess:
-        if preprocess_fn is None:
-            raise ValueError("preprocess=True but no preprocess_fn provided")
-
         try:
-            kwargs = preprocess_kwargs or {}
-            st = preprocess_fn(st, **kwargs)
-        except Exception as e:
-            raise RuntimeError(f"Preprocessing failed: {e}")
+            prepared = preprocess_fn(
+                prepared,
+                **dict(preprocess_kwargs or {}),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Preprocessing failed: {exc}") from exc
 
-        if not st or len(st) == 0:
-            raise ValueError("Stream empty after preprocessing")
+    if not isinstance(prepared, Stream):
+        raise TypeError("Preprocessing must return an ObsPy Stream")
 
-    # -------------------------------------------------
-    # Filename construction
-    # -------------------------------------------------
-    filetime: UTCDateTime = st[0].stats.starttime
+    if not prepared:
+        raise ValueError("Stream empty after preprocessing")
 
-    if numchans is None:
-        numchans = len(st)
+    if any(tr.stats.npts == 0 for tr in prepared):
+        raise ValueError("Stream contains a zero-length trace")
 
-    dbstring = str(dbstring)
-    if len(dbstring) < 5:
-        dbstring = dbstring + "_" * (5 - len(dbstring))
+    if sort_traces:
+        prepared.sort(keys=["station", "channel"])
+
+    if merge_traces:
+        prepared.merge(
+            method=merge_method,
+            fill_value=fill_value,
+        )
+
+    if not prepared:
+        raise ValueError("Stream empty after merging")
+
+    # Use the union of all trace windows, rather than the first trace.
+    start = min(tr.stats.starttime for tr in prepared)
+    end = max(tr.stats.endtime for tr in prepared)
+
+    if align_traces:
+        prepared.trim(
+            starttime=start,
+            endtime=end,
+            pad=True,
+            fill_value=fill_value,
+        )
+
+    filetime = min(tr.stats.starttime for tr in prepared)
+    channel_count = len(prepared) if numchans is None else numchans
+
+    dbstring = str(dbstring).ljust(5, "_")
 
     if not y2kfix and filetime.year < 2000:
-        basename = (
-            f"{filetime.year - 1900:02d}{filetime.month:02d}-"
-            f"{filetime.day:02d}-{filetime.hour:02d}{filetime.minute:02d}-"
-            f"{filetime.second:02d}M.{dbstring}_{numchans:03d}"
+        date_prefix = (
+            f"{filetime.year - 1900:02d}{filetime.month:02d}"
         )
     else:
-        basename = (
-            f"{filetime.year:04d}-{filetime.month:02d}-{filetime.day:02d}-"
-            f"{filetime.hour:02d}{filetime.minute:02d}-{filetime.second:02d}"
-            f"M.{dbstring}_{numchans:03d}"
-        )
+        date_prefix = f"{filetime.year:04d}-{filetime.month:02d}"
 
-    # -------------------------------------------------
-    # Output directory
-    # -------------------------------------------------
+    basename = (
+        f"{date_prefix}-{filetime.day:02d}-"
+        f"{filetime.hour:02d}{filetime.minute:02d}-"
+        f"{filetime.second:02d}M."
+        f"{dbstring}_{channel_count:03d}"
+    )
+
+    out_dir = Path(out_root)
     if year_month_dirs:
-        out_dir = out_root / f"{filetime.year:04d}" / f"{filetime.month:02d}"
-    else:
-        out_dir = out_root
+        out_dir /= f"{filetime.year:04d}/{filetime.month:02d}"
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / basename
 
-    # -------------------------------------------------
-    # Write
-    # -------------------------------------------------
-    if fmt.lower() == "mseed":
-        write_mseed(st, str(out_path), **write_kwargs)
+    if out_path.exists():
+        if not out_path.is_file():
+            raise IsADirectoryError(str(out_path))
+        if skip_existing:
+            return str(out_path)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    kwargs = dict(write_kwargs or {})
+
+    if fmt.upper() == "MSEED":
+        # Renamed outputs and pickle fallbacks would invalidate the
+        # SEISAN filename returned to the waveform index.
+        if not kwargs.get("overwrite_ok", True):
+            raise ValueError(
+                "Use skip_existing=True instead of overwrite_ok=False"
+            )
+        if kwargs.get("pickle_fallback", False):
+            raise ValueError(
+                "pickle_fallback is incompatible with a MiniSEED WAV file"
+            )
+
+        kwargs.setdefault("fill_value", fill_value)
+        written = write_mseed(prepared, str(out_path), **kwargs)
+
+        if written is None:
+            raise OSError(f"Failed to write MiniSEED file: {out_path}")
+
+        if Path(written) != out_path:
+            raise OSError(
+                f"Writer returned unexpected path: {written}; "
+                f"expected {out_path}"
+            )
     else:
-        st.write(str(out_path), format=fmt, **write_kwargs)
+        prepared.write(str(out_path), format=fmt, **kwargs)
 
     return str(out_path)
