@@ -345,6 +345,9 @@ class SAMWindowProcessor:
                 return cache[product]
             if product in REDUCED_PARENTS:
                 parent = get_metric(REDUCED_PARENTS[product])
+                if parent is None:
+                    cache[product] = None
+                    return None
                 kwargs = dict(Q=self.reduction_q,
                               wavespeed_kms=self.reduction_wavespeed_kms,
                               peakf=self.reduction_peak_frequency)
@@ -363,6 +366,7 @@ class SAMWindowProcessor:
                 st = raw if product == 'RSAM' else _calibrated_stream(
                     raw, inv, product, self.pre_filt)
                 if not st:
+                    cache[product] = None
                     return None
                 obj = METRICS[product](stream=st, sampling_interval=self.sampling_interval,
                                        filter=self.filter_band, bands=self.bands,

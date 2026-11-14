@@ -168,7 +168,9 @@ def _calibrated_stream(raw, inventory, product, pre_filt):
     output = 'DISP' if product == 'DSAM' else 'VEL'
     units = 'm' if product == 'DSAM' else 'm/s'
     st = Stream()
-    for tr in raw:
+    # Deconvolve contiguous measured data. ObsPy's FFT consumes the backing
+    # buffer of a masked array, which can turn gaps into spurious impulses.
+    for tr in raw.split():
         t = tr.copy()
         try:
             # Never silently reinterpret uncorrected counts as physical units.
@@ -179,7 +181,7 @@ def _calibrated_stream(raw, inventory, product, pre_filt):
             raise RuntimeError(f'{tr.id}: response removal to {units} failed: {exc}') from exc
         t.stats.units = units
         st.append(t)
-    return st
+    return _merge_stream(st)
 
 
 def _days(start, end):
@@ -221,7 +223,7 @@ def _scheduler_config(config: Config, digest: str) -> ArchiveConfig:
                             location=config.location, channel=config.channel),
         window_seconds=86400, halo_seconds=config.halo_seconds,
         workers=config.workers, resume=config.resume,
-        algorithm_version=f'archive_metrics_v2:{digest}:{interval_id}',
+        algorithm_version=f'archive_metrics_v3:{digest}:{interval_id}',
     )
 
 

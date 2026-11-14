@@ -53,6 +53,7 @@ def convert_dmx_to_seisan(
     pattern: str = "**/*.DMX",
     max_files: int | None = None,
     remove_irig: bool = True,
+    recover_partial: bool = False,
     event_id_func=None,
     id_fixer=None,
     out_waveform_index: str | Path | None = None,
@@ -122,6 +123,7 @@ def convert_dmx_to_seisan(
     claimed_paths = {}
     counts = dict(processed=len(files), written=0, existing=0, empty=0, failed=0)
 
+    recovery_reports = {}
     for i, dmx in enumerate(files, 1):
         event_id = None
         pairs = []
@@ -134,9 +136,11 @@ def convert_dmx_to_seisan(
             if verbose:
                 print(f"[{i}/{len(files)}] {event_id}: {dmx}")
             stage = "read"
-            st = read_dmx_file(dmx, defaultnet=network, verbose=verbose)
+            st = read_dmx_file(dmx, defaultnet=network, verbose=verbose, recover_partial=recover_partial)
             if not st:
                 raise ValueError("DMX reader returned an empty stream")
+            if any(hasattr(t.stats,"dmx_recovery") for t in st):
+                recovery_reports[str(dmx)] = dict(st[0].stats.dmx_recovery)
             stage = "prepare"
             st = remove_empty_traces(st)
             if remove_irig:
@@ -220,6 +224,9 @@ def convert_dmx_to_seisan(
             ) for old, new in pairs)
 
     index = pd.DataFrame(index_rows, columns=index_columns)
+    if recover_partial:
+        index["partial_recovery"] = index["dmx_file"].map(lambda p:p in recovery_reports)
+        index["recovery_details"] = index["dmx_file"].map(lambda p:__import__("json").dumps(recovery_reports.get(p,{}),default=str))
     mapping = pd.DataFrame(sorted(successful_map.items()),
                            columns=["original_id", "fixed_id"])
     provenance = pd.DataFrame(provenance_rows, columns=provenance_columns)
@@ -546,6 +553,9 @@ def read_dmx_file(
     fix: bool = True,
     defaultnet: str = "",
     verbose: bool = False,
+    *,
+    recover_partial: bool = True,
+    recovery_ascii: str | Path | None = None,
 ) -> Stream:
     """
     Read a legacy VDAP DMX waveform file.
@@ -553,7 +563,11 @@ def read_dmx_file(
     If fix=True, fill missing network codes with defaultnet and convert
     samples to float before subtracting the legacy 2048-count offset.
 
-    Read failures are reported and return an empty Stream. Correction
+    A failed regular read optionally falls back to a validated prefix. Partial
+    results emit a RuntimeWarning and carry stats.dmx_recovery provenance.
+    recover_partial=False retains strict historical failure behavior. The
+    converter requires explicit recover_partial=True to publish partial data.
+    Unrecoverable read failures return an empty Stream. Correction
     errors propagate to the caller; partially corrected data are not returned.
 
     Station and channel ID conversion must be applied separately.
@@ -566,8 +580,21 @@ def read_dmx_file(
     try:
         st = read(str(dmx_file))
     except Exception as exc:
-        print(f"Failed to read DMX file: {dmx_file} | {exc}")
-        return Stream()
+        if not recover_partial:
+            print(f"Failed to read DMX file: {dmx_file} | {exc}")
+            return Stream()
+        from flovopy.core.dmx_recovery import recover_dmx_prefix
+        import warnings
+        try:
+            st,report=recover_dmx_prefix(dmx_file,ascii_file=recovery_ascii)
+            if not st:
+                print(f"No validated DMX prefix: {dmx_file} | {exc}")
+                return Stream()
+            for tr in st:tr.stats.dmx_recovery['original_error']=repr(exc)
+            warnings.warn(f"Partial DMX recovery: {dmx_file.name}: {len(st)} trace(s); remainder excluded",RuntimeWarning,stacklevel=2)
+        except Exception as recovery_error:
+            print(f"Failed to recover DMX file: {dmx_file} | {recovery_error}")
+            return Stream()
 
     for tr in st:
         tr.stats.vdap_original_id = tr.id
@@ -956,10 +983,12 @@ def parse_vdap_phase_line(line, *, network='', dialect='auto'):
 
 
 def read_vdap_pha_file(path, *, network='', dialect='auto', strict=True,
-                       return_diagnostics=False):
+                       return_diagnostics=False, allow_terminal_separator=False):
     """Read one event's VDAP PHA file; retain file/line provenance.
 
     Multi-event 10/100 separators are rejected, never merged into one event.
+    allow_terminal_separator=True accepts one final 10/100 marker only when
+    followed by blank lines or a DOS EOF marker, never another event.
     With strict=False, malformed lines are returned as structured diagnostics;
     I/O errors always raise. No deduplication or outlier rejection is applied.
     Return picks, or (picks, diagnostics) if return_diagnostics=True.
@@ -969,9 +998,12 @@ def read_vdap_pha_file(path, *, network='', dialect='auto', strict=True,
     path = Path(path)
     picks, diagnostics = [], []
     with path.open('r', encoding='utf-8', errors='strict') as stream:
-        for lineno, raw in enumerate(stream, 1):
+        lines=stream.readlines()
+        for lineno, raw in enumerate(lines, 1):
             line = raw.rstrip('\r\n')
             if line.strip() in ('10', '100'):
+                if allow_terminal_separator and picks and all(not rest.strip().strip('\x1a').strip() for rest in lines[lineno:]):
+                    break
                 raise ValueError(f'{path}:{lineno}: multi-event delimiters are unsupported')
             try:
                 parsed = parse_vdap_phase_line(line, network=network, dialect=dialect)

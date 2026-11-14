@@ -1162,3 +1162,66 @@ def compute_stream_spectrograms(stream, **kwargs):
             raise ValueError(f'duplicate trace ID: {trace.id}')
         results[trace.id] = compute_spectrogram_result(trace, **kwargs)
     return results
+
+
+@dataclass
+class BandSpectrogramResult:
+    """Precomputed band values, including overlapping bands and unresolved clocks.
+
+    Unlike SpectrogramResult, times are datetime64 calendar labels, not an
+    assertion of UTC or FFT centres. Values have shape (band, time). Each band
+    has its own [low, high] limits; overlaps are allowed. No PSD/ASD interpretation
+    or bandwidth normalization is applied. interval_seconds is the explicit
+    display/support duration, not an inferred acquisition averaging window.
+    """
+    trace_id: str
+    times: np.ndarray
+    values: np.ndarray
+    band_limits_hz: np.ndarray
+    band_names: list
+    interval_seconds: float
+    time_anchor: str = 'start'
+    time_basis: str = 'recorded calendar labels; UTC unresolved'
+    quantity: str = 'reported_band_amplitude'
+    units: str = 'arbitrary units'
+    metadata: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        self.times = np.asarray(self.times, dtype='datetime64[ns]').copy()
+        self.values = np.asarray(np.ma.asarray(self.values, dtype=float).filled(np.nan)).copy()
+        self.band_limits_hz = np.asarray(self.band_limits_hz, dtype=float).copy()
+        self.band_names = list(self.band_names)
+        if self.times.ndim != 1 or np.isnat(self.times).any():
+            raise ValueError('times must be one-dimensional, valid recorded calendar labels')
+        if self.values.shape != (len(self.band_names), len(self.times)):
+            raise ValueError('values must have shape (bands, times)')
+        if self.band_limits_hz.shape != (len(self.band_names), 2):
+            raise ValueError('band_limits_hz must have shape (bands, 2)')
+        if (not np.isfinite(self.band_limits_hz).all() or
+            (self.band_limits_hz[:, 0] < 0).any() or
+            (self.band_limits_hz[:, 1] <= self.band_limits_hz[:, 0]).any()):
+            raise ValueError('Band limits must be finite, nonnegative and increasing per band')
+        if len(set(self.band_names)) != len(self.band_names):
+            raise ValueError('Band names must be unique')
+        if len(self.times) > 1 and (np.diff(self.times) <= np.timedelta64(0, 'ns')).any():
+            raise ValueError('Times must be sorted and unique; resolve duplicates explicitly')
+        if not np.isfinite(self.interval_seconds) or self.interval_seconds <= 0:
+            raise ValueError('interval_seconds must be positive and finite')
+        if self.time_anchor not in ('start', 'center', 'end'):
+            raise ValueError('time_anchor must be start, center or end')
+
+    def plot(self, **kwargs):
+        """Plot precomputed values directly, without a new FFT or synthetic trace."""
+        return plot_band_spectrograms([self], **kwargs)
+
+
+def plot_band_spectrograms(results, **kwargs):
+    """Render precomputed BandSpectrogramResult objects in a multi-channel layout."""
+    from flovopy.plotting.spectrograms import plot_band_spectrograms as render
+    return render(results, **kwargs)
+
+
+def plot_daily_band_spectrograms(results, output_dir, **kwargs):
+    """Write daily/hourly calendar pages; no timezone or clock correction."""
+    from flovopy.plotting.spectrograms import plot_daily_band_spectrograms as render
+    return render(results, output_dir, **kwargs)

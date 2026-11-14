@@ -190,3 +190,171 @@ def plot_waveform_spectrograms(
     if outfile is not None:
         fig.savefig(outfile, dpi=150)
     return fig
+
+
+# Precomputed legacy band data: deliberately independent of the waveform/UTC API.
+def plot_band_spectrograms(results, *, spectral_bands=None, broad_bands=None,
+                          start=None, end=None, color_scale='individual', clim=None,
+                          log_colors=False, cmap='viridis', title=None, figsize=None,
+                          outfile=None):
+    """IceWeb-style rows for precomputed, possibly overlapping band amplitudes.
+
+    Select contiguous nonoverlapping spectral_bands for the Hz heatmap; overlapping
+    broad_bands are line panels with explicit frequency labels. No FFT, density
+    scaling, dB conversion, interpolation or UTC assumption. start/end select
+    [start, end) recorded labels. Missing records remain blank. Positive-only
+    logarithmic color normalization changes display, not measurement units.
+    """
+    from matplotlib.collections import PolyCollection
+    from matplotlib.colors import LogNorm
+    results=list(results)
+    if not results: raise ValueError('No band spectrograms supplied')
+    ids=[r.trace_id for r in results]
+    if color_scale=='shared' and len({(r.units,r.quantity) for r in results})!=1:
+        raise ValueError('Shared color scales require matching quantity and units')
+    if len(set(ids))!=len(ids): raise ValueError('Duplicate channel IDs; keep source versions separate')
+    if len({r.time_basis for r in results})!=1:
+        raise ValueError('Mixed clock conventions; plot separately or reconcile explicitly')
+    if color_scale not in ('individual','shared'): raise ValueError('color_scale must be individual or shared')
+    start=np.datetime64(start,'ns') if start is not None else None
+    end=np.datetime64(end,'ns') if end is not None else None
+    if (start is not None and np.isnat(start)) or (end is not None and np.isnat(end)):
+        raise ValueError('Invalid date limit')
+    if start is not None and end is not None and end<=start: raise ValueError('end must exceed start')
+    prepared=[]
+    for r in results:
+        names=list(spectral_bands) if spectral_bands is not None else list(r.band_names)
+        broad=list(broad_bands or [])
+        if not names or len(set(names))!=len(names) or len(set(broad))!=len(broad):
+            raise ValueError('Band selections must be nonempty/unique')
+        try: indexes=[r.band_names.index(n) for n in names];bi=[r.band_names.index(n) for n in broad]
+        except ValueError as exc: raise ValueError(f'Unknown band in {r.trace_id}') from exc
+        bounds=r.band_limits_hz[indexes]
+        if len(bounds)>1 and not np.allclose(bounds[:-1,1],bounds[1:,0],rtol=0,atol=1e-10):
+            raise ValueError('Heatmap bands must be ordered, contiguous and nonoverlapping; plot other bands separately')
+        keep=np.ones(len(r.times),dtype=bool)
+        if start is not None: keep &= r.times>=start
+        if end is not None: keep &= r.times<end
+        times=r.times[keep];values=r.values[:,keep]
+        # Never let nominal support rectangles overwrite adjacent observations.
+        duration=float(r.interval_seconds)
+        if len(times)>1 and (np.diff(times).astype('timedelta64[ns]').astype(float)/1e9 < duration-1e-9).any():
+            raise ValueError('Display intervals overlap; choose a shorter support duration explicitly')
+        prepared.append((r,indexes,bi,bounds,times,values))
+    if not any(len(item[4]) for item in prepared): raise ValueError('No records in selected window')
+    def norm_for(values):
+        values=np.asarray(values);valid=values[np.isfinite(values)]
+        if log_colors:valid=valid[valid>0]
+        if clim is not None:
+            if len(clim)!=2 or not np.isfinite(clim).all() or clim[1]<=clim[0] or (log_colors and clim[0]<=0):
+                raise ValueError('Invalid color limits')
+            lo,hi=clim
+        elif len(valid):
+            lo,hi=float(valid.min()),float(valid.max())
+            if hi==lo:
+                if log_colors:lo,hi=lo/1.01,hi*1.01
+                else:lo,hi=lo-.5,hi+.5
+        else:lo,hi=(1.,10.) if log_colors else (0.,1.)
+        return LogNorm(lo,hi) if log_colors else Normalize(lo,hi)
+    shared=None
+    if color_scale=='shared':
+        shared=norm_for(np.concatenate([v[ix,:].ravel() for _,ix,_,_,_,v in prepared]))
+    with_broad=bool(broad_bands)
+    fig,axes=plt.subplots(len(results),2 if with_broad else 1,squeeze=False,
+        figsize=figsize or (14 if with_broad else 11,max(3,3*len(results))),sharex=True)
+    for row,(r,indexes,bi,bounds,times,values) in enumerate(prepared):
+        ax=axes[row,0];vertices=[];colors=[]
+        duration=r.interval_seconds/86400
+        shift={'start':0,'center':-.5,'end':-1}[r.time_anchor]*duration
+        xs=mdates.date2num(times)+shift
+        for j,x in enumerate(xs):
+            for k,index in enumerate(indexes):
+                value=values[index,j]
+                if not np.isfinite(value) or (log_colors and value<=0):continue
+                lo,hi=bounds[k]
+                vertices.append([(x,lo),(x+duration,lo),(x+duration,hi),(x,hi)]);colors.append(value)
+        norm=shared if shared is not None else norm_for(values[indexes,:])
+        collection=PolyCollection(vertices,array=np.asarray(colors),norm=norm,cmap=cmap,edgecolors='none')
+        ax.add_collection(collection);ax.autoscale_view();ax.set_ylim(bounds[0,0],bounds[-1,1]);ax.xaxis_date()
+        ax.set(ylabel='Frequency (Hz)',title=str(r.trace_id)+' — SSAM bands')
+        fig.colorbar(collection,ax=ax,label=r.units)
+        if with_broad:
+            lineax=axes[row,1]
+            # Break lines at gaps, retaining the original samples unchanged.
+            for index in bi:
+                tx=[];vy=[]
+                for j,t in enumerate(times):
+                    if j and (times[j]-times[j-1])/np.timedelta64(1,'s')>r.interval_seconds*1.01:
+                        tx.append(t);vy.append(np.nan)
+                    tx.append(t);vy.append(values[index,j])
+                lo,hi=r.band_limits_hz[index]
+                lineax.plot(np.asarray(tx,dtype='datetime64[ns]'),vy,'.-',linewidth=.7,markersize=2,
+                            label=f'{r.band_names[index]}: {lo:g}–{hi:g} Hz')
+            lineax.set(ylabel=r.units,title=str(r.trace_id)+' — broad bands')
+            lineax.legend(fontsize='small',ncol=2);lineax.grid(alpha=.2)
+        for axis in axes[row]:
+            locator=mdates.AutoDateLocator(minticks=3,maxticks=6)
+            axis.xaxis.set_major_locator(locator)
+            axis.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+            axis.set_xlabel('Recorded calendar time (no clock correction)')
+    if start is not None and end is not None:axes[0,0].set_xlim(mdates.date2num(start),mdates.date2num(end))
+    elif start is not None:axes[0,0].set_xlim(left=mdates.date2num(start))
+    elif end is not None:axes[0,0].set_xlim(right=mdates.date2num(end))
+    fig.suptitle(title or 'SSAM band amplitudes — recorded calendar labels')
+    fig._flovopy_band_axes=axes
+    fig.tight_layout()
+    if outfile is not None:fig.savefig(outfile,dpi=180)
+    return fig
+
+
+def plot_daily_band_spectrograms(results, output_dir, *, page='day', start=None,
+                                 end=None, overwrite=False, **plot_kwargs):
+    """Write one multi-channel plot per nonempty calendar day or hour.
+
+    Returns generated paths. end is exclusive. Creates no zero-filled pages.
+    Files are preflighted before writing; existing products require overwrite=True.
+    A manifest retains band definitions, source metadata and unresolved clock policy.
+    """
+    from pathlib import Path
+    import json
+    results=list(results)
+    if not results: raise ValueError('No band spectrograms supplied')
+    if page not in ('day','hour'):raise ValueError('page must be day or hour')
+    if 'outfile' in plot_kwargs:raise ValueError('Batch writer manages outfile')
+    unit='D' if page=='day' else 'h'
+    start=np.datetime64(start,'ns') if start is not None else None
+    end=np.datetime64(end,'ns') if end is not None else None
+    if (start is not None and np.isnat(start)) or (end is not None and np.isnat(end)):
+        raise ValueError('Invalid date limit')
+    if start is not None and end is not None and end<=start:raise ValueError('end must exceed start')
+    pages=set()
+    for r in results:
+        times=r.times
+        if start is not None:times=times[times>=start]
+        if end is not None:times=times[times<end]
+        pages.update(times.astype(f'datetime64[{unit}]').astype('int64').tolist())
+    if not pages:raise ValueError('No records in selected window')
+    output=Path(output_dir)
+    plan=[]
+    for value in sorted(pages):
+        lo=np.datetime64(value,unit).astype('datetime64[ns]')
+        hi=lo+np.timedelta64(1,unit)
+        label=np.datetime_as_string(lo,unit=unit).replace(':','').replace('-','')
+        plan.append((max(lo,start) if start is not None else lo,
+                     min(hi,end) if end is not None else hi,output/f'ssam_{page}_{label}.png'))
+    manifest_path=output/'ssam_pages.json'
+    if not overwrite and any(p.exists() for p in [manifest_path,*[p for _,_,p in plan]]):
+        raise FileExistsError('Spectrogram page/manifest exists; choose another directory or overwrite=True')
+    output.mkdir(parents=True,exist_ok=True)
+    generated=[]
+    for lo,hi,path in plan:
+        fig=plot_band_spectrograms(results,start=lo,end=hi,**plot_kwargs)
+        try:fig.savefig(path,dpi=180)
+        finally:plt.close(fig)
+        generated.append(path)
+    manifest=dict(page=page,paths=[str(p) for p in generated],start=str(start),end_exclusive=str(end),
+        plot_options=plot_kwargs,channels=[dict(trace_id=r.trace_id,time_basis=r.time_basis,
+        units=r.units,quantity=r.quantity,time_anchor=r.time_anchor,display_interval_seconds=r.interval_seconds,
+        band_names=r.band_names,band_limits_hz=r.band_limits_hz.tolist(),metadata=r.metadata) for r in results])
+    manifest_path.write_text(json.dumps(manifest,indent=2,default=str)+'\n')
+    return generated

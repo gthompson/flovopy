@@ -63,4 +63,15 @@ class VDAPIngestTests(unittest.TestCase):
         value=parse_hypo71_line(''.join(line));self.assertLess(value['latitude'],0);self.assertLess(value['longitude'],0)
         line[20]='Q';self.assertIsNone(parse_hypo71_line(''.join(line)))
 
+    def test_opt_in_terminal_separator_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'event.PHA'
+            pick='PI2L P PU0 910603125636.37\n'
+            path.write_text(pick+'                 10\n\n\x1a\n')
+            with self.assertRaises(ValueError):read_vdap_pha_file(path)
+            self.assertEqual(len(read_vdap_pha_file(path,allow_terminal_separator=True)),1)
+            for text in [pick+'10\n'+pick,pick+'10\n100\n']:
+                path.write_text(text)
+                with self.assertRaises(ValueError):read_vdap_pha_file(path,allow_terminal_separator=True)
+
 if __name__=='__main__':unittest.main()

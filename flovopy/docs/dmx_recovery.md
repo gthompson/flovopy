@@ -1,0 +1,9 @@
+# DMX validated-prefix fallback
+
+`flovopy.core.vdap.read_dmx_file` first tries the ordinary ObsPy reader. If it raises, `recover_partial=True` (reader default) attempts complete S6 structures from byte zero, stopping at the first structural or descriptor defect. It does not resynchronize beyond that defect. `recovery_ascii` optionally supplies SUD2ASC text for exact sample checks; recovery stops before the first nonmatching or incomplete trace. Without ASCII, the last trace preceding the defect is conservatively excluded as well.
+
+Returned traces retain `stats.dmx_recovery` with the source hash, accepted-prefix extent, reason, guard status, original exception and partial flag. Recovery emits a RuntimeWarning. `recover_partial=False` preserves strict empty-stream failure behavior. Existing fix/count-offset behavior is applied once, after recovery; fix=False retains original samples. No clock correction, interpolation or sample repair occurs. The year bound is a broad sanity screen (1900–2100), not a dataset-specific timestamp correction.
+
+`convert_dmx_to_seisan` defaults to recover_partial=False, so production behavior does not silently change. Explicit True enables partial exports and adds partial_recovery and recovery_details columns to the waveform index. Those columns must be retained in downstream provenance; MiniSEED alone does not preserve the complete recovery report. Raw trace membership is reported before constant/IRIG removal. Existing conversion merge, padding, rate relabeling and ID policies remain separate from recovery.
+
+Tests cover normal reads, conservative boundary behavior, missing/truncated payloads, no resynchronization, single count-offset application, source immutability, warnings/provenance and partial-export flags. Agreement between readers does not validate acquisition clocks or physical signal quality.
