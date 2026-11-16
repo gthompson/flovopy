@@ -1,0 +1,180 @@
+"""Antelope CSS3.0 ASCII catalog tables and ObsPy event conversion."""
+from pathlib import Path
+from collections import defaultdict
+from urllib.parse import quote
+
+import pandas as pd
+from obspy import UTCDateTime
+from obspy.core.event import (Catalog, Event, Origin, Pick, Arrival, Magnitude,
+                              WaveformStreamID, ResourceIdentifier, CreationInfo)
+
+# Antelope V3 Schema Reference Manual: field order, scalar type and print width.
+_LAYOUTS = {
+    'arrival': 'sta:s6 time:t17 arid:i8 jdate:y8 stassid:i8 chanid:i8 chan:s8 iphase:s8 stype:s1 deltim:r6 azimuth:r7 delaz:r7 slow:r7 delslo:r7 ema:r7 rect:r7 amp:r10 per:r7 logat:r7 clip:s1 fm:s2 snr:r10 qual:s1 auth:s15 commid:i8 lddate:t17',
+    'assoc': 'arid:i8 orid:i8 sta:s6 phase:s8 belief:r4 delta:r8 seaz:r7 esaz:r7 timeres:r8 timedef:s1 azres:r7 azdef:s1 slores:r7 slodef:s1 emares:r7 wgt:r6 vmodel:s15 commid:i8 lddate:t17',
+    'event': 'evid:i8 evname:s15 prefor:i8 auth:s15 commid:i8 lddate:t17',
+    'lastid': 'keyname:s15 keyvalue:i8 lddate:t17',
+    'netmag': 'magid:i8 net:s8 orid:i8 evid:i8 magtype:s6 nsta:i8 magnitude:r7 uncertainty:r7 auth:s15 commid:i8 lddate:t17',
+    'origerr': 'orid:i8 sxx:r15 syy:r15 szz:r15 stt:r15 sxy:r15 sxz:r15 syz:r15 stx:r15 sty:r15 stz:r15 sdobs:r9 smajax:r9 sminax:r9 strike:r6 sdepth:r9 stime:r8 conf:r5 commid:i8 lddate:t17',
+    'origin': 'lat:r9 lon:r9 depth:r9 time:t17 orid:i8 evid:i8 jdate:y8 nass:i4 ndef:i4 ndp:i4 grn:i8 srn:i8 etype:s2 review:s4 depdp:r9 dtype:s1 mb:r7 mbid:i8 ms:r7 msid:i8 ml:r7 mlid:i8 algorithm:s15 auth:s15 commid:i8 lddate:t17',
+    'remark': 'commid:i8 lineno:i8 remark:s80 lddate:t17',
+    'stamag': 'magid:i8 sta:s6 arid:i8 orid:i8 evid:i8 phase:s8 magtype:s6 magnitude:r7 uncertainty:r7 auth:s15 commid:i8 lddate:t17',
+    'detection': 'srcid:s64 tagname:s8 sta:s6 chan:s8 time:t17 arid:i8 state:s3 filter:s30 snr:r10 lddate:t17',
+    'detev': 'sta:s6 chan:s8 filter:s30 time:t17 tron:r12 troff:r12 iphase:s8 snr:r10 lddate:t17',
+}
+
+
+def read_table(path, table=None):
+    """Read a table file, or a database basename and table name, into pandas.
+
+    Columns retain CSS names, epoch seconds, native units and CSS null sentinels.
+    Character fields are stripped of padding but preserve interior spaces.
+    """
+    path = Path(path)
+    if table is None:
+        table = path.suffix.lstrip(".")
+    else:
+        path = Path(f"{path}.{table}")
+    if table not in _LAYOUTS:
+        raise ValueError(f"Unsupported CSS relation {table!r}. Available: {', '.join(_LAYOUTS)}")
+    fields = []
+    offset = 0
+    for definition in _LAYOUTS[table].split():
+        name, fmt = definition.split(":")
+        end = offset + int(fmt[1:])
+        fields.append((name, fmt[0], slice(offset, end)))
+        offset = end + 1
+    rows = []
+    with path.open(encoding="ascii") as stream:
+        for number, line in enumerate(stream, 1):
+            line = line.rstrip("\r\n")
+            if not line.strip():
+                continue
+            if len(line.rstrip()) > end or len(line) < fields[-1][2].start:
+                raise ValueError(f"{path}:{number}: unexpected CSS record length {len(line)}")
+            row = []
+            for name, kind, span in fields:
+                value = line[span].strip()
+                try:
+                    if kind == "s":
+                        row.append(value)
+                    elif kind in ("i", "y"):
+                        row.append(int(value))
+                    else:
+                        row.append(float(value))
+                except ValueError as exc:
+                    raise ValueError(f"{path}:{number}: invalid {name}: {value!r}") from exc
+            rows.append(row)
+    return pd.DataFrame.from_records(rows, columns=[name for name, _, _ in fields])
+
+
+class CSS_Catalog(Catalog):
+    """ObsPy Catalog retaining source relations, detector records and unassociated picks."""
+
+    def __init__(self, events=None, **kwargs):
+        super().__init__(events=events, **kwargs)
+        self.tables = {}
+        self.unassociated_picks = []
+        self.issues = []
+
+    @property
+    def detections(self):
+        """Detector state changes, as recorded in the detection relation."""
+        return self.tables.get("detection", pd.DataFrame(columns=[
+            field.split(":")[0] for field in _LAYOUTS["detection"].split()]))
+
+
+def read_events(path, *, namespace=None):
+    """Read sibling Antelope CSS3.0 ASCII relations into a CSS_Catalog.
+
+    Pass the database basename/descriptor or any supported table path.
+    namespace defaults to the volume basename and scopes QuakeML resource IDs.
+    Missing optional tables are allowed. Inspect catalog.issues for unresolved links.
+    """
+    base = Path(path)
+    if base.suffix.lstrip(".") in _LAYOUTS:
+        base = base.with_suffix("")
+    catalog = CSS_Catalog()
+    for table in _LAYOUTS:
+        if Path(f"{base}.{table}").is_file():
+            catalog.tables[table] = read_table(base, table)
+    if not catalog.tables:
+        raise FileNotFoundError(f"No supported CSS tables beside {base}")
+    prefix = "smi:local/css/" + quote(namespace or base.name, safe="")
+
+    def rid(kind, key):
+        return ResourceIdentifier(f"{prefix}/{kind}/{key}")
+
+    def records(table):
+        frame = catalog.tables.get(table)
+        return () if frame is None else frame.itertuples(index=False)
+
+    events, origins, picks = {}, {}, {}
+    seen_picks = defaultdict(set)
+
+    def event(key):
+        if key not in events:
+            events[key] = Event(resource_id=rid("event", key))
+        return events[key]
+
+    for r in records("event"):
+        event(r.evid).creation_info = CreationInfo(author=None if r.auth == "-" else r.auth)
+    for r in records("origin"):
+        key = r.evid if r.evid != -1 else f"orid-{r.orid}"
+        e = event(key)
+        o = Origin(resource_id=rid("origin", r.orid),
+                   time=UTCDateTime(r.time) if r.time > -9999999999 else None,
+                   latitude=None if r.lat == -999 else r.lat,
+                   longitude=None if r.lon == -999 else r.lon,
+                   depth=None if r.depth == -999 else r.depth * 1000)
+        e.origins.append(o)
+        origins[r.orid] = (key, o)
+    for r in records("event"):
+        if r.prefor == -1:
+            continue
+        if r.prefor in origins and origins[r.prefor][0] == r.evid:
+            events[r.evid].preferred_origin_id = origins[r.prefor][1].resource_id
+        else:
+            catalog.issues.append(f"event {r.evid}: unresolved prefor {r.prefor}")
+    for r in records("arrival"):
+        if r.time <= -9999999999:
+            catalog.issues.append(f"arrival {r.arid}: missing time")
+            continue
+        pick = Pick(resource_id=rid("pick", r.arid), time=UTCDateTime(r.time),
+                    waveform_id=WaveformStreamID(network_code="", station_code=r.sta, channel_code=None if r.chan == "-" else r.chan),
+                    phase_hint=None if r.iphase == "-" else r.iphase)
+        if r.deltim >= 0:
+            pick.time_errors.uncertainty = r.deltim
+        picks[r.arid] = pick
+    associated = set()
+    for r in records("assoc"):
+        if r.orid not in origins or r.arid not in picks:
+            catalog.issues.append(f"assoc: unresolved orid {r.orid} or arid {r.arid}")
+            continue
+        key, origin = origins[r.orid]
+        pick = picks[r.arid]
+        if r.arid not in seen_picks[key]:
+            events[key].picks.append(pick)
+            seen_picks[key].add(r.arid)
+        origin.arrivals.append(Arrival(resource_id=rid("assoc", f"{r.orid}-{r.arid}"),
+                                       pick_id=pick.resource_id, phase=None if r.phase == "-" else r.phase,
+                                       time_residual=None if r.timeres == -999 else r.timeres))
+        associated.add(r.arid)
+    catalog.unassociated_picks = [p for arid, p in picks.items() if arid not in associated]
+    for r in records("netmag"):
+        if r.magnitude == -999:
+            continue
+        if r.evid not in events:
+            catalog.issues.append(f"netmag {r.magid}: unresolved evid {r.evid}")
+            continue
+        mag = Magnitude(resource_id=rid("magnitude", r.magid), mag=r.magnitude,
+                        magnitude_type=r.magtype, station_count=r.nsta if r.nsta >= 0 else None)
+        if r.orid in origins and origins[r.orid][0] == r.evid:
+            mag.origin_id = origins[r.orid][1].resource_id
+        if r.uncertainty >= 0:
+            mag.mag_errors.uncertainty = r.uncertainty
+        events[r.evid].magnitudes.append(mag)
+    catalog.events = list(events.values())
+    for e in catalog:
+        e.scope_resource_ids()
+    return catalog
