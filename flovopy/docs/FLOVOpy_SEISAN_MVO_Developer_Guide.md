@@ -191,13 +191,13 @@ write_catalog_result(
 enhanced_catalog = to_enhanced_catalog(result)
 ```
 
-`convert_archive_catalog()` returns `CatalogConversionResult` with `catalog` (ObsPy Catalog), `records` (EnhancedEvent instances when requested), `source_paths`, and `failures`. The default parser is generic `Sfile`; pass `MVOSfile` explicitly for Montserrat. `strict=True` raises the first parsing error; default `False` records failures and continues. The older `seisan_to_catalog()`, `iter_parsed_sfiles()`, and `write_quakeml()` entry points remain available.
+`convert_archive_catalog()` returns `CatalogConversionResult` with `catalog`, `source_paths`, and `failures`. `catalog` is an ObsPy Catalog, or with `enhanced=True` an `EnhancedCatalog` whose events are `EnhancedEvent` instances carrying the metadata in `.meta` (one object per S-file, no parallel list). The default parser is generic `Sfile`; pass `MVOSfile` explicitly for Montserrat. `strict=True` raises the first parsing error; default `False` records failures and continues. The older `seisan_to_catalog()`, `iter_parsed_sfiles()`, and `write_quakeml()` entry points remain available.
 
 **QuakeML stores standard event fields** (subject to actual parser support): event identifiers, picks, origins, magnitudes, arrivals, etc. **MVO-specific data are not automatically preserved in standard QuakeML.** The optional JSONL metadata sidecar serializes `EnhancedEvent.meta`, including available source references, analyst/classification data, and AEF rows. `metadata_path` requires enhanced records for every successfully converted event; it does not invent missing metadata. Keep S-files and sidecars together for auditability.
 
 ### 6.1 EnhancedEvent and EnhancedCatalog
 
-`MVOSfile.to_enhancedevent(stream=None)` now constructs `EnhancedEventMeta` and uses `EnhancedEvent.wrap(self.eventobj, meta=meta, stream=stream)`. This is the preferred bridge from the MVO parser to the enhanced scientific-event representation. Waveform samples live in the transient enhanced-event stream, **not** in QuakeML. `to_enhanced_catalog(result)` creates an `EnhancedCatalog` from enhanced records. Pass 6 tests cover object identity between its events and records, but not a complete event-processing workflow.
+`MVOSfile.to_enhancedevent(stream=None)` now constructs `EnhancedEventMeta` and uses `EnhancedEvent.wrap(self.eventobj, meta=meta, stream=stream)`. This is the preferred bridge from the MVO parser to the enhanced scientific-event representation. Waveform samples live in the transient enhanced-event stream, **not** in QuakeML. `to_enhanced_catalog(result)` returns the enhanced conversion's catalog as an `EnhancedCatalog` holding the same Event objects. Pass 6 tests cover that identity, but not a complete event-processing workflow.
 
 Do not add arbitrary `.stream` attributes to plain ObsPy Event objects; this previously generated an ObsPy warning. `EnhancedEvent.wrap` was changed to attach transient waveform state without triggering that warning.
 

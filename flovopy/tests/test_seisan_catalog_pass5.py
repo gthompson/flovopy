@@ -57,7 +57,8 @@ def test_quakeml_roundtrip_and_failures(tmp_path):
 
 def test_enhanced_sidecar(tmp_path):
     result = convert_archive_catalog(Archive(), 0, 1, parser=Parser, enhanced=True)
-    assert result.records[0].meta.metrics['subclass'] == 'LV'
+    assert result.catalog.events[0].meta.metrics['subclass'] == 'LV'
+    assert len(result.catalog) == 1 and not hasattr(result, 'records')
     write_catalog_result(result, tmp_path / 'catalog.xml',
                          metadata_path=tmp_path / 'meta.jsonl')
     row = json.loads((tmp_path / 'meta.jsonl').read_text())

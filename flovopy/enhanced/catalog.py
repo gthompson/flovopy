@@ -28,14 +28,14 @@ class EnhancedCatalog(Catalog):
     Extended ObsPy Catalog for volcano-seismic workflows.
 
     - Holds ObsPy Events (self itself is a Catalog)
-    - Keeps parallel metadata as EnhancedEvent "records" (per-event extras, file paths, etc.)
+    - Its one event list is self.events; iterating or indexing yields EnhancedEvents
+      (plain ObsPy Events are promoted in place, gaining an empty .meta)
     - Provides cached DataFrame views and convenience filters
     - Bridges to EventRate (regularly sampled series) via to_event_rate(...)
     """
     def __init__(
         self,
         events: Optional[List[Event]] = None,
-        records: Optional[List[EnhancedEvent]] = None,
         triggerParams: Optional[Dict[str, Any]] = None,
         starttime: Optional[UTCDateTime] = None,
         endtime: Optional[UTCDateTime] = None,
@@ -45,7 +45,6 @@ class EnhancedCatalog(Catalog):
         creation_info: Optional[CreationInfo] = None,
     ):
         super().__init__(events=events or [])
-        self.records: List[EnhancedEvent] = records or []
         self.triggerParams: Dict[str, Any] = triggerParams or {}
         self.starttime = starttime
         self.endtime = endtime
@@ -57,6 +56,14 @@ class EnhancedCatalog(Catalog):
             self.resource_id = resource_id
         if creation_info:
             self.creation_info = creation_info
+
+    # ---------- Event access ----------
+    def __iter__(self):
+        return (EnhancedEvent.promote(ev) for ev in self.events)
+
+    def __getitem__(self, index):
+        item = super().__getitem__(index)
+        return EnhancedEvent.promote(item) if isinstance(item, Event) else item
 
     # ---------- Cached DataFrame ----------
     @property
@@ -119,10 +126,7 @@ class EnhancedCatalog(Catalog):
             },
         )
 
-        # Wrap and use the SAME object for both Catalog events and records
-        enh = EnhancedEvent.wrap(event, meta=meta, stream=stream)
-        self.append(enh)
-        self.records.append(enh)
+        self.append(EnhancedEvent.wrap(event, meta=meta, stream=stream))
 
         # bust cache
         self._df_cache = None
@@ -132,8 +136,8 @@ class EnhancedCatalog(Catalog):
         return [ev.origins[0].time for ev in self if ev.origins]
 
     def plot_streams(self) -> None:
-        for i, enh in enumerate(self.records):
-            if enh.stream:
+        for i, enh in enumerate(self):
+            if getattr(enh, "stream", None):
                 print(f"\nEVENT #{i+1}  time: {enh.stream[0].stats.starttime}\n")
                 enh.stream.plot(equal_scale=False)
 
@@ -141,16 +145,14 @@ class EnhancedCatalog(Catalog):
     def concat(self, other: "EnhancedCatalog") -> None:
         for ev in other:
             self.append(ev)
-        self.records.extend(other.records)
         self._df_cache = None
 
     def merge(self, other: "EnhancedCatalog") -> None:
         existing = {e.resource_id.id for e in self if e.resource_id}
-        for enh in other.records:
+        for enh in other:
             rid = enh.resource_id.id if enh.resource_id else None
             if rid not in existing:
-                self.append(enh)          # enh is an Event
-                self.records.append(enh)  # keep the same object in records
+                self.append(enh)
         self._df_cache = None
 
     # ---------- Summaries ----------
@@ -190,7 +192,7 @@ class EnhancedCatalog(Catalog):
         """
         rows = []
 
-        for ev in self.records:  # EnhancedEvent (subclass of ObsPy Event)
+        for ev in self:  # EnhancedEvent (subclass of ObsPy Event)
             rid = getattr(getattr(ev, "resource_id", None), "id", None)
 
             # Pull ASL series (if present) + summary metrics
@@ -355,7 +357,7 @@ class EnhancedCatalog(Catalog):
             - energy      : float, if magnitude present
         """
         rows = []
-        for enh in self.records:  # enh is an EnhancedEvent (subclass of Event)
+        for enh in self:  # enh is an EnhancedEvent (subclass of Event)
             rid = getattr(getattr(enh, "resource_id", None), "id", None)
             meta_src = (
                 getattr(enh.meta, "asl_source", None)
@@ -453,7 +455,7 @@ class EnhancedCatalog(Catalog):
         write_obspy_json: bool = False,
         include_trajectory_in_sidecar: bool = True,
     ) -> None:
-        for ev in self.records:  # ev is an EnhancedEvent (subclass of Event)
+        for ev in self:  # ev is an EnhancedEvent (subclass of Event)
             if not ev.origins or not getattr(ev.origins[0], "time", None):
                 continue
             t = ev.origins[0].time
@@ -472,32 +474,32 @@ class EnhancedCatalog(Catalog):
 
     # ---------- Filters (return new EnhancedCatalogs) ----------
     def filter_by_event_type(self, event_type: str) -> "EnhancedCatalog":
-        recs = [r for r in self.records if getattr(r, "event_type", None) == event_type]
-        return EnhancedCatalog(events=[r for r in recs], records=recs)
+        recs = [r for r in self if getattr(r, "event_type", None) == event_type]
+        return EnhancedCatalog(events=recs)
 
 
     def filter_by_mainclass(self, mainclass: str) -> "EnhancedCatalog":
         def has_mc(ev: Event) -> bool:
             return any((c.text or "").startswith("mainclass:") and mainclass in (c.text or "")
                     for c in (ev.comments or []))
-        recs = [r for r in self.records if has_mc(r)]
-        return EnhancedCatalog(events=[r for r in recs], records=recs)
+        recs = [r for r in self if has_mc(r)]
+        return EnhancedCatalog(events=recs)
 
 
     def filter_by_subclass(self, subclass: str) -> "EnhancedCatalog":
         def has_sc(ev: Event) -> bool:
             return any((c.text or "").startswith("subclass:") and subclass in (c.text or "")
                     for c in (ev.comments or []))
-        recs = [r for r in self.records if has_sc(r)]
-        return EnhancedCatalog(events=[r for r in recs], records=recs)
+        recs = [r for r in self if has_sc(r)]
+        return EnhancedCatalog(events=recs)
 
 
     def group_by(self, field: str) -> Dict[Any, "EnhancedCatalog"]:
         """
-        Group records by a classification field: 'event_type', 'mainclass', or 'subclass'.
+        Group events by a classification field: 'event_type', 'mainclass', or 'subclass'.
         """
         grouped: Dict[Any, List[EnhancedEvent]] = defaultdict(list)
-        for r in self.records:
+        for r in self:
             val = None
             if field == "event_type":
                 val = getattr(r, "event_type", None)
@@ -510,14 +512,14 @@ class EnhancedCatalog(Catalog):
             grouped[val].append(r)
 
         return {
-            key: EnhancedCatalog(events=[rr for rr in recs], records=recs)
+            key: EnhancedCatalog(events=recs)
             for key, recs in grouped.items()
         }
 
     # ---------- Builders ----------
     @classmethod
     def from_dataframe(cls, df: pd.DataFrame, *, load_waveforms: bool = False) -> "EnhancedCatalog":
-        records: List[EnhancedEvent] = []
+        events: List[EnhancedEvent] = []
 
         for _, row in df.iterrows():
             ev = Event()
@@ -556,10 +558,9 @@ class EnhancedCatalog(Catalog):
                 wav_paths=wav_paths,
                 metrics={}
             )
-            records.append(EnhancedEvent.wrap(ev, meta=meta, stream=stream))
+            events.append(EnhancedEvent.wrap(ev, meta=meta, stream=stream))
 
-        # EnhancedEvent IS an Event, so return the same objects for both lists.
-        return cls(events=[r for r in records], records=records)
+        return cls(events=events)
     
 
 
@@ -576,7 +577,7 @@ class EnhancedCatalog(Catalog):
         is read (if it exists) and attached as `enh.stream`.
         """
         qml_files = sorted(glob.glob(os.path.join(catdir, "**", "*.qml"), recursive=True))
-        records: List[EnhancedEvent] = []
+        events: List[EnhancedEvent] = []
 
         for qml_file in qml_files:
             base = os.path.splitext(qml_file)[0]
@@ -599,10 +600,9 @@ class EnhancedCatalog(Catalog):
                     except Exception as e:
                         print(f"[WARN] Could not load waveform {fn}: {e}")
 
-            records.append(enh)
+            events.append(enh)
 
-        # EnhancedEvent is an Event, so use the same objects for both lists
-        return cls(events=[r for r in records], records=records)
+        return cls(events=events)
 
     @classmethod
     def from_sidecars(cls, paths, *, require_quakeml=False):
@@ -611,14 +611,14 @@ class EnhancedCatalog(Catalog):
         Paths may end in .json or name the base. No waveform access occurs.
         Duplicate resource IDs raise: choose one active version per event.
         """
-        records=[];seen=set()
+        events=[];seen=set()
         for path in paths:
             base=os.fspath(path)
             if base.endswith('.json'):base=base[:-5]
             event=EnhancedEvent.load(base,require_quakeml=require_quakeml)
             if event.event_id in seen:raise ValueError('Duplicate event ID: '+event.event_id)
-            seen.add(event.event_id);records.append(event)
-        return cls(events=records,records=records)
+            seen.add(event.event_id);events.append(event)
+        return cls(events=events)
 
     def metrics_dataframe(self, *, level='trace'):
         """Export ALL sidecar fields, not the selected event-summary columns.
@@ -632,9 +632,7 @@ class EnhancedCatalog(Catalog):
         """
         if level not in ('trace','event'):raise ValueError('level must be trace or event')
         rows=[]
-        records=self.records if self.records else list(self)
-        for event in records:
-            if not isinstance(event,EnhancedEvent):event=EnhancedEvent.wrap(event)
+        for event in self:
             if level=='trace' and not event.meta.traces:continue
             payload=event.to_json();traces=payload.pop('traces',[])
             if level=='event':
@@ -666,7 +664,7 @@ class EnhancedCatalog(Catalog):
                 if base.endswith('.json'):base=base[:-5]
                 event=EnhancedEvent.load(base,require_quakeml=False)
                 if not include_trace_summaries:event.meta.traces=[]
-                catalog=cls(events=[event],records=[event])
+                catalog=cls(events=[event])
                 yield from catalog.metrics_dataframe(level=level).to_dict('records')
         fields=[];seen=set()
         for row in rows():

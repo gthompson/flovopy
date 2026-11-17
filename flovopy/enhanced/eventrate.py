@@ -12,11 +12,33 @@ from obspy.core.event import Catalog, Event
 # If you keep these in flovopy.core.physics:
 from flovopy.core.physics import magnitude2Eseismic, Eseismic2magnitude
 
+import re as _re
+
+_FREQ_ALIASES = {'T': 'min', 'H': 'h', 'S': 's', 'U': 'us', 'N': 'ns'}
+
+def _norm_freq(f):
+    """Normalise legacy uppercase pandas frequency aliases (pandas >= 2.2).
+
+    'H' -> 'h', 'T' -> 'min', '5T' -> '5min', '1H' -> '1h', etc.
+    Passes through already-valid aliases unchanged.
+    """
+    if f is None:
+        return None
+    m = _re.fullmatch(r'(\d*)([A-Za-z]+)', f.strip())
+    if not m:
+        return f
+    n_part, s_part = m.group(1), m.group(2)
+    return f"{n_part}{_FREQ_ALIASES.get(s_part.upper(), s_part)}"
+
 
 @dataclass
 class EventRateConfig:
     """Configuration for turning a catalog into a regular time series."""
-    interval: str = "D"                 # 'T','H','D','W','M','Y' or pandas offset alias
+    interval: str = "h"                 # bin/window size; pandas offset alias — legacy uppercase ('H','T') accepted
+    step: Optional[str] = None          # how often the window advances
+                                        # None  → step == interval (non-overlapping, original behaviour)
+                                        # e.g. step='min' with interval='h' → 1-hour trailing window
+                                        #      computed every minute (causal, alarm-ready)
     groupby: Optional[str] = None       # e.g., 'subclass' | 'event_type' | None
     threshold_magnitude: float = 1.0
     lowest_magnitude: float = -2.0      # replace placeholders < this with min valid
@@ -61,6 +83,8 @@ class EventRate:
         If None, we try to read common fields from EnhancedEvent.meta or Event.comments.
         """
         cfg = config or EventRateConfig()
+        interval = _norm_freq(cfg.interval)
+        step     = _norm_freq(cfg.step)
         if cfg.time_source not in ('origin','recorded_file'):raise ValueError('Invalid time_source')
 
         # -------- collect per-event rows --------
@@ -142,47 +166,129 @@ class EventRate:
         else:
             df["energy"] = np.nan
 
-        # -------- resample/bin --------
-        group_cols: List[Any] = [pd.Grouper(key="time", freq=cfg.interval)]
-        if cfg.groupby and cfg.groupby in df.columns:
-            group_cols.append(cfg.groupby)
+        # ================================================================
+        # BRANCH A: step is None — non-overlapping fixed bins (original)
+        # ================================================================
+        if step is None:
+            # -------- resample/bin --------
+            group_cols: List[Any] = [pd.Grouper(key="time", freq=interval)]
+            if cfg.groupby and cfg.groupby in df.columns:
+                group_cols.append(cfg.groupby)
 
-        grouped = df.groupby(group_cols).agg(
-            event_count=("magnitude", "size"),
-            magnitude_count=("magnitude", "count"),
-            minimum_magnitude=("magnitude", "min"),
-            average_magnitude=("magnitude", "mean"),
-            maximum_magnitude=("magnitude", "max"),
-            cumulative_energy=("energy", lambda values: values.sum(min_count=1)),
-        ).reset_index()
+            grouped = df.groupby(group_cols).agg(
+                event_count=("magnitude", "size"),
+                magnitude_count=("magnitude", "count"),
+                minimum_magnitude=("magnitude", "min"),
+                average_magnitude=("magnitude", "mean"),
+                maximum_magnitude=("magnitude", "max"),
+                cumulative_energy=("energy", lambda values: values.sum(min_count=1)),
+            ).reset_index()
 
-        if cfg.include_energy:
-            grouped["cumulative_magnitude"] = Eseismic2magnitude(grouped["cumulative_energy"])
+            if cfg.include_energy:
+                grouped["cumulative_magnitude"] = Eseismic2magnitude(grouped["cumulative_energy"])
+            else:
+                grouped["cumulative_magnitude"] = np.nan
+
+            # thresholded series
+            thr = df[df["magnitude"] >= cfg.threshold_magnitude].groupby(group_cols).agg(
+                thresholded_count=("magnitude", "count"),
+                thresholded_energy=("energy", "sum"),
+            ).reset_index()
+
+            on_keys = ["time"] + ([cfg.groupby] if cfg.groupby and cfg.groupby in grouped.columns else [])
+            grouped = grouped.merge(thr, on=on_keys, how="left")
+
+            grouped["thresholded_count"] = grouped["thresholded_count"].fillna(0)
+            if cfg.include_energy:
+                grouped["thresholded_energy"] = grouped["thresholded_energy"].fillna(0)
+            grouped["thresholded_magnitude"] = Eseismic2magnitude(grouped["thresholded_energy"].fillna(0)) if cfg.include_energy else np.nan
+
+            if cfg.include_energy:
+                unknown = grouped["magnitude_count"].eq(0)
+                grouped.loc[unknown,["cumulative_energy","cumulative_magnitude","thresholded_energy","thresholded_magnitude"]] = np.nan
+            grouped["thresholded_magnitude"] = grouped["thresholded_magnitude"].replace([np.inf,-np.inf],np.nan)
+
+            # ensure time col present & sorted
+            grouped["time"] = pd.to_datetime(grouped["time"])
+            grouped = grouped.sort_values(["time"] + ([cfg.groupby] if cfg.groupby and cfg.groupby in grouped.columns else []))
+
+        # ================================================================
+        # BRANCH B: step set — sliding trailing-window grid (causal)
+        # ================================================================
         else:
-            grouped["cumulative_magnitude"] = np.nan
+            t_min  = df["time"].min()
+            t_max  = df["time"].max()
+            grid   = pd.date_range(
+                start=t_min.floor(step),
+                end=t_max.ceil(interval),
+                freq=step,
+                tz=t_min.tzinfo,
+            )
+            win_ns = pd.tseries.frequencies.to_offset(interval).nanos
 
-        # thresholded series
-        thr = df[df["magnitude"] >= cfg.threshold_magnitude].groupby(group_cols).agg(
-            thresholded_count=("magnitude", "count"),
-            thresholded_energy=("energy", "sum"),
-        ).reset_index()
+            df_sorted  = df.sort_values("time").reset_index(drop=True)
+            # pandas >= 3 may store datetimes in µs; compare in ns like the grid.
+            times_arr  = df_sorted["time"].values.astype("datetime64[ns]")
+            mags_arr   = df_sorted["magnitude"].values
+            engy_arr   = (df_sorted["energy"].values
+                          if cfg.include_energy
+                          else np.full(len(df_sorted), np.nan))
 
-        on_keys = ["time"] + ([cfg.groupby] if cfg.groupby and cfg.groupby in grouped.columns else [])
-        grouped = grouped.merge(thr, on=on_keys, how="left")
+            groups = (
+                df_sorted[cfg.groupby].unique().tolist()
+                if cfg.groupby and cfg.groupby in df_sorted.columns
+                else [None]
+            )
 
-        grouped["thresholded_count"] = grouped["thresholded_count"].fillna(0)
-        if cfg.include_energy:
-            grouped["thresholded_energy"] = grouped["thresholded_energy"].fillna(0)
-        grouped["thresholded_magnitude"] = Eseismic2magnitude(grouped["thresholded_energy"].fillna(0)) if cfg.include_energy else np.nan
+            result_rows = []
+            for grp in groups:
+                if grp is not None:
+                    mask_grp  = (df_sorted[cfg.groupby] == grp).values
+                    t_g, m_g, e_g = times_arr[mask_grp], mags_arr[mask_grp], engy_arr[mask_grp]
+                else:
+                    t_g, m_g, e_g = times_arr, mags_arr, engy_arr
 
-        if cfg.include_energy:
-            unknown = grouped["magnitude_count"].eq(0)
-            grouped.loc[unknown,["cumulative_energy","cumulative_magnitude","thresholded_energy","thresholded_magnitude"]] = np.nan
-        grouped["thresholded_magnitude"] = grouped["thresholded_magnitude"].replace([np.inf,-np.inf],np.nan)
+                t_g_int = t_g.astype("int64")
 
-        # ensure time col present & sorted
-        grouped["time"] = pd.to_datetime(grouped["time"])
-        grouped = grouped.sort_values(["time"] + ([cfg.groupby] if cfg.groupby and cfg.groupby in grouped.columns else []))
+                for t in grid:
+                    t_ns   = t.value
+                    win_lo = t_ns - win_ns
+                    in_win = (t_g_int > win_lo) & (t_g_int <= t_ns)
+                    m_win  = m_g[in_win]
+                    e_win  = e_g[in_win]
+                    n      = int(in_win.sum())
+                    n_mag  = int(np.isfinite(m_win).sum())
+
+                    cum_e  = float(np.nansum(e_win)) if n_mag > 0 else np.nan
+                    thr_m  = m_win >= cfg.threshold_magnitude
+                    thr_e  = float(np.nansum(e_win[thr_m])) if thr_m.any() else 0.0
+
+                    row = {
+                        "time":                  t,
+                        "event_count":           n,
+                        "magnitude_count":       n_mag,
+                        "minimum_magnitude":     float(np.nanmin(m_win)) if n_mag else np.nan,
+                        "average_magnitude":     float(np.nanmean(m_win)) if n_mag else np.nan,
+                        "maximum_magnitude":     float(np.nanmax(m_win)) if n_mag else np.nan,
+                        "cumulative_energy":     cum_e,
+                        "cumulative_magnitude":  float(Eseismic2magnitude(cum_e)) if n_mag else np.nan,
+                        "thresholded_count":     int(thr_m.sum()),
+                        "thresholded_energy":    thr_e if cfg.include_energy else np.nan,
+                        "thresholded_magnitude": (
+                            float(Eseismic2magnitude(thr_e))
+                            if (cfg.include_energy and thr_m.any()) else np.nan
+                        ),
+                    }
+                    if grp is not None:
+                        row[cfg.groupby] = grp
+                    result_rows.append(row)
+
+            grouped = pd.DataFrame(result_rows)
+            grouped["thresholded_magnitude"] = grouped["thresholded_magnitude"].replace(
+                [np.inf, -np.inf], np.nan
+            )
+            sort_cols = ["time"] + ([cfg.groupby] if cfg.groupby and cfg.groupby in grouped.columns else [])
+            grouped   = grouped.sort_values(sort_cols).reset_index(drop=True)
 
         # Optional rolling/EMA on counts (per group if present)
         if cfg.rolling or cfg.ema_alpha:

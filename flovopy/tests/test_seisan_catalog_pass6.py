@@ -28,15 +28,14 @@ def test_mvo_parser_native_conversion_is_used():
     assert _enhance(parser) is native
 
 
-def test_enhanced_catalog_shares_records():
+def test_enhanced_catalog_uses_converted_events():
     ev = EnhancedEvent.wrap(Event())
-    result = CatalogConversionResult(catalog=Catalog(events=[ev]), records=[ev])
+    result = CatalogConversionResult(catalog=Catalog(events=[ev]))
     catalog = to_enhanced_catalog(result)
-    assert catalog.events[0] is catalog.records[0]
     assert catalog.events[0] is ev
 
 
-def test_enhanced_catalog_requires_records():
+def test_enhanced_catalog_requires_enhanced_events():
     result = CatalogConversionResult(catalog=Catalog(events=[Event()]))
     with pytest.raises(ValueError, match="enhanced=True"):
         to_enhanced_catalog(result)

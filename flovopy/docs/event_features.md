@@ -191,9 +191,9 @@ arbitrary histogram features are not included without a scientific use case.
 
 ## Verification
 
-Run `python -m pytest tests/test_features.py` from the FloVoPy checkout, with the
-updated `pinatubo_features_v6` directory beside it for the pipeline integration
-test. Tests cover synthetic known-delay HF/LF bursts at multiple rates, a known
+Run `python -m pytest tests/test_features.py` from the FloVoPy checkout. The
+pipeline integration test lives with the pipeline, in the Pinatubo1991SeismicData
+repository (`20_analysis/tests/test_pipeline.py`). Tests cover synthetic known-delay HF/LF bursts at multiple rates, a known
 0.5-s echo, sinusoidal power metrics, tiny-amplitude/DC invariance, analytic
 impulse energy duration/moments, invalid inputs/configuration, noise thresholds,
 window censoring, nonmutation, legacy metric preservation and pipeline CSV/JSON.

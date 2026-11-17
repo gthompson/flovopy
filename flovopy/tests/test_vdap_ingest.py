@@ -32,6 +32,63 @@ class VDAPIngestTests(unittest.TestCase):
         self.assertEqual(picks[1]['time'],UTCDateTime('1991-06-03T13:00:02'))
         self.assertEqual(picks[1]['channel'],'ELZ')
 
+    def test_unified_card_rules(self):
+        # Real cards from the 1991 Pinatubo monthly files.
+        def parse(line,issues=None):
+            return [(p['phase'],p['time'],p['onset'],p['first_motion'],p['weight'])
+                    for p in parse_vdap_phase_line(line,network='XB',issues=issues)]
+        T=UTCDateTime
+        # S quality fields are kept.
+        self.assertEqual(parse('CABN P 5 91 731163611.90       15.56ESU1')[1],('S',T('1991-07-31T16:36:15.56'),'E','U',1))
+        # Minute 60 rolls into the next hour.
+        self.assertEqual(parse('FNGZEP+1 91 815 560 2.14        5.69ISU1'),
+                         [('P',T('1991-08-15T06:00:02.14'),'E',None,1),('S',T('1991-08-15T06:00:05.69'),'I','U',1)])
+        # P seconds >= 60: S counts from the written minute, not the rolled P minute.
+        self.assertEqual(parse('CABN P 4 91 722124060.00       62.56 S 1')[1][:2],('S',T('1991-07-22T12:41:02.56')))
+        # A bare "P" code is a fixed card, not a tokenized record.
+        self.assertEqual(parse('QADZ P   91 818123059.91'),[('P',T('1991-08-18T12:30:59.91'),None,None,None)])
+        # Placeholders are skipped.
+        self.assertEqual(parse_vdap_phase_line('XXXXIPU0 91 8 3 02752.47',network='XB'),[])
+        # A damaged S field keeps the valid P and reports the S problem.
+        issues=[]
+        self.assertEqual([p[0] for p in parse('CABN P 4 91 726134854.31       5\x00\x008.12 S 1',issues)],['P'])
+        self.assertTrue(issues)
+        # Damaged timestamps are rejected rather than guessed.
+        for bad in ['PPON P 410530154826.01       26.66 S 0','CABZIPD1 91 818 9 5.57        7.75ISD3',
+                    'CRWZIPD0 91 8 31457525','CABPD5 91 815112640.10       42.96ISU1']:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse_vdap_phase_line(bad,network='XB')
+
+    def test_multievent_blocks_and_filters(self):
+        from flovopy.core.vdap import read_vdap_pha_blocks,dedupe_picks,filter_picks_near_median
+        text='\n'.join(['BUGZIPU0 91 731162835.39       37.49 S 1','BUGZIPU0 91 731162835.39','garbage','10',
+                        '10','CABZ PU0 91 7311700 1.00','PI2ZIPU0 91 7311700 2.00','QADZIPU0 91 7311700 3.00',
+                        'CRWZIPU0 91 7311710 3.00','100',''])
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'pinjul91.pha';path.write_text(text)
+            blocks,diag=read_vdap_pha_blocks(path,network='XB')
+        self.assertEqual([b['block_index'] for b in blocks],[0,1,2,3])
+        self.assertEqual([len(b['picks']) for b in blocks],[3,0,4,0])
+        self.assertEqual((diag[0]['source_line'],diag[0]['severity']),(3,'error'))
+        self.assertEqual(blocks[0]['picks'][0]['raw_lineno'],1)
+        self.assertEqual(len(dedupe_picks(blocks[0]['picks'])),2)
+        kept,rejected=filter_picks_near_median(blocks[2]['picks'],30)
+        self.assertEqual(([p['station'] for p in kept],[p['station'] for p in rejected]),(['CAB','PI2','QAD'],['CRW']))
+
+    def test_fixed_s_only_and_shifted_timestamps(self):
+        # Lines from the 1991 Pinatubo monthly PHA files. Blank P seconds must
+        # not shift the minute, and a P code without P seconds gives no P pick.
+        cases=[('CABN     91 8 2 2 6            37.91 S 3',[('S','1991-08-02T02:06:37.91')]),
+               ('CABZ     91 7311942            16.45 S  ',[('S','1991-07-31T19:42:16.45')]),
+               ('PI2L     91 8 4 2 3            63.19ES?1',[('S','1991-08-04T02:04:03.19')]),
+               ('CABN P 4 91 8 823 4            70.13 S 2',[('S','1991-08-08T23:05:10.13')]),
+               ('BUGZIPU0  91 8 6 65625.02',[('P','1991-08-06T06:56:25.02')]),
+               ('BUGZ PU0 910603073938.49       39.99 S 2',[('P','1991-06-03T07:39:38.49'),('S','1991-06-03T07:39:39.99')])]
+        for line,expected in cases:
+            with self.subTest(line=line):
+                picks=parse_vdap_phase_line(line,network='XB',dialect='fixed')
+                self.assertEqual([(p['phase'],p['time']) for p in picks],[(ph,UTCDateTime(t)) for ph,t in expected])
+
     def test_errors_and_multievent_rejection(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'event.PHA';path.write_text('garbage\nPI2L P 0 910603120001.00\n')

@@ -142,6 +142,15 @@ class EnhancedEvent(Event):
         object.__setattr__(ev, "stream", stream)
         return ev
 
+    @classmethod
+    def promote(cls, event: Event) -> "EnhancedEvent":
+        """Turn an ObsPy Event into an EnhancedEvent in place (same object, empty meta)."""
+        if not isinstance(event, cls):
+            object.__setattr__(event, "__class__", cls)
+            object.__setattr__(event, "_meta", EnhancedEventMeta())
+            object.__setattr__(event, "stream", None)
+        return event
+
     # --------- Sidecar persistence ---------
     def to_json(self) -> Dict[str, Any]:
         """

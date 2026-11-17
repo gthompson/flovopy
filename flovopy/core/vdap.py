@@ -50,12 +50,14 @@ def convert_dmx_to_seisan(
     network: str,
     database: str,
     sampling_rate: float | None = None,
+    rate_max_denominator: int | None = 100,
     pattern: str = "**/*.DMX",
     max_files: int | None = None,
     remove_irig: bool = True,
     recover_partial: bool = False,
     event_id_func=None,
     id_fixer=None,
+    time_correction=None,
     out_waveform_index: str | Path | None = None,
     out_trace_id_map: str | Path | None = None,
     out_trace_id_map_tex: str | Path | None = None,
@@ -68,12 +70,24 @@ def convert_dmx_to_seisan(
     """Convert legacy DMX files to SEISAN-named MiniSEED and build indexes.
 
     ``sampling_rate`` corrects metadata only; it does not resample samples.
-    Data correction is delegated to read_dmx_file (float conversion and
+    By default (``sampling_rate=None``) the original header rate is kept,
+    snapped to the nearest fraction with denominator <= ``rate_max_denominator``
+    (see snap_sampling_rate) so that traces merge and the rate survives the
+    MiniSEED round trip; ``rate_max_denominator=None`` disables snapping.
+    The index records ``raw_sampling_rate`` (header) and ``sampling_rate``
+    (saved). Data correction is delegated to read_dmx_file (float conversion and
     subtraction of 2048). Low gain is preserved by fix_legacy_vdap_id.
 
     event_id_func(path) returns an event ID, or None to reject a filename.
     The default expects YYMMDDNN.DMX. id_fixer(trace, network=network)
     modifies each trace in place; the default is fix_legacy_vdap_id.
+
+    time_correction(path, event_id, starttime) may return a tuple
+    ``(offset_seconds, label)``; every trace start time is shifted by the
+    offset before the SEISAN name is chosen (see flovopy.core.clock). An offset
+    of None marks the file as failed (stage ``clock``) rather than guessing.
+    The index then records ``raw_starttime``, ``clock_offset_s`` and
+    ``clock_regime``. Without it, header times are kept as read.
 
     Files are sorted, merged (method=1, zero-filled) and padded to the union
     of their time windows before writing. Existing files are reused unless
@@ -116,7 +130,10 @@ def convert_dmx_to_seisan(
         raise FileNotFoundError(f"No files matching {pattern!r} under {rawtop}")
 
     index_columns = ["event_id", "dmx_file", "wav_file", "starttime", "endtime",
-                     "stations", "channels", "ntraces", "status"]
+                     "stations", "channels", "ntraces", "status",
+                     "raw_sampling_rate", "sampling_rate"]
+    if time_correction is not None:
+        index_columns += ["raw_starttime", "clock_offset_s", "clock_regime"]
     provenance_columns = ["dmx_file", "event_id", "original_id", "fixed_id", "status"]
     index_rows, provenance_rows, failures = [], [], []
     successful_map = {}
@@ -149,8 +166,11 @@ def convert_dmx_to_seisan(
                 counts["empty"] += 1
                 status = "empty"
                 continue
+            raw_rates = sorted({float(tr.stats.sampling_rate) for tr in st})
             if sampling_rate is not None:
                 fix_sampling_rate(st, sampling_rate)
+            else:
+                snap_sampling_rates(st, rate_max_denominator)
             for tr in st:
                 original = tr.stats.get("vdap_original_id", tr.id)
                 id_fixer(tr, network=network)
@@ -170,6 +190,18 @@ def convert_dmx_to_seisan(
             end = max(tr.stats.endtime for tr in st)
             st.trim(start, end, pad=True, fill_value=0)
             t = min(tr.stats.starttime for tr in st)
+            clock = {}
+            if time_correction is not None:
+                stage = "clock"
+                offset, label = time_correction(dmx, event_id, t)
+                if offset is None:
+                    raise ValueError(f"No clock correction for {event_id} at {t}: {label}")
+                for tr in st:
+                    tr.stats.starttime += offset
+                clock = dict(raw_starttime=t.isoformat(), clock_offset_s=float(offset),
+                             clock_regime=label)
+                t = min(tr.stats.starttime for tr in st)
+                stage = "prepare"
             name = (f"{t.year:04d}-{t.month:02d}-{t.day:02d}-"
                     f"{t.hour:02d}{t.minute:02d}-{t.second:02d}M."
                     f"{str(database).ljust(5, '_')}_{len(st):03d}")
@@ -195,8 +227,9 @@ def convert_dmx_to_seisan(
             expected_ids = {tr.id for tr in st}
             if {tr.id for tr in saved} != expected_ids:
                 raise ValueError("Saved IDs differ from proposed IDs; regenerate with overwrite=True")
-            expected_rates = {(tr.id, tr.stats.sampling_rate) for tr in st}
-            if {(tr.id, tr.stats.sampling_rate) for tr in saved} != expected_rates:
+            expected_rates = {tr.id: tr.stats.sampling_rate for tr in st}
+            if any(not math.isclose(tr.stats.sampling_rate, expected_rates[tr.id], rel_tol=1e-9)
+                   for tr in saved):
                 raise ValueError("Saved sample rates differ; regenerate with overwrite=True")
             status = "existing" if existed and not overwrite else "written"
             index_rows.append(dict(
@@ -206,6 +239,10 @@ def convert_dmx_to_seisan(
                 stations=",".join(sorted({tr.stats.station for tr in saved})),
                 channels=",".join(sorted({tr.stats.channel for tr in saved})),
                 ntraces=len(saved), status=status,
+                raw_sampling_rate=";".join(repr(r) for r in raw_rates),
+                sampling_rate=";".join(repr(r) for r in sorted(
+                    {float(tr.stats.sampling_rate) for tr in saved})),
+                **clock,
             ))
             successful_map.update(proposed)
             counts[status] += 1
@@ -732,6 +769,38 @@ def fix_sampling_rate(st, fs):
     for tr in st:
         tr.stats.sampling_rate = fs
 
+
+def snap_sampling_rate(fs, max_denominator=100):
+    """Return ``fs`` snapped to the nearest fraction with a small denominator.
+
+    DMX headers store the acquisition rate as float32. For the VDAP PCs this is
+    100.80644989... Hz, the float32 image of 3125/31 Hz (a 9.92 ms sample
+    interval). Snapping removes float32 noise so traces from one file (or
+    several files) have identical rates and can be merged, and the value
+    survives a MiniSEED write/read unchanged. The relative change is ~1e-8,
+    unlike forcing a nominal rate (100 Hz is 0.8% off).
+    """
+    from fractions import Fraction
+    fs = float(fs)
+    if not math.isfinite(fs) or fs <= 0:
+        raise ValueError(f"Invalid sampling rate {fs!r}")
+    if max_denominator is None:
+        return fs
+    snapped = float(Fraction(fs).limit_denominator(int(max_denominator)))
+    # Accept the fraction only within ~3 float32 ulps of the header value; a
+    # small denominator keeps neighbouring float32 values on the same fraction.
+    return snapped if math.isclose(snapped, fs, rel_tol=2e-7) else fs
+
+
+def snap_sampling_rates(st, max_denominator=100):
+    """Snap every trace rate in place; keep the header value in stats."""
+    for tr in st:
+        raw = float(tr.stats.sampling_rate)
+        if "vdap_raw_sampling_rate" not in tr.stats:
+            tr.stats.vdap_raw_sampling_rate = raw
+        tr.stats.sampling_rate = snap_sampling_rate(raw, max_denominator)
+    return st
+
 def discover_dmx_files(rawtop, pattern):
     return sorted(Path(rawtop).glob(pattern))
 
@@ -889,15 +958,43 @@ def station0_to_inventory(
 
 
 
-def parse_vdap_phase_line(line, *, network='', dialect='auto'):
-    """Decode one single-event VDAP phase record into pick dictionaries.
+_VDAP_STAMP = re.compile(r'(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\.\d+)?')
 
-    Supports compact 12-digit timestamps (YYMMDDHHMMSS.fraction) in tokenized
-    records and the documented fixed-column VDAP P/S dialect. No multi-event
-    delimiter interpretation, time clustering or outlier filtering occurs.
-    Placeholder XXXX/XXX records return []; malformed records raise ValueError.
-    Legacy station suffixes are decoded by fix_legacy_vdap_id (including L).
-    S fields contain seconds within the minute, not a P-to-S duration.
+
+def _vdap_reference_minute(yymmddhhmm):
+    """UTCDateTime of a YYMMDDHHMM string; minute 60 rolls into the next hour."""
+    if not re.fullmatch(r'\d{10}', yymmddhhmm):
+        raise ValueError(f'Invalid VDAP timestamp: {yymmddhhmm!r}')
+    yy, mo, day, hour, minute = (int(yymmddhhmm[i:i+2]) for i in range(0, 10, 2))
+    year = yy + (1900 if yy >= 70 else 2000)
+    if not 1 <= mo <= 12 or not 1 <= day <= 31 or hour > 24 or minute > 60:
+        raise ValueError(f'Invalid VDAP timestamp: {yymmddhhmm!r}')
+    return UTCDateTime(year, mo, day) + hour*3600 + minute*60
+
+
+def parse_vdap_phase_line(line, *, network='', dialect='auto', issues=None):
+    """Decode one VDAP phase record (single-event or monthly file) into picks.
+
+    This is the single implementation of VDAP/HYPO71 phase-card decoding; the
+    goal is to keep every reading that can be decoded unambiguously.
+
+    Dialects: compact tokenized records ``STA [P|S] QUAL YYMMDDHHMMSS.ff`` and
+    the fixed-column card: station+component (cols 1-4), P quality (5-8),
+    YYMMDDHHMM SS.SS (9-23; a few legacy cards are shifted one column), and an
+    S field of seconds (cols 31-36) followed by onset/S/motion/weight (37-40).
+
+    Rules:
+    * Placeholder stations (XXX, XXXX, XXXXIPU0 ...) return [].
+    * Blank columns are zero-filled in place. Blank P seconds give no P pick;
+      the card then supplies only the reference minute for the S pick.
+    * Minutes and seconds of 60 or more roll over arithmetically (HYPO71).
+    * S seconds are counted from the written reference minute, not from the
+      P time; an S earlier than P is moved one minute later.
+    * Onset (I/E), first motion (U/D) and weight are kept for P and S.
+    * Malformed cards (bad station, timestamp or no phase) raise ValueError;
+      nothing is guessed. A damaged or ambiguous S field does not discard a
+      valid P: the S is skipped and a message is appended to ``issues`` (a
+      list) when given.
     """
     if dialect not in ('auto', 'tokenized', 'fixed'):
         raise ValueError("dialect must be 'auto', 'tokenized', or 'fixed'")
@@ -905,16 +1002,18 @@ def parse_vdap_phase_line(line, *, network='', dialect='auto'):
     if not text.strip():
         return []
     tokens = text.split()
-    if tokens[0].upper() in ('XXX', 'XXXX'):
+    if tokens[0].upper().startswith('XXX'):
         return []
 
+    def note(message):
+        if issues is not None:
+            issues.append(message)
+
     def timestamp(value):
-        match = re.fullmatch(r'(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\.\d+)?', value)
+        match = _VDAP_STAMP.fullmatch(value)
         if not match:
             raise ValueError(f'Invalid VDAP timestamp: {value!r}')
-        yy, mo, day, hour, minute, sec = map(int, match.groups()[:6])
-        year = yy + (1900 if yy >= 70 else 2000)
-        return UTCDateTime(year, mo, day) + hour*3600 + minute*60 + sec + float(match[7] or 0)
+        return _vdap_reference_minute(value[:10]) + int(match[6]) + float(match[7] or 0)
 
     def metadata(station):
         if not re.fullmatch(r'[A-Z0-9]{2,6}', station):
@@ -932,9 +1031,13 @@ def parse_vdap_phase_line(line, *, network='', dialect='auto'):
                     first_motion=motion, weight=weight)
 
     quality_pattern = r'(?P<onset>[IE])?(?P<phase>[PS])?(?P<motion>[UD])?(?P<weight>\d)?'
+    # Tokenized only when the last token is a complete compact timestamp; a
+    # fixed card with a bare "P" code (e.g. "QADZ P   91 818123059.91") also
+    # splits into four tokens but its last token is not a 12-digit stamp.
+    stamp_like = bool(_VDAP_STAMP.fullmatch(tokens[-1]))
     compact_quality = re.fullmatch(quality_pattern, tokens[1].upper()) if len(tokens) == 3 else None
-    token_like = ((len(tokens) == 4 and tokens[1].upper() in ('P', 'S')) or
-                  (compact_quality is not None and compact_quality['phase'] is not None))
+    token_like = stamp_like and ((len(tokens) == 4 and tokens[1].upper() in ('P', 'S')) or
+                                 (compact_quality is not None and compact_quality['phase'] is not None))
     if dialect == 'tokenized' or (dialect == 'auto' and token_like):
         if len(tokens) == 3:
             station, code, stamp = tokens
@@ -957,26 +1060,51 @@ def parse_vdap_phase_line(line, *, network='', dialect='auto'):
         raise ValueError('Short fixed-column phase record')
     meta = metadata(text[:4].strip().upper())
     pcode = text[4:8].upper().ljust(4)
-    start = 9 if text[8:9] == ' ' else 8
-    stamp = text[start:start+15].strip().replace(' ', '0')
-    time = timestamp(stamp)
+    # Zero-fill blanks in place, never after stripping: S-only cards leave the
+    # P-seconds columns blank, and stripping first shifts the minute.
+    start = 8
+    while start < 11 and text[start:start+1] == ' ':
+        start += 1
+    field = text[start:start+15].ljust(15)
+    p_seconds = field[10:15]
+    reference = _vdap_reference_minute(field[:10].replace(' ', '0'))
     picks = []
-    if pcode[1:2] == 'P':
-        picks.append(pick(meta, 'P', time, pcode))
-    spos = [i for i, c in enumerate(text) if c.upper() == 'S' and 35 <= i <= 40]
-    if len(spos) > 1:
-        raise ValueError('Ambiguous S-phase fields')
-    if spos:
-        pos = spos[0]
-        value = float(text[pos-7:pos-1].strip())
-        if not math.isfinite(value) or value < 0:
-            raise ValueError('Invalid S seconds')
-        minute_start = UTCDateTime(time.year, time.month, time.day, time.hour, time.minute)
-        stime = minute_start + value
-        while stime < time:
-            stime += 60
-        scode = text[max(0, pos-1):pos+3].upper()
-        picks.append(pick(meta, 'S', stime, scode))
+    ptime = reference
+    if p_seconds.strip():
+        sec = p_seconds.replace(' ', '0')
+        # SS.SS is right-justified: the decimal point is always in column 21
+        # (field index 12). Cards missing characters fail this check.
+        if field[12] != '.' or not re.fullmatch(r'\d{0,2}\.\d+', sec):
+            raise ValueError(f'Invalid VDAP timestamp: {field!r}')
+        ptime = reference + float(sec)
+        if pcode[1:2] == 'P':
+            picks.append(pick(meta, 'P', ptime, pcode))
+    elif pcode[1:2] == 'P':
+        note('P code without P seconds; no P pick')
+
+    s_field = text[30:41]
+    if 'S' in s_field.upper():
+        # The S phase letter belongs in column 38 (index 37); fall back to the
+        # single S anywhere in indices 35-40.
+        spos = [i for i, c in enumerate(text) if c.upper() == 'S' and 35 <= i <= 40]
+        pos = 37 if text[37:38].upper() == 'S' else (spos[0] if len(spos) == 1 else None)
+        if pos is None:
+            note(f'Ambiguous S field {s_field!r}; S skipped')
+        else:
+            if len(spos) > 1:
+                note(f'Extra S characters in {s_field!r}; S read at column {pos+1}')
+            try:
+                value = float(text[pos-7:pos-1].strip())
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError
+            except ValueError:
+                note(f'Invalid S seconds {text[pos-7:pos-1]!r}; S skipped')
+            else:
+                stime = reference + value
+                while stime < ptime:
+                    stime += 60
+                scode = text[max(0, pos-1):pos+3].upper()
+                picks.append(pick(meta, 'S', stime, scode))
     if not picks:
         raise ValueError('No supported phase fields')
     return picks
@@ -1018,6 +1146,88 @@ def read_vdap_pha_file(path, *, network='', dialect='auto', strict=True,
                 item.update(raw_line=line, raw_lineno=lineno, raw_file=path.name)
                 picks.append(item)
     return (picks, diagnostics) if return_diagnostics else picks
+
+
+def read_vdap_pha_blocks(path, *, network='', dialect='auto'):
+    """Read a multi-event VDAP PHA file (e.g. monthly) as separator blocks.
+
+    Events are delimited only by lines containing ``10`` or ``100``; no time
+    splitting, deduplication or outlier rejection is applied here (see
+    dedupe_picks and filter_picks_near_median). Every pick carries raw_line,
+    raw_lineno and raw_file. Undecodable characters are replaced, so a damaged
+    card becomes a diagnostic rather than an I/O error.
+
+    Returns ``(blocks, diagnostics)``. Each block is a dict with block_index
+    (counting all separator blocks, including empty ones), first_line,
+    last_line and picks. Diagnostics are dicts with source_file, source_line,
+    raw_line, severity ('error' = line rejected, 'warning' = part of a line
+    skipped) and message.
+    """
+    path = Path(path)
+    blocks, diagnostics = [], []
+    current = dict(block_index=0, first_line=None, last_line=None, picks=[])
+
+    def close():
+        blocks.append(current)
+
+    with path.open('r', encoding='utf-8', errors='replace') as stream:
+        for lineno, raw in enumerate(stream, 1):
+            line = raw.rstrip('\r\n')
+            if not line.strip() or not line.strip('\x1a').strip():
+                continue
+            if line.strip() in ('10', '100'):
+                close()
+                current = dict(block_index=current['block_index'] + 1,
+                               first_line=None, last_line=None, picks=[])
+                continue
+            issues = []
+            try:
+                parsed = parse_vdap_phase_line(line, network=network, dialect=dialect, issues=issues)
+            except (ValueError, IndexError) as exc:
+                diagnostics.append(dict(source_file=path.name, source_line=lineno, raw_line=line,
+                                        severity='error', message=str(exc)))
+                continue
+            diagnostics.extend(dict(source_file=path.name, source_line=lineno, raw_line=line,
+                                    severity='warning', message=m) for m in issues)
+            if current['first_line'] is None:
+                current['first_line'] = lineno
+            current['last_line'] = lineno
+            for item in parsed:
+                item.update(raw_line=line, raw_lineno=lineno, raw_file=path.name)
+                current['picks'].append(item)
+    close()
+    return blocks, diagnostics
+
+
+def dedupe_picks(picks, time_eps_s=1e-3):
+    """Drop repeated picks: same seed_id and phase within ``time_eps_s``.
+
+    Picks are returned sorted by (seed_id, phase, time); the first of each
+    duplicate run is kept.
+    """
+    out, last = [], {}
+    for p in sorted(picks, key=lambda p: (p.get('seed_id') or '', p.get('phase') or '', float(p['time']))):
+        key = (p.get('seed_id') or '', p.get('phase') or '')
+        if key in last and abs(p['time'] - last[key]) <= time_eps_s:
+            continue
+        out.append(p)
+        last[key] = p['time']
+    return out
+
+
+def filter_picks_near_median(picks, max_offset_s, *, min_picks=3):
+    """Split picks into those within ``max_offset_s`` of the median time and the rest.
+
+    Groups with fewer than ``min_picks`` timed picks are returned unchanged,
+    since there is no support for calling outliers. Returns (kept, rejected).
+    """
+    times = [float(p['time']) for p in picks if p.get('time') is not None]
+    if len(picks) < min_picks or len(times) < min_picks:
+        return list(picks), []
+    median = float(np.median(times))
+    kept = [p for p in picks if abs(float(p['time']) - median) <= max_offset_s]
+    rejected = [p for p in picks if abs(float(p['time']) - median) > max_offset_s]
+    return kept, rejected
 
 
 def detect_pretrigger_window(trace_or_stream, *, settings=None):

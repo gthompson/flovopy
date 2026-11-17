@@ -36,6 +36,10 @@ Actions:
 - Verify that the Malfante-inspired features work independently.
 - Rerun the production test suite.
 
+Resolved: the pipeline lives in Pinatubo1991SeismicData/20_analysis/pipeline.py.
+The test moved there as `20_analysis/tests/test_pipeline.py::test_reusable_features_are_opt_in_and_leave_legacy_metrics_unchanged`
+and was removed from FloVoPy, which no longer depends on the Pinatubo code.
+
 ## Priority 2: Resolve legacy research test failures
 
 Five tests fail during collection:

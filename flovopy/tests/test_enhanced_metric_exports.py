@@ -33,7 +33,7 @@ class EnhancedMetricTests(unittest.TestCase):
             self.assertEqual(loaded.meta.metrics['custom'],3);self.assertEqual(len(loaded.origins),1)
     def test_dynamic_new_fields_export_without_schema_allowlist(self):
         event=EnhancedEvent(meta=EnhancedEventMeta(traces=[{'window':'event','metrics':{'unanticipated_metric':7,'nested':{'x':[1,2,3]}}}]))
-        catalog=EnhancedCatalog(events=[event],records=[event]);frame=catalog.metrics_dataframe()
+        catalog=EnhancedCatalog(events=[event]);frame=catalog.metrics_dataframe()
         self.assertEqual(frame['trace.metrics.unanticipated_metric'].iloc[0],7)
         self.assertEqual(json.loads(frame['trace.metrics.nested.x'].iloc[0]),[1,2,3])
         self.assertEqual(len(catalog.metrics_dataframe(level='event')),1)
@@ -45,7 +45,7 @@ class EnhancedMetricTests(unittest.TestCase):
         events=[]
         for i in range(2):
             events.append(EnhancedEvent(resource_id=f'smi:local/test{i}',meta=EnhancedEventMeta(metrics={'record_reference_recorded_time':'1991-06-01T12:00:00Z'})))
-        catalog=EnhancedCatalog(events=events,records=events)
+        catalog=EnhancedCatalog(events=events)
         self.assertTrue(catalog.to_event_rate().df.empty)
         frame=catalog.to_event_rate(EventRateConfig(time_source='recorded_file',include_energy=False)).df
         self.assertEqual(frame.event_count.sum(),2);self.assertEqual(frame.magnitude_count.sum(),0)
@@ -69,7 +69,7 @@ class EnhancedMetricTests(unittest.TestCase):
         from obspy.core.event import Magnitude
         events=[EnhancedEvent(origins=[Origin(time=UTCDateTime(1991,6,1))],magnitudes=[Magnitude(mag=2.)]),
                 EnhancedEvent(origins=[Origin(time=UTCDateTime(1991,6,1))])]
-        catalog=EnhancedCatalog(events=events,records=events)
+        catalog=EnhancedCatalog(events=events)
         rate=catalog.to_event_rate();row=rate.df.iloc[0]
         self.assertEqual(row.event_count,2);self.assertEqual(row.magnitude_count,1)
         self.assertAlmostEqual(row.average_magnitude,2.)

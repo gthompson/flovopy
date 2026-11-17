@@ -1,7 +1,3 @@
-import importlib.util
-import json
-from pathlib import Path
-import sys
 import numpy as np
 import pytest
 from obspy import Trace, Stream
@@ -106,31 +102,6 @@ def test_trace_stream_preserve_legacy_and_input():
     noise=Trace(x.copy(),header={'sampling_rate':50})
     with pytest.raises(ValueError): extract_trace_features(tr,noise)
     assert r['provenance']['npts'] == len(x)
-
-
-def test_pipeline_opt_in_and_legacy(tmp_path):
-    directory=Path(__file__).resolve().parents[2]/'pinatubo_features_v6'
-    sys.path.insert(0,str(directory))
-    spec=importlib.util.spec_from_file_location('feature_test_pipeline',directory/'pipeline.py')
-    pipeline=importlib.util.module_from_spec(spec);spec.loader.exec_module(pipeline)
-    cfg=json.loads((directory/'config.example.json').read_text())
-    x=signal()[1]+np.random.default_rng(2).normal(0,.001,3000)
-    path=tmp_path/'test.mseed'
-    Trace(x,header={'sampling_rate':100,'station':'TEST','channel':'EHZ'}).write(str(path),format='MSEED')
-    _,old,q,_=pipeline.process_file(path,cfg)
-    assert len(old) == 2, q
-    cfg['processing']['compute_reusable_features']=True
-    _,new,q,_=pipeline.process_file(path,cfg)
-    assert len(new) == 2,q
-    assert 'features.values.hf_lf.peak_delay_s' in new[1]
-    for a,b in zip(old,new):
-        for k,v in a.items():
-            if isinstance(v,float) and np.isnan(v):
-                assert np.isnan(b[k])
-            else: assert b[k] == v, k
-    json.dumps(pipeline._plain(new),allow_nan=False)
-    pipeline.write_csv(tmp_path/'metrics.csv',new)
-    assert 'features.version' in (tmp_path/'metrics.csv').read_text()
 
 
 def test_uncalibrated_opt_in_has_no_physical_metrics():

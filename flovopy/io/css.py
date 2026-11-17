@@ -8,6 +8,8 @@ from obspy import UTCDateTime
 from obspy.core.event import (Catalog, Event, Origin, Pick, Arrival, Magnitude,
                               WaveformStreamID, ResourceIdentifier, CreationInfo)
 
+from flovopy.enhanced.catalog import EnhancedCatalog
+
 # Antelope V3 Schema Reference Manual: field order, scalar type and print width.
 _LAYOUTS = {
     'arrival': 'sta:s6 time:t17 arid:i8 jdate:y8 stassid:i8 chanid:i8 chan:s8 iphase:s8 stype:s1 deltim:r6 azimuth:r7 delaz:r7 slow:r7 delslo:r7 ema:r7 rect:r7 amp:r10 per:r7 logat:r7 clip:s1 fm:s2 snr:r10 qual:s1 auth:s15 commid:i8 lddate:t17',
@@ -68,14 +70,29 @@ def read_table(path, table=None):
     return pd.DataFrame.from_records(rows, columns=[name for name, _, _ in fields])
 
 
-class CSS_Catalog(Catalog):
-    """ObsPy Catalog retaining source relations, detector records and unassociated picks."""
+class CSS_Catalog(EnhancedCatalog):
+    """ObsPy Catalog retaining CSS3.0 source relations, detector records,
+    and unassociated picks.
+
+    Subclasses EnhancedCatalog so that to_event_rate(), to_dataframe(),
+    filter helpers, and group_by() are available without duplication.
+
+    CSS-specific extras
+    -------------------
+    tables : dict
+        Raw DataFrames keyed by CSS relation name (origin, arrival, assoc, …),
+        exactly as returned by read_table().
+    unassociated_picks : list of obspy.core.event.Pick
+        Arrivals not linked to any origin via the assoc table.
+    issues : list of str
+        Unresolved cross-table links logged during read_events().
+    """
 
     def __init__(self, events=None, **kwargs):
-        super().__init__(events=events, **kwargs)
-        self.tables = {}
-        self.unassociated_picks = []
-        self.issues = []
+        super().__init__(events=events or [])
+        self.tables: dict = {}
+        self.unassociated_picks: list = []
+        self.issues: list = []
 
     @property
     def detections(self):

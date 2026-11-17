@@ -17,8 +17,9 @@ from flovopy.seisanio.core.sfile import Sfile
 
 @dataclass
 class CatalogConversionResult:
+    """S-file conversion output. With enhanced=True, catalog is an EnhancedCatalog
+    whose events are EnhancedEvents (one object per S-file, metadata in .meta)."""
     catalog: Catalog = field(default_factory=Catalog)
-    records: list = field(default_factory=list)
     failures: list[dict[str, str]] = field(default_factory=list)
     source_paths: list[str] = field(default_factory=list)
 
@@ -77,12 +78,18 @@ def _enhance(parsed):
 def convert_archive_catalog(archive, starttime, endtime, *, db=None,
                             parser=Sfile, mainclass='*', enhanced=False,
                             strict=False):
-    """Parse S-files once, returning catalog, enhanced records and failures.
+    """Parse S-files once, returning the catalog and failures.
+
+    enhanced=True stores EnhancedEvents (with .meta) in an EnhancedCatalog.
 
     Parser defaults to generic Sfile; pass MVOSfile explicitly for MVO.
     Failures are reported rather than silently discarded. No data is written.
     """
-    result = CatalogConversionResult()
+    if enhanced:
+        from flovopy.enhanced.catalog import EnhancedCatalog
+        result = CatalogConversionResult(catalog=EnhancedCatalog())
+    else:
+        result = CatalogConversionResult()
     for path in archive.iter_sfiles(starttime, endtime, db=db,
                                     mainclass=mainclass):
         path = str(path)
@@ -91,11 +98,8 @@ def convert_archive_catalog(archive, starttime, endtime, *, db=None,
             event = getattr(parsed, 'eventobj', None)
             if event is None:
                 raise ValueError('Parser returned no ObsPy Event')
-            record = _enhance(parsed) if enhanced else None
-            result.catalog.events.append(event)
+            result.catalog.events.append(_enhance(parsed) if enhanced else event)
             result.source_paths.append(path)
-            if record is not None:
-                result.records.append(record)
         except Exception as exc:
             result.failures.append({'path': path, 'error': f'{type(exc).__name__}: {exc}'})
             if strict:
@@ -138,16 +142,16 @@ def write_catalog_result(result, quakeml_path, *, metadata_path=None,
                          failures_path=None):
     """Export QuakeML and optional JSONL sidecars.
 
-    Metadata sidecar requires result.records (enhanced=True at conversion).
+    Metadata sidecar requires EnhancedEvents (enhanced=True at conversion).
     QuakeML cannot preserve MVO AEF and other nonstandard fields.
     """
-    if metadata_path is not None and len(result.records) != len(result.catalog.events):
+    if metadata_path is not None and not _all_enhanced(result.catalog):
         raise ValueError('Metadata sidecar requires enhanced=True for all events')
     if metadata_path is not None:
         rows = []
-        for event, record in zip(result.catalog.events, result.records):
+        for event in result.catalog.events:
             rows.append({'event_id': str(event.resource_id),
-                         'metadata': _jsonable(record.meta.to_json_dict())})
+                         'metadata': _jsonable(event.meta.to_json_dict())})
         payload = ''.join(json.dumps(row, allow_nan=False) + '\n' for row in rows)
     else:
         payload = None
@@ -163,12 +167,20 @@ def write_catalog_result(result, quakeml_path, *, metadata_path=None,
     return Path(quakeml_path)
 
 
+def _all_enhanced(catalog):
+    from flovopy.enhanced.event import EnhancedEvent
+    # Check the list itself: iterating an EnhancedCatalog would promote events.
+    return all(isinstance(e, EnhancedEvent) for e in catalog.events)
+
+
 def to_enhanced_catalog(result):
-    """Create an EnhancedCatalog with events and records sharing identity.
+    """Return the conversion's catalog as an EnhancedCatalog (same Event objects).
 
     Requires an enhanced conversion so no metadata is silently lost.
     """
     from flovopy.enhanced.catalog import EnhancedCatalog
-    if len(result.records) != len(result.catalog.events):
+    if not _all_enhanced(result.catalog):
         raise ValueError("EnhancedCatalog requires enhanced=True for all events")
-    return EnhancedCatalog(events=list(result.records), records=list(result.records))
+    if isinstance(result.catalog, EnhancedCatalog):
+        return result.catalog
+    return EnhancedCatalog(events=result.catalog.events)

@@ -110,7 +110,7 @@ class EventFeatureExtractor:
     def extract_features(self) -> pd.DataFrame:
         rows = []
 
-        for rec in self.catalog.records:
+        for rec in self.catalog:
             feat = {
                 "event_id": rec.event.resource_id.id if rec.event.resource_id else None
             }
@@ -306,9 +306,7 @@ def classify_and_add_event(
 
     # 3) extract features (single row)
     extractor = EventFeatureExtractor(
-        EnhancedCatalog(events=[Event()], records=[catalog.records[0]])  # dummy catalog not used
-        if len(catalog.records) == 0 else EnhancedCatalog(events=[catalog.records[-1].event],
-                                                          records=[catalog.records[-1]])
+        EnhancedCatalog(events=list(catalog)[-1:] or [Event()])
     )
     # Use a tiny internal method rather than building an ad-hoc catalog wrapper:
     # We’ll mimic the extractor logic against this single stream/trigger.
