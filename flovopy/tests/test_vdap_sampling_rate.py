@@ -54,11 +54,13 @@ class SamplingRateTests(unittest.TestCase):
 
     def test_time_correction_shifts_start_and_name(self):
         seen = []
-        def correct(path, event_id, t):
-            seen.append((path.name, event_id, t))
+        def correct(path, event_id, t, header):
+            seen.append((path.name, event_id, t, header['localtime']))
             return -7 * 3600.0, 'H_UTC_PDT'
         row, st = self.convert(time_correction=correct)
         self.assertEqual(seen[0][:2], ('91060100.DMX', '91060100'))
+        self.assertEqual(seen[0][3], 0.0)  # synthetic descriptor has localtime 0
+        self.assertEqual(row.dmx_localtime, '0')
         self.assertEqual(st[0].stats.starttime, UTCDateTime('1991-05-31T17:00:00'))
         self.assertTrue(Path(row.wav_file).name.startswith('1991-05-31-1700-00M'))
         self.assertEqual((row.raw_starttime, row.clock_offset_s, row.clock_regime),

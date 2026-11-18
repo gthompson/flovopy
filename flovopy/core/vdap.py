@@ -82,12 +82,19 @@ def convert_dmx_to_seisan(
     The default expects YYMMDDNN.DMX. id_fixer(trace, network=network)
     modifies each trace in place; the default is fix_legacy_vdap_id.
 
-    time_correction(path, event_id, starttime) may return a tuple
-    ``(offset_seconds, label)``; every trace start time is shifted by the
-    offset before the SEISAN name is chosen (see flovopy.core.clock). An offset
-    of None marks the file as failed (stage ``clock``) rather than guessing.
-    The index then records ``raw_starttime``, ``clock_offset_s`` and
-    ``clock_regime``. Without it, header times are kept as read.
+    The index records the SUDS trace-descriptor time fields ``dmx_localtime``
+    (as stored; nominally minutes to add to GMT for local time, written in
+    seconds by some VDAP software) and ``dmx_timecorrect`` (unique values,
+    ";"-joined) as clock evidence.
+
+    time_correction(path, event_id, starttime, header) may return a tuple
+    ``(offset_seconds, label)``; ``header`` holds the ``localtime`` and
+    ``timecorrect`` values (single value, or None if absent or mixed). Every
+    trace start time is shifted by the offset before the SEISAN name is
+    chosen (see flovopy.core.clock). An offset of None marks the file as
+    failed (stage ``clock``) rather than guessing. The index then records
+    ``raw_starttime``, ``clock_offset_s`` and ``clock_regime``. Without it,
+    header times are kept as read.
 
     Files are sorted, merged (method=1, zero-filled) and padded to the union
     of their time windows before writing. Existing files are reused unless
@@ -131,7 +138,7 @@ def convert_dmx_to_seisan(
 
     index_columns = ["event_id", "dmx_file", "wav_file", "starttime", "endtime",
                      "stations", "channels", "ntraces", "status",
-                     "raw_sampling_rate", "sampling_rate"]
+                     "raw_sampling_rate", "sampling_rate", "dmx_localtime", "dmx_timecorrect"]
     if time_correction is not None:
         index_columns += ["raw_starttime", "clock_offset_s", "clock_regime"]
     provenance_columns = ["dmx_file", "event_id", "original_id", "fixed_id", "status"]
@@ -167,6 +174,7 @@ def convert_dmx_to_seisan(
                 status = "empty"
                 continue
             raw_rates = sorted({float(tr.stats.sampling_rate) for tr in st})
+            header = _dmx_time_fields(st)
             if sampling_rate is not None:
                 fix_sampling_rate(st, sampling_rate)
             else:
@@ -193,7 +201,7 @@ def convert_dmx_to_seisan(
             clock = {}
             if time_correction is not None:
                 stage = "clock"
-                offset, label = time_correction(dmx, event_id, t)
+                offset, label = time_correction(dmx, event_id, t, header)
                 if offset is None:
                     raise ValueError(f"No clock correction for {event_id} at {t}: {label}")
                 for tr in st:
@@ -242,6 +250,7 @@ def convert_dmx_to_seisan(
                 raw_sampling_rate=";".join(repr(r) for r in raw_rates),
                 sampling_rate=";".join(repr(r) for r in sorted(
                     {float(tr.stats.sampling_rate) for tr in saved})),
+                dmx_localtime=header["localtime_all"], dmx_timecorrect=header["timecorrect_all"],
                 **clock,
             ))
             successful_map.update(proposed)
@@ -758,6 +767,18 @@ def fix_legacy_vdap_id(
 # ============================================================================
 # Helpers
 # ============================================================================
+
+def _dmx_time_fields(st):
+    """Collect SUDS descriptrace ``localtime``/``timecorrect`` values from a DMX stream."""
+    out = {}
+    for field in ("localtime", "timecorrect"):
+        values = sorted({float(tr.stats.dmx.descripttrace[field]) for tr in st
+                         if "dmx" in tr.stats and "descripttrace" in tr.stats.dmx
+                         and field in tr.stats.dmx.descripttrace})
+        out[field] = values[0] if len(values) == 1 else None
+        out[field + "_all"] = ";".join(f"{v:g}" for v in values)
+    return out
+
 
 def remove_IRIG_channel(st):
     to_remove = [tr for tr in st if (tr.stats.station or "").upper().startswith("IRIG")]

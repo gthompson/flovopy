@@ -53,6 +53,19 @@ class ClockTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             c.apply(out, 'wav', 't')
 
+    def test_marker_and_uncertainty(self):
+        table = pd.DataFrame([
+            dict(stream='w', regime='old', start='', end='1991-05-26T16:45', marker='0', utc_offset_h='-15', uncertainty_s='5'),
+            dict(stream='w', regime='new', start='1991-05-26T07:40', end='', marker='-25200', utc_offset_h='-7', uncertainty_s='5'),
+        ])
+        c = ClockRegimes(table)
+        self.assertEqual(c.to_utc('w', '1991-05-26T15:41', marker=0)[0], UTCDateTime('1991-05-26T00:41'))
+        self.assertEqual(c.to_utc('w', '1991-05-26T08:40', marker='-25200')[0], UTCDateTime('1991-05-26T01:40'))
+        self.assertEqual(c.lookup('w', '1991-05-26T09:00')['status'], 'ambiguous')
+        self.assertEqual(c.lookup('w', '1991-06-26T09:00', marker=0)['status'], 'unresolved')
+        out = c.apply(pd.DataFrame(dict(t=['1991-06-01T00:00:00'], m=[-25200])), 'w', 't', marker_column='m')
+        self.assertEqual((out.t[0], out.clock_uncertainty_s[0]), ('1991-05-31T17:00:00', 5.0))
+
     def test_validation(self):
         with self.assertRaises(ValueError):
             ClockRegimes(TABLE.assign(end='1990-01-01').iloc[[1]])
