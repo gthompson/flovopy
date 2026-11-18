@@ -1,5 +1,14 @@
 """Catalog-to-REA export using ObsPy's public Nordic writer.
 
+ObsPy 1.5's header writer is repaired here:
+- the fraction of a second in type-1 ("SS.s") and high-accuracy H ("SS.sss")
+  lines is taken from the first digit(s) of the microsecond integer, so
+  58.08 s is written as "58.8" and 58.012 s as "58.120". Origin times are
+  rewritten, rounded correctly (with minute/hour/day carry);
+- a magnitude with no type is written as "W" (moment magnitude); it is
+  written with a blank type instead.
+RMS comes from ``origin.quality.standard_error``; callers should fill it.
+
 Originless-event anchors and dataset comments are caller policies. A manifest
 makes reruns idempotent for stable event IDs, verifies reused output hashes,
 and records standard-filename collision shifts. Do not run concurrent writers
@@ -27,6 +36,52 @@ def _atomic_json(path, data):
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+WRITER_VERSION = 'flovopy-nordic-repair-2'
+
+
+def _blank_unknown_magnitude_types(event):
+    """ObsPy maps magnitude_type None to 'W'; an unmappable label maps to blank."""
+    for magnitude in event.magnitudes:
+        if magnitude.magnitude_type is None:
+            magnitude.magnitude_type = 'unknown'
+    return event
+
+
+def _round_time(t, step_ns):
+    """Round half-up to a multiple of step_ns, in integer nanoseconds (no float ties)."""
+    ns = UTCDateTime(t).ns
+    return UTCDateTime(ns=(ns + step_ns // 2) // step_ns * step_ns)
+
+
+def repair_nordic_header_times(text, origins):
+    """Rewrite origin times in Nordic type-1 and H lines.
+
+    ``origins`` lists origins in the order ObsPy writes them (preferred first,
+    then the others in event order). Consecutive type-1 lines belong to one
+    origin (a second line carries extra magnitudes); an H line belongs to the
+    preceding origin. Returns the repaired text.
+    """
+    lines = text.split('\n')
+    index = -1
+    previous_type = None
+    for k, line in enumerate(lines):
+        kind = line[79:80] if len(line) >= 80 else ''
+        if kind == '1':
+            if previous_type != '1':
+                index += 1
+            if 0 <= index < len(origins) and origins[index].time is not None:
+                t = _round_time(origins[index].time, 100_000_000)
+                fields = f' {t.year:4d} {t.month:2d}{t.day:2d} {t.hour:2d}{t.minute:2d} {t.second + t.microsecond / 1e6:4.1f}'
+                lines[k] = fields + line[20:]
+        elif kind == 'H' and 0 <= index < len(origins) and origins[index].time is not None:
+            t = _round_time(origins[index].time, 1_000_000)
+            fields = f' {t.year:4d} {t.month:2d}{t.day:2d} {t.hour:2d}{t.minute:2d} {t.second + t.microsecond / 1e6:6.3f}'
+            lines[k] = fields + line[22:]
+        if kind:
+            previous_type = kind
+    return '\n'.join(lines)
 
 
 def _fingerprint(event, parameters):
@@ -113,6 +168,7 @@ def export_catalog_to_rea(
                 result['skipped'].append(dict(event_id=key,reason='no_time_anchor'))
                 continue
             event.preferred_origin_id=origin.resource_id
+            _blank_unknown_magnitude_types(event)
             evtype = event_type(event) if callable(event_type) else event_type
             if evtype not in ('L', 'R', 'D'):
                 raise ValueError('Invalid event type')
@@ -122,7 +178,7 @@ def export_catalog_to_rea(
             waves=list(dict.fromkeys(Path(w).name for w in waves if w))
             parameters=dict(author=author,event_type=evtype,nordic_format=nordic_format,
                             high_accuracy=high_accuracy,waveforms=waves,collision=collision,
-                            max_shift_seconds=max_shift_seconds)
+                            max_shift_seconds=max_shift_seconds,writer=WRITER_VERSION)
             fingerprint=_fingerprint(event,parameters)
             old=entries.get(key)
             target=None;shift=0
@@ -157,11 +213,17 @@ def export_catalog_to_rea(
             temporary=Path(handle.name);handle.close()
             try:
                 # Public writer writes only the requested file. No os.chdir.
-                Catalog(events=[event]).write(str(temporary),format='NORDIC',userid=author,
-                    evtype=evtype,wavefiles=[waves],nordic_format=nordic_format,
-                    high_accuracy=high_accuracy)
+                import warnings
+                with warnings.catch_warnings():
+                    # Expected for magnitudes with no type (written blank on purpose).
+                    warnings.filterwarnings('ignore', message='unknown is not convertible')
+                    Catalog(events=[event]).write(str(temporary),format='NORDIC',userid=author,
+                        evtype=evtype,wavefiles=[waves],nordic_format=nordic_format,
+                        high_accuracy=high_accuracy)
                 if not temporary.stat().st_size:
                     raise OSError('Nordic writer produced an empty file')
+                written_order=[origin]+[o for o in event.origins if o is not origin and o != origin]
+                temporary.write_text(repair_nordic_header_times(temporary.read_text(), written_order))
                 if target.exists() and owners.get(target)!=key:
                     raise FileExistsError(f'Output belongs to another event: {target}')
                 if target.exists():

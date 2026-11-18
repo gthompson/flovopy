@@ -14,6 +14,37 @@ def event(key,time=T,origin=True):
         e.preferred_origin_id=e.origins[0].resource_id
     return e
 
+class NordicRepairTests(unittest.TestCase):
+    def test_seconds_magnitude_type_and_rms(self):
+        from obspy.core.event import Magnitude, OriginQuality
+        cases=[('1991-06-03T12:00:58.08','58.1','58.080'),('1991-06-03T12:59:59.96','0.0','59.960'),
+               ('1991-06-03T12:00:05.012','5.0','5.012')]
+        for when,sec1,secH in cases:
+            with self.subTest(when=when), tempfile.TemporaryDirectory() as tmp:
+                e=event('a',UTCDateTime(when));e.origins[0].quality=OriginQuality(standard_error=0.12)
+                e.magnitudes=[Magnitude(mag=1.4,origin_id=e.origins[0].resource_id)]
+                r=export_catalog_to_rea(Catalog(events=[e]),tmp,high_accuracy=True)
+                lines=r['written'][0].read_text().splitlines()
+                one=next(l for l in lines if l[79:80]=='1');h=next(l for l in lines if l[79:80]=='H')
+                self.assertEqual(one[16:20].strip(),sec1)
+                self.assertEqual(h[16:22].strip(),secH)
+                self.assertEqual(one[59],' ')                  # unknown magnitude type, not 'W'
+                self.assertEqual(one[51:55].strip(),'0.1')      # RMS from origin.quality
+                back=read_events(str(r['written'][0]),format='NORDIC')[0].origins[0].time
+                self.assertLess(abs(back-UTCDateTime(when)),0.051)
+
+    def test_ties_round_half_up(self):
+        from flovopy.seisanio.rea_export import _round_time
+        for when,want in [('1991-08-16T17:17:31.55','1991-08-16T17:17:31.6'),('1991-05-24T14:22:30.85','1991-05-24T14:22:30.9')]:
+            self.assertEqual(_round_time(UTCDateTime(when),100_000_000),UTCDateTime(want))
+
+    def test_minute_carry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r=export_catalog_to_rea(Catalog(events=[event('a',UTCDateTime('1991-06-03T23:59:59.97'))]),tmp)
+            one=next(l for l in r['written'][0].read_text().splitlines() if l[79:80]=='1')
+            self.assertEqual(one[1:20],'1991  6 4  0 0  0.0')
+
+
 class REAExportTests(unittest.TestCase):
     def test_write_reuse_select_and_no_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:
