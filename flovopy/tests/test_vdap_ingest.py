@@ -25,12 +25,20 @@ class VDAPIngestTests(unittest.TestCase):
         self.assertEqual(p['onset'],'I')
 
     def test_fixed_s_minute_rollover(self):
+        # An S in the next minute is written as seconds >= 60 (HYPO71).
         line=list('PI2LIPU0 910603125958.00'.ljust(42))
-        line[30:36]='  2.00';line[37]='S'
+        line[30:36]=' 62.00';line[37]='S'
         picks=parse_vdap_phase_line(''.join(line),network='XB',dialect='fixed')
         self.assertEqual(len(picks),2)
         self.assertEqual(picks[1]['time'],UTCDateTime('1991-06-03T13:00:02'))
         self.assertEqual(picks[1]['channel'],'ELZ')
+        # S seconds below P seconds are not moved a minute later: the S is skipped, the P kept.
+        for card in ['GRNZ P 4 910603171748.23       48.22 S 3',      # 91060310: S 0.01 s before P
+                     'BUGZEP 1 91 8 9231436.76       31.13ES?2']:     # S 5.6 s before P
+            issues=[]
+            picks=parse_vdap_phase_line(card,network='XB',issues=issues)
+            self.assertEqual([p['phase'] for p in picks],['P'])
+            self.assertTrue(any('earlier than P' in i for i in issues))
 
     def test_unified_card_rules(self):
         # Real cards from the 1991 Pinatubo monthly files.

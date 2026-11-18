@@ -1010,7 +1010,10 @@ def parse_vdap_phase_line(line, *, network='', dialect='auto', issues=None):
       the card then supplies only the reference minute for the S pick.
     * Minutes and seconds of 60 or more roll over arithmetically (HYPO71).
     * S seconds are counted from the written reference minute, not from the
-      P time; an S earlier than P is moved one minute later.
+      P time. An S later in the next minute is written as seconds >= 60
+      (HYPO71). An S earlier than the P on the same card is not physical and
+      is skipped (noted in ``issues``); it is never moved a minute later. In
+      the 1991 Pinatubo files every such S lies 0.01-5.6 s before its P.
     * Onset (I/E), first motion (U/D) and weight are kept for P and S.
     * Malformed cards (bad station, timestamp or no phase) raise ValueError;
       nothing is guessed. A damaged or ambiguous S field does not discard a
@@ -1122,10 +1125,11 @@ def parse_vdap_phase_line(line, *, network='', dialect='auto', issues=None):
                 note(f'Invalid S seconds {text[pos-7:pos-1]!r}; S skipped')
             else:
                 stime = reference + value
-                while stime < ptime:
-                    stime += 60
-                scode = text[max(0, pos-1):pos+3].upper()
-                picks.append(pick(meta, 'S', stime, scode))
+                if stime < ptime:
+                    note(f'S ({value:g} s) earlier than P ({float(ptime - reference):g} s); S skipped')
+                else:
+                    scode = text[max(0, pos-1):pos+3].upper()
+                    picks.append(pick(meta, 'S', stime, scode))
     if not picks:
         raise ValueError('No supported phase fields')
     return picks
