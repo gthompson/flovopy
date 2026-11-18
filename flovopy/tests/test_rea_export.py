@@ -116,4 +116,59 @@ class REAExportTests(unittest.TestCase):
             self.assertEqual(len(read_events(str(result['written'][0]),format='NORDIC')),1)
             with self.assertRaises(ValueError):export_catalog_to_rea(Catalog(),tmp,database='../escape')
 
+
+class ManifestAndWarningTests(unittest.TestCase):
+    def _catalog(self,n,picks=False):
+        events=[event(f'e{i}',T+10*i) for i in range(n)]
+        if picks:
+            for e in events:
+                e.picks=[Pick(time=e.origins[0].time+1,phase_hint='P',
+                              waveform_id=WaveformStreamID('XB','PPO','','EHZ'))]
+        return Catalog(events=events)
+
+    def test_manifest_written_once_per_run(self):
+        import flovopy.seisanio.rea_export as rea
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(rea,'_atomic_json',wraps=rea._atomic_json) as save:
+                result=export_catalog_to_rea(self._catalog(5),tmp)
+            self.assertEqual(len(result['written']),5);self.assertEqual(save.call_count,1)
+            entries=json.loads(result['manifest_path'].read_text())['events']
+            self.assertEqual(len(entries),5)
+            with patch.object(rea,'_atomic_json',wraps=rea._atomic_json) as save:
+                again=export_catalog_to_rea(self._catalog(5),tmp)
+            self.assertEqual(len(again['reused']),5);save.assert_not_called()
+
+    def test_checkpoints_while_running(self):
+        import flovopy.seisanio.rea_export as rea
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(rea,'_atomic_json',wraps=rea._atomic_json) as save:
+                export_catalog_to_rea(self._catalog(3),tmp,checkpoint_seconds=0)
+            self.assertEqual(save.call_count,3)
+
+    def test_interrupt_still_records_written_files(self):
+        import flovopy.seisanio.rea_export as rea
+        real=rea.repair_nordic_header_times;calls=[]
+        def stop_on_third(text,origins):
+            calls.append(1)
+            if len(calls)==3:
+                raise KeyboardInterrupt
+            return real(text,origins)
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(rea,'repair_nordic_header_times',side_effect=stop_on_third):
+                with self.assertRaises(KeyboardInterrupt):
+                    export_catalog_to_rea(self._catalog(5),tmp)
+            manifest=Path(tmp).resolve()/'.flovopy_rea_manifest.json'
+            self.assertEqual(len(json.loads(manifest.read_text())['events']),2)
+            rerun=export_catalog_to_rea(self._catalog(5),tmp)
+            self.assertEqual((len(rerun['reused']),len(rerun['written']),len(rerun['failed'])),(2,3,0))
+
+    def test_writer_warning_issued_once_with_count(self):
+        import warnings
+        with tempfile.TemporaryDirectory() as tmp, warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            result=export_catalog_to_rea(self._catalog(4,picks=True),tmp)
+        self.assertEqual(len(result['written']),4)
+        mode=[str(w.message) for w in caught if 'Evaluation mode' in str(w.message)]
+        self.assertEqual(mode,['Evaluation mode None is not mappable (Nordic writer; 4 events)'])
+
 if __name__=='__main__':unittest.main()
