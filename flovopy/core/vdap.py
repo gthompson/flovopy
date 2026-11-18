@@ -63,6 +63,7 @@ def convert_dmx_to_seisan(
     out_trace_id_map_tex: str | Path | None = None,
     out_failures: str | Path | None = None,
     out_trace_id_provenance: str | Path | None = None,
+    out_file_log: str | Path | None = None,
     overwrite: bool = False,
     continue_on_error: bool = True,
     verbose: bool = False,
@@ -102,9 +103,18 @@ def convert_dmx_to_seisan(
     their IDs and sample rates must match the proposed conversion. Reused files
     must be regenerated explicitly to apply changed IDs or rate corrections.
 
+    Traces are dropped before writing when they have no samples, are flat
+    (every sample equal, e.g. a dead channel) or are the IRIG time code
+    (``remove_irig``). Nothing is dropped silently: each dropped trace is a
+    row in trace_id_provenance (``trace_status`` ``no_samples``, ``flat`` or
+    ``irig``, with an empty ``fixed_id``), the index counts them
+    (``dropped_traces``, ``dropped_trace_ids``), and file_log has one row per
+    DMX file with its outcome (``written``, ``existing``, ``empty`` when no
+    trace is left, or ``failed``), so its rows add up to every file found.
+
     Returns DataFrames: waveform_index, trace_id_map (unique verified output-ID
     mappings), trace_id_provenance (per-file observed mappings and status),
-    failures; plus a summary dictionary. Existing-file mappings are included
+    failures, file_log; plus a summary dictionary. Existing-file mappings are included
     only when saved IDs and sample rates match the proposed conversion.
     CSV/LaTeX exports are optional; empty tables retain their column names.
     Per-file exceptions are collected unless continue_on_error=False.
@@ -138,11 +148,15 @@ def convert_dmx_to_seisan(
 
     index_columns = ["event_id", "dmx_file", "wav_file", "starttime", "endtime",
                      "stations", "channels", "ntraces", "status",
-                     "raw_sampling_rate", "sampling_rate", "dmx_localtime", "dmx_timecorrect"]
+                     "raw_sampling_rate", "sampling_rate", "dmx_localtime", "dmx_timecorrect",
+                     "dropped_traces", "dropped_trace_ids"]
     if time_correction is not None:
         index_columns += ["raw_starttime", "clock_offset_s", "clock_regime"]
-    provenance_columns = ["dmx_file", "event_id", "original_id", "fixed_id", "status"]
-    index_rows, provenance_rows, failures = [], [], []
+    provenance_columns = ["dmx_file", "event_id", "original_id", "fixed_id", "status",
+                          "trace_status", "npts"]
+    file_log_columns = ["dmx_file", "event_id", "status", "stage", "traces_read", "traces_saved",
+                        "traces_no_samples", "traces_flat", "traces_irig", "wav_file", "error"]
+    index_rows, provenance_rows, failures, file_log = [], [], [], []
     successful_map = {}
     claimed_paths = {}
     counts = dict(processed=len(files), written=0, existing=0, empty=0, failed=0)
@@ -151,6 +165,10 @@ def convert_dmx_to_seisan(
     for i, dmx in enumerate(files, 1):
         event_id = None
         pairs = []
+        dropped = []  # (original_id, reason, npts)
+        kept_npts = {}
+        traces_read = 0
+        wav_file = error = ""
         status = "failed"
         stage = "event_id"
         try:
@@ -166,9 +184,18 @@ def convert_dmx_to_seisan(
             if any(hasattr(t.stats,"dmx_recovery") for t in st):
                 recovery_reports[str(dmx)] = dict(st[0].stats.dmx_recovery)
             stage = "prepare"
-            st = remove_empty_traces(st)
-            if remove_irig:
-                remove_IRIG_channel(st)
+            traces_read = len(st)
+            for tr in list(st):
+                original = tr.stats.get("vdap_original_id", tr.id)
+                if tr.stats.npts == 0:
+                    dropped.append((original, "no_samples", 0))
+                elif not remove_empty_traces(Stream([tr]), inplace=False):  # flat (or all NaN)
+                    dropped.append((original, "flat", int(tr.stats.npts)))
+                elif remove_irig and (tr.stats.station or "").upper().startswith("IRIG"):
+                    dropped.append((original, "irig", int(tr.stats.npts)))
+                else:
+                    continue
+                st.remove(tr)
             if not st:
                 counts["empty"] += 1
                 status = "empty"
@@ -181,6 +208,7 @@ def convert_dmx_to_seisan(
                 snap_sampling_rates(st, rate_max_denominator)
             for tr in st:
                 original = tr.stats.get("vdap_original_id", tr.id)
+                kept_npts[original] = int(tr.stats.npts)
                 id_fixer(tr, network=network)
                 pairs.append((original, tr.id))
 
@@ -251,11 +279,15 @@ def convert_dmx_to_seisan(
                 sampling_rate=";".join(repr(r) for r in sorted(
                     {float(tr.stats.sampling_rate) for tr in saved})),
                 dmx_localtime=header["localtime_all"], dmx_timecorrect=header["timecorrect_all"],
+                dropped_traces=len(dropped),
+                dropped_trace_ids=";".join(f"{old}:{why}" for old, why, _ in dropped),
                 **clock,
             ))
             successful_map.update(proposed)
+            wav_file = str(wavpath)
             counts[status] += 1
         except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
             counts["failed"] += 1
             failures.append(dict(dmx_file=str(dmx), event_id=event_id,
                                  stage=stage, error=f"{type(exc).__name__}: {exc}"))
@@ -266,8 +298,21 @@ def convert_dmx_to_seisan(
         finally:
             provenance_rows.extend(dict(
                 dmx_file=str(dmx), event_id=event_id, original_id=old,
-                fixed_id=new, status=status,
+                fixed_id=new, status=status, trace_status="kept", npts=kept_npts.get(old),
             ) for old, new in pairs)
+            provenance_rows.extend(dict(
+                dmx_file=str(dmx), event_id=event_id, original_id=old,
+                fixed_id="", status=status, trace_status=why, npts=npts,
+            ) for old, why, npts in dropped)
+            reasons = [why for _, why, _ in dropped]
+            file_log.append(dict(
+                dmx_file=str(dmx), event_id=event_id, status=status,
+                stage="" if status in ("written", "existing") else stage,
+                traces_read=traces_read,
+                traces_saved=traces_read - len(dropped) if status in ("written", "existing") else 0,
+                traces_no_samples=reasons.count("no_samples"), traces_flat=reasons.count("flat"),
+                traces_irig=reasons.count("irig"), wav_file=wav_file, error=error,
+            ))
 
     index = pd.DataFrame(index_rows, columns=index_columns)
     if recover_partial:
@@ -277,8 +322,12 @@ def convert_dmx_to_seisan(
                            columns=["original_id", "fixed_id"])
     provenance = pd.DataFrame(provenance_rows, columns=provenance_columns)
     failure_table = pd.DataFrame(failures, columns=["dmx_file", "event_id", "stage", "error"])
+    file_table = pd.DataFrame(file_log, columns=file_log_columns)
+    if len(file_table) != len(files):
+        raise RuntimeError(f"file log has {len(file_table)} rows for {len(files)} files")
     for table, path in [(index, out_waveform_index), (mapping, out_trace_id_map),
-                        (failure_table, out_failures), (provenance, out_trace_id_provenance)]:
+                        (failure_table, out_failures), (provenance, out_trace_id_provenance),
+                        (file_table, out_file_log)]:
         if path is not None:
             path = Path(path).expanduser()
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -290,7 +339,8 @@ def convert_dmx_to_seisan(
                          caption="Verified output DMX trace ID mappings.",
                          label="tab:trace_id_mapping")
     return dict(waveform_index=index, trace_id_map=mapping,
-                trace_id_provenance=provenance, failures=failure_table, summary=counts)
+                trace_id_provenance=provenance, failures=failure_table,
+                file_log=file_table, summary=counts)
 
 # -----------------------------------------------------------------------------
 # Coordinate helpers
