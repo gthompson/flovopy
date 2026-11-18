@@ -1240,6 +1240,43 @@ def dedupe_picks(picks, time_eps_s=1e-3):
     return out
 
 
+def split_picks_by_time_gap(picks, max_gap_s=20.0, *, min_stations=3):
+    """Split one phase-card block into events where it holds more than one.
+
+    Picks are sorted by time and cut wherever consecutive picks are more than
+    ``max_gap_s`` apart. Each piece with at least ``min_stations`` distinct
+    stations is an event. Smaller pieces (stray or mistimed cards) are merged
+    into the nearest event in time, so later outlier filtering still sees and
+    reports them. With fewer than two such events the block is returned
+    unchanged as a single group. Picks without a time stay with the first
+    group. Returns a list of pick lists in time order.
+    """
+    timed = sorted((p for p in picks if p.get('time') is not None), key=lambda p: p['time'])
+    untimed = [p for p in picks if p.get('time') is None]
+    if len(timed) < 2:
+        return [list(picks)] if picks else []
+    pieces = [[timed[0]]]
+    for previous, pick in zip(timed, timed[1:]):
+        if float(pick['time'] - previous['time']) > max_gap_s:
+            pieces.append([pick])
+        else:
+            pieces[-1].append(pick)
+    major = [i for i, piece in enumerate(pieces) if len({p.get('station') for p in piece}) >= min_stations]
+    if len(major) < 2:
+        return [list(picks)]
+    groups = {i: list(pieces[i]) for i in major}
+    for i, piece in enumerate(pieces):
+        if i in groups:
+            continue
+        mid = piece[len(piece) // 2]['time']
+        nearest = min(major, key=lambda j: min(abs(float(mid - pieces[j][0]['time'])),
+                                               abs(float(mid - pieces[j][-1]['time']))))
+        groups[nearest].extend(piece)
+    out = [sorted(groups[i], key=lambda p: p['time']) for i in major]
+    out[0] = untimed + out[0]
+    return out
+
+
 def filter_picks_near_median(picks, max_offset_s, *, min_picks=3):
     """Split picks into those within ``max_offset_s`` of the median time and the rest.
 

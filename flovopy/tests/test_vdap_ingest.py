@@ -83,6 +83,16 @@ class VDAPIngestTests(unittest.TestCase):
         kept,rejected=filter_picks_near_median(blocks[2]['picks'],30)
         self.assertEqual(([p['station'] for p in kept],[p['station'] for p in rejected]),(['CAB','PI2','QAD'],['CRW']))
 
+    def test_split_block_with_two_events(self):
+        from flovopy.core.vdap import split_picks_by_time_gap
+        T=UTCDateTime('1991-07-10T12:00:00')
+        def pk(sta,dt):return dict(station=sta,time=T+dt)
+        first=[pk('CAB',0),pk('BUG',1),pk('FNG',2)];second=[pk('CAB',50),pk('BUG',51),pk('QAD',52)]
+        groups=split_picks_by_time_gap(first+second+[pk('PI2',400)])
+        self.assertEqual([len(g) for g in groups],[3,4])          # stray PI2 joins the nearer event
+        self.assertEqual(split_picks_by_time_gap(first+[pk('CAB',50),pk('BUG',51)]),[first+[pk('CAB',50),pk('BUG',51)]])
+        self.assertEqual(split_picks_by_time_gap([]),[])
+
     def test_fixed_s_only_and_shifted_timestamps(self):
         # Lines from the 1991 Pinatubo monthly PHA files. Blank P seconds must
         # not shift the minute, and a P code without P seconds gives no P pick.
