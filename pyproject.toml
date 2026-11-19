@@ -16,6 +16,9 @@ dependencies = [
   "numpy"
 ]
 
+[project.optional-dependencies]
+parquet = ["pyarrow"]
+
 [project.scripts]
 run-iceweb = "flovopy.wrappers.run_iceweb:main"
 run-asl = "flovopy.wrappers.run_asl:main"

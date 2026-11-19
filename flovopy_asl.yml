@@ -33,6 +33,7 @@ dependencies:
   - numpy
   - scipy
   - pandas
+  - pyarrow  # Parquet metric exports
   - matplotlib
   - xarray
   - netcdf4

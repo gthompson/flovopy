@@ -37,6 +37,27 @@ class EnhancedMetricTests(unittest.TestCase):
         self.assertEqual(frame['trace.metrics.unanticipated_metric'].iloc[0],7)
         self.assertEqual(json.loads(frame['trace.metrics.nested.x'].iloc[0]),[1,2,3])
         self.assertEqual(len(catalog.metrics_dataframe(level='event')),1)
+    def test_sidecar_parquet_matches_csv_and_keeps_types(self):
+        import pandas as pd
+        events=[EnhancedEvent(resource_id='smi:local/a',meta=EnhancedEventMeta(traces=[
+                    {'window':'noise','metrics':{'n':3,'x':1.5,'ok':True,'arr':[1,None]}}])),
+                EnhancedEvent(resource_id='smi:local/b',meta=EnhancedEventMeta(traces=[
+                    {'window':'event','metrics':{'n':4,'x':2,'late':'yes'}},{'window':'event','metrics':{}}]))]
+        with TemporaryDirectory() as root:
+            paths=[]
+            for i,event in enumerate(events):event.save(root,f'e{i}',write_quakeml=False);paths.append(Path(root)/f'e{i}.json')
+            csv_fields=EnhancedCatalog.export_sidecars_csv(paths,Path(root)/'all.csv')
+            fields=EnhancedCatalog.export_sidecars_parquet(paths,Path(root)/'all.parquet',batch_rows=2)
+            self.assertEqual(fields,csv_fields)
+            frame=pd.read_parquet(Path(root)/'all.parquet');self.assertEqual(list(frame.columns),fields);self.assertEqual(len(frame),3)
+            self.assertEqual(str(frame['trace.metrics.n'].dtype),'float64')  # missing in one row: pandas gives NaN
+            self.assertEqual(frame['trace.metrics.x'].tolist()[:2],[1.5,2.0])
+            self.assertEqual(json.loads(frame['trace.metrics.arr'].iloc[0]),[1,None])
+            self.assertEqual(frame['trace.metrics.late'].isna().tolist(),[True,False,True])
+            import pyarrow.parquet as pq
+            schema=pq.read_schema(Path(root)/'all.parquet')
+            self.assertEqual(str(schema.field('trace.metrics.ok').type),'bool');self.assertEqual(str(schema.field('trace.metrics.late').type),'string')
+            self.assertFalse((Path(root)/'all.parquet.tmp').exists())
     def test_json_mask_and_collision_are_explicit(self):
         self.assertEqual(json_compatible(np.ma.array([1.,2.],mask=[False,True])),[1.,None])
         with self.assertRaises(ValueError):flatten_metrics({'a.b':1,'a':{'b':2}})

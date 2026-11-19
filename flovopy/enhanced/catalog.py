@@ -678,9 +678,76 @@ class EnhancedCatalog(Catalog):
         os.replace(temporary,filepath)
         return fields
 
+    def export_metrics_parquet(self, filepath, *, level='trace'):
+        """Write the full dynamic metrics view to Parquet (see export_sidecars_parquet)."""
+        return _write_rows_parquet(lambda:self.metrics_dataframe(level=level).to_dict('records'),filepath)
+
+    @classmethod
+    def export_sidecars_parquet(cls, paths, filepath, *, level='trace', include_trace_summaries=True,
+                                batch_rows=20000, compression='zstd'):
+        """Parquet counterpart of export_sidecars_csv, with memory bounded to one batch of rows.
+
+        The first pass finds the union of keys and a type for each column: bool,
+        int64 or float64 when every non-null value fits, otherwise string. Arrays
+        and lists stay complete JSON strings, as in the CSV export. Requires pyarrow.
+        Returns the list of columns.
+        """
+        paths=list(paths)
+        def rows():
+            for path in paths:
+                base=os.fspath(path)
+                if base.endswith('.json'):base=base[:-5]
+                event=EnhancedEvent.load(base,require_quakeml=False)
+                if not include_trace_summaries:event.meta.traces=[]
+                yield from cls(events=[event]).metrics_dataframe(level=level).to_dict('records')
+        return _write_rows_parquet(rows,filepath,batch_rows=batch_rows,compression=compression)
+
     # ---------- EventRate bridge ----------
     def to_event_rate(self, config: Optional[EventRateConfig] = None) -> EventRate:
         """
         Build a regularly sampled event-rate view from this catalog.
         """
         return EventRate.from_catalog(self, config=config)
+
+
+def _write_rows_parquet(rows, filepath, *, batch_rows=20000, compression='zstd'):
+    """Two-pass Parquet writer for flattened metric rows; rows() must yield the same rows each call."""
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise ImportError('Parquet export needs pyarrow (conda install -c conda-forge pyarrow)') from exc
+    import math
+    fields=[];kinds={}
+    for row in rows():
+        for key,value in row.items():
+            if key not in kinds:fields.append(key);kinds[key]=set()
+            if value is None or (isinstance(value,float) and math.isnan(value)):continue
+            kinds[key].add(bool if isinstance(value,(bool,np.bool_)) else int if isinstance(value,(int,np.integer))
+                           else float if isinstance(value,(float,np.floating)) else str)
+    if not fields:fields=['event_id','trace_entry_index'];kinds={k:set() for k in fields}
+    def arrow_type(found):
+        if found=={bool}:return pa.bool_()
+        if found=={int}:return pa.int64()
+        if found and found<={int,float}:return pa.float64()
+        return pa.string()
+    schema=pa.schema([(key,arrow_type(kinds[key])) for key in fields])
+    text={key for key in fields if schema.field(key).type==pa.string()}
+    def convert(key,value):
+        if value is None or (isinstance(value,float) and math.isnan(value)):return None
+        if key in text and not isinstance(value,str):return json.dumps(value) if isinstance(value,(bool,np.bool_)) else str(value)
+        return value
+    temporary=os.fspath(filepath)+'.tmp'
+    writer=pq.ParquetWriter(temporary,schema,compression=compression)
+    try:
+        batch=[]
+        def flush():
+            writer.write_table(pa.Table.from_pydict({key:[convert(key,row.get(key)) for row in batch] for key in fields},schema=schema))
+            batch.clear()
+        for row in rows():
+            batch.append(row)
+            if len(batch)>=batch_rows:flush()
+        if batch:flush()
+    finally:writer.close()
+    os.replace(temporary,filepath)
+    return fields
