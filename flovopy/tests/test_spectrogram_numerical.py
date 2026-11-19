@@ -3,6 +3,7 @@ import pytest
 from obspy import Stream, Trace, UTCDateTime
 from flovopy.processing.spectrograms import (
     SpectrogramResult, compute_spectrogram_result, compute_stream_spectrograms,
+    compute_multitaper_spectrogram_result, multitaper_psd, dpss_tapers,
 )
 
 
@@ -106,3 +107,31 @@ def test_stream():
 def test_shape_validation():
     with pytest.raises(ValueError):
         SpectrogramResult('a', np.array([0]), np.array([1]), np.zeros((2, 1)), np.array([1]))
+
+
+def test_multitaper_density_normalisation_and_peak():
+    fs = 100
+    x = 3 * np.sin(2 * np.pi * 6 * np.arange(10000) / fs)
+    f, psd, count, k = multitaper_psd(x, fs, nperseg=256, step=128, nw=2.5)
+    assert np.trapezoid(psd, f) == pytest.approx(4.5, abs=0.15)
+    assert abs(f[np.argmax(psd)] - 6) < 1
+    assert k == 4 and count == 77
+    result = compute_multitaper_spectrogram_result(trace(x), fft_seconds=2.56, step_seconds=0.16, nw=2.5, units='counts')
+    assert np.trapezoid(result.values[:, 0], result.frequencies) == pytest.approx(4.5, abs=0.15)
+    assert result.units == '(counts)²/Hz' and result.metadata['tapers'] == 4
+
+
+def test_multitaper_rejects_gaps_and_non_integer_rates_round():
+    tr = trace(np.ones(2000))
+    tr.data = np.ma.array(tr.data, mask=False)
+    tr.data.mask[300:500] = True
+    result = compute_multitaper_spectrogram_result(tr, fft_seconds=2.56, step_seconds=0.16, nw=2.5)
+    assert np.isnan(result.values[:, result.coverage < 1]).all()
+    assert np.isfinite(result.values[:, result.coverage == 1]).all()
+    odd = trace(np.random.default_rng(0).normal(size=3000), fs=3125 / 31)
+    result = compute_multitaper_spectrogram_result(odd, fft_seconds=1.28, step_seconds=0.16, nw=2.5)
+    assert result.metadata['fft_seconds'] == pytest.approx(129 * 31 / 3125)
+    with pytest.raises(ValueError):
+        multitaper_psd(np.r_[np.ones(300), np.nan], 100, nperseg=256, step=128, nw=2.5)
+    with pytest.raises(ValueError):
+        dpss_tapers(8, 4)

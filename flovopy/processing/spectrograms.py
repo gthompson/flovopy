@@ -591,39 +591,6 @@ def _pick_strongest_trace(stream):
             best = tr
     return best
 
-def _multitaper_spectrogram(x: np.ndarray, fs: float,
-                            nperseg: int, noverlap: int,
-                            NW: float = 3.0, K: Optional[int] = None
-                            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Multitaper (DPSS) spectrogram: returns (freqs, times, Sxx_dB).
-    """
-    x = np.asarray(x, float)
-    step = nperseg - noverlap
-    if step <= 0 or len(x) < nperseg:
-        raise ValueError("nperseg/noverlap incompatible with data length.")
-    n_frames = 1 + (len(x) - nperseg) // step
-    if K is None:
-        K = max(1, int(2 * NW) - 1)  # e.g., NW=3 -> K=5
-
-    tapers, eigs = dpss(nperseg, NW=NW, Kmax=K, return_ratios=True)
-    freqs = np.fft.rfftfreq(nperseg, 1.0 / fs)
-    Sxx = np.zeros((len(freqs), n_frames), dtype=float)
-
-    # simple equal weighting across tapers (adaptive weighting is a further upgrade)
-    for i in range(n_frames):
-        seg = x[i * step : i * step + nperseg]
-        acc = 0.0
-        for k in range(K):
-            Xk = rfft(seg * tapers[k])
-            acc += (np.abs(Xk) ** 2)
-        Sxx[:, i] = acc / K
-
-    Sxx = np.maximum(Sxx, np.finfo(float).eps)
-    Sxx_db = 10.0 * np.log10(Sxx)
-    t = (np.arange(n_frames) * step + 0.5 * nperseg) / fs
-    return freqs, t, Sxx_db
-
 def plot_strongest_trace_multitaper(
     stream_or_data,
     fs=None,
@@ -1163,6 +1130,90 @@ def compute_stream_spectrograms(stream, **kwargs):
         results[trace.id] = compute_spectrogram_result(trace, **kwargs)
     return results
 
+
+
+def dpss_tapers(nperseg, nw, k=None):
+    """DPSS tapers for equal-weight multitaper estimates; K defaults to 2*NW-1."""
+    nperseg = int(nperseg)
+    nw = float(nw)
+    if not 0 < nw < nperseg / 2:
+        raise ValueError('Invalid DPSS time-bandwidth product')
+    k = max(1, int(2 * nw) - 1) if k is None else int(k)
+    if k < 1:
+        raise ValueError('K must be at least 1')
+    return dpss(nperseg, NW=nw, Kmax=k, sym=False)
+
+
+def multitaper_periodogram(block, fs, tapers):
+    """Equal-weight DPSS PSD of one block, density-scaled like scipy.signal.periodogram.
+
+    The block mean is removed first. Returns (frequencies, psd).
+    """
+    block = np.asarray(block, dtype=np.float64)
+    if not np.isfinite(block).all():
+        raise ValueError('Multitaper input contains gaps')
+    block = block - block.mean()
+    n = len(block)
+    spectra = [_periodogram(block, fs=fs, window=taper, detrend=False, nfft=n,
+                            scaling='density', return_onesided=True)[1] for taper in tapers]
+    return np.fft.rfftfreq(n, 1 / fs), np.mean(spectra, axis=0)
+
+
+def multitaper_psd(data, fs, *, nperseg, step, nw, k=None):
+    """Average of equal-weight DPSS PSDs over complete segments (a multitaper Welch).
+
+    Segments start every ``step`` samples; no padding. Returns
+    (frequencies, psd, segment_count, tapers_used). Gaps raise.
+    """
+    x = np.asarray(data, dtype=np.float64)
+    if not np.isfinite(x).all():
+        raise ValueError('PSD input contains gaps')
+    nperseg = int(nperseg)
+    step = int(step)
+    if nperseg < 2 or step < 1 or nperseg > len(x):
+        raise ValueError('Segment length does not fit the data')
+    tapers = dpss_tapers(nperseg, nw, k)
+    spectra = [multitaper_periodogram(x[a:a + nperseg], fs, tapers)[1]
+               for a in range(0, len(x) - nperseg + 1, step)]
+    return np.fft.rfftfreq(nperseg, 1 / fs), np.mean(spectra, axis=0), len(spectra), len(tapers)
+
+
+def compute_multitaper_spectrogram_result(trace, *, fft_seconds, step_seconds, nw, k=None, units=None):
+    """Gap-rejecting, density-normalised, equal-weight DPSS spectrogram.
+
+    FFT length and step are rounded to whole samples (so non-integer sampling
+    rates work); windows start at the trace start. Windows containing any gap
+    are kept as all-NaN columns with their coverage. ``times`` are Unix UTC
+    seconds at FFT centres. No dB or legacy scaling is applied.
+    """
+    if not isinstance(trace, Trace):
+        raise TypeError('trace must be an ObsPy Trace')
+    x = np.array(np.ma.asarray(trace.data, dtype=np.float64).filled(np.nan), copy=True)
+    x[~np.isfinite(x)] = np.nan
+    fs = float(trace.stats.sampling_rate)
+    n = int(round(fs * fft_seconds))
+    step = max(1, int(round(fs * step_seconds)))
+    if n < 4 or n > len(x):
+        raise ValueError('FFT window does not fit the trace')
+    tapers = dpss_tapers(n, nw, k)
+    offsets = np.arange(0, len(x) - n + 1, step)
+    frequencies = np.fft.rfftfreq(n, 1 / fs)
+    values = np.full((len(frequencies), len(offsets)), np.nan)
+    coverage = np.zeros(len(offsets))
+    for j, a in enumerate(offsets):
+        block = x[a:a + n]
+        coverage[j] = np.isfinite(block).mean()
+        if coverage[j] < 1:
+            continue
+        values[:, j] = multitaper_periodogram(block, fs, tapers)[1]
+    base_units = units if units is not None else trace.stats.get('units', None)
+    return SpectrogramResult(
+        trace.id, float(trace.stats.starttime.timestamp) + (offsets + (n - 1) / 2) / fs,
+        frequencies, values, coverage, quantity='psd',
+        units=None if base_units is None else f'({base_units})²/Hz',
+        metadata=dict(fft_seconds=n / fs, step_seconds=step / fs, nw=float(nw), tapers=len(tapers),
+                      estimator='equal_weight_DPSS_density', bandwidth_hz=2 * float(nw) / (n / fs),
+                      sampling_rate=fs, gap_policy='reject_partial_fft'))
 
 @dataclass
 class BandSpectrogramResult:
