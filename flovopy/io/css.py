@@ -1,4 +1,4 @@
-"""Antelope CSS3.0 ASCII catalog tables and ObsPy event conversion."""
+"""Antelope CSS3.0 ASCII catalog tables: reading into ObsPy events, and a pure-Python writer."""
 from pathlib import Path
 from collections import defaultdict
 from urllib.parse import quote
@@ -195,3 +195,126 @@ def read_events(path, *, namespace=None):
     for e in catalog:
         e.scope_resource_ids()
     return catalog
+
+
+# CSS3.0 null values (Antelope css3.0 schema). By scalar kind, then per field.
+_NULL_BY_KIND = {'s': '-', 'i': -1, 'y': -1, 't': -9999999999.999, 'r': -1.0}
+_NULL_BY_FIELD = {name: -999.0 for name in (
+    'lat', 'lon', 'depth', 'depdp', 'mb', 'ms', 'ml', 'magnitude', 'logat',
+    'seaz', 'esaz', 'timeres', 'azres', 'slores', 'emares')}
+_NULL_BY_FIELD['conf'] = 0.0
+# Decimal places of real fields, from the schema print formats. Epoch times use 5.
+_DECIMALS = dict(
+    lat=4, lon=4, depth=4, depdp=4, sdepth=4, sdobs=4, smajax=4, sminax=4,
+    sxx=4, syy=4, szz=4, stt=4, sxy=4, sxz=4, syz=4, stx=4, sty=4, stz=4,
+    deltim=3, rect=3, delta=3, timeres=3, wgt=3, conf=3,
+    azimuth=2, delaz=2, slow=2, delslo=2, ema=2, per=2, logat=2, snr=2, belief=2,
+    seaz=2, esaz=2, slores=2, magnitude=2, uncertainty=2, mb=2, ms=2, ml=2,
+    strike=2, stime=2, tron=3, troff=3,
+    amp=1, azres=1, emares=1)
+
+
+def _fields(table):
+    if table not in _LAYOUTS:
+        raise ValueError(f"Unsupported CSS relation {table!r}. Available: {', '.join(_LAYOUTS)}")
+    return [(name, fmt[0], int(fmt[1:])) for name, fmt in
+            (definition.split(':') for definition in _LAYOUTS[table].split())]
+
+
+def _format_field(table, name, kind, width, value):
+    """One fixed-width field. Reals drop decimals to fit the width (as a fixed-width
+    print would round); anything that still does not fit is refused, never truncated."""
+    if kind == 's':
+        text = str(value)
+        if not text.strip():
+            raise ValueError(f'{table}.{name}: empty string; use None for CSS null')
+        if text != text.strip():
+            # Readers strip padding, so edge whitespace would be lost silently.
+            raise ValueError(f'{table}.{name}: leading/trailing whitespace in {text!r}')
+        if any(c in text for c in '\r\n\t') or not text.isascii():
+            raise ValueError(f'{table}.{name}: non-ASCII or control character in {text!r}')
+        if len(text) > width:
+            raise ValueError(f'{table}.{name}: {text!r} exceeds {width} characters')
+        return text.ljust(width)
+    if kind in ('i', 'y'):
+        if isinstance(value, bool) or int(value) != value:
+            raise ValueError(f'{table}.{name}: integer required, got {value!r}')
+        text = str(int(value)).rjust(width)
+    else:
+        value = float(value)
+        if value != value or value in (float('inf'), float('-inf')):
+            raise ValueError(f'{table}.{name}: non-finite value; use None for CSS null')
+        decimals = 5 if kind == 't' else _DECIMALS.get(name, 4)
+        text = f"{value:{width}.{decimals}f}"
+        while len(text) > width and decimals > 0:
+            decimals -= 1
+            text = f"{value:{width}.{decimals}f}"
+    if len(text) > width:
+        raise ValueError(f'{table}.{name}: {value!r} does not fit in {width} characters')
+    return text
+
+
+def format_record(table, **values):
+    """Format one CSS3.0 record; omitted fields and None become CSS nulls."""
+    fields = _fields(table)
+    unknown = set(values) - {name for name, _, _ in fields}
+    if unknown:
+        raise ValueError(f'{table}: unknown fields {sorted(unknown)}')
+    parts = []
+    for name, kind, width in fields:
+        value = values.get(name)
+        if value is None:
+            value = _NULL_BY_FIELD.get(name, _NULL_BY_KIND[kind]) if kind == 'r' else _NULL_BY_KIND[kind]
+        parts.append(_format_field(table, name, kind, width, value))
+    return ' '.join(parts)
+
+
+class CSSWriter:
+    """Pure-Python writer for a new CSS3.0 flat-file database (no Antelope needed).
+
+    Mirrors the Datascope calls a catalogue exporter needs: ``nextid(key)`` and
+    ``add(table, **fields)``. Rows are held in memory and written on ``close()``
+    as fixed-width ASCII relations, plus ``lastid`` and a descriptor file
+    (``schema css3.0``) at ``dbpath``. Refuses to overwrite an existing database.
+    Output reads back with :func:`read_events`; run Antelope ``dbverify`` for a
+    native check where Antelope is available.
+    """
+
+    def __init__(self, dbpath, *, schema='css3.0'):
+        self.dbpath = Path(dbpath)
+        if self.dbpath.exists() or list(self.dbpath.parent.glob(self.dbpath.name + '.*')):
+            raise FileExistsError(f'Refusing to overwrite CSS database: {self.dbpath}')
+        self.schema = schema
+        self.rows = defaultdict(list)
+        self.lastid = {}
+        self.closed = False
+
+    def nextid(self, key):
+        self.lastid[key] = self.lastid.get(key, 0) + 1
+        return self.lastid[key]
+
+    def add(self, table, **values):
+        if self.closed:
+            raise ValueError('CSS database already closed')
+        self.rows[table].append(format_record(table, **values))
+
+    def close(self):
+        """Write all relations once; returns {table: row count}."""
+        if self.closed:
+            return {t: len(r) for t, r in self.rows.items()}
+        lddate = float(UTCDateTime())
+        for key, value in sorted(self.lastid.items()):
+            self.rows['lastid'].append(format_record('lastid', keyname=key, keyvalue=value, lddate=lddate))
+        self.dbpath.parent.mkdir(parents=True, exist_ok=True)
+        for table, rows in self.rows.items():
+            Path(f'{self.dbpath}.{table}').write_text('\n'.join(rows) + '\n', encoding='ascii')
+        self.dbpath.write_text(f'#\nschema {self.schema}\n', encoding='ascii')
+        self.closed = True
+        return {t: len(r) for t, r in self.rows.items()}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
