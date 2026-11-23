@@ -23,6 +23,12 @@ _LAYOUTS = {
     'stamag': 'magid:i8 sta:s6 arid:i8 orid:i8 evid:i8 phase:s8 magtype:s6 magnitude:r7 uncertainty:r7 auth:s15 commid:i8 lddate:t17',
     'detection': 'srcid:s64 tagname:s8 sta:s6 chan:s8 time:t17 arid:i8 state:s3 filter:s30 snr:r10 lddate:t17',
     'detev': 'sta:s6 chan:s8 filter:s30 time:t17 tron:r12 troff:r12 iphase:s8 snr:r10 lddate:t17',
+    # Waveform index and station relations (css3.0 plus Antelope's snetsta/schanloc).
+    'wfdisc': 'sta:s6 chan:s8 time:t17 wfid:i8 chanid:i8 jdate:y8 endtime:t17 nsamp:i8 samprate:r11 calib:r16 calper:r16 instype:s6 segtype:s1 datatype:s2 clip:s1 dir:s64 dfile:s32 foff:i10 commid:i8 lddate:t17',
+    'snetsta': 'snet:s8 fsta:s10 sta:s6 lddate:t17',
+    'schanloc': 'sta:s6 fchan:s8 loc:s8 chan:s8 lddate:t17',
+    'site': 'sta:s6 ondate:y8 offdate:y8 lat:r9 lon:r9 elev:r9 staname:s50 statype:s4 refsta:s6 dnorth:r9 deast:r9 lddate:t17',
+    'sitechan': 'sta:s6 chan:s8 ondate:y8 chanid:i8 offdate:y8 ctype:s4 edepth:r9 hang:r6 vang:r6 descrip:s50 lddate:t17',
 }
 
 
@@ -202,7 +208,8 @@ _NULL_BY_KIND = {'s': '-', 'i': -1, 'y': -1, 't': -9999999999.999, 'r': -1.0}
 _NULL_BY_FIELD = {name: -999.0 for name in (
     'lat', 'lon', 'depth', 'depdp', 'mb', 'ms', 'ml', 'magnitude', 'logat',
     'seaz', 'esaz', 'timeres', 'azres', 'slores', 'emares')}
-_NULL_BY_FIELD['conf'] = 0.0
+_NULL_BY_FIELD.update(conf=0.0, elev=-999.0, endtime=9999999999.999, calib=0.0,
+                      dnorth=0.0, deast=0.0, edepth=-9.9999)
 # Decimal places of real fields, from the schema print formats. Epoch times use 5.
 _DECIMALS = dict(
     lat=4, lon=4, depth=4, depdp=4, sdepth=4, sdobs=4, smajax=4, sminax=4,
@@ -211,7 +218,8 @@ _DECIMALS = dict(
     azimuth=2, delaz=2, slow=2, delslo=2, ema=2, per=2, logat=2, snr=2, belief=2,
     seaz=2, esaz=2, slores=2, magnitude=2, uncertainty=2, mb=2, ms=2, ml=2,
     strike=2, stime=2, tron=3, troff=3,
-    amp=1, azres=1, emares=1)
+    amp=1, azres=1, emares=1,
+    samprate=7, calib=6, calper=6, elev=4, dnorth=4, deast=4, edepth=4, hang=1, vang=1)
 
 
 def _fields(table):
@@ -264,27 +272,37 @@ def format_record(table, **values):
     for name, kind, width in fields:
         value = values.get(name)
         if value is None:
-            value = _NULL_BY_FIELD.get(name, _NULL_BY_KIND[kind]) if kind == 'r' else _NULL_BY_KIND[kind]
+            value = _NULL_BY_FIELD.get(name, _NULL_BY_KIND[kind]) if kind in 'rt' else _NULL_BY_KIND[kind]
         parts.append(_format_field(table, name, kind, width, value))
     return ' '.join(parts)
 
 
 class CSSWriter:
-    """Pure-Python writer for a new CSS3.0 flat-file database (no Antelope needed).
+    """Pure-Python writer for a CSS3.0 flat-file database (no Antelope needed).
 
-    Mirrors the Datascope calls a catalogue exporter needs: ``nextid(key)`` and
+    Mirrors the Datascope calls an exporter needs: ``nextid(key)`` and
     ``add(table, **fields)``. Rows are held in memory and written on ``close()``
     as fixed-width ASCII relations, plus ``lastid`` and a descriptor file
-    (``schema css3.0``) at ``dbpath``. Refuses to overwrite an existing database.
-    Output reads back with :func:`read_events`; run Antelope ``dbverify`` for a
-    native check where Antelope is available.
+    (``schema css3.0``, and ``dbpath`` lines for ``links``) at ``dbpath``.
+
+    By default refuses an existing database. ``overwrite=True`` replaces it as a
+    derived product: every relation file this module knows is rewritten or removed,
+    each via a temporary file, and nothing else in the directory is touched.
+    Leaving a ``with`` block on an exception writes nothing.
+
+    ``links``: other databases whose tables this one should see, as Antelope
+    ``dbpath`` entries, e.g. ``['../WAV/PNTBO/{PNTBO}']`` (relative to this directory).
     """
 
-    def __init__(self, dbpath, *, schema='css3.0'):
+    def __init__(self, dbpath, *, schema='css3.0', overwrite=False, links=()):
         self.dbpath = Path(dbpath)
-        if self.dbpath.exists() or list(self.dbpath.parent.glob(self.dbpath.name + '.*')):
+        if not overwrite and (self.dbpath.exists() or list(self.dbpath.parent.glob(self.dbpath.name + '.*'))):
             raise FileExistsError(f'Refusing to overwrite CSS database: {self.dbpath}')
+        if self.dbpath.is_dir():
+            raise IsADirectoryError(f'CSS descriptor path is a directory: {self.dbpath}')
         self.schema = schema
+        self.overwrite = overwrite
+        self.links = [str(link) for link in links]
         self.rows = defaultdict(list)
         self.lastid = {}
         self.closed = False
@@ -298,23 +316,38 @@ class CSSWriter:
             raise ValueError('CSS database already closed')
         self.rows[table].append(format_record(table, **values))
 
+    def counts(self):
+        return {t: len(r) for t, r in self.rows.items()}
+
     def close(self):
         """Write all relations once; returns {table: row count}."""
         if self.closed:
-            return {t: len(r) for t, r in self.rows.items()}
+            return self.counts()
+        import os, tempfile
         lddate = float(UTCDateTime())
         for key, value in sorted(self.lastid.items()):
             self.rows['lastid'].append(format_record('lastid', keyname=key, keyvalue=value, lddate=lddate))
         self.dbpath.parent.mkdir(parents=True, exist_ok=True)
-        for table, rows in self.rows.items():
-            Path(f'{self.dbpath}.{table}').write_text('\n'.join(rows) + '\n', encoding='ascii')
-        self.dbpath.write_text(f'#\nschema {self.schema}\n', encoding='ascii')
+        descriptor = f'#\nschema {self.schema}\n' + ''.join(f'dbpath {":".join(self.links)}\n' for _ in self.links[:1])
+        outputs = {Path(f'{self.dbpath}.{t}'): '\n'.join(r) + '\n' for t, r in self.rows.items() if r}
+        outputs[self.dbpath] = descriptor
+        for path, text in outputs.items():
+            handle = tempfile.NamedTemporaryFile('w', dir=path.parent, prefix='.css-', delete=False, encoding='ascii')
+            with handle:
+                handle.write(text)
+            os.replace(handle.name, path)
+        if self.overwrite:
+            for table in _LAYOUTS:
+                stale = Path(f'{self.dbpath}.{table}')
+                if stale not in outputs and stale.exists():
+                    stale.unlink()
         self.closed = True
-        return {t: len(r) for t, r in self.rows.items()}
+        return self.counts()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
-        self.close()
+    def __exit__(self, exc_type, *exc):
+        if exc_type is None:
+            self.close()
         return False
