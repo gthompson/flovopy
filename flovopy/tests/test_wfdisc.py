@@ -96,6 +96,9 @@ def test_calib_units():
     cha = _inventory()[0][0][0]
     cha.response.instrument_sensitivity.input_units = 'PA'
     assert calib_from_channel(cha)[2] == 'unsupported_units:PA'
+    cha = _inventory()[0][0][0]
+    cha.response.instrument_sensitivity.output_units = 'V'  # sensor-only model: no counts calibration
+    assert calib_from_channel(cha) == (None, None, 'unsupported_output_units:V')
 
 
 def test_sds_groups(tmp_path):

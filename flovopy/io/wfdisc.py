@@ -81,6 +81,9 @@ def calib_from_channel(channel):
     power = {'M': 0, 'NM': 0, 'M/S': 1, 'M/SEC': 1, 'M/S**2': 2, 'M/S/S': 2, 'M/S2': 2, 'M/SEC**2': 2}.get(units)
     if power is None:
         return None, None, f'unsupported_units:{units or "none"}'
+    out = (sens.output_units or '').upper().replace(' ', '')
+    if out not in ('COUNTS', 'COUNT', 'DU', 'DIGITALCOUNTS'):  # e.g. a sensor-only model ending in V
+        return None, None, f'unsupported_output_units:{out or "none"}'
     scale = 1.0 if units == 'NM' else 1e9
     omega = 2 * math.pi * sens.frequency
     return scale / (sens.value * omega ** power), 1.0 / sens.frequency, 'stationxml'
