@@ -90,6 +90,12 @@ def test_inventory_calib_site_sitechan(seisan):
     assert site.staname[0] == 'Clark Air Base' and math.isclose(site.elev[0], 0.5)
     sc = read_table(seisan / 'PNTBO', 'sitechan')
     assert (sc.vang[0], sc.hang[0], sc.ctype[0]) == (0.0, 0.0, 'n')
+    # Authoritative calibration: wfdisc.calib == instrument.ncalib * sensor.calratio for the epoch.
+    sen, ins = read_table(seisan / 'PNTBO', 'sensor'), read_table(seisan / 'PNTBO', 'instrument')
+    assert len(sen) == 1 and len(ins) == 1 and sen.inid[0] == ins.inid[0] and sen.chanid[0] == 1
+    assert math.isclose(ins.ncalib[0] * sen.calratio[0], wf.calib[0], rel_tol=1e-5)
+    assert sen.time[0] == pytest.approx((T0 - 86400).timestamp) and sen.endtime[0] == pytest.approx(9999999999.999)
+    assert (ins.band[0], ins.digital[0], ins.ncalper[0], sen.instant[0]) == ('s', 'd', 1.0, 'y')
 
 
 def test_calib_units():

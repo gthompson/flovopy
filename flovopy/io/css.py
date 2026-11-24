@@ -29,6 +29,9 @@ _LAYOUTS = {
     'schanloc': 'sta:s6 fchan:s8 loc:s8 chan:s8 lddate:t17',
     'site': 'sta:s6 ondate:y8 offdate:y8 lat:r9 lon:r9 elev:r9 staname:s50 statype:s4 refsta:s6 dnorth:r9 deast:r9 lddate:t17',
     'sitechan': 'sta:s6 chan:s8 ondate:y8 chanid:i8 offdate:y8 ctype:s4 edepth:r9 hang:r6 vang:r6 descrip:s50 lddate:t17',
+    # Calibration: wfdisc.calib = instrument.ncalib * sensor.calratio (layouts as in the pisces css3 schema).
+    'sensor': 'sta:s6 chan:s8 time:t17 endtime:t17 inid:i8 chanid:i8 jdate:y8 calratio:r16 calper:r16 tshift:r6 instant:s1 lddate:t17',
+    'instrument': 'inid:i8 insname:s50 instype:s6 band:s1 digital:s1 samprate:r11 ncalib:r16 ncalper:r16 dir:s64 dfile:s32 rsptype:s6 lddate:t17',
 }
 
 
@@ -209,7 +212,7 @@ _NULL_BY_FIELD = {name: -999.0 for name in (
     'lat', 'lon', 'depth', 'depdp', 'mb', 'ms', 'ml', 'magnitude', 'logat',
     'seaz', 'esaz', 'timeres', 'azres', 'slores', 'emares')}
 _NULL_BY_FIELD.update(conf=0.0, elev=-999.0, endtime=9999999999.999, calib=0.0,
-                      dnorth=0.0, deast=0.0, edepth=-9.9999)
+                      dnorth=0.0, deast=0.0, edepth=-9.9999, calratio=1.0, tshift=0.0)
 # Decimal places of real fields, from the schema print formats. Epoch times use 5.
 _DECIMALS = dict(
     lat=4, lon=4, depth=4, depdp=4, sdepth=4, sdobs=4, smajax=4, sminax=4,
@@ -219,7 +222,7 @@ _DECIMALS = dict(
     seaz=2, esaz=2, slores=2, magnitude=2, uncertainty=2, mb=2, ms=2, ml=2,
     strike=2, stime=2, tron=3, troff=3,
     amp=1, azres=1, emares=1,
-    samprate=7, calib=6, calper=6, elev=4, dnorth=4, deast=4, edepth=4, hang=1, vang=1)
+    samprate=7, calib=6, calper=6, calratio=6, ncalib=6, ncalper=6, tshift=2, elev=4, dnorth=4, deast=4, edepth=4, hang=1, vang=1)
 
 
 def _fields(table):

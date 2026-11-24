@@ -89,6 +89,24 @@ def calib_from_channel(channel):
     return scale / (sens.value * omega ** power), 1.0 / sens.frequency, 'stationxml'
 
 
+# SEED band code to CSS instrument.band (s short period, b broadband, l long period, ...).
+_BAND = {'E': 's', 'S': 's', 'H': 'b', 'B': 'b', 'M': 'm', 'L': 'l', 'V': 'v', 'U': 'u'}
+
+
+def _instrument_name(channel):
+    sensor = getattr(channel, 'sensor', None)
+    stages = getattr(getattr(channel, 'response', None), 'response_stages', None) or []
+    named = '; '.join(s.name for s in stages if getattr(s, 'name', None))
+    text = '; '.join(t for t in (getattr(sensor, 'type', None), named) if t) or 'unnamed'
+    return _ascii(text, 50)
+
+
+def _instype(channel):
+    sensor = getattr(channel, 'sensor', None)
+    text = ''.join(c for c in str(getattr(sensor, 'type', '') or '') if c.isalnum())
+    return text[:6] or None
+
+
 def _jdate(time):
     return int(UTCDateTime(time).strftime('%Y%j'))
 
@@ -144,7 +162,10 @@ def write_waveform_database(dbpath, files, *, inventory=None, station_map=None, 
 
     ``dir`` is each file's directory relative to ``dbpath``'s directory. Files that
     cannot be indexed are reported in ``errors`` and contribute no rows.
-    With ``inventory``: calib/calper from sensitivities, plus site and sitechan.
+    With ``inventory``: site and sitechan; sensor and instrument for every channel epoch whose
+    response ends in counts (the authoritative calibration: one instrument row per distinct
+    nominal calibration, ``ncalib``/``ncalper``, and one sensor row per epoch with
+    ``calratio`` 1); and wfdisc calib/calper copied from them for convenience.
     Returns a report dict.
     """
     dbpath = Path(dbpath)
@@ -155,7 +176,7 @@ def write_waveform_database(dbpath, files, *, inventory=None, station_map=None, 
     lddate = float(UTCDateTime())
     netsta, chanloc, errors = {}, {}, []
     calib_status, gaps = Counter(), Counter()
-    sitechan_ids = {}
+    sitechan_ids, instruments = {}, {}
     if inventory is not None:
         site_keys = Counter()
         for net in inventory:
@@ -174,6 +195,21 @@ def write_waveform_database(dbpath, files, *, inventory=None, station_map=None, 
                     chanloc[(css_sta, cha.code, cha.location_code)] = css_chan
                     chanid = writer.nextid('chanid')
                     sitechan_ids[id(cha)] = chanid
+                    calib, calper, status = calib_from_channel(cha)
+                    if calib is not None:
+                        key = (_instrument_name(cha), round(calib, 9), calper, round(cha.sample_rate or 0, 7))
+                        if key not in instruments:
+                            instruments[key] = writer.nextid('inid')
+                            writer.add('instrument', inid=instruments[key], insname=key[0],
+                                       instype=_instype(cha), band=_BAND.get(cha.code[:1]), digital='d',
+                                       samprate=cha.sample_rate or None, ncalib=calib, ncalper=calper,
+                                       lddate=lddate)
+                        writer.add('sensor', sta=css_sta, chan=css_chan,
+                                   time=float(cha.start_date) if cha.start_date else None,
+                                   endtime=float(cha.end_date) if cha.end_date else None,
+                                   inid=instruments[key], chanid=chanid,
+                                   jdate=_jdate(cha.start_date) if cha.start_date else None,
+                                   calratio=1.0, calper=calper, tshift=0.0, instant='y', lddate=lddate)
                     writer.add('sitechan', sta=css_sta, chan=css_chan,
                                ondate=_jdate(cha.start_date) if cha.start_date else None, chanid=chanid,
                                offdate=_jdate(cha.end_date) if cha.end_date else None, ctype='n',
